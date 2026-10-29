@@ -34,6 +34,7 @@ actions!(
         OpenLeader,
         CycleTabForward,
         CycleTabBackward,
+        CloseTab,
         ToggleCmdLock,
         OpenReviewEdits,
         OpenConnections,
@@ -286,6 +287,18 @@ impl AppRoot {
             return;
         };
         pane.update(cx, |pane, cx| pane.cycle_backward(cx));
+    }
+
+    /// Close the current pane's shown tab, or the window once it has no
+    /// tabs left.
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tiles.read(cx).has_items(cx) {
+            crate::window_controls::close_window(window, cx);
+            return;
+        }
+        if let Some(pane) = self.tiles.read(cx).active_pane(cx) {
+            pane.update(cx, |pane, cx| pane.close_active_tab(cx));
+        }
     }
 
     fn toggle_cmd_lock(&mut self, _: &ToggleCmdLock, _window: &mut Window, cx: &mut Context<Self>) {
@@ -640,6 +653,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::open_leader))
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
+            .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
                 this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
             }))
@@ -1717,6 +1731,8 @@ impl PanelApp {
                 gpui::MenuItem::action("Open recording…", crate::session::OpenRecording),
                 gpui::MenuItem::action("Save snapshot", crate::session::SaveSnapshot),
                 gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("Close tab", CloseTab),
             ]),
         ]);
         cx.bind_keys([
@@ -1735,6 +1751,7 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+            KeyBinding::new("secondary-w", CloseTab, None),
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
             KeyBinding::new("secondary-i", ShowInspector, None),

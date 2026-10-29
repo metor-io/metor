@@ -290,6 +290,13 @@ impl Pane {
         }
     }
 
+    /// Close the shown tab, as its close button would.
+    pub fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_item().map(|item| item.entity_id()) {
+            self.close_tab(id, cx);
+        }
+    }
+
     pub fn cycle_forward(&mut self, cx: &mut Context<Self>) {
         if self.items.len() > 1 {
             self.active_index = (self.active_index + 1) % self.items.len();
