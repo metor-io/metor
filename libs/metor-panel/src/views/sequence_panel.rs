@@ -175,14 +175,19 @@ impl Render for SequenceView {
             .child(
                 Switch::new(history, HEADER_CONTROL_HEIGHT, cx)
                     .labels("Channels", "History")
-                    .apply(div().id("seq-mode").cursor_pointer(), &theme)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = match this.mode {
-                            SequenceListMode::Channels => SequenceListMode::History,
-                            SequenceListMode::History => SequenceListMode::Channels,
-                        };
-                        cx.notify();
-                    })),
+                    .on_pick({
+                        let view = cx.entity().downgrade();
+                        std::rc::Rc::new(move |picked, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.mode = match picked {
+                                    0 => SequenceListMode::Channels,
+                                    _ => SequenceListMode::History,
+                                };
+                                cx.notify();
+                            });
+                        })
+                    })
+                    .apply(div().id("seq-mode"), &theme),
             );
 
         let mut list = div()
