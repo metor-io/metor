@@ -30,8 +30,7 @@ use super::plot_common::PanZoom;
 use super::plot_common::chrome::{paint_axes, paint_axis_backdrop};
 use super::time_series::{
     Colormap, IntensityScale, Override, PADDING, PlotBounds, TimeFormat, X_LABEL_HEIGHT,
-    Y_LABEL_WIDTH, format_time_label, format_value_label, plot_area, value_ticks, x_tick_anchor,
-    x_ticks,
+    Y_LABEL_WIDTH, format_time_label, plot_area, value_ticks, x_tick_anchor, x_ticks,
 };
 
 pub(crate) mod grid;
@@ -307,7 +306,7 @@ impl Chrome {
                 "{} · {} · {}{}",
                 format_time_label(sample.ts, data_start as i64, p.x_time_format, view.width()),
                 axis,
-                format_value_label(sample.value as f64),
+                crate::views::format::format_exact(sample.value as f64),
                 scale.unit(),
             );
             Some((pos, SharedString::from(text)))
@@ -370,22 +369,32 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
         );
     }
 
-    for tick in value_ticks(view.min_y, view.max_y, 5) {
-        let y = view.to_screen(pa, view.min_x, tick).y;
-        if y < pa.origin.y || y > pa.origin.y + pa.size.height {
-            continue;
+    let ticks: Vec<(f64, Pixels)> = value_ticks(view.min_y, view.max_y, 5)
+        .map(|tick| (tick, view.to_screen(pa, view.min_x, tick).y))
+        .filter(|(_, y)| *y >= pa.origin.y && *y <= pa.origin.y + pa.size.height)
+        .collect();
+    match chrome.hz_per_bin {
+        Some(step) => {
+            for (tick, y) in ticks {
+                crate::views::plot_common::paint_text_label(
+                    format_frequency(tick * step),
+                    theme.text_secondary,
+                    |width, font_size| {
+                        point(pa.origin.x - width - px(4.0 * s), y - font_size / 2.0)
+                    },
+                    window,
+                    cx,
+                );
+            }
         }
-        let label = match chrome.hz_per_bin {
-            Some(step) => format_frequency(tick * step),
-            None => format_value_label(tick),
-        };
-        crate::views::plot_common::paint_text_label(
-            label,
+        None => crate::views::plot_common::paint_y_value_labels(
+            &ticks,
+            pa.origin.y,
+            |width| pa.origin.x - width - px(4.0 * s),
             theme.text_secondary,
-            |width, font_size| point(pa.origin.x - width - px(4.0 * s), y - font_size / 2.0),
             window,
             cx,
-        );
+        ),
     }
 
     paint_axes(pa, theme.axis_color, window);
@@ -452,7 +461,7 @@ fn paint_colorbar(pa: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx: 
         ),
     ] {
         crate::views::plot_common::paint_text_label(
-            format!("{}{}", format_value_label(value), unit),
+            format!("{}{}", crate::views::format::format_exact(value), unit),
             theme.text_secondary,
             |label_width, _| point(left - label_width - px(3.0 * s), y),
             window,

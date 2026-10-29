@@ -261,22 +261,6 @@ pub(crate) fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us
     }
 }
 
-pub(crate) fn format_value_label(v: f64) -> String {
-    if v == 0.0 {
-        return "0".to_string();
-    }
-    let abs = v.abs();
-    if abs >= 1000.0 {
-        format!("{:.0}", v)
-    } else if abs >= 1.0 {
-        format!("{:.1}", v)
-    } else if abs >= 0.01 {
-        format!("{:.2}", v)
-    } else {
-        format!("{:.1e}", v)
-    }
-}
-
 pub(crate) const Y_LABEL_WIDTH: f32 = 50.0;
 pub(crate) const X_LABEL_HEIGHT: f32 = 10.0;
 pub(crate) const PADDING: f32 = 8.0;
@@ -693,26 +677,21 @@ fn paint_overlay(
         // Right edge of column `i` (column 0 abuts the plot, higher indices
         // step left by Y_LABEL_WIDTH each).
         let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH * s);
-        for tick in value_ticks(ab.min_y, ab.max_y, 5) {
-            let y = ab.to_screen(pb, ab.min_x, tick).y;
-            if y < pb.origin.y || y > pb.origin.y + pb.size.height {
-                continue;
-            }
-            // Right-aligned 4px clear of the axis rule; a label wider than
-            // its column pins to the pane edge instead of painting over the
-            // tile border (this canvas draws above the tile chrome).
-            crate::views::plot_common::paint_value_label(
-                tick,
-                color,
-                |width, font_size| {
-                    let x =
-                        (col_right - width - px(4.0 * s)).max(outer_bounds.origin.x + px(2.0 * s));
-                    point(x, y - font_size / 2.0)
-                },
-                window,
-                cx,
-            );
-        }
+        let ticks: Vec<(f64, Pixels)> = value_ticks(ab.min_y, ab.max_y, 5)
+            .map(|tick| (tick, ab.to_screen(pb, ab.min_x, tick).y))
+            .filter(|(_, y)| *y >= pb.origin.y && *y <= pb.origin.y + pb.size.height)
+            .collect();
+        // Right-aligned 4px clear of the axis rule; a label wider than its
+        // column pins to the pane edge instead of painting over the tile
+        // border (this canvas draws above the tile chrome).
+        crate::views::plot_common::paint_y_value_labels(
+            &ticks,
+            pb.origin.y,
+            |width| (col_right - width - px(4.0 * s)).max(outer_bounds.origin.x + px(2.0 * s)),
+            color,
+            window,
+            cx,
+        );
     }
 
     // X tick labels track the primary axis's X range.
@@ -1680,7 +1659,7 @@ impl TimeSeriesPlot {
                 (
                     s.color,
                     s.label,
-                    SharedString::from(format_value_label(s.value)),
+                    SharedString::from(crate::views::format::format_exact(s.value)),
                 )
             })
             .collect();
