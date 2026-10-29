@@ -90,6 +90,43 @@ impl SequenceView {
     }
 }
 
+impl SequenceView {
+    /// One half of the Channels / History switch: the shown one reads as
+    /// pressed, the other as a button to it.
+    fn mode_segment(
+        &self,
+        label: &'static str,
+        mode: SequenceListMode,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let shown = self.mode == mode;
+        div()
+            .id(("seq-mode", mode as usize))
+            .px_2()
+            .py(px(1.0))
+            .rounded(px(3.0))
+            .text_size(px(11.0))
+            .when(shown, |segment| {
+                segment
+                    .bg(theme.selection_bg)
+                    .text_color(theme.text_primary)
+            })
+            .when(!shown, |segment| {
+                segment
+                    .text_color(theme.text_tertiary)
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(theme.text_secondary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mode = mode;
+                        cx.notify();
+                    }))
+            })
+            .child(label)
+            .into_any_element()
+    }
+}
+
 impl Render for SequenceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
@@ -167,23 +204,19 @@ impl Render for SequenceView {
             )
             .child(
                 div()
-                    .id("seq-mode")
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded(px(3.0))
+                    .flex()
+                    .flex_row()
+                    .p(px(1.0))
+                    .gap(px(1.0))
+                    .rounded(px(4.0))
                     .bg(theme.bg_elevated)
-                    .text_color(theme.text_secondary)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child(if history { "History" } else { "Channels" })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = if this.mode == SequenceListMode::History {
-                            SequenceListMode::Channels
-                        } else {
-                            SequenceListMode::History
-                        };
-                        cx.notify();
-                    })),
+                    .children(
+                        [
+                            ("Channels", SequenceListMode::Channels),
+                            ("History", SequenceListMode::History),
+                        ]
+                        .map(|(label, mode)| self.mode_segment(label, mode, &theme, cx)),
+                    ),
             );
 
         let mut list = div()
