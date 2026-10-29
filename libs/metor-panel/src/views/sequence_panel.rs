@@ -14,6 +14,7 @@ use crate::sequences::{self, ChannelReaders, HistoryEntry, SequenceHistory, stat
 use crate::theme::{theme, ui_px};
 use crate::views::format::format_age;
 use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
+use crate::views::switch::Switch;
 use crate::views::table;
 
 /// Size of one square control in the channel grid, in unscaled pixels.
@@ -90,42 +91,9 @@ impl SequenceView {
     }
 }
 
-impl SequenceView {
-    /// One half of the Channels / History switch: the shown one reads as
-    /// pressed, the other as a button to it.
-    fn mode_segment(
-        &self,
-        label: &'static str,
-        mode: SequenceListMode,
-        theme: &crate::theme::Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let shown = self.mode == mode;
-        div()
-            .id(("seq-mode", mode as usize))
-            .px_2()
-            .py(px(1.0))
-            .rounded(px(3.0))
-            .text_size(px(11.0))
-            .when(shown, |segment| {
-                segment
-                    .bg(theme.selection_bg)
-                    .text_color(theme.text_primary)
-            })
-            .when(!shown, |segment| {
-                segment
-                    .text_color(theme.text_tertiary)
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(theme.text_secondary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.mode = mode;
-                        cx.notify();
-                    }))
-            })
-            .child(label)
-            .into_any_element()
-    }
-}
+/// Height of the header's buttons and its Channels / History switch, so
+/// they line up.
+const HEADER_CONTROL_HEIGHT: f32 = 18.0;
 
 impl Render for SequenceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -188,8 +156,10 @@ impl Render for SequenceView {
             .child(
                 div()
                     .id("seq-reload")
+                    .h(px(HEADER_CONTROL_HEIGHT))
+                    .flex()
+                    .items_center()
                     .px_2()
-                    .py(px(1.0))
                     .rounded(px(3.0))
                     .bg(theme.bg_elevated)
                     .text_color(theme.text_secondary)
@@ -203,20 +173,16 @@ impl Render for SequenceView {
                     })),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .p(px(1.0))
-                    .gap(px(1.0))
-                    .rounded(px(4.0))
-                    .bg(theme.bg_elevated)
-                    .children(
-                        [
-                            ("Channels", SequenceListMode::Channels),
-                            ("History", SequenceListMode::History),
-                        ]
-                        .map(|(label, mode)| self.mode_segment(label, mode, &theme, cx)),
-                    ),
+                Switch::new(history, HEADER_CONTROL_HEIGHT, cx)
+                    .labels("Channels", "History")
+                    .apply(div().id("seq-mode").cursor_pointer(), &theme)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.mode = match this.mode {
+                            SequenceListMode::Channels => SequenceListMode::History,
+                            SequenceListMode::History => SequenceListMode::Channels,
+                        };
+                        cx.notify();
+                    })),
             );
 
         let mut list = div()

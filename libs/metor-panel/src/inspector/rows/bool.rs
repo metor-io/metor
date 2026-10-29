@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use gpui::{AnyElement, App, MouseMoveEvent, SharedString, Window, prelude::*};
 
-use super::{InspectorRow, RowAction, checkbox, row_base, row_label};
+use super::{InspectorRow, RowAction, row_base, row_label};
 use crate::inspector::drag_paint;
 use crate::theme::theme;
+use crate::views::switch::Switch;
 
-/// Inspector row for a `bool` field, rendered as a checkbox.
+/// Inspector row for a `bool` field, rendered as a [`Switch`].
 ///
 /// The default form owns its bool and flips it locally on activation,
 /// mirroring the value into the entity through `toggle`. The
@@ -77,7 +78,7 @@ impl InspectorRow for BoolRow {
         let static_value = self.value;
         row_base(row_ix, selected, cx)
             .child(row_label(self.label.clone(), theme.text_primary))
-            .child(checkbox(self.current(cx), &theme))
+            .child(Switch::new(self.current(cx), 14.0, cx).apply(gpui::div(), &theme))
             .when(!super::passive(cx), |row| {
                 row.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                     if !event.dragging() {

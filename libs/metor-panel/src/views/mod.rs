@@ -34,6 +34,7 @@ pub mod sequence_panel;
 pub mod spectrogram;
 pub mod state_chip;
 pub mod state_image;
+pub(crate) mod switch;
 pub mod table;
 pub mod time_series;
 pub mod timeline;
