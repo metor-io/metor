@@ -91,10 +91,6 @@ impl SequenceView {
     }
 }
 
-/// Height of the header's buttons and its Channels / History switch, so
-/// they line up. Tall enough that the switch's knob has room inside its track.
-const HEADER_CONTROL_HEIGHT: f32 = 24.0;
-
 impl Render for SequenceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
@@ -154,18 +150,8 @@ impl Render for SequenceView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                div()
+                table::header_button("Reload", &theme)
                     .id("seq-reload")
-                    .h(px(HEADER_CONTROL_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .rounded(px(3.0))
-                    .bg(theme.bg_elevated)
-                    .text_color(theme.text_secondary)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child("Reload")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = sequences::try_global(cx) {
                             store.read(cx).reload();
@@ -173,7 +159,7 @@ impl Render for SequenceView {
                     })),
             )
             .child(
-                Switch::new(history, HEADER_CONTROL_HEIGHT, cx)
+                Switch::new(history, table::HEADER_CONTROL_HEIGHT, cx)
                     .labels("Channels", "History")
                     .on_pick({
                         let view = cx.entity().downgrade();

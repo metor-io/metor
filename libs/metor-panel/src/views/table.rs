@@ -14,6 +14,29 @@ use crate::theme::{theme, ui_px, ui_scale};
 /// Height of the column header, shared with the chip headers of the log,
 /// sequence and alarm panels so a row of tabs lines up across panes.
 pub(crate) const HEADER_HEIGHT: f32 = 32.0;
+/// Height of the buttons and switches in those chip headers, so they line
+/// up. Tall enough that a switch's knob has room inside its track.
+pub(crate) const HEADER_CONTROL_HEIGHT: f32 = 24.0;
+
+/// A text button in a chip header, the caller adding its id and click.
+pub(crate) fn header_button(
+    label: impl Into<gpui::SharedString>,
+    theme: &crate::theme::Theme,
+) -> gpui::Div {
+    gpui::div()
+        .h(px(HEADER_CONTROL_HEIGHT))
+        .flex()
+        .flex_none()
+        .items_center()
+        .px_2()
+        .rounded(px(3.0))
+        .bg(theme.bg_elevated)
+        .text_color(theme.text_secondary)
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .hover(|style| style.text_color(theme.text_primary))
+        .child(label.into())
+}
 /// Height of one body row in the panel's dense tables. The component outline
 /// sets the house style here; panes that only *look* like a table (the
 /// execution timeline's lanes) take the same number so rows line up when two

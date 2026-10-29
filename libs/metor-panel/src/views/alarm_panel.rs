@@ -19,6 +19,7 @@ use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::theme::theme;
 use crate::views::format::format_age;
+use crate::views::switch::Switch;
 use crate::views::table;
 
 /// Which set the alarm list shows.
@@ -34,13 +35,8 @@ pub enum AlarmListMode {
 }
 
 impl AlarmListMode {
-    pub fn cycle(self) -> Self {
-        match self {
-            Self::Active => Self::History,
-            Self::History => Self::Shelved,
-            Self::Shelved => Self::Active,
-        }
-    }
+    /// In the order the header's switch lists them.
+    const ALL: [Self; 3] = [Self::Active, Self::History, Self::Shelved];
 
     fn label(self) -> &'static str {
         match self {
@@ -151,7 +147,7 @@ impl Render for AlarmView {
         let mode = self.mode;
         let store = alarms::try_global(cx);
 
-        // Header: severity count chips, then an Ack-all control and the mode toggle.
+        // Header: severity count chips, then an Ack-all control and the mode switch.
         // No title — the tab already names the panel.
         let mut header = div()
             .flex()
@@ -197,16 +193,8 @@ impl Render for AlarmView {
             let shelved = state.shelves_sorted().len();
             if shelved > 0 {
                 header = header.child(
-                    div()
+                    table::header_button(format!("{shelved} shelved"), &theme)
                         .id("alarm-shelved-count")
-                        .px_2()
-                        .py(px(1.0))
-                        .rounded(px(3.0))
-                        .bg(theme.bg_elevated)
-                        .text_color(theme.text_tertiary)
-                        .text_size(px(11.0))
-                        .cursor_pointer()
-                        .child(SharedString::from(format!("{shelved} shelved")))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.mode = AlarmListMode::Shelved;
                             cx.notify();
@@ -218,16 +206,8 @@ impl Render for AlarmView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                div()
+                table::header_button("Ack all", &theme)
                     .id("alarm-ack-all")
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded(px(3.0))
-                    .bg(theme.bg_elevated)
-                    .text_color(theme.text_secondary)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child("Ack all")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = alarms::try_global(cx) {
                             store.read(cx).acknowledge_all();
@@ -235,20 +215,22 @@ impl Render for AlarmView {
                     })),
             )
             .child(
-                div()
-                    .id("alarm-mode")
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded(px(3.0))
-                    .bg(theme.bg_elevated)
-                    .text_color(theme.text_secondary)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child(mode.label())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = this.mode.cycle();
-                        cx.notify();
-                    })),
+                Switch::choice(
+                    AlarmListMode::ALL.map(|m| m.label().into()).to_vec(),
+                    AlarmListMode::ALL.iter().position(|m| *m == mode),
+                    table::HEADER_CONTROL_HEIGHT,
+                    cx,
+                )
+                .on_pick({
+                    let view = cx.entity().downgrade();
+                    std::rc::Rc::new(move |picked, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.mode = AlarmListMode::ALL[picked];
+                            cx.notify();
+                        });
+                    })
+                })
+                .apply(div().id("alarm-mode"), &theme),
             );
 
         let mut list = div()
