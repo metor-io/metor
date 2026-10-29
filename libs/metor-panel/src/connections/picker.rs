@@ -62,7 +62,7 @@ enum Slot {
 pub struct ConnectionPicker {
     store: Entity<ConnectionsStore>,
     startup: Option<Entity<crate::session::startup::SessionStartup>>,
-    logo: Option<Entity<super::logo::AsciiLogo>>,
+    logo: Option<super::logo::Logo>,
     search: TextField,
     phase: Phase,
     selected: usize,
@@ -115,7 +115,7 @@ impl ConnectionPicker {
         cx.observe(&startup, |_, _, cx| cx.notify()).detach();
         let mut picker = Self::new(store, true, cx);
         picker.startup = Some(startup);
-        picker.logo = Some(cx.new(|_| super::logo::AsciiLogo::new()));
+        picker.logo = Some(super::logo::Logo::for_splash(cx));
         picker.overlays = crate::app::build_overlays(cx);
         picker
     }
@@ -1252,6 +1252,7 @@ impl Render for ConnectionPicker {
             return div().into_any_element();
         }
         let theme = theme(cx);
+        let logo = self.logo.as_ref().map(|logo| logo.render(window, cx));
 
         // Caption bar: sized like the app's other bars — title on the left,
         // search living in the bar itself, close affordance only when
@@ -1402,12 +1403,13 @@ impl Render for ConnectionPicker {
                         .border_r_1()
                         .border_color(theme.border_primary)
                         .child(
-                            div().flex().flex_col().flex_1().min_h_0().p(px(8.)).child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .when_some(self.logo.clone(), |view, logo| view.child(logo)),
-                            ),
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h_0()
+                                .p(px(8.))
+                                .child(div().flex_1().min_h_0().children(logo)),
                         )
                         .child(
                             div()

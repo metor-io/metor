@@ -1243,6 +1243,7 @@ pub struct PanelApp {
     )>,
     themes: Vec<crate::theme::Theme>,
     default_theme: Option<SharedString>,
+    splash_logo: Option<crate::connections::logo::SplashLogoBuilder>,
 }
 
 impl PanelApp {
@@ -1275,6 +1276,7 @@ impl PanelApp {
             views: Vec::new(),
             themes: Vec::new(),
             default_theme: None,
+            splash_logo: None,
         }
     }
 
@@ -1480,6 +1482,20 @@ impl PanelApp {
         self
     }
 
+    /// Show `logo` on the startup screen in place of the metor logo. It is
+    /// built again every frame, like any element, and fills the top of the
+    /// screen's sidebar.
+    pub fn splash_logo<E, F>(mut self, logo: F) -> Self
+    where
+        E: IntoElement,
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+    {
+        self.splash_logo = Some(std::rc::Rc::new(move |window, cx| {
+            logo(window, cx).into_any_element()
+        }));
+        self
+    }
+
     /// Boot the metor-db wire-protocol server on `addr` in a background task
     /// before opening the window. Omit to leave serving to the consumer.
     pub fn serve(mut self, addr: SocketAddr) -> Self {
@@ -1562,6 +1578,9 @@ impl PanelApp {
                 // may be the only UI a blocking discovery source (an auth
                 // prompt, say) has to draw into while the screen is up.
                 install_overlay_builders(&self.overlays, cx);
+                if let Some(logo) = self.splash_logo.clone() {
+                    cx.set_global(crate::connections::logo::SplashLogo(logo));
+                }
                 let path = self.startup_open.take();
                 crate::session::startup::open(self, path, cx);
             }
@@ -1589,6 +1608,7 @@ impl PanelApp {
             views,
             themes: _,
             default_theme: _,
+            splash_logo: _,
         } = self;
 
         let db = db.expect("session selected before DB services start");
