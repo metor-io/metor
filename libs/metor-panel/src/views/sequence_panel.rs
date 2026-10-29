@@ -92,8 +92,8 @@ impl SequenceView {
 }
 
 /// Height of the header's buttons and its Channels / History switch, so
-/// they line up.
-const HEADER_CONTROL_HEIGHT: f32 = 18.0;
+/// they line up. Tall enough that the switch's knob has room inside its track.
+const HEADER_CONTROL_HEIGHT: f32 = 24.0;
 
 impl Render for SequenceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

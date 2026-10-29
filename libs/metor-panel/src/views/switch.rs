@@ -50,7 +50,8 @@ impl Switch {
     /// Name both sides inside the track, with the knob widened under
     /// whichever is chosen. A choice between two named things has no "on",
     /// so the track is the buttons' surface either way, and the labels are
-    /// sized like button text: 11px on an 18px switch.
+    /// sized like button text: 11px on a 24px switch, padded as
+    /// wide as a button's.
     pub(crate) fn labels(
         mut self,
         off: impl Into<SharedString>,
@@ -141,8 +142,8 @@ impl Switch {
                 .items_center()
                 .justify_center()
                 .h_full()
-                .px(self.len(self.height * 2.0 / 7.0))
-                .text_size(self.len(self.height * 11.0 / 18.0))
+                .px(self.len(self.height / 3.0))
+                .text_size(self.len(self.height * 11.0 / 24.0))
                 .line_height(relative(1.0))
                 .text_color(mix(theme.text_secondary, theme.bg_primary, covered))
                 .child(text)
