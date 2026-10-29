@@ -15,12 +15,15 @@ use metor_proto_wkt::AlarmId;
 
 use crate::alarms::latch::TileState;
 use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
+use crate::icons::Icon;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::theme::{theme, ui_px};
+use crate::views::buttons::{self, icon_button, pressable};
 use crate::views::format::format_age;
 use crate::views::switch::Switch;
 use crate::views::table;
+use crate::views::value_strip::STRIP_BOX_HEIGHT;
 
 /// Which set the alarm list shows.
 #[derive(
@@ -193,7 +196,7 @@ impl Render for AlarmView {
             let shelved = state.shelves_sorted().len();
             if shelved > 0 {
                 header = header.child(
-                    table::header_button(format!("{shelved} shelved"), &theme)
+                    buttons::header_button(format!("{shelved} shelved"), &theme)
                         .id("alarm-shelved-count")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.mode = AlarmListMode::Shelved;
@@ -206,7 +209,7 @@ impl Render for AlarmView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                table::header_button("Ack all", &theme)
+                buttons::header_button("Ack all", &theme)
                     .id("alarm-ack-all")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = alarms::try_global(cx) {
@@ -288,6 +291,9 @@ fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+/// Height of an alarm row's square buttons: a medium sequence control's.
+const ROW_BUTTON: f32 = STRIP_BOX_HEIGHT;
+
 /// One alarm's row, spaced like a sequence channel's: the same padding and
 /// gaps, in UI units so it follows the panel's text size.
 fn list_row(theme: &crate::theme::Theme) -> gpui::Div {
@@ -353,32 +359,52 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                     )
             });
 
-            let ack: AnyElement = if acked {
-                div()
-                    .flex_none()
-                    .text_color(color)
-                    .text_size(ui_px(11.0))
-                    .child("✓ acked")
-                    .into_any_element()
+            // Acknowledged, the check stays where the button was, inert,
+            // so the row's buttons don't shift.
+            let occ = alarm.occurrence;
+            let ack = if acked {
+                icon_button(
+                    ("ack", occ as usize),
+                    Icon::Check,
+                    color,
+                    gpui::transparent_black(),
+                    "Acknowledged",
+                    ROW_BUTTON,
+                )
             } else {
-                let occ = alarm.occurrence;
-                table::header_button("Ack", theme)
-                    .text_color(theme.text_primary)
-                    .id(("ack", occ as usize))
-                    .on_click(move |_, _, cx| {
-                        if let Some(store) = alarms::try_global(cx) {
-                            store.read(cx).acknowledge(occ);
-                        }
-                    })
-                    .into_any_element()
+                pressable(
+                    icon_button(
+                        ("ack", occ as usize),
+                        Icon::Check,
+                        color,
+                        theme.alarm_tint(idx),
+                        "Acknowledge",
+                        ROW_BUTTON,
+                    ),
+                    theme,
+                )
+                .on_click(move |_, _, cx| {
+                    if let Some(store) = alarms::try_global(cx) {
+                        store.read(cx).acknowledge(occ);
+                    }
+                })
             };
 
             let def_id = alarm.def_id.clone();
-            let shelve = table::header_button("Shelve", theme)
-                .id(("shelve", alarm.occurrence as usize))
-                .on_click(move |event, window, cx| {
-                    open_shelve_page(def_id.clone(), event.position(), window, cx)
-                });
+            let shelve = pressable(
+                icon_button(
+                    ("shelve", occ as usize),
+                    Icon::BellOff,
+                    theme.text_secondary,
+                    theme.bg_elevated,
+                    "Shelve…",
+                    ROW_BUTTON,
+                ),
+                theme,
+            )
+            .on_click(move |event, window, cx| {
+                open_shelve_page(def_id.clone(), event.position(), window, cx)
+            });
 
             list_row(theme)
                 .child(
@@ -478,13 +504,22 @@ fn shelved_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                         .child(SharedString::from(format_remaining(shelf.until))),
                 )
                 .child(
-                    table::header_button("Unshelve", theme)
-                        .id(SharedString::from(format!("unshelve-{def_id}")))
-                        .on_click(move |_, _, cx| {
-                            if let Some(store) = alarms::try_global(cx) {
-                                store.read(cx).unshelve(def_id.clone());
-                            }
-                        }),
+                    pressable(
+                        icon_button(
+                            SharedString::from(format!("unshelve-{def_id}")),
+                            Icon::Bell,
+                            theme.text_secondary,
+                            theme.bg_elevated,
+                            "Unshelve",
+                            ROW_BUTTON,
+                        ),
+                        theme,
+                    )
+                    .on_click(move |_, _, cx| {
+                        if let Some(store) = alarms::try_global(cx) {
+                            store.read(cx).unshelve(def_id.clone());
+                        }
+                    }),
                 )
                 .into_any_element()
         })

@@ -3,6 +3,7 @@ pub mod alarm_panel;
 pub mod annunciator;
 pub mod attitude;
 pub(crate) mod binding;
+pub(crate) mod buttons;
 pub mod column_browser;
 pub mod component_browser;
 pub(crate) mod copy;

@@ -15,7 +15,7 @@ use crate::theme::{theme, ui_px};
 use crate::views::format::format_age;
 use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
 use crate::views::switch::Switch;
-use crate::views::table;
+use crate::views::{buttons, table};
 
 /// Size of one square control in the channel grid, in unscaled pixels.
 const SQUARE_TILE: (f32, f32) = (260.0, 132.0);
@@ -150,7 +150,7 @@ impl Render for SequenceView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                table::header_button("Reload", &theme)
+                buttons::header_button("Reload", &theme)
                     .id("seq-reload")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = sequences::try_global(cx) {

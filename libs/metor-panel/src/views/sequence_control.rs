@@ -39,6 +39,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, Channel, ChannelStatus, ChannelStatusReader, state_label};
 use crate::theme::{Theme, font_family, theme, ui_px};
 use crate::views::TooltipText;
+use crate::views::buttons::{icon_button, pressable};
 use crate::views::format::format_age;
 use crate::views::value_strip::{
     STRIP_BOX_HEIGHT, STRIP_BOX_VALUE_SIZE, apply_chevron, box_corners, box_fill, box_padding,
@@ -705,45 +706,6 @@ fn frame(layout: SequenceLayout) -> Div {
         .px(ui_px(10.0))
         .when(layout == SequenceLayout::Square, |el| el.py(ui_px(10.0)))
         .overflow_hidden()
-}
-
-fn icon_button(
-    id: &'static str,
-    icon: Icon,
-    color: Hsla,
-    bg: Hsla,
-    tooltip: &'static str,
-    height: f32,
-) -> Stateful<Div> {
-    let width = height.clamp(SLIM_HEIGHT, SQUARE_BUTTON);
-    div()
-        .id(id)
-        .debug_selector(|| id.into())
-        .flex_none()
-        .w(ui_px(width))
-        .h(ui_px(height))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(ui_px(4.0))
-        .bg(bg)
-        .tooltip(move |_window, cx| TooltipText::build(tooltip.into(), cx))
-        .child(icon.svg(
-            if height > STRIP_BOX_HEIGHT {
-                15.0
-            } else {
-                13.0
-            },
-            color,
-        ))
-}
-
-/// The pointer and hover tint of an [`icon_button`] that acts on click.
-/// Inert ones (a command the channel won't take now) keep neither, so they
-/// don't read as pressable.
-fn pressable(button: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
-    let hover = theme.selection_bg;
-    button.cursor_pointer().hover(move |s| s.bg(hover))
 }
 
 /// Rows listing every declared channel, plus a free-text entry.
