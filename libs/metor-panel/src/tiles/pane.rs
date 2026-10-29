@@ -1258,6 +1258,18 @@ mod tests {
         });
     }
 
+    /// Draw a frame now. A test window draws when an update's effects
+    /// flush, so the refresh goes in an update of its own.
+    fn draw(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, _| window.refresh());
+    }
+
+    /// Let a zoom's motion run out, then draw the frame after it.
+    fn settle_zoom(cx: &mut gpui::VisualTestContext) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        draw(cx);
+    }
+
     /// A tile group already split in two, with the original pane on the left.
     fn split_group(cx: &mut Context<TileGroup>) -> TileGroup {
         crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
@@ -1287,7 +1299,16 @@ mod tests {
         });
 
         click(cx, tab, MouseButton::Left, 2);
-        cx.refresh().unwrap();
+        draw(cx);
+        draw(cx);
+        cx.update(|window, cx| {
+            let width = left.read(cx).content_bounds.size.width;
+            assert!(
+                width < window.viewport_size().width,
+                "the pane grows from its slot rather than jumping"
+            );
+        });
+        settle_zoom(cx);
         cx.update(|window, cx| {
             assert_eq!(tg.read(cx).zoomed(), Some(&left));
             let pane = left.read(cx);
@@ -1303,6 +1324,19 @@ mod tests {
         click(cx, tab, MouseButton::Left, 1);
         click(cx, tab, MouseButton::Left, 2);
         cx.update(|_, cx| assert!(tg.read(cx).zoomed().is_none()));
+        draw(cx);
+        draw(cx);
+        cx.update(|window, cx| {
+            let width = left.read(cx).content_bounds.size.width;
+            assert!(
+                width > window.viewport_size().width / 2.0,
+                "the pane shrinks back into its slot rather than jumping"
+            );
+        });
+        settle_zoom(cx);
+        cx.update(|window, cx| {
+            assert!(left.read(cx).content_bounds.size.width <= window.viewport_size().width / 2.0);
+        });
     }
 
     #[gpui::test]
