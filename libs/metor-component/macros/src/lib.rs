@@ -7,7 +7,7 @@
 //!
 //! These are the *standalone* derives: they turn any `#[repr(C)]` struct into
 //! a component group, with `#[metor_fsw(parent = "…")]` setting the dotted
-//! prefix. `metor-fsw-2` bundles equivalent expansions into
+//! prefix. `metor-fsw-3` bundles equivalent expansions into
 //! `#[derive(Frame)]`; reach for these when a struct is a component group but
 //! not a frame in its own right — a nested sub-struct, say.
 //!

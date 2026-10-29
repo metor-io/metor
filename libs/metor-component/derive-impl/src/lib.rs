@@ -1,5 +1,5 @@
 //! The `quote!` bodies shared by `metor-component-macros` and
-//! `metor-fsw-2-macros`'s component derives (`AsVTable`, `Metadatatize`,
+//! `metor-fsw-3-macros`'s component derives (`AsVTable`, `Metadatatize`,
 //! `Componentize`, `Decomponentize`).
 //!
 //! This crate holds no proc-macro entry points — a proc-macro crate cannot

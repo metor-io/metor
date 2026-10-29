@@ -122,7 +122,7 @@ mod tests {
 
     /// A hand-written fsw link server: accept one connection, push the
     /// identity and one self-describing data msg, then record every inbound
-    /// msg. No metor-fsw-2 dependency — the wire shapes are the contract.
+    /// msg. No flight-software dependency — the wire shapes are the contract.
     fn fake_fsw(
         listener: stellarator::net::TcpListener,
         command_ids: Vec<PacketId>,

@@ -209,10 +209,6 @@ impl AddMenu {
                 self.command("Sequence Grid", WidgetKind::new("sequence_grid")),
             ),
             (Some(Pane), self.command("Timeline", WidgetKind::new("timeline"))),
-            (
-                Some(Pane),
-                self.command("Execution Timeline", WidgetKind::new("exec_timeline")),
-            ),
         ];
         entries
             .into_iter()

@@ -25,10 +25,10 @@ use crate::views::inspector_pane::InspectorPane;
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
-    ComponentOutline, ExecTimeline, Gauge, GaugeConfig, ListPlot, Map, MapConfig, Meter,
-    MeterConfig, Monitor, MonitorConfig, SamplesTable, SamplesTableConfig, SequenceControl,
-    SequenceControlConfig, SequenceGrid, Spectrogram, StateChip, StateChipConfig, TimeSeriesPlot,
-    Timeline, TrafficLight, TrafficLightConfig, XyPlot,
+    ComponentOutline, Gauge, GaugeConfig, ListPlot, Map, MapConfig, Meter, MeterConfig, Monitor,
+    MonitorConfig, SamplesTable, SamplesTableConfig, SequenceControl, SequenceControlConfig,
+    SequenceGrid, Spectrogram, StateChip, StateChipConfig, TimeSeriesPlot, Timeline, TrafficLight,
+    TrafficLightConfig, XyPlot,
 };
 use crate::views::{Label, LabelConfig, StateImage, StateImageConfig};
 
@@ -268,17 +268,6 @@ impl WidgetRegistry {
             )
             .with_minimum_size((80.0, 31.0))
             .with_tile("timeline", |_| "Timeline".into()),
-        );
-        self.register(
-            WidgetKind::new("exec_timeline"),
-            WidgetSpec::typed(
-                (520.0, 260.0),
-                |w| numbered("Execution Timeline", w),
-                ExecTimeline::from_config,
-                ExecTimeline::to_config,
-            )
-            .with_tile("exec_timeline", |_| "Execution".into())
-            .with_live_tile_title(ExecTimeline::title),
         );
         // The outline replaced the component and data tables, so its
         // dashboard kind keeps the `table` id saved dashboards use.
@@ -772,7 +761,6 @@ mod tests {
             "list_plot",
             "spectrogram",
             "timeline",
-            "exec_timeline",
             "component_outline",
             "viewer_3d",
             "traffic_light",

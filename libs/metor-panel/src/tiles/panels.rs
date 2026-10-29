@@ -527,27 +527,6 @@ mod tests {
                 .is_ok()
         );
 
-        let timeline = crate::views::ExecTimelineConfig {
-            label: "Steps".into(),
-            x_range: "LAST 30 s".into(),
-            show_slots: false,
-            show_coordinator_row: false,
-            trigger: true,
-            hidden_rows: vec!["downlink".into(), "nav".into()],
-        };
-        let s = serde_json::to_string(&timeline).unwrap();
-        let back: crate::views::ExecTimelineConfig = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.label, "Steps");
-        assert_eq!(back.x_range, "LAST 30 s");
-        assert!(!back.show_slots);
-        assert!(!back.show_coordinator_row);
-        assert!(back.trigger);
-        assert_eq!(back.hidden_rows, vec!["downlink", "nav"]);
-        // The toggles default on and the trigger off, so a document written
-        // before they existed shows every lane on the app-wide range.
-        let bare: crate::views::ExecTimelineConfig = serde_json::from_str("{}").unwrap();
-        assert!(bare.show_slots && bare.show_coordinator_row && !bare.trigger);
-
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {
                 label: "satellite".into(),
@@ -851,13 +830,11 @@ mod tests {
         assert_eq!(legacy.columns, 0);
     }
 
-    /// Cross-language pin: the outline the Python preset builder emits
-    /// (`metor_config.Outline`) must parse into this config exactly.
-    /// `test_golden.py` asserts the builder still produces the fixture;
-    /// this asserts the panel still reads every field of it.
+    /// Pin: an outline saved in this shape must keep parsing into this config
+    /// exactly, every field of it.
     #[test]
     fn the_golden_python_outline_parses() {
-        let blob = include_str!("../../../metor-fsw-2/tests/golden/outline.json");
+        let blob = include_str!("../../tests/golden/outline.json");
         let cfg: OutlinePanelConfig = serde_json::from_str(blob).unwrap();
         assert_eq!(cfg.root, "sat1.wheels");
         assert_eq!(cfg.columns, ["name", "value", "unit"]);
