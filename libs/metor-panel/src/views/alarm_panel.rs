@@ -17,7 +17,7 @@ use crate::alarms::latch::TileState;
 use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 use crate::views::format::format_age;
 use crate::views::switch::Switch;
 use crate::views::table;
@@ -288,6 +288,20 @@ fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+/// One alarm's row, spaced like a sequence channel's: the same padding and
+/// gaps, in UI units so it follows the panel's text size.
+fn list_row(theme: &crate::theme::Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(ui_px(8.0))
+        .px(ui_px(10.0))
+        .py(ui_px(8.0))
+        .border_b_1()
+        .border_color(theme.border_primary)
+}
+
 /// Rows for everything awaiting an operator. A latched row — the alarm cleared before
 /// anyone looked — keeps its place with a dimmed severity bar and a "cleared" badge, and
 /// its `Ack` retires the latch outright.
@@ -317,44 +331,40 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
             let cleared_badge = pending.cleared_at.map(|cleared_at| {
                 div()
                     .flex()
+                    .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap(ui_px(8.0))
                     .child(
                         div()
-                            .px_2()
-                            .py(px(1.0))
-                            .rounded(px(3.0))
+                            .px(ui_px(6.0))
+                            .py(ui_px(1.0))
+                            .rounded(ui_px(3.0))
                             .bg(theme.alarm_tint(idx))
                             .text_color(color)
-                            .text_size(px(10.0))
+                            .text_size(ui_px(10.0))
                             .child("cleared"),
                     )
                     .child(
                         div()
                             .text_color(theme.text_tertiary)
-                            .text_size(px(11.0))
+                            .text_size(ui_px(11.0))
                             .child(format_age(cleared_at, Timestamp::now())),
                     )
             });
 
             let ack: AnyElement = if acked {
                 div()
+                    .flex_none()
                     .text_color(color)
-                    .text_size(px(11.0))
+                    .text_size(ui_px(11.0))
                     .child("✓ acked")
                     .into_any_element()
             } else {
                 let occ = alarm.occurrence;
-                div()
+                table::header_button("Ack", theme)
+                    .text_color(theme.text_primary)
                     .id(("ack", occ as usize))
-                    .px_2()
-                    .py(px(2.0))
-                    .rounded_md()
-                    .bg(theme.bg_elevated)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child("Ack")
                     .on_click(move |_, _, cx| {
                         if let Some(store) = alarms::try_global(cx) {
                             store.read(cx).acknowledge(occ);
@@ -364,53 +374,55 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
             };
 
             let def_id = alarm.def_id.clone();
-            let shelve = div()
+            let shelve = table::header_button("Shelve", theme)
                 .id(("shelve", alarm.occurrence as usize))
-                .px_2()
-                .py(px(2.0))
-                .rounded_md()
-                .bg(theme.bg_elevated)
-                .text_color(theme.text_secondary)
-                .text_size(px(11.0))
-                .cursor_pointer()
-                .child("Shelve")
                 .on_click(move |event, window, cx| {
                     open_shelve_page(def_id.clone(), event.position(), window, cx)
                 });
 
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(theme.border_primary)
-                .child(div().w(px(4.0)).h(px(28.0)).rounded_sm().bg(bar_color))
+            list_row(theme)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(ui_px(4.0))
+                        .h(ui_px(28.0))
+                        .rounded(ui_px(2.0))
+                        .bg(bar_color),
+                )
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .flex_grow_1()
-                        .child(div().text_color(name_color).child(SharedString::from(name)))
+                        .min_w_0()
                         .child(
                             div()
+                                .truncate()
+                                .text_size(ui_px(12.0))
+                                .text_color(name_color)
+                                .child(SharedString::from(name)),
+                        )
+                        .child(
+                            div()
+                                .truncate()
                                 .text_color(theme.text_secondary)
-                                .text_size(px(11.0))
+                                .text_size(ui_px(11.0))
                                 .child(SharedString::from(alarm.message.clone())),
                         ),
                 )
                 .child(
                     div()
+                        .flex_none()
+                        .text_size(ui_px(12.0))
                         .text_color(theme.text_secondary)
                         .child(SharedString::from(value_str)),
                 )
                 .children(cleared_badge)
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.text_tertiary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(format_age(alarm.raised_at, Timestamp::now())),
                 )
                 .child(shelve)
@@ -433,49 +445,41 @@ fn shelved_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
             let reason = shelf.reason.clone().unwrap_or_default();
             let def_id = def_id.clone();
 
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(theme.border_primary)
+            list_row(theme)
                 .child(
                     div()
                         .flex_grow_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(ui_px(12.0))
                         .text_color(theme.text_primary)
                         .child(SharedString::from(name)),
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_color(theme.text_secondary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(SharedString::from(reason)),
                 )
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.text_tertiary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(SharedString::from(shelf.operator.clone())),
                 )
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.text_secondary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(SharedString::from(format_remaining(shelf.until))),
                 )
                 .child(
-                    div()
+                    table::header_button("Unshelve", theme)
                         .id(SharedString::from(format!("unshelve-{def_id}")))
-                        .px_2()
-                        .py(px(2.0))
-                        .rounded_md()
-                        .bg(theme.bg_elevated)
-                        .text_size(px(11.0))
-                        .cursor_pointer()
-                        .child("Unshelve")
                         .on_click(move |_, _, cx| {
                             if let Some(store) = alarms::try_global(cx) {
                                 store.read(cx).unshelve(def_id.clone());
