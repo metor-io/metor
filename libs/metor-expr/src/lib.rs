@@ -1,13 +1,12 @@
 //! A typed subset of Python, compiled to closed WebAssembly modules.
 //!
-//! The premise, from `metor-fsw-2/docs/plans/python-expressions.md`: the panel
-//! and the vehicle should run *the same artifact*, an operator should write it
-//! in the language they already write `target.py` in, and typing a character
-//! into an expression field should not be able to stall anything. That rules
-//! out shipping an interpreter as the guest (no static output schema, no
-//! closed module, fuel that meters dispatch rather than user work) and it
-//! rules out any pipeline with a toolchain in it. What is left is a compiler
-//! small enough to live in the flight binary: parse, check, encode.
+//! The premise: the panel and the vehicle should run *the same artifact*, an
+//! operator should write it in the language they already write `target.py` in,
+//! and typing a character into an expression field should not be able to stall
+//! anything. That rules out shipping an interpreter as the guest (no static
+//! output schema, no closed module, fuel that meters dispatch rather than user
+//! work) and it rules out any pipeline with a toolchain in it. What is left is
+//! a compiler small enough to live in the flight binary: parse, check, encode.
 //!
 //! ```
 //! let module = metor_expr::compile("def f(x: f64) -> f64:\n    return x * 2.0\n").unwrap();
@@ -16,7 +15,7 @@
 //!
 //! ## A frame is a class, a system is a decorated function
 //!
-//! The unit of the language is the one metor-fsw-2 already has. A `Frame`
+//! The unit of the language is the one the flight software already has. A `Frame`
 //! class is a named record of values sharing a timestamp; a `@system` is a
 //! function whose signature *is* its wiring surface — frame parameters are
 //! input ports, a `State` parameter is what it keeps, the return frame is what
@@ -106,8 +105,6 @@ mod diag;
 mod ir;
 mod lang;
 mod manifest;
-mod pack;
-mod pack_abi;
 mod resolve;
 pub mod state;
 pub mod template;
@@ -117,7 +114,6 @@ pub use manifest::{
     Binding, COMPILER_VERSION, Decl, Field, FnSig, Form, Frame, Init, Layout, Manifest, Port,
     Resample, Stage, StateField, System,
 };
-pub use pack::{ComponentSource, PackProgram, PackResolver, compile_pack};
 pub use resolve::{CompSchema, FrameSchema, Resolver, Unresolved};
 
 /// Decode the manifest a module carries behind `expr_manifest_ptr`.

@@ -13,7 +13,7 @@
 //!   [`metor_proto::com_de`]) move component values in and out of a sink.
 //!
 //! Derive all four with `#[derive(AsVTable, Metadatatize, Componentize,
-//! Decomponentize)]`. `metor-fsw-2` re-exports this whole surface and bundles
+//! Decomponentize)]`. `metor-fsw-3` re-exports this whole surface and bundles
 //! the same four derives into its `#[derive(Frame)]`, so framework consumers
 //! rarely name this crate directly — the exception is a nested struct that is
 //! a component group but not a frame in its own right.

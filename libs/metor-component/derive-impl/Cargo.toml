@@ -3,7 +3,7 @@ name = "metor-component-derive-impl"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
-description = "Shared derive-emitter internals behind metor-component's and metor-fsw-2's component derives."
+description = "Shared derive-emitter internals behind metor-component's and metor-fsw-3's component derives."
 repository = "https://github.com/metor-sys/metor"
 
 [lints]

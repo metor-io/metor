@@ -42,7 +42,6 @@ pub mod tiles;
 pub mod transient;
 pub mod views;
 pub(crate) mod window_controls;
-pub mod wiring;
 pub(crate) mod workspace;
 
 pub use app::PanelApp;

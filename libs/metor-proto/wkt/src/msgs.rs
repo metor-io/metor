@@ -940,31 +940,12 @@ pub struct SequenceCommand {
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct ReloadSequences {}
 
-/// The complete target wiring IR, broadcast by the control system at startup
-/// and re-broadcast on a [`ReloadSequences`] request — the same telemetry
-/// pub/sub pattern [`SequenceRegistry`] uses. The payload is the versioned
-/// `Wiring` serialized as JSON (the self-describing §6 wire format), so a
-/// consumer decodes the whole topology — systems, slots, edges, scopes, and
-/// source anchors — with `serde_json` and never needs bundle access. The JSON
-/// crosses the ring as a plain postcard `String`; `ir_version` rides alongside
-/// it so a consumer can gate before parsing. Because the payload carries the
-/// full graph it can exceed the default message-ring cap, so the control
-/// system sizes its `wiring` channel from the concrete payload at build.
-#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
-pub struct WiringManifest {
-    /// The IR schema version the `ir_json` was produced against.
-    pub ir_version: u32,
-    /// The full `Wiring` IR as JSON.
-    pub ir_json: String,
-}
-
 /// One named panel layout a target ships as a recommended default.
 ///
 /// `layout` is a serde_json-encoded [`TileLayout`](crate::TileLayout)
 /// document — the tree is recursive, which a postcard schema cannot express,
-/// so it crosses the ring as a plain postcard `String` (the
-/// [`WiringManifest`] convention). The document carries its own version for
-/// consumers to gate on before hydrating.
+/// so it crosses the ring as a plain postcard `String`. The document carries
+/// its own version for consumers to gate on before hydrating.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct Preset {
     pub name: String,
@@ -1678,47 +1659,6 @@ mod preset_id_tests {
 }
 
 #[cfg(test)]
-mod wiring_manifest_tests {
-    use super::*;
-
-    #[test]
-    fn wiring_manifest_roundtrips() {
-        let manifest = WiringManifest {
-            ir_version: 1,
-            ir_json: r#"{"ir_version":1,"systems":[]}"#.into(),
-        };
-        let bytes = postcard::to_allocvec(&manifest).expect("encode");
-        let back: WiringManifest = postcard::from_bytes(&bytes).expect("decode");
-        assert_eq!(back.ir_version, manifest.ir_version);
-        assert_eq!(back.ir_json, manifest.ir_json);
-    }
-
-    /// The pinned id — the natural schema-name-hash id; the pin catches a
-    /// type rename, which would silently re-key every persisted recording —
-    /// and its distinctness from every other assigned id in this module.
-    #[test]
-    fn wiring_manifest_id_is_pinned_and_unique() {
-        assert_eq!(WiringManifest::ID, [9, 81]);
-        for id in [
-            SequenceRegistry::ID,
-            SequenceChannelEvent::ID,
-            SequenceCommand::ID,
-            ReloadSequences::ID,
-            AlarmDef::ID,
-            AlarmDefs::ID,
-            AlarmRaised::ID,
-            AlarmCleared::ID,
-            AlarmAck::ID,
-            AlarmShelved::ID,
-            AlarmUnshelved::ID,
-        ] {
-            assert_ne!(id, WiringManifest::ID);
-        }
-        assert!(!NODE_PROTOCOL_MESSAGES.contains(&WiringManifest::ID));
-    }
-}
-
-#[cfg(test)]
 mod log_event_tests {
     use super::*;
 
@@ -1728,7 +1668,7 @@ mod log_event_tests {
             timestamp: Timestamp(42),
             level: LogLevel::Warn,
             source: "nav".into(),
-            target: "metor_fsw2::coordinator".into(),
+            target: "metor_fsw3::coordinator".into(),
             message: "slot load failed".into(),
             span: Some("run:load_slot".into()),
             fields: vec![("slot".into(), "nav".into())],
@@ -1755,7 +1695,6 @@ mod log_event_tests {
             SequenceChannelEvent::ID,
             SequenceCommand::ID,
             ReloadSequences::ID,
-            WiringManifest::ID,
             AlarmDef::ID,
             AlarmDefs::ID,
             AlarmRaised::ID,

@@ -14,9 +14,7 @@
 //!   must stay closed, so a panic traps rather than reporting (wasm32 with
 //!   `panic = "abort"` aborts; nothing unwinds), and every kernel writes
 //!   through caller-supplied pointers into linear memory. Shapes arrive as
-//!   arguments because the compiler knows them statically. The [`pack`]
-//!   module's ring handles do allocate — once, at bind time, before the host
-//!   pins guest memory — and nothing allocates per evaluation.
+//!   arguments because the compiler knows them statically.
 //! - **The tensor layer is `nox_array`, not `nox`.** The M0 spike measured
 //!   nox's `Dyn` path and rejected it: `Array<T, Dyn>` is `Vec`-backed, so
 //!   every operation would allocate; `RealField: faer::ComplexField` drags
@@ -37,9 +35,15 @@
 //! `__heap_base` is unclaimed at link time, so the compiler lays argument,
 //! return, and temporary buffers out from that address, appends data segments
 //! for the ones with constant contents, and raises the memory minimum to
-//! cover the rest. The allocator (dlmalloc, serving [`pack`]'s bind-time
-//! handles and `fsw_pack_alloc`) grows fresh pages via `memory.grow`, so it
-//! can never hand out bytes the compiler placed below the raised minimum.
+//! cover the rest.
+
+#![no_std]
+
+/// Nothing here panics on purpose; a bug that does traps rather than unwinds.
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
 
 macro_rules! unary {
     ($($name:ident),* $(,)?) => {
@@ -101,4 +105,3 @@ pub extern "C" fn rng_unit(state: *mut u64) -> f64 {
 #[cfg(feature = "tensor-kernels")]
 mod tensor;
 
-mod pack;

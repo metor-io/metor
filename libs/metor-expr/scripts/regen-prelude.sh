@@ -17,8 +17,10 @@ fi
 # wasm-ld defaults to a 1 MiB shadow stack placed first, so an untouched build
 # claims 17 linear-memory pages before a single expression exists. Guest code
 # has no deep recursion to fund — fuel bounds it long before the stack does —
-# and one page of stack leaves the whole module inside three.
-export RUSTFLAGS="-C link-arg=-zstack-size=65536 -C link-arg=--global-base=65536 ${RUSTFLAGS:-}"
+# and one page of stack leaves the whole module inside three. `__heap_base` is
+# exported only when something links against it, and with no allocator in the
+# guest nothing does, so ask for it: the compiler lays its buffers out from it.
+export RUSTFLAGS="-C link-arg=-zstack-size=65536 -C link-arg=--global-base=65536 -C link-arg=--export=__heap_base ${RUSTFLAGS:-}"
 
 cargo build \
     --manifest-path "$here/prelude/Cargo.toml" \

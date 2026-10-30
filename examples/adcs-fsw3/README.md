@@ -98,6 +98,6 @@ spherical-harmonic workspaces inside that call. Reusing them needs a patch to
 
 ## Not ported
 
-`examples/adcs-fsw2` also has a safe-mode sequence, alarms, presets and
+The retired fsw-2 example also had a safe-mode sequence, alarms, presets and
 dashboards, the Python expression system, and uplink routes. fsw-3 has none of
 these yet.

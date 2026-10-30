@@ -1087,18 +1087,12 @@ mod tests {
         assert_eq!(DashboardPanelConfig::default().zoom, 1.0);
     }
 
-    /// Cross-language pin: the dashboard the Python preset builder emits
-    /// (`metor_config.Dashboard`) must parse into this config exactly.
-    ///
-    /// Both sides read one fixture — `test_golden.py` asserts the recorder
-    /// still produces it, this asserts the panel still understands it. The
-    /// widget `config` blob is an opaque string to the FSW-side preset
-    /// validator, so nothing upstream catches a shape mismatch; without this
-    /// pin a rename turns a shipped dashboard into placeholder tiles with no
-    /// error anywhere.
+    /// Pin: a dashboard saved in this shape must keep parsing into this config
+    /// exactly. Without it a rename turns a shipped dashboard into placeholder
+    /// tiles with no error anywhere.
     #[test]
     fn the_golden_python_dashboard_parses() {
-        let blob = include_str!("../../../../metor-fsw-2/tests/golden/dashboard.json");
+        let blob = include_str!("../../../tests/golden/dashboard.json");
         let cfg: DashboardPanelConfig = serde_json::from_str(blob).unwrap();
         assert_eq!(cfg.title, "Golden");
 

@@ -1644,14 +1644,12 @@ impl PanelApp {
         crate::dynamic::worker::DynamicWorker::init(cx);
         crate::views::map::tiles::TileStore::init(cx);
         crate::backfill::Backfiller::init(db.clone(), cx);
-        crate::views::exec_timeline::inspector_rows::register_inspector_rows(cx);
         crate::views::Timeline::register(cx);
         crate::alarms::AlarmStore::init(db.clone(), cx);
         crate::logs::LogStore::init(db.clone(), cx);
         crate::presets::TargetPresetStore::init(db.clone(), cx);
         crate::sequences::SequenceStore::init(db.clone(), cx);
         crate::plot_events::EventSourceRegistry::init(cx);
-        crate::wiring::WiringStore::init(db.clone(), cx);
         register_pane_item_deserializers(db.clone(), cx);
         for (kind, spec) in views {
             cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
@@ -2053,7 +2051,6 @@ mod keybinding_tests {
     #[test]
     fn the_leader_never_fires_while_something_is_being_typed_into() {
         assert!(fires(NOT_TYPING, &["AppRoot"]));
-        assert!(fires(NOT_TYPING, &["AppRoot", "ExecTimeline"]));
         assert!(fires(NOT_TYPING, &["AppRoot", "Dashboard"]));
 
         for typing in [

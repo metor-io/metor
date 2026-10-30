@@ -1,3 +1,0 @@
-target-version = "py310"
-# This fixture must exactly match the Rust module generator's output.
-extend-exclude = ["tests/data"]

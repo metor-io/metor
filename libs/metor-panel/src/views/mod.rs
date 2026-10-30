@@ -8,7 +8,6 @@ pub mod column_browser;
 pub mod component_browser;
 pub(crate) mod copy;
 pub mod dashboard;
-pub mod exec_timeline;
 pub mod filter_bar;
 pub mod format;
 pub mod gauge;
@@ -50,7 +49,6 @@ pub use annunciator::{AlarmWhen, Annunciator, AnnunciatorConfig, AnnunciatorSour
 pub use attitude::{AttitudeConfig, AttitudeIndicator, VectorMarker, VectorMarkerConfig};
 pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
-pub use exec_timeline::{ExecTimeline, ExecTimelineConfig};
 pub use filter_bar::{FilterBar, FilterBarEvent};
 pub(crate) use format::format_number;
 pub use format::{ElementIndexes, format_element_value, format_value};

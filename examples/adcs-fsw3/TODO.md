@@ -363,9 +363,10 @@ See the README's "Known allocation" section.
 
 ### F12. Exec timeline on fsw-3
 
-The panel view reads fsw-2 IR and `system_status` paths. It matters once the
-schedule holds 30+ systems.
-- Workaround: none. Port the view to `{ns}.{id}.status.exec_time_ns`.
+The panel's execution timeline read fsw-2 IR and `system_status` paths, and was
+deleted with fsw-2. It matters once the schedule holds 30+ systems.
+- Workaround: none. Rebuild the view on `{ns}.{id}.status.exec_time_ns` (git
+  history has the fsw-2 version under `libs/metor-panel/src/views/exec_timeline`).
 
 ### F13. Large records (images)
 
