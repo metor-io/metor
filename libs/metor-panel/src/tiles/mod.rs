@@ -189,35 +189,6 @@ impl Member {
         }
     }
 
-    /// Put `new_pane` along a whole edge of this member: appended to it when
-    /// it already runs along `direction`'s axis, otherwise beside it in a
-    /// new axis that takes its place.
-    fn dock(&mut self, new_pane: &Entity<Pane>, direction: SplitDirection) {
-        let new = Member::Pane(new_pane.clone());
-        if let Member::Axis(axis) = self
-            && axis.axis == direction.axis()
-        {
-            let at = if direction.increasing() {
-                axis.members.len()
-            } else {
-                0
-            };
-            axis.members.insert(at, new);
-            axis.flexes.insert(at, 1.0);
-            return;
-        }
-        let old = std::mem::replace(
-            self,
-            Member::Axis(SplitAxis::new(direction.axis(), Vec::new())),
-        );
-        let members = if direction.increasing() {
-            vec![old, new]
-        } else {
-            vec![new, old]
-        };
-        *self = Member::Axis(SplitAxis::new(direction.axis(), members));
-    }
-
     /// Remove `target` from the tree. Returns `true` when found.
     ///
     /// Leaves empty axis nodes behind; run [`Member::collapse`] afterwards to
@@ -288,15 +259,33 @@ impl Member {
         }
     }
 
+    /// `moving` names the pane a zoom is drawing over the layout, whose slot
+    /// is left empty here.
     fn render(
         &self,
         path: SplitPath,
         tile_group: &Entity<TileGroup>,
         gaps: &split_preview::GapWeights,
+        moving: Option<gpui::EntityId>,
         cx: &mut App,
     ) -> AnyElement {
         match self {
             Member::Pane(pane) => {
+                let tg = tile_group.clone();
+                let id = pane.entity_id();
+                let slot = gpui::canvas(
+                    move |bounds, _, cx| {
+                        tg.update(cx, |this, _| {
+                            this.pane_bounds.insert(id, bounds);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full();
+                if moving == Some(id) {
+                    return div().relative().size_full().child(slot).into_any_element();
+                }
                 if gaps.contains_key(&pane.entity_id()) {
                     let placeholder = pane.read(cx).items().is_empty();
                     let color = if placeholder {
@@ -318,6 +307,7 @@ impl Member {
                 let tg = tile_group.clone();
                 let focus_pane = pane.clone();
                 div()
+                    .relative()
                     .size_full()
                     .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
                         tg.update(cx, |this, _cx| {
@@ -325,6 +315,7 @@ impl Member {
                         });
                         crate::inspector::target::select_pane(&focus_pane, cx);
                     })
+                    .child(slot)
                     .child(pane.clone())
                     .into_any_element()
             }
@@ -371,7 +362,7 @@ impl Member {
                     let mut child_path = path.clone();
                     child_path.push(ix);
 
-                    let child_element = member.render(child_path, tile_group, gaps, cx);
+                    let child_element = member.render(child_path, tile_group, gaps, moving, cx);
                     let locked_px = gap_amount
                         .is_none()
                         .then(|| locked_along_axis(member, axis.axis, cx))
@@ -544,6 +535,11 @@ pub struct TileGroup {
     /// Transient: never serialized, and cleared by any edit that changes
     /// which panes exist so the user is never left staring past a new one.
     zoomed: Option<Entity<Pane>>,
+    /// The zoomed pane growing over the layout, or shrinking back into it.
+    zoom_motion: Option<motion::ZoomMotion>,
+    /// Where each pane was last drawn, which is where a zoom grows from and
+    /// shrinks back to.
+    pane_bounds: std::collections::HashMap<gpui::EntityId, gpui::Bounds<gpui::Pixels>>,
     split_preview: split_preview::SplitPreview,
 }
 
@@ -559,6 +555,8 @@ impl TileGroup {
             axis_bounds: Default::default(),
             focused_pane: Some(pane),
             zoomed: None,
+            zoom_motion: None,
+            pane_bounds: Default::default(),
             split_preview: Default::default(),
         }
     }
@@ -576,6 +574,8 @@ impl TileGroup {
             axis_bounds: Default::default(),
             focused_pane: Some(pane),
             zoomed: None,
+            zoom_motion: None,
+            pane_bounds: Default::default(),
             split_preview: Default::default(),
         }
     }
@@ -593,20 +593,51 @@ impl TileGroup {
     /// nothing to zoom.
     pub fn toggle_zoom(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
         if self.zoomed.as_ref() == Some(pane) {
-            self.zoomed = None;
+            self.exit_zoom(cx);
         } else if self.panes.len() > 1 && self.panes.contains(pane) {
+            self.animate_zoom(pane.clone(), true, cx);
             self.zoomed = Some(pane.clone());
             self.focused_pane = Some(pane.clone());
-        } else {
-            return;
+            cx.notify();
         }
-        cx.notify();
     }
 
     pub fn exit_zoom(&mut self, cx: &mut Context<Self>) {
-        if self.zoomed.take().is_some() {
+        if let Some(pane) = self.zoomed.take() {
+            self.animate_zoom(pane, false, cx);
             cx.notify();
         }
+    }
+
+    /// Grow `pane` from its slot (`zooming`) or shrink it back, unless
+    /// motion is turned down or the pane has not been drawn yet.
+    fn animate_zoom(&mut self, pane: Entity<Pane>, zooming: bool, cx: &App) {
+        let drawn = self.pane_bounds.contains_key(&pane.entity_id());
+        self.zoom_motion = (drawn && crate::motion::enabled(cx)).then(|| {
+            motion::ZoomMotion::new(
+                pane,
+                zooming,
+                self.zoom_motion.as_ref(),
+                std::time::Instant::now(),
+            )
+        });
+    }
+
+    /// The pane moving between its slot and the whole group this frame,
+    /// and how much of the group it covers. Ends the motion once it has
+    /// arrived, when a drag starts, or when an edit has since changed the
+    /// zoom out from under it.
+    fn zoom_frame(&mut self, cx: &App) -> Option<(Entity<Pane>, f32)> {
+        let motion = self.zoom_motion.as_ref()?;
+        let current = motion.zooming() == (self.zoomed.as_ref() == Some(&motion.pane));
+        let frame = (current && self.panes.contains(&motion.pane) && !cx.has_active_drag())
+            .then(|| motion.coverage(std::time::Instant::now()))
+            .flatten()
+            .map(|coverage| (motion.pane.clone(), coverage));
+        if frame.is_none() {
+            self.zoom_motion = None;
+        }
+        frame
     }
 
     /// The "current" pane keyboard commands target: the last-clicked pane if it
@@ -685,28 +716,13 @@ impl TileGroup {
         cx.notify();
     }
 
-    /// Dock `new_pane` along one whole edge of the layout rather than beside
-    /// a single pane — where a panel that serves every pane, like the
-    /// inspector, belongs. The current pane stays current.
-    pub fn dock_pane(
-        &mut self,
-        new_pane: Entity<Pane>,
-        direction: SplitDirection,
-        cx: &mut Context<Self>,
-    ) {
-        self.root.dock(&new_pane, direction);
-        cx.subscribe(&new_pane, Self::handle_pane_event).detach();
-        self.zoomed = None;
-        self.panes.push(new_pane);
-        cx.notify();
-    }
-
     /// Drop a pane from the layout; usually triggered by a pane emitting
     /// [`PaneEvent::Empty`].
     pub fn remove_pane(&mut self, target: &Entity<Pane>, cx: &mut Context<Self>) {
         self.root.remove(target);
         self.root.collapse();
         self.panes.retain(|p| p.entity_id() != target.entity_id());
+        self.pane_bounds.remove(&target.entity_id());
         if self.zoomed.as_ref() == Some(target) || self.panes.len() < 2 {
             self.zoomed = None;
         }
@@ -815,6 +831,8 @@ impl TileGroup {
             axis_bounds: Default::default(),
             focused_pane: panes.first().cloned(),
             zoomed: None,
+            zoom_motion: None,
+            pane_bounds: Default::default(),
             split_preview: Default::default(),
         };
         for pane in &panes {
@@ -1004,7 +1022,16 @@ impl Render for TileGroup {
         // While zoomed the pane stands in for the whole tree, so a drag's
         // split preview opens its gap inside the zoomed area; the drop then
         // edits the real tree and un-zooms.
-        let zoomed = self.zoomed.clone().map(Member::Pane);
+        let moving = self.zoom_frame(cx);
+        if moving.is_some() {
+            window.request_animation_frame();
+        }
+        // While a zoom grows or shrinks the layout shows underneath it, with
+        // the pane drawn on top at its in-between size.
+        let zoomed = match moving {
+            Some(_) => None,
+            None => self.zoomed.clone().map(Member::Pane),
+        };
         let committed = zoomed.as_ref().unwrap_or(&self.root);
         let (layout, gaps) = self.split_preview.layout(committed, window, cx);
         let tracker = tile_group.clone();
@@ -1039,8 +1066,27 @@ impl Render for TileGroup {
                 SplitPath::new(),
                 &tile_group,
                 &gaps,
+                moving.as_ref().map(|(pane, _)| pane.entity_id()),
                 cx,
             ));
+        if let Some((pane, coverage)) = moving
+            && let Some(slot) = self.pane_bounds.get(&pane.entity_id())
+        {
+            let group = self.split_preview.bounds;
+            let toward = |from: Pixels, to: Pixels| from + (to - from) * coverage;
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(toward(slot.origin.x - group.origin.x, px(0.)))
+                    .top(toward(slot.origin.y - group.origin.y, px(0.)))
+                    .w(toward(slot.size.width, group.size.width))
+                    .h(toward(slot.size.height, group.size.height))
+                    .overflow_hidden()
+                    .bg(theme.bg_secondary)
+                    .shadow_lg()
+                    .child(pane),
+            );
+        }
         for (pane, bounds) in self.split_preview.drop_regions() {
             if !self.panes.contains(pane) {
                 continue;
@@ -1237,41 +1283,6 @@ mod tests {
             assert_eq!(item.serialization_key(), "registered_test");
             assert_eq!(item.serialize(cx), config);
             assert!(item.entity_any(cx).downcast::<RegisteredTestView>().is_ok());
-        });
-    }
-
-    #[gpui::test]
-    fn docking_runs_a_pane_along_the_whole_edge(cx: &mut gpui::TestAppContext) {
-        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
-        cx.update(|cx| {
-            let first = tg.read(cx).panes()[0].clone();
-            let below = cx.new(|cx| Pane::new(Vec::new(), cx));
-            let right = cx.new(|cx| Pane::new(Vec::new(), cx));
-            let left = cx.new(|cx| Pane::new(Vec::new(), cx));
-            tg.update(cx, |tg, cx| {
-                tg.split_pane(&first, below.clone(), SplitDirection::Down, cx);
-                tg.dock_pane(right.clone(), SplitDirection::Right, cx);
-                tg.dock_pane(left.clone(), SplitDirection::Left, cx);
-            });
-            let tg = tg.read(cx);
-            let Member::Axis(root) = &tg.root else {
-                panic!("docking wraps the root in an axis");
-            };
-            assert_eq!(root.axis, Axis::Horizontal);
-            let ids: Vec<_> = root
-                .members
-                .iter()
-                .map(|m| match m {
-                    Member::Pane(p) => Some(p.entity_id()),
-                    Member::Axis(_) => None,
-                })
-                .collect();
-            assert_eq!(
-                ids,
-                [Some(left.entity_id()), None, Some(right.entity_id())],
-                "the earlier vertical split stays whole between the docks"
-            );
-            assert_eq!(tg.panes().len(), 4);
         });
     }
 

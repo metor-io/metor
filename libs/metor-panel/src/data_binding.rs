@@ -294,6 +294,14 @@ impl BoundHistory {
         Some(extent)
     }
 
+    /// Whether nothing in `range` of the output is still to fetch: every
+    /// remote span there has landed.
+    pub fn landed(&self, range: std::ops::Range<metor_proto::types::Timestamp>) -> bool {
+        let mut gaps = metor_db::manifest::GapVec::new();
+        self.component.time_series.coverage(range, &mut gaps);
+        gaps.is_empty()
+    }
+
     pub fn request(&self, range: std::ops::Range<metor_proto::types::Timestamp>, cx: &App) {
         hydrate(&self.component, range.clone(), cx);
         self.request_replay(range, cx);
@@ -333,7 +341,7 @@ impl BoundHistory {
     }
 }
 
-fn hydrate(
+pub(crate) fn hydrate(
     component: &metor_db::Component,
     range: std::ops::Range<metor_proto::types::Timestamp>,
     cx: &App,

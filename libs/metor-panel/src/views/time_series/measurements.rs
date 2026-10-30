@@ -188,7 +188,7 @@ fn trapezoidal_integral(samples: &[(Timestamp, f64)]) -> f64 {
 pub fn format_value(kind: MeasurementKind, value: f64) -> SharedString {
     match kind {
         MeasurementKind::DeltaX => format_duration_us(value).into(),
-        _ => super::format_value_label(value).into(),
+        _ => crate::views::format::format_exact(value).into(),
     }
 }
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use gpui::{
     Bounds, Context, Entity, Hsla, IntoElement, MouseButton, Pixels, Render, SharedString, Styled,
-    Window, canvas, div, point, prelude::*, px,
+    Window, canvas, div, prelude::*, px,
 };
 use metor_db::DB;
 
@@ -251,32 +251,30 @@ fn paint_numeric_overlay(
 
     paint_axis_backdrop(outer_bounds, pb, window, cx);
 
-    for tick in value_ticks(view.min_y, view.max_y, 5) {
-        let y = view.to_screen(pb, view.min_x, tick).y;
-        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
-            continue;
-        }
-        super::paint_value_label(
-            tick,
-            theme.text_secondary,
-            |width, font_size| point(pb.origin.x - width - px(4.0 * s), y - font_size / 2.0),
-            window,
-            cx,
-        );
-    }
-    for tick in value_ticks(view.min_x, view.max_x, 5) {
-        let x = view.to_screen(pb, tick, view.min_y).x;
-        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
-            continue;
-        }
-        super::paint_value_label(
-            tick,
-            theme.text_secondary,
-            |width, _| point(x - width / 2.0, pb.origin.y + pb.size.height + px(4.0 * s)),
-            window,
-            cx,
-        );
-    }
+    let y_ticks: Vec<(f64, Pixels)> = value_ticks(view.min_y, view.max_y, 5)
+        .map(|tick| (tick, view.to_screen(pb, view.min_x, tick).y))
+        .filter(|(_, y)| *y >= pb.origin.y && *y <= pb.origin.y + pb.size.height)
+        .collect();
+    super::paint_y_value_labels(
+        &y_ticks,
+        pb.origin.y,
+        |width| pb.origin.x - width - px(4.0 * s),
+        theme.text_secondary,
+        window,
+        cx,
+    );
+    let x_ticks: Vec<(f64, Pixels)> = value_ticks(view.min_x, view.max_x, 5)
+        .map(|tick| (tick, view.to_screen(pb, tick, view.min_y).x))
+        .filter(|(_, x)| *x >= pb.origin.x && *x <= pb.origin.x + pb.size.width)
+        .collect();
+    super::paint_x_value_labels(
+        &x_ticks,
+        pb.origin.y + pb.size.height + px(4.0 * s),
+        pb.origin.x + pb.size.width,
+        theme.text_secondary,
+        window,
+        cx,
+    );
 
     paint_axes(pb, theme.axis_color, window);
 }

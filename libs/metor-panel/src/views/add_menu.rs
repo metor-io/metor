@@ -183,7 +183,10 @@ impl AddMenu {
             (
                 None,
                 self.component("Samples", WidgetKind::samples_table(), |component| {
-                    SamplesTableConfig { component }
+                    SamplesTableConfig {
+                        components: vec![component],
+                        ..Default::default()
+                    }
                 }),
             ),
             (None, self.sequence_control()),
@@ -405,7 +408,7 @@ impl AddMenu {
                 crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
                     let cfg = SequenceControlConfig {
                         channel,
-                        compact: false,
+                        ..Default::default()
                     };
                     menu.add(&WidgetKind::sequence_control(), &cfg, cx);
                 })

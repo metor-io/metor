@@ -1,251 +1,140 @@
-//! Ingests the control system's sequence broadcast (the channel registry plus per-channel
-//! lifecycle events) into a single app-global store that views observe, and publishes the
-//! operator's commands back to the control system.
+//! The control system's sequence channels: which exist, what each may load,
+//! and which components carry each one's state, plus the operator's commands
+//! back to the control system.
 //!
 //! A *channel* is a slot that holds at most one loaded *sequence* (a small script that
 //! drives the system). The control system is the source of truth: it declares the channels
-//! and their loadable sequences via [`SequenceRegistry`] and reports every transition via
-//! [`SequenceChannelEvent`]. The panel only renders that state and publishes
-//! [`SequenceCommand`]/[`ReloadSequences`] — it never decides a channel's run state itself.
-//! Commands are fire-and-forget: the control system executes one and reports the result as
-//! an event, which flows back through the ingest loop so every connected client converges.
+//! via [`SequenceRegistry`], telemeters each channel's state as ordinary components every
+//! cycle, writes its message component only when something happens, and names them all in
+//! the registry. [`SequenceStore`] keeps only that
+//! declaration. A channel's state is read like any other telemetry, at the selected time,
+//! by [`ChannelStatusReader`], and its history of messages by [`SequenceHistory`]; the
+//! panel never decides what a channel's state is or which commands it would take.
 //!
-//! State folding lives in [`SequenceState`] (pure, unit-tested). [`SequenceStore`] is the
-//! gpui entity that owns it plus the reader tasks; a gpui global hands the entity
-//! to any view via [`try_global`].
+//! Commands ([`SequenceCommand`]/[`ReloadSequences`]) are fire-and-forget: the control
+//! system executes one and the result shows up in the channel's components.
 
-use std::collections::VecDeque;
+mod history;
+mod status;
+
 use std::sync::Arc;
 
 use gpui::{App, Entity, SharedString, Task};
 use metor_db::DB;
-use metor_proto::types::{Msg, Timestamp};
+use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
-    ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
-    SequenceRegistry, SequenceRunState,
+    ReloadSequences, SequenceChannelComponents, SequenceChannelState, SequenceCommand,
+    SequenceCommandKind, SequenceRegistry,
 };
 
 use crate::msg_ingest::{self, IngestSource};
 
+pub use history::{HistoryEntry, SequenceHistory};
+pub use status::{ChannelReaders, ChannelStatus, ChannelStatusReader};
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-/// How many past events the in-memory history ring keeps for the sequence panel. Deeper
-/// history can be queried from the persisted message log on demand.
-const MAX_HISTORY: usize = 1000;
-
-/// The live state of one channel, folded from the registry and its events. The channel's
-/// **name** (the slot's instance name on the control system) is its identity — the same
-/// key `SequenceCommand::channel` addresses.
-#[derive(Clone, Debug)]
-pub struct ChannelState {
+/// One declared channel. The **name** (the slot's instance name on the control
+/// system) is its identity: the key `SequenceCommand::channel` addresses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Channel {
     pub name: SharedString,
-    /// Sequence names that may be loaded into this channel (from the registry).
+    /// Sequence names that may be loaded into this channel; the channel's
+    /// `loaded` component indexes it.
     pub available: Vec<SharedString>,
-    /// The currently loaded sequence — or, while a `Loading` event is pending its
-    /// `Loaded`, the one being loaded.
-    pub loaded: Option<SharedString>,
-    pub run_state: SequenceRunState,
-    /// The latest status line reported by a `Loading`/`Progress`/`Failed` event.
-    pub last_message: Option<SharedString>,
-    pub updated_at: Timestamp,
+    /// The wrapped system's type, shown in place of a sequence when the
+    /// channel loads nothing.
+    pub system: SharedString,
+    pub components: ChannelComponents,
 }
 
-/// One entry in the sequence history log shown by the panel.
-#[derive(Clone, Debug)]
-pub struct SequenceLogEntry {
-    pub channel_name: SharedString,
-    pub timestamp: Timestamp,
-    pub run_state: SequenceRunState,
-    pub label: SharedString,
+impl Channel {
+    /// The sequence the `loaded` index names, if it is in range.
+    pub fn sequence(&self, loaded: Option<u32>) -> Option<SharedString> {
+        self.available.get(loaded? as usize).cloned()
+    }
 }
 
-/// The folded sequence state. Kept free of gpui/DB so the reconciliation rules can be
-/// tested directly.
+/// The component carrying each field of a channel's state. `None` where the
+/// registry names nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelComponents {
+    pub state: Option<ComponentId>,
+    pub loaded: Option<ComponentId>,
+    pub artifact: Option<ComponentId>,
+    pub accepts: Option<ComponentId>,
+    pub message: Option<ComponentId>,
+    pub elapsed: Option<ComponentId>,
+    pub abort_elapsed: Option<ComponentId>,
+}
+
+impl ChannelComponents {
+    fn from_names(names: &SequenceChannelComponents) -> Self {
+        let id = |name: &str| (!name.is_empty()).then(|| ComponentId::new(name));
+        Self {
+            state: id(&names.state),
+            loaded: id(&names.loaded),
+            artifact: id(&names.artifact),
+            accepts: id(&names.accepts),
+            message: id(&names.message),
+            elapsed: id(&names.elapsed),
+            abort_elapsed: id(&names.abort_elapsed),
+        }
+    }
+}
+
+/// The declared channels, as of the latest registry. Kept free of gpui/DB so
+/// it can be tested directly.
 #[derive(Default)]
 pub struct SequenceState {
-    /// Channels in declaration order from the latest registry.
-    channels: Vec<ChannelState>,
-    history: VecDeque<SequenceLogEntry>,
-    /// Total events ever pushed; a monotonic staleness stamp for observers
-    /// (the plot's event overlay) that stays valid as the ring evicts.
-    history_pushed: u64,
+    channels: Vec<Channel>,
 }
 
 impl SequenceState {
-    /// Apply a whole-registry declaration. Channels that persist keep their runtime state
-    /// (`loaded`/`run_state`/`last_message`); channels no longer declared are dropped.
-    pub fn apply_registry(&mut self, timestamp: Timestamp, registry: SequenceRegistry) {
-        let mut previous = std::mem::take(&mut self.channels);
-        self.channels.reserve(registry.channels.len());
-        for spec in registry.channels {
-            let name = SharedString::from(spec.name);
-            let available = spec.available.into_iter().map(SharedString::from).collect();
-            let mut channel = previous
-                .iter()
-                .position(|channel| channel.name == name)
-                .map(|index| previous.swap_remove(index))
-                .unwrap_or_else(|| ChannelState {
-                    name,
-                    available: Vec::new(),
-                    loaded: None,
-                    run_state: SequenceRunState::Idle,
-                    last_message: None,
-                    updated_at: timestamp,
-                });
-            channel.available = available;
-            self.channels.push(channel);
-        }
-    }
-
-    /// Apply one per-channel lifecycle event. Events for undeclared channels are ignored —
-    /// the registry is the source of which channels exist.
-    pub fn apply_event(&mut self, timestamp: Timestamp, event: SequenceChannelEvent) {
-        let Some(ch) = self
+    /// Replace the declaration: the registry is always whole, so channels it
+    /// no longer names are gone.
+    pub fn apply_registry(&mut self, registry: SequenceRegistry) {
+        self.channels = registry
             .channels
-            .iter_mut()
-            .find(|channel| channel.name == event.channel.as_str())
-        else {
-            return;
-        };
-        ch.updated_at = timestamp;
-        let channel_name = ch.name.clone();
-        let label: SharedString = match &event.kind {
-            SequenceEventKind::Loading { name } => {
-                ch.loaded = Some(name.clone().into());
-                ch.run_state = SequenceRunState::Idle;
-                ch.last_message = Some("Loading…".into());
-                format!("Loading {name}").into()
-            }
-            SequenceEventKind::Loaded { name } => {
-                ch.loaded = Some(name.clone().into());
-                ch.run_state = SequenceRunState::Idle;
-                ch.last_message = None;
-                format!("Loaded {name}").into()
-            }
-            SequenceEventKind::Unloaded => {
-                ch.loaded = None;
-                ch.run_state = SequenceRunState::Idle;
-                ch.last_message = None;
-                "Unloaded".into()
-            }
-            SequenceEventKind::Started => {
-                ch.run_state = SequenceRunState::Running;
-                "Started".into()
-            }
-            SequenceEventKind::Progress { detail } => {
-                ch.run_state = SequenceRunState::Running;
-                ch.last_message = Some(detail.clone().into());
-                format!("Progress: {detail}").into()
-            }
-            SequenceEventKind::Stopped => {
-                ch.run_state = SequenceRunState::Stopped;
-                "Stopped".into()
-            }
-            SequenceEventKind::Aborted => {
-                ch.run_state = SequenceRunState::Aborted;
-                "Aborted".into()
-            }
-            SequenceEventKind::Completed => {
-                ch.run_state = SequenceRunState::Completed;
-                "Completed".into()
-            }
-            SequenceEventKind::Failed { reason } => {
-                ch.run_state = SequenceRunState::Failed;
-                ch.last_message = Some(reason.clone().into());
-                format!("Failed: {reason}").into()
-            }
-            SequenceEventKind::Refused { reason } => {
-                // A rejected command changed nothing; report why without
-                // disturbing the channel's actual run state.
-                ch.last_message = Some(reason.clone().into());
-                format!("Refused: {reason}").into()
-            }
-        };
-        let run_state = ch.run_state;
-        self.push_event(SequenceLogEntry {
-            channel_name,
-            timestamp,
-            run_state,
-            label,
-        });
-    }
-
-    fn push_event(&mut self, event: SequenceLogEntry) {
-        self.history.push_back(event);
-        self.history_pushed += 1;
-        while self.history.len() > MAX_HISTORY {
-            self.history.pop_front();
-        }
-    }
-
-    /// Total events ever pushed; a cheap change stamp for the plot's event overlay.
-    pub fn history_pushed(&self) -> u64 {
-        self.history_pushed
+            .into_iter()
+            .map(|spec| Channel {
+                name: spec.name.into(),
+                available: spec.available.into_iter().map(SharedString::from).collect(),
+                system: spec.system.into(),
+                components: ChannelComponents::from_names(&spec.components),
+            })
+            .collect();
     }
 
     /// Channels in registry declaration order.
-    pub fn channels_ordered(&self) -> &[ChannelState] {
+    pub fn channels_ordered(&self) -> &[Channel] {
         &self.channels
     }
 
-    pub fn channel(&self, name: &str) -> Option<&ChannelState> {
+    pub fn channel(&self, name: &str) -> Option<&Channel> {
         self.channels.iter().find(|channel| channel.name == name)
     }
+}
 
-    #[cfg(test)]
-    pub fn channel_count(&self) -> usize {
-        self.channels.len()
-    }
-
-    pub fn count_in_state(&self, run_state: SequenceRunState) -> usize {
-        self.channels
-            .iter()
-            .filter(|c| c.run_state == run_state)
-            .count()
-    }
-
-    pub fn history(&self) -> &VecDeque<SequenceLogEntry> {
-        &self.history
+/// Display name for a channel state; `None` (no reading yet, or a code this
+/// panel doesn't know) reads as unknown.
+pub fn state_label(state: Option<SequenceChannelState>) -> &'static str {
+    match state {
+        Some(SequenceChannelState::Running) => "Running",
+        Some(SequenceChannelState::Stopped) => "Stopped",
+        Some(SequenceChannelState::Completed) => "Completed",
+        Some(SequenceChannelState::Aborted) => "Aborted",
+        Some(SequenceChannelState::Failed) => "Failed",
+        Some(SequenceChannelState::Panicked) => "Panicked",
+        Some(SequenceChannelState::Unloaded) => "Unloaded",
+        Some(SequenceChannelState::Quiescing) => "Quiescing",
+        None => "Unknown",
     }
 }
 
-/// Stable index for a run state, used to pick a theme color (mirrors `severity_index`).
-pub fn run_state_index(run_state: SequenceRunState) -> usize {
-    match run_state {
-        SequenceRunState::Idle => 0,
-        SequenceRunState::Running => 1,
-        SequenceRunState::Completed => 2,
-        SequenceRunState::Aborted => 3,
-        SequenceRunState::Stopped => 4,
-        SequenceRunState::Failed => 5,
-    }
-}
-
-/// Whether a channel in this run state may be reset to the beginning.
-pub fn is_resettable(run_state: SequenceRunState) -> bool {
-    matches!(
-        run_state,
-        SequenceRunState::Completed
-            | SequenceRunState::Aborted
-            | SequenceRunState::Stopped
-            | SequenceRunState::Failed
-    )
-}
-
-pub fn run_state_label(run_state: SequenceRunState) -> &'static str {
-    match run_state {
-        SequenceRunState::Idle => "Idle",
-        SequenceRunState::Running => "Running",
-        SequenceRunState::Completed => "Completed",
-        SequenceRunState::Aborted => "Aborted",
-        SequenceRunState::Stopped => "Stopped",
-        SequenceRunState::Failed => "Failed",
-    }
-}
-
-/// The gpui entity wrapping [`SequenceState`]; owns the in-process ingestion tasks and the
-/// DB handle used to publish commands.
+/// The gpui entity wrapping [`SequenceState`]; owns the registry ingest task
+/// and the DB handle used to publish commands.
 pub struct SequenceStore {
     state: SequenceState,
     db: Arc<DB>,
@@ -257,29 +146,44 @@ pub fn try_global(cx: &App) -> Option<Entity<SequenceStore>> {
     msg_ingest::global(cx)
 }
 
+/// The declared channels' names, in display order; empty without a store.
+pub fn channel_names(cx: &App) -> Vec<SharedString> {
+    try_global(cx)
+        .map(|store| {
+            store
+                .read(cx)
+                .state()
+                .channels_ordered()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl SequenceStore {
+    /// Install the store and the [`SequenceHistory`] that follows its channels.
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        msg_ingest::install(cx, |cx| {
-            // Registry declares channels before their events can fold, so it leads the
-            // sources list and wins equal-timestamp ties in the merged backfill.
-            let sources = vec![
-                IngestSource::new(SequenceRegistry::ID, |store: &mut Self, ts, reg| {
-                    store.state.apply_registry(ts, reg)
-                }),
-                IngestSource::new(SequenceChannelEvent::ID, |store: &mut Self, ts, ev| {
-                    store.state.apply_event(ts, ev)
-                }),
-            ];
+        let store = msg_ingest::install(cx, |cx| {
+            let sources = vec![IngestSource::new(
+                SequenceRegistry::ID,
+                |store: &mut Self, _ts, reg| store.state.apply_registry(reg),
+            )];
             Self {
                 state: SequenceState::default(),
                 _task: msg_ingest::spawn_ingest(db.clone(), sources, cx),
                 db,
             }
         });
+        SequenceHistory::init(store, cx);
     }
 
     pub fn state(&self) -> &SequenceState {
         &self.state
+    }
+
+    pub(crate) fn db(&self) -> &Arc<DB> {
+        &self.db
     }
 
     fn publish(&self, channel: &str, command: SequenceCommandKind) {
@@ -314,8 +218,7 @@ impl SequenceStore {
         self.publish(channel, SequenceCommandKind::Stop);
     }
 
-    /// Rebuild the loaded sequence from the beginning. Only meaningful from a terminal state
-    /// (see [`is_resettable`]); the control system ignores it otherwise.
+    /// Rebuild the loaded sequence from the beginning.
     pub fn reset(&self, channel: &str) {
         self.publish(channel, SequenceCommandKind::Reset);
     }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui::{
     Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point,
-    Rems, SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div,
+    Rems, SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
     prelude::*, px,
 };
 
@@ -103,22 +103,69 @@ pub fn plot_legend<T: 'static, N: 'static>(
     row
 }
 
-/// Shape and paint a numeric axis label, allowing callers to position it
-/// from the shaped width without duplicating GPUI text plumbing.
-pub fn paint_value_label(
-    value: f64,
+/// Paint a value axis's tick labels, each at the vertical centre given
+/// beside its value and placed horizontally by `x` from its shaped width.
+/// When the labels are offsets from a shared base, the base sits at `top`
+/// and a tick label it would overlap is left out.
+pub fn paint_y_value_labels(
+    ticks: &[(f64, Pixels)],
+    top: Pixels,
+    x: impl Fn(Pixels) -> Pixels,
     color: Hsla,
-    origin: impl FnOnce(Pixels, Pixels) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    paint_text_label(
-        super::time_series::format_value_label(value),
-        color,
-        origin,
-        window,
-        cx,
-    );
+    let values: Vec<f64> = ticks.iter().map(|(value, _)| *value).collect();
+    let labels = crate::views::format::axis_labels(&values);
+    let font_size = label_font_size(window);
+    let clear_below = labels.base.as_ref().map(|base| {
+        let base = shape_label(base.clone(), color, window);
+        paint_shaped(&base, point(x(base.width), top), window, cx);
+        top + font_size * 1.5
+    });
+    for ((_, y), text) in ticks.iter().zip(labels.ticks) {
+        if clear_below.is_some_and(|clear| *y < clear) {
+            continue;
+        }
+        let label = shape_label(text, color, window);
+        paint_shaped(
+            &label,
+            point(x(label.width), *y - font_size / 2.0),
+            window,
+            cx,
+        );
+    }
+}
+
+/// Paint a value axis's tick labels centred under the horizontal positions
+/// given beside their values, along `y`. When the labels are offsets from a
+/// shared base, the base ends at `right` and a tick label it would overlap
+/// is left out.
+pub fn paint_x_value_labels(
+    ticks: &[(f64, Pixels)],
+    y: Pixels,
+    right: Pixels,
+    color: Hsla,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let values: Vec<f64> = ticks.iter().map(|(value, _)| *value).collect();
+    let labels = crate::views::format::axis_labels(&values);
+    let gap = label_font_size(window) / 2.0;
+    let clear_right = labels.base.as_ref().map(|base| {
+        let base = shape_label(base.clone(), color, window);
+        let left = right - base.width;
+        paint_shaped(&base, point(left, y), window, cx);
+        left - gap
+    });
+    for ((_, x), text) in ticks.iter().zip(labels.ticks) {
+        let label = shape_label(text, color, window);
+        let left = *x - label.width / 2.0;
+        if clear_right.is_some_and(|clear| left + label.width > clear) {
+            continue;
+        }
+        paint_shaped(&label, point(left, y), window, cx);
+    }
 }
 
 /// Shape and paint a label, allowing its final position to depend on the
@@ -130,8 +177,16 @@ pub fn paint_text_label(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let text = text.into();
-    let font_size = px(LABEL_FONT_SIZE * ui_scale(window));
+    let font_size = label_font_size(window);
+    let shaped = shape_label(text.into(), color, window);
+    paint_shaped(&shaped, origin(shaped.width, font_size), window, cx);
+}
+
+fn label_font_size(window: &Window) -> Pixels {
+    px(LABEL_FONT_SIZE * ui_scale(window))
+}
+
+fn shape_label(text: SharedString, color: Hsla, window: &mut Window) -> gpui::ShapedLine {
     let run = TextRun {
         len: text.len(),
         font: window.text_style().font(),
@@ -140,17 +195,20 @@ pub fn paint_text_label(
         underline: None,
         strikethrough: None,
     };
-    let shaped = window
+    let font_size = label_font_size(window);
+    window
         .text_system()
-        .shape_line(text, font_size, &[run], None);
-    let _ = shaped.paint(
-        origin(shaped.width, font_size),
-        font_size,
-        TextAlign::Left,
-        None,
-        window,
-        cx,
-    );
+        .shape_line(text, font_size, &[run], None)
+}
+
+fn paint_shaped(
+    shaped: &gpui::ShapedLine,
+    origin: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let font_size = label_font_size(window);
+    let _ = shaped.paint(origin, font_size, TextAlign::Left, None, window, cx);
 }
 
 /// Sync the tracker and task maps to the current `traces`: drop entries whose

@@ -22,7 +22,7 @@ use crate::views::{
     AlarmListMode, AlarmView, ComponentBrowser, ComponentOutline, LevelFilter, LogView,
     OutlineColumns, SequenceView, new_component_browser,
 };
-use crate::views::{Col, default_columns};
+use crate::views::{Col, SequenceLayout, default_columns};
 
 use super::pane::Pane;
 
@@ -63,6 +63,7 @@ impl Default for LogPanelConfig {
 #[serde(default)]
 pub struct SequencePanelConfig {
     pub show_history: bool,
+    pub layout: SequenceLayout,
 }
 
 pub(crate) fn alarm_view(
@@ -106,12 +107,14 @@ pub(crate) fn sequence_view(
 ) -> SequenceView {
     let mut view = SequenceView::new(cx);
     view.set_history(cfg.show_history);
+    view.layout = cfg.layout;
     view
 }
 
 pub(crate) fn sequence_config(view: &SequenceView, _cx: &App) -> SequencePanelConfig {
     SequencePanelConfig {
         show_history: view.is_history(),
+        layout: view.layout,
     }
 }
 
@@ -766,7 +769,7 @@ mod tests {
 
         let seq = SequenceControlConfig {
             channel: "mode".into(),
-            compact: true,
+            layout: SequenceLayout::Square,
         };
         let s = serde_json::to_string(&seq).unwrap();
         assert_eq!(
@@ -775,7 +778,16 @@ mod tests {
         );
         let partial: SequenceControlConfig = serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
         assert_eq!(partial.channel, "mode");
-        assert!(!partial.compact);
+        assert_eq!(partial.layout, SequenceLayout::Medium);
+        // Controls saved with the old `compact` flag, or the `compact` layout
+        // that became medium, load as medium.
+        for legacy in [
+            r#"{"channel":"mode","compact":false}"#,
+            r#"{"channel":"mode","layout":"compact"}"#,
+        ] {
+            let legacy: SequenceControlConfig = serde_json::from_str(legacy).unwrap();
+            assert_eq!(legacy.layout, SequenceLayout::Medium);
+        }
 
         let attitude = AttitudeConfig {
             component: "sat.nav.attitude_estimate.q_hat_b_eci".into(),

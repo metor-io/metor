@@ -60,18 +60,25 @@ pub(crate) fn elapsed(t: Timestamp, zero: Timestamp) -> String {
     format!("T{}{time}", if delta < 0 { '-' } else { '+' })
 }
 
-pub(crate) fn timestamp(t: Timestamp, config: &TemporalConfig, context: &TimeContext) -> String {
-    if config.display == TimeDisplay::Elapsed {
-        let Some(zero) = origin(config, context) else {
-            return "T0 unavailable".into();
-        };
-        return elapsed(t, zero);
-    }
-    let zone = if config.timezone.eq_ignore_ascii_case("local") {
+/// `t` as an offset from T0, or why there is none.
+pub(crate) fn elapsed_or_unavailable(t: Timestamp, origin: Option<Timestamp>) -> String {
+    origin.map_or_else(|| "T0 unavailable".into(), |zero| elapsed(t, zero))
+}
+
+/// The zone the time controls show wall-clock time in.
+pub(crate) fn zone(timezone: &str) -> jiff::tz::TimeZone {
+    if timezone.eq_ignore_ascii_case("local") {
         jiff::tz::TimeZone::system()
     } else {
-        jiff::tz::TimeZone::get(&config.timezone).unwrap_or(jiff::tz::TimeZone::UTC)
-    };
+        jiff::tz::TimeZone::get(timezone).unwrap_or(jiff::tz::TimeZone::UTC)
+    }
+}
+
+pub(crate) fn timestamp(t: Timestamp, config: &TemporalConfig, context: &TimeContext) -> String {
+    if config.display == TimeDisplay::Elapsed {
+        return elapsed_or_unavailable(t, origin(config, context));
+    }
+    let zone = zone(&config.timezone);
     jiff::Timestamp::from_microsecond(t.0)
         .map(|t| {
             t.to_zoned(zone)

@@ -324,6 +324,36 @@ where
     D: for<'a> Fn(ComponentView<'a>) -> Option<V> + Send + 'static,
     A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
 {
+    spawn_stamped_stream(
+        db,
+        component_id,
+        cx,
+        move |db, id| {
+            let (initial, decode) = prepare(db, id);
+            (initial, move |_, view: ComponentView<'_>| decode(view))
+        },
+        apply,
+    )
+}
+
+/// [`spawn_seeded_stream`], decoding each sample with its stamp: for a
+/// component written only when something happens, where when it was written
+/// is part of the value.
+pub(crate) fn spawn_stamped_stream<E, I, V, P, D, A>(
+    db: Arc<DB>,
+    component_id: ComponentId,
+    cx: &mut Context<E>,
+    prepare: P,
+    apply: A,
+) -> gpui::Task<()>
+where
+    E: 'static,
+    I: Send + 'static,
+    V: Send + 'static,
+    P: FnOnce(&DB, ComponentId) -> (I, D) + Send + 'static,
+    D: for<'a> Fn(Timestamp, ComponentView<'a>) -> Option<V> + Send + 'static,
+    A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
+{
     let reader = crate::temporal::samples::acquire(db.clone(), component_id, cx);
     cx.spawn(async move |this, cx| {
         let component = crate::wait_for_component(&db, component_id).await;
@@ -337,7 +367,7 @@ where
                 match selection.sample {
                     Some(sample) => {
                         if let Ok((_, value)) = component.schema.parse_value(&sample.bytes)
-                            && let Some(value) = decode(value)
+                            && let Some(value) = decode(sample.timestamp, value)
                         {
                             apply(view, StreamUpdate::Value(value), cx);
                             if selection.stale {

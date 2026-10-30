@@ -68,6 +68,9 @@ impl AssetSource for IconAssets {
             }
             "icons/viewport.svg" => Some(include_bytes!("../assets/icons/viewport.svg")),
             "icons/favorite.svg" => Some(include_bytes!("../assets/icons/favorite.svg")),
+            "icons/check.svg" => Some(include_bytes!("../assets/icons/check.svg")),
+            "icons/bell.svg" => Some(include_bytes!("../assets/icons/bell.svg")),
+            "icons/bell-off.svg" => Some(include_bytes!("../assets/icons/bell-off.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -131,6 +134,9 @@ pub enum Icon {
     VerticalChevrons,
     Viewport,
     Favorite,
+    Check,
+    Bell,
+    BellOff,
 }
 
 impl Icon {
@@ -183,6 +189,9 @@ impl Icon {
             Icon::VerticalChevrons => "icons/vertical-chevrons.svg",
             Icon::Viewport => "icons/viewport.svg",
             Icon::Favorite => "icons/favorite.svg",
+            Icon::Check => "icons/check.svg",
+            Icon::Bell => "icons/bell.svg",
+            Icon::BellOff => "icons/bell-off.svg",
         }
     }
 
@@ -192,5 +201,20 @@ impl Icon {
             .path(SharedString::from(self.asset_path()))
             .size(ui_px(size))
             .text_color(color)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::AssetSource;
+
+    use super::{Icon, IconAssets};
+
+    #[test]
+    fn the_alarm_icons_are_bundled() {
+        for icon in [Icon::Check, Icon::Bell, Icon::BellOff] {
+            let bytes = IconAssets.load(icon.asset_path()).unwrap();
+            assert!(bytes.is_some_and(|b| b.starts_with(b"<svg")), "{icon:?}");
+        }
     }
 }

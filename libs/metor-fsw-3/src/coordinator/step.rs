@@ -29,6 +29,13 @@ pub trait Step {
         None
     }
 
+    /// Whether `load` can ever succeed: true only for a step that swaps
+    /// systems, whatever it holds now. A channel stops offering `Load` for a
+    /// step that can't.
+    fn loads(&self) -> bool {
+        false
+    }
+
     /// Replaces the system this step runs with the system called `name`.
     fn load(&mut self, _name: &str, _cx: &mut StepCx<'_>) -> Result<(), LoadError> {
         Err(LoadError::NotLoadable)

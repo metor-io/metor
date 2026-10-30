@@ -192,14 +192,9 @@ pub(crate) fn snapshot(source: &dyn EventSource, cx: &mut App) -> Arc<EventIndex
             }
         }
         EventKindKey::Sequences => {
-            if let Some(store) = sequences::try_global(cx) {
-                let store = store.read(cx);
-                let state = store.state();
-                let first = state
-                    .history_pushed()
-                    .saturating_sub(state.history().len() as u64);
-                for (i, e) in state.history().iter().enumerate() {
-                    push(first + i as u64, 0, &mut || sequence_plot_event(e, &theme));
+            if let Some(history) = SequenceHistory::global(cx) {
+                for e in history.read(cx).entries() {
+                    push(e.seq, 0, &mut || sequence_plot_event(e, &theme));
                 }
             }
         }

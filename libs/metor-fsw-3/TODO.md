@@ -88,16 +88,17 @@ accepts; a dialer connects.
 
 `channel=` wraps a cyclic system in the channel adapter, which applies
 `Start`, `Stop`, `Abort`, `Reset`, and `Load` from `SequenceCommand`
-messages and reports `SequenceChannelEvent`s and a `channel_status`
-frame. `#[sequence]` async fns are polled once per cycle through a `Seq`
-handle. `DlSlot` loads pack systems from a content-addressed store that
-`metor build` fills, and `ChannelRegistry` publishes the target's
-channels. Landed 2026-09-24.
+messages, reports its state in a `channel_status` frame each cycle, and
+writes each message it raises as a `channel_message` frame. `#[sequence]`
+async fns are polled once per cycle through a `Seq` handle. `DlSlot`
+loads pack systems from a content-addressed store that `metor build`
+fills, and `ChannelRegistry` publishes the target's channels and names
+the components carrying each one's state. Landed 2026-09-24.
 
 - Channels on async systems: a per-member stop and cancel in the thread
   group, and a `Threads` handle the recipe can re-place with.
 - `Target.add` returns the system's own type, so a checker does not see
-  a channel's `events` and `channel_status` handles.
+  a channel's `channel_status` or `channel_message` handle.
 - Postcard samples: `Sample<T>` holds only `Frame + Copy` records. A
   postcard record needs its decoded value held across the cycle without
   allocating after make.

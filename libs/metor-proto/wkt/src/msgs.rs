@@ -712,12 +712,122 @@ pub const SEQUENCE_CHANNEL_NAME_CAP: usize = 48;
 /// referenced by name when loaded into a channel.
 pub type SequenceName = String;
 
-/// One channel slot declared by the control system: its name (the channel's stable
-/// address) and the set of sequence names that may be loaded into it.
-#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+/// One channel declared by the control system: its name (the channel's stable
+/// address), the sequences that may be loaded into it, and the components that
+/// carry its state.
+///
+/// The control system telemeters a channel's state as components every cycle,
+/// and writes a message component only when something happens; this entry
+/// names each of them in full, so a UI reads them like any other component and
+/// never derives a name. Commands are the only messages a
+/// UI sends, and the registry the only one besides commands it reads.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct SequenceChannelSpec {
     pub name: SequenceChannelName,
     pub available: Vec<SequenceName>,
+    /// The wrapped system's type, shown in place of a sequence for a channel
+    /// that loads nothing (`available` is empty).
+    pub system: String,
+    pub components: SequenceChannelComponents,
+}
+
+/// The full component name of each field of a channel's state.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
+pub struct SequenceChannelComponents {
+    /// A [`SequenceChannelState`] code.
+    pub state: String,
+    /// The loaded sequence's index in the channel's `available` list, or
+    /// `u32::MAX` when nothing is loaded.
+    pub loaded: String,
+    /// The file name of the loaded occupant's library, or empty.
+    pub artifact: String,
+    /// The blake3 hash of the loaded occupant's library, or zeros.
+    pub hash: String,
+    /// The commands the channel would accept now, as [`SequenceAccepts`] bits.
+    pub accepts: String,
+    /// What happened on the channel: a transition, a refused command, or how
+    /// its system ended. It has one sample per message, stamped when
+    /// the message was raised, so its samples are the channel's history.
+    pub message: String,
+    /// Seconds the loaded sequence has run. It pauses while the channel is
+    /// stopped and holds once the run ends.
+    pub elapsed: String,
+    /// Seconds since a commanded abort began, counting while the sequence winds
+    /// down gracefully; zero when no abort is in progress.
+    pub abort_elapsed: String,
+}
+
+/// A channel's state, as its `state` component carries it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SequenceChannelState {
+    Running = 0,
+    Stopped = 1,
+    Completed = 2,
+    Aborted = 3,
+    Failed = 4,
+    Panicked = 5,
+    Unloaded = 6,
+    /// Waiting for the system's work in flight to finish before a reset or
+    /// load takes effect.
+    Quiescing = 7,
+}
+
+impl SequenceChannelState {
+    pub const ALL: [Self; 8] = [
+        Self::Running,
+        Self::Stopped,
+        Self::Completed,
+        Self::Aborted,
+        Self::Failed,
+        Self::Panicked,
+        Self::Unloaded,
+        Self::Quiescing,
+    ];
+
+    /// The code the `state` component carries.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// The state a `state` component's code names, if any.
+    pub fn from_code(code: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.code() == code)
+    }
+}
+
+/// The commands a channel would accept now, one bit per command, as its
+/// `accepts` component carries them.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SequenceAccepts(pub u32);
+
+impl SequenceAccepts {
+    pub const LOAD: u32 = 1 << 0;
+    pub const START: u32 = 1 << 1;
+    pub const ABORT: u32 = 1 << 2;
+    pub const STOP: u32 = 1 << 3;
+    pub const RESET: u32 = 1 << 4;
+
+    /// The bit for `command`.
+    pub fn bit(command: &SequenceCommandKind) -> u32 {
+        match command {
+            SequenceCommandKind::Load { .. } => Self::LOAD,
+            SequenceCommandKind::Start => Self::START,
+            SequenceCommandKind::Abort => Self::ABORT,
+            SequenceCommandKind::Stop => Self::STOP,
+            SequenceCommandKind::Reset => Self::RESET,
+        }
+    }
+
+    /// Whether `command` would be accepted.
+    pub fn allows(self, command: &SequenceCommandKind) -> bool {
+        self.contains(Self::bit(command))
+    }
+
+    /// Whether the command `bit` names would be accepted.
+    pub fn contains(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
 }
 
 /// Whole-registry declaration of the sequence channels, broadcast by the control system.
@@ -728,7 +838,8 @@ pub struct SequenceRegistry {
     pub channels: Vec<SequenceChannelSpec>,
 }
 
-/// Run state of a channel's loaded sequence, as reported by the control system.
+/// Run state of a channel's loaded sequence, as fsw-2 reports it. Kept only
+/// for fsw-2, and deleted with it; fsw-3 reports [`SequenceChannelState`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceRunState {
@@ -740,9 +851,9 @@ pub enum SequenceRunState {
     Failed,
 }
 
-/// A single transition in a channel's lifecycle. Events arrive in order through one log,
-/// so the per-channel state machine (`Loaded` → `Started` → `Progress`* → terminal) is
-/// totally ordered.
+/// A single transition in a channel's lifecycle, as fsw-2 reports it. Events arrive in
+/// order through one log, so the per-channel state machine (`Loaded` → `Started` →
+/// `Progress`* → terminal) is totally ordered. Kept only for fsw-2, and deleted with it.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceEventKind {
@@ -781,7 +892,8 @@ pub enum SequenceEventKind {
     },
 }
 
-/// A granular per-channel state update, broadcast by the control system (control → panel).
+/// A granular per-channel state update, broadcast by fsw-2 (control → panel). Kept only
+/// for fsw-2, and deleted with it; fsw-3 telemeters the channel's components instead.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceChannelEvent {
     pub channel: SequenceChannelName,
@@ -789,7 +901,8 @@ pub struct SequenceChannelEvent {
 }
 
 /// An operator command on a channel, published by the panel (panel → control). The
-/// control system executes it and reports the result via [`SequenceChannelEvent`].
+/// control system executes it, and the channel's components report the result: its
+/// `state`, and a `message` saying what happened or why it was refused.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceCommandKind {
@@ -803,7 +916,7 @@ pub enum SequenceCommandKind {
     /// Hard-stop (drop) — may leave the system unsafe.
     Stop,
     /// Rebuild the loaded sequence from the beginning, returning the channel to a ready
-    /// (idle) state. Only valid from a terminal `Completed`/`Aborted` state.
+    /// (stopped) state. The channel's `accepts` says when it applies.
     Reset,
 }
 
@@ -1332,10 +1445,17 @@ mod sequence_tests {
                 SequenceChannelSpec {
                     name: "deploy".into(),
                     available: vec!["deploy_solar_array".into(), "deploy_antenna".into()],
+                    system: "dl_slot".into(),
+                    components: SequenceChannelComponents {
+                        state: "fsw.deploy.channel_status.state".into(),
+                        elapsed: "fsw.deploy.channel_status.elapsed".into(),
+                        ..Default::default()
+                    },
                 },
                 SequenceChannelSpec {
                     name: "attitude".into(),
                     available: vec!["detumble".into()],
+                    ..Default::default()
                 },
             ],
         };
@@ -1394,13 +1514,21 @@ mod sequence_tests {
             channels: vec![SequenceChannelSpec {
                 name: "adcs".into(),
                 available: vec!["detumble".into()],
+                system: "s".into(),
+                components: SequenceChannelComponents {
+                    state: "t".into(),
+                    ..Default::default()
+                },
             }],
         };
         assert_eq!(
             postcard::to_allocvec(&registry).unwrap(),
-            // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8).
+            // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8);
+            // system "s"; then the eight component names, `state` "t" and the
+            // rest empty.
             [
-                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e'
+                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e',
+                1, b's', 1, b't', 0, 0, 0, 0, 0, 0, 0
             ]
         );
 
@@ -1438,6 +1566,25 @@ mod sequence_tests {
             // channel "adcs"; command variant 1 (Start).
             [4, b'a', b'd', b'c', b's', 1]
         );
+    }
+
+    #[test]
+    fn channel_state_codes_round_trip() {
+        for state in SequenceChannelState::ALL {
+            assert_eq!(SequenceChannelState::from_code(state.code()), Some(state));
+        }
+        assert_eq!(SequenceChannelState::Running.code(), 0);
+        assert_eq!(SequenceChannelState::Quiescing.code(), 7);
+        assert_eq!(SequenceChannelState::from_code(8), None);
+    }
+
+    #[test]
+    fn accepts_bits_name_each_command() {
+        let accepts = SequenceAccepts(SequenceAccepts::START | SequenceAccepts::RESET);
+        assert!(accepts.allows(&SequenceCommandKind::Start));
+        assert!(accepts.allows(&SequenceCommandKind::Reset));
+        assert!(!accepts.allows(&SequenceCommandKind::Stop));
+        assert!(!accepts.allows(&SequenceCommandKind::Load { name: "x".into() }));
     }
 
     #[test]

@@ -357,6 +357,10 @@ impl Step for DlSlot {
         }
     }
 
+    fn loads(&self) -> bool {
+        true
+    }
+
     /// If the new system's library or ports are rejected, the current system
     /// keeps running. If the new system's constructor fails, the previous
     /// system is created again.

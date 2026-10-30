@@ -493,14 +493,15 @@ class ChannelTest(ConfigTest):
         cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
         nav = fsw.add("nav", Nav(), channel="nav")
-        self.assertEqual(nav.events.ref, PortRef("nav", "events"))
         self.assertEqual(nav.channel_status.ref, PortRef("nav", "channel_status"))
+        self.assertEqual(nav.channel_message.ref, PortRef("nav", "channel_message"))
         plain = fsw.add("plain", Nav())
         with self.assertRaisesRegex(AttributeError, "channel_status"):
             plain.channel_status  # type: ignore[attr-defined]
         pub = fsw.add("pub", Publish([nav], transport=Listen("127.0.0.1:0")))
         ports = [i["port"] for i in fsw.to_config()["coordinator"]["systems"][3]["inputs"]]
         self.assertIn("nav.channel_status", ports)
+        self.assertIn("nav.channel_message", ports)
         self.assertIsNotNone(pub)
 
     def test_thread_and_channel_refused(self) -> None:
@@ -527,7 +528,7 @@ class ChannelTest(ConfigTest):
         fsw = Target(cycle_rate=50.0)
         mode = fsw.add("mode", DlSlot(allow=[Safe(), Hold()]), channel="mode")
         self.assertEqual(mode.cmd.ref, PortRef("mode", "cmd"))
-        self.assertEqual(mode.events.ref, PortRef("mode", "events"))
+        self.assertEqual(mode.channel_status.ref, PortRef("mode", "channel_status"))
 
     def test_slot_refusals(self) -> None:
         fsw = Target(cycle_rate=50.0)
@@ -569,10 +570,55 @@ class ChannelTest(ConfigTest):
         params = systems["channels"]["params"]
         self.assertEqual(
             params["channels"],
-            [{"name": "nav", "available": []}, {"name": "mode", "available": ["safe", "hold"]}],
+            [
+                {
+                    "name": "nav",
+                    "available": [],
+                    "system": "nav",
+                    "components": component_names("nav"),
+                },
+                {
+                    "name": "mode",
+                    "available": ["safe", "hold"],
+                    "system": "dl_slot",
+                    "components": component_names("mode"),
+                },
+            ],
         )
         self.assertEqual(params["period"], 50)
         self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")
+
+    def test_registry_names_channel_components(self) -> None:
+        fsw = Target(cycle_rate=50.0, namespace="sat")
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
+        fsw.commands(cmds.sequence_command)
+        fsw.add("nav", Nav(), channel="guidance")
+        fsw.add("channels", ChannelRegistry())
+        systems = {s["id"]: s for s in fsw.to_config()["coordinator"]["systems"]}
+        [nav] = systems["channels"]["params"]["channels"]
+        # The components are named by system, not channel, under the
+        # target's namespace.
+        self.assertEqual(nav["name"], "guidance")
+        self.assertEqual(nav["components"], component_names("sat.nav"))
+        self.assertEqual(nav["components"]["message"], "sat.nav.channel_message.text")
+        self.assertEqual(systems["nav"]["channel"], {"name": "guidance", "start": "running"})
+
+
+def component_names(prefix: str) -> dict[str, str]:
+    """The registry's names for a channel's components under ``prefix``: each
+    ``channel_status`` field, and the ``channel_message`` text as ``message``."""
+    fields = [
+        "state",
+        "loaded",
+        "artifact",
+        "hash",
+        "accepts",
+        "elapsed",
+        "abort_elapsed",
+    ]
+    names = {field: f"{prefix}.channel_status.{field}" for field in fields}
+    names["message"] = f"{prefix}.channel_message.text"
+    return names
 
 
 if __name__ == "__main__":

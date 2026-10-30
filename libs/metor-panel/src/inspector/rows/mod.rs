@@ -11,7 +11,6 @@ use gpui::{
 use crate::theme::theme;
 
 pub mod bool;
-pub mod checkbox;
 pub mod color;
 pub mod command;
 pub mod default_action;
@@ -25,7 +24,6 @@ pub mod text;
 pub mod text_field;
 
 pub use bool::BoolRow;
-pub use checkbox::checkbox;
 pub use color::ColorRow;
 pub use command::CommandRow;
 pub use default_action::DefaultActionRow;

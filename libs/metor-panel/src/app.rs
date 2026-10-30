@@ -34,6 +34,7 @@ actions!(
         OpenLeader,
         CycleTabForward,
         CycleTabBackward,
+        CloseTab,
         ToggleCmdLock,
         OpenReviewEdits,
         OpenConnections,
@@ -286,6 +287,18 @@ impl AppRoot {
             return;
         };
         pane.update(cx, |pane, cx| pane.cycle_backward(cx));
+    }
+
+    /// Close the current pane's shown tab, or the window once it has no
+    /// tabs left.
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tiles.read(cx).has_items(cx) {
+            crate::window_controls::close_window(window, cx);
+            return;
+        }
+        if let Some(pane) = self.tiles.read(cx).active_pane(cx) {
+            pane.update(cx, |pane, cx| pane.close_active_tab(cx));
+        }
     }
 
     fn toggle_cmd_lock(&mut self, _: &ToggleCmdLock, _window: &mut Window, cx: &mut Context<Self>) {
@@ -640,6 +653,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::open_leader))
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
+            .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
                 this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
             }))
@@ -812,9 +826,9 @@ impl AppRoot {
         bar.into_any_element()
     }
 
-    /// Reveal the inspector pane, or dock a new one along the layout's right
-    /// edge at a fixed width. The current pane becomes its first target, so
-    /// it opens on what the user was looking at rather than empty.
+    /// Reveal the inspector pane, or split the active pane to open one
+    /// beside it. The current pane becomes its first target, so it opens on
+    /// what the user was looking at rather than empty.
     fn show_inspector(&mut self, _: &ShowInspector, _window: &mut Window, cx: &mut Context<Self>) {
         use crate::inspector::target::{self, INSPECTOR_PANE_KEY};
         let open = self.tiles.read(cx).panes().iter().any(|pane| {
@@ -829,19 +843,19 @@ impl AppRoot {
             });
             return;
         }
-        if let Some(active) = self.tiles.read(cx).active_pane(cx) {
-            target::select_pane(&active, cx);
-        }
+        let Some(active) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
+        target::select_pane(&active, cx);
         let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
         let pane = cx.new(|cx| crate::tiles::Pane::new(Vec::new(), cx));
         pane.update(cx, |pane, cx| {
             if let Some(item) = registry.deserialize(INSPECTOR_PANE_KEY, "{}", cx) {
                 pane.add_item(item, cx);
             }
-            pane.set_locked_size(Some(size(320.0, 320.0)), cx);
         });
         self.tiles.update(cx, |tiles, cx| {
-            tiles.dock_pane(pane, crate::tiles::SplitDirection::Right, cx)
+            tiles.split_pane(&active, pane, crate::tiles::SplitDirection::Right, cx)
         });
     }
 
@@ -1229,6 +1243,7 @@ pub struct PanelApp {
     )>,
     themes: Vec<crate::theme::Theme>,
     default_theme: Option<SharedString>,
+    splash_logo: Option<crate::connections::logo::SplashLogoBuilder>,
 }
 
 impl PanelApp {
@@ -1261,6 +1276,7 @@ impl PanelApp {
             views: Vec::new(),
             themes: Vec::new(),
             default_theme: None,
+            splash_logo: None,
         }
     }
 
@@ -1466,6 +1482,20 @@ impl PanelApp {
         self
     }
 
+    /// Show `logo` on the startup screen in place of the metor logo. It is
+    /// built again every frame, like any element, and fills the top of the
+    /// screen's sidebar.
+    pub fn splash_logo<E, F>(mut self, logo: F) -> Self
+    where
+        E: IntoElement,
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+    {
+        self.splash_logo = Some(std::rc::Rc::new(move |window, cx| {
+            logo(window, cx).into_any_element()
+        }));
+        self
+    }
+
     /// Boot the metor-db wire-protocol server on `addr` in a background task
     /// before opening the window. Omit to leave serving to the consumer.
     pub fn serve(mut self, addr: SocketAddr) -> Self {
@@ -1548,6 +1578,9 @@ impl PanelApp {
                 // may be the only UI a blocking discovery source (an auth
                 // prompt, say) has to draw into while the screen is up.
                 install_overlay_builders(&self.overlays, cx);
+                if let Some(logo) = self.splash_logo.clone() {
+                    cx.set_global(crate::connections::logo::SplashLogo(logo));
+                }
                 let path = self.startup_open.take();
                 crate::session::startup::open(self, path, cx);
             }
@@ -1575,6 +1608,7 @@ impl PanelApp {
             views,
             themes: _,
             default_theme: _,
+            splash_logo: _,
         } = self;
 
         let db = db.expect("session selected before DB services start");
@@ -1717,6 +1751,8 @@ impl PanelApp {
                 gpui::MenuItem::action("Open recording…", crate::session::OpenRecording),
                 gpui::MenuItem::action("Save snapshot", crate::session::SaveSnapshot),
                 gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("Close tab", CloseTab),
             ]),
         ]);
         cx.bind_keys([
@@ -1735,6 +1771,7 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+            KeyBinding::new("secondary-w", CloseTab, None),
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
             KeyBinding::new("secondary-i", ShowInspector, None),

@@ -167,9 +167,10 @@ class Target:
 
         ``thread`` runs an async system on the named thread. ``channel`` puts
         a cyclic system behind a channel with that name, so it can be started,
-        stopped, and loaded by commands. This adds ``events`` and
-        ``channel_status`` outputs. ``start`` sets the channel's state at boot:
-        ``"running"`` (the default) or ``"stopped"``.
+        stopped, and loaded by commands. This adds a ``channel_status`` output,
+        which carries the channel's state each cycle, and a ``channel_message``
+        output, which carries each message as it is raised. ``start`` sets the
+        channel's state at boot: ``"running"`` (the default) or ``"stopped"``.
         """
         return self._add(self._systems, name, system, _adapter(thread, channel, start))
 

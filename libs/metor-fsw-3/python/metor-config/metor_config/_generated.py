@@ -16,6 +16,12 @@ PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)
 """The built-in systems' pack. It has no library, so no config lists it."""
 
 
+class ChannelMessage(Record):
+    _name = "channel_message"
+    _kind = "frame"
+    _pack = PACK
+
+
 class ChannelStatus(Record):
     _name = "channel_status"
     _kind = "frame"
@@ -46,12 +52,6 @@ class ResourceStatus(Record):
     _pack = PACK
 
 
-class SequenceChannelEvent(Record):
-    _name = "sequence_channel_event"
-    _kind = "msg"
-    _pack = PACK
-
-
 class SequenceCommand(Record):
     _name = "sequence_command"
     _kind = "msg"
@@ -73,7 +73,7 @@ class SystemStatus(Record):
 FRAMEWORK_PORTS: dict[str, type[Record]] = {"log": LogEvent, "status": SystemStatus}
 """The outputs every system has, whether or not it declares them."""
 
-CHANNEL_PORTS: dict[str, type[Record]] = {"events": SequenceChannelEvent, "channel_status": ChannelStatus}
+CHANNEL_PORTS: dict[str, type[Record]] = {"channel_status": ChannelStatus, "channel_message": ChannelMessage}
 """The outputs a system gets when it runs behind a channel."""
 
 COMMANDS_PORT = "commands"

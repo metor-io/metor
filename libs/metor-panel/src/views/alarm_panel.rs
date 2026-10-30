@@ -15,10 +15,15 @@ use metor_proto_wkt::AlarmId;
 
 use crate::alarms::latch::TileState;
 use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
+use crate::icons::Icon;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
+use crate::views::buttons::{self, icon_button, pressable};
+use crate::views::format::format_age;
+use crate::views::switch::Switch;
 use crate::views::table;
+use crate::views::value_strip::STRIP_BOX_HEIGHT;
 
 /// Which set the alarm list shows.
 #[derive(
@@ -33,13 +38,8 @@ pub enum AlarmListMode {
 }
 
 impl AlarmListMode {
-    pub fn cycle(self) -> Self {
-        match self {
-            Self::Active => Self::History,
-            Self::History => Self::Shelved,
-            Self::Shelved => Self::Active,
-        }
-    }
+    /// In the order the header's switch lists them.
+    const ALL: [Self; 3] = [Self::Active, Self::History, Self::Shelved];
 
     fn label(self) -> &'static str {
         match self {
@@ -89,17 +89,6 @@ impl AlarmView {
     /// Whether the history tab is showing, for persistence.
     pub fn is_history(&self) -> bool {
         self.mode == AlarmListMode::History
-    }
-}
-
-fn format_age(raised_at: Timestamp) -> String {
-    let secs = (Timestamp::now().0 - raised_at.0).max(0) as f64 / 1e6;
-    if secs < 60.0 {
-        format!("{secs:.0}s ago")
-    } else if secs < 3600.0 {
-        format!("{:.0}m ago", secs / 60.0)
-    } else {
-        format!("{:.1}h ago", secs / 3600.0)
     }
 }
 
@@ -161,7 +150,7 @@ impl Render for AlarmView {
         let mode = self.mode;
         let store = alarms::try_global(cx);
 
-        // Header: severity count chips, then an Ack-all control and the mode toggle.
+        // Header: severity count chips, then an Ack-all control and the mode switch.
         // No title — the tab already names the panel.
         let mut header = div()
             .flex()
@@ -207,16 +196,8 @@ impl Render for AlarmView {
             let shelved = state.shelves_sorted().len();
             if shelved > 0 {
                 header = header.child(
-                    div()
+                    buttons::header_button(format!("{shelved} shelved"), &theme)
                         .id("alarm-shelved-count")
-                        .px_2()
-                        .py(px(1.0))
-                        .rounded(px(3.0))
-                        .bg(theme.bg_elevated)
-                        .text_color(theme.text_tertiary)
-                        .text_size(px(11.0))
-                        .cursor_pointer()
-                        .child(SharedString::from(format!("{shelved} shelved")))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.mode = AlarmListMode::Shelved;
                             cx.notify();
@@ -228,16 +209,8 @@ impl Render for AlarmView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                div()
+                buttons::header_button("Ack all", &theme)
                     .id("alarm-ack-all")
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded(px(3.0))
-                    .bg(theme.bg_elevated)
-                    .text_color(theme.text_secondary)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child("Ack all")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = alarms::try_global(cx) {
                             store.read(cx).acknowledge_all();
@@ -245,20 +218,22 @@ impl Render for AlarmView {
                     })),
             )
             .child(
-                div()
-                    .id("alarm-mode")
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded(px(3.0))
-                    .bg(theme.bg_elevated)
-                    .text_color(theme.text_secondary)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child(mode.label())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = this.mode.cycle();
-                        cx.notify();
-                    })),
+                Switch::choice(
+                    AlarmListMode::ALL.map(|m| m.label().into()).to_vec(),
+                    AlarmListMode::ALL.iter().position(|m| *m == mode),
+                    table::HEADER_CONTROL_HEIGHT,
+                    cx,
+                )
+                .on_pick({
+                    let view = cx.entity().downgrade();
+                    std::rc::Rc::new(move |picked, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.mode = AlarmListMode::ALL[picked];
+                            cx.notify();
+                        });
+                    })
+                })
+                .apply(div().id("alarm-mode"), &theme),
             );
 
         let mut list = div()
@@ -316,6 +291,23 @@ fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+/// Height of an alarm row's square buttons: a medium sequence control's.
+const ROW_BUTTON: f32 = STRIP_BOX_HEIGHT;
+
+/// One alarm's row, spaced like a sequence channel's: the same padding and
+/// gaps, in UI units so it follows the panel's text size.
+fn list_row(theme: &crate::theme::Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(ui_px(8.0))
+        .px(ui_px(10.0))
+        .py(ui_px(8.0))
+        .border_b_1()
+        .border_color(theme.border_primary)
+}
+
 /// Rows for everything awaiting an operator. A latched row — the alarm cleared before
 /// anyone looked — keeps its place with a dimmed severity bar and a "cleared" badge, and
 /// its `Ack` retires the latch outright.
@@ -345,101 +337,119 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
             let cleared_badge = pending.cleared_at.map(|cleared_at| {
                 div()
                     .flex()
+                    .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap(ui_px(8.0))
                     .child(
                         div()
-                            .px_2()
-                            .py(px(1.0))
-                            .rounded(px(3.0))
+                            .px(ui_px(6.0))
+                            .py(ui_px(1.0))
+                            .rounded(ui_px(3.0))
                             .bg(theme.alarm_tint(idx))
                             .text_color(color)
-                            .text_size(px(10.0))
+                            .text_size(ui_px(10.0))
                             .child("cleared"),
                     )
                     .child(
                         div()
                             .text_color(theme.text_tertiary)
-                            .text_size(px(11.0))
-                            .child(SharedString::from(format_age(cleared_at))),
+                            .text_size(ui_px(11.0))
+                            .child(format_age(cleared_at, Timestamp::now())),
                     )
             });
 
-            let ack: AnyElement = if acked {
-                div()
-                    .text_color(color)
-                    .text_size(px(11.0))
-                    .child("✓ acked")
-                    .into_any_element()
+            // Acknowledged, the check stays where the button was, inert,
+            // so the row's buttons don't shift.
+            let occ = alarm.occurrence;
+            let ack = if acked {
+                icon_button(
+                    ("ack", occ as usize),
+                    Icon::Check,
+                    color,
+                    gpui::transparent_black(),
+                    "Acknowledged",
+                    ROW_BUTTON,
+                )
             } else {
-                let occ = alarm.occurrence;
-                div()
-                    .id(("ack", occ as usize))
-                    .px_2()
-                    .py(px(2.0))
-                    .rounded_md()
-                    .bg(theme.bg_elevated)
-                    .text_size(px(11.0))
-                    .cursor_pointer()
-                    .child("Ack")
-                    .on_click(move |_, _, cx| {
-                        if let Some(store) = alarms::try_global(cx) {
-                            store.read(cx).acknowledge(occ);
-                        }
-                    })
-                    .into_any_element()
+                pressable(
+                    icon_button(
+                        ("ack", occ as usize),
+                        Icon::Check,
+                        color,
+                        theme.alarm_tint(idx),
+                        "Acknowledge",
+                        ROW_BUTTON,
+                    ),
+                    theme,
+                )
+                .on_click(move |_, _, cx| {
+                    if let Some(store) = alarms::try_global(cx) {
+                        store.read(cx).acknowledge(occ);
+                    }
+                })
             };
 
             let def_id = alarm.def_id.clone();
-            let shelve = div()
-                .id(("shelve", alarm.occurrence as usize))
-                .px_2()
-                .py(px(2.0))
-                .rounded_md()
-                .bg(theme.bg_elevated)
-                .text_color(theme.text_secondary)
-                .text_size(px(11.0))
-                .cursor_pointer()
-                .child("Shelve")
-                .on_click(move |event, window, cx| {
-                    open_shelve_page(def_id.clone(), event.position(), window, cx)
-                });
+            let shelve = pressable(
+                icon_button(
+                    ("shelve", occ as usize),
+                    Icon::BellOff,
+                    theme.text_secondary,
+                    theme.bg_elevated,
+                    "Shelve…",
+                    ROW_BUTTON,
+                ),
+                theme,
+            )
+            .on_click(move |event, window, cx| {
+                open_shelve_page(def_id.clone(), event.position(), window, cx)
+            });
 
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(theme.border_primary)
-                .child(div().w(px(4.0)).h(px(28.0)).rounded_sm().bg(bar_color))
+            list_row(theme)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(ui_px(4.0))
+                        .h(ui_px(28.0))
+                        .rounded(ui_px(2.0))
+                        .bg(bar_color),
+                )
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .flex_grow_1()
-                        .child(div().text_color(name_color).child(SharedString::from(name)))
+                        .min_w_0()
                         .child(
                             div()
+                                .truncate()
+                                .text_size(ui_px(12.0))
+                                .text_color(name_color)
+                                .child(SharedString::from(name)),
+                        )
+                        .child(
+                            div()
+                                .truncate()
                                 .text_color(theme.text_secondary)
-                                .text_size(px(11.0))
+                                .text_size(ui_px(11.0))
                                 .child(SharedString::from(alarm.message.clone())),
                         ),
                 )
                 .child(
                     div()
+                        .flex_none()
+                        .text_size(ui_px(12.0))
                         .text_color(theme.text_secondary)
                         .child(SharedString::from(value_str)),
                 )
                 .children(cleared_badge)
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.text_tertiary)
-                        .text_size(px(11.0))
-                        .child(SharedString::from(format_age(alarm.raised_at))),
+                        .text_size(ui_px(11.0))
+                        .child(format_age(alarm.raised_at, Timestamp::now())),
                 )
                 .child(shelve)
                 .child(ack)
@@ -461,54 +471,55 @@ fn shelved_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
             let reason = shelf.reason.clone().unwrap_or_default();
             let def_id = def_id.clone();
 
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(theme.border_primary)
+            list_row(theme)
                 .child(
                     div()
                         .flex_grow_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(ui_px(12.0))
                         .text_color(theme.text_primary)
                         .child(SharedString::from(name)),
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_color(theme.text_secondary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(SharedString::from(reason)),
                 )
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.text_tertiary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(SharedString::from(shelf.operator.clone())),
                 )
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.text_secondary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .child(SharedString::from(format_remaining(shelf.until))),
                 )
                 .child(
-                    div()
-                        .id(SharedString::from(format!("unshelve-{def_id}")))
-                        .px_2()
-                        .py(px(2.0))
-                        .rounded_md()
-                        .bg(theme.bg_elevated)
-                        .text_size(px(11.0))
-                        .cursor_pointer()
-                        .child("Unshelve")
-                        .on_click(move |_, _, cx| {
-                            if let Some(store) = alarms::try_global(cx) {
-                                store.read(cx).unshelve(def_id.clone());
-                            }
-                        }),
+                    pressable(
+                        icon_button(
+                            SharedString::from(format!("unshelve-{def_id}")),
+                            Icon::Bell,
+                            theme.text_secondary,
+                            theme.bg_elevated,
+                            "Unshelve",
+                            ROW_BUTTON,
+                        ),
+                        theme,
+                    )
+                    .on_click(move |_, _, cx| {
+                        if let Some(store) = alarms::try_global(cx) {
+                            store.read(cx).unshelve(def_id.clone());
+                        }
+                    }),
                 )
                 .into_any_element()
         })
@@ -568,7 +579,7 @@ fn history_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                     div()
                         .text_color(theme.text_tertiary)
                         .text_size(px(11.0))
-                        .child(SharedString::from(format_age(event.timestamp))),
+                        .child(format_age(event.timestamp, Timestamp::now())),
                 )
                 .into_any_element()
         })

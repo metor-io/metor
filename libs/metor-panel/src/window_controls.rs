@@ -48,11 +48,14 @@ pub(crate) fn needs_window_controls(window: &Window) -> bool {
 /// without native controls. Occluded so the buttons win the non-client
 /// hit-test over the surrounding titlebar drag area.
 pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElement {
-    window_controls_with_close(theme, window, true, |window, cx| {
-        // remove_window skips the should-close hook.
-        crate::connections::flush_layout_including(window, cx);
-        window.remove_window();
-    })
+    window_controls_with_close(theme, window, true, close_window)
+}
+
+/// Close a running panel's window, saving its layout first.
+pub(crate) fn close_window(window: &mut Window, cx: &mut App) {
+    // remove_window skips the should-close hook.
+    crate::connections::flush_layout_including(window, cx);
+    window.remove_window();
 }
 
 /// Startup closes the application; running panels close an individual window.

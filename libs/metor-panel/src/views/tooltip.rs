@@ -6,7 +6,7 @@
 
 use gpui::{AnyView, App, Context, IntoElement, Render, SharedString, Window, div, prelude::*, px};
 
-use crate::theme::theme;
+use crate::theme::{font_family, theme};
 
 pub struct TooltipText {
     text: SharedString,
@@ -21,7 +21,10 @@ impl TooltipText {
 impl Render for TooltipText {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
+        // A tooltip is its own root, outside the app's, so it inherits none
+        // of the app's text style.
         div()
+            .font_family(font_family(cx))
             .px(px(8.0))
             .py(px(4.0))
             .rounded(px(4.0))

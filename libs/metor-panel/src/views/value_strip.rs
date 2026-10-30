@@ -17,6 +17,7 @@ pub use super::format::StripCell;
 use super::format::ValueFormatter;
 #[cfg(test)]
 use super::format::format_element;
+use super::switch::Switch;
 
 /// Scalar interpretation of every cell in a strip.
 ///
@@ -709,8 +710,7 @@ impl Render for ComponentValueStrip {
                     is_solo,
                     is_pending,
                     stale,
-                    draws_as_toggle,
-                    bool_value,
+                    draws_as_toggle.then(|| Switch::new(bool_value, STRIP_BOX_HEIGHT, cx).scaled()),
                     accent,
                     has_apply_group,
                 )
@@ -923,8 +923,7 @@ fn build_cell_chrome(
     is_solo: bool,
     is_pending: bool,
     stale: bool,
-    is_bool: bool,
-    bool_value: bool,
+    switch: Option<Switch>,
     accent: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
@@ -933,34 +932,17 @@ fn build_cell_chrome(
         inside_apply_group,
     );
 
-    if is_bool {
-        // Bool cells double as their own toggle track. Padding mirrors text
-        // cells so the baseline aligns; the knob is inset so the track
-        // still reads as a frame.
-        let track_color = if is_pending {
-            theme.drop_target
+    if let Some(switch) = switch {
+        // Bool cells are a switch the height of a box, with the box's own
+        // corners so a fused apply chevron still reads as one pill.
+        let switch = if is_pending {
+            switch.track(theme.drop_target)
         } else if stale {
-            theme.stale_bg()
-        } else if bool_value {
-            theme.control_active_track()
+            switch.track(theme.stale_bg())
         } else {
-            theme.bg_secondary
+            switch
         };
-        let knob = div()
-            .w(ui_px(15.0))
-            .h(ui_px(15.0))
-            .rounded(px(BOX_RADIUS))
-            .bg(theme.text_primary);
-        atom = atom
-            .w(ui_px(40.0))
-            .h(ui_px(STRIP_BOX_HEIGHT))
-            .py(ui_px(4.0))
-            .px(ui_px(4.0))
-            .items_center()
-            .bg(track_color)
-            .when(bool_value, |el| el.flex_row_reverse())
-            .child(knob);
-        return atom;
+        return box_corners(switch.apply(atom, theme), inside_apply_group);
     }
 
     atom = box_padding(atom);
@@ -1183,7 +1165,7 @@ pub(crate) fn render_static_cells(
     for (idx, cell) in cells.iter().enumerate() {
         let id_key = row_key.wrapping_mul(64).wrapping_add(idx);
         row = row.child(build_cell_chrome(
-            id_key, cell, style, theme, false, false, false, false, false, None, false,
+            id_key, cell, style, theme, false, false, false, None, None, false,
         ));
     }
     row

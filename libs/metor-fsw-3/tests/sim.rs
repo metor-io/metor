@@ -12,8 +12,8 @@ use metor_fsw_3::coordinator::{
     SystemTable,
 };
 use metor_fsw_3::io::{Cap, ResourceStatus, Uart};
-use metor_fsw_3::metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
-use metor_fsw_3::{ChannelState, ChannelStatus, Coordinator, Input, Output, Timestamp, system};
+use metor_fsw_3::metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceCommandKind};
+use metor_fsw_3::{ChannelStatus, Coordinator, Input, Output, Timestamp, system};
 
 use gps::{Gps, GpsState, UartScript, gps, uart_script};
 
@@ -194,7 +194,7 @@ fn reset_cancels_a_read_parked_on_the_wire() {
     ]);
     steps(&mut c, 4, 10);
     let states = seen.states.borrow();
-    let quiescing = ChannelState::Quiescing as u32;
+    let quiescing = SequenceChannelState::Quiescing.code();
     let waited: Vec<i64> = states
         .iter()
         .filter(|(_, s)| *s == quiescing)
@@ -202,7 +202,7 @@ fn reset_cancels_a_read_parked_on_the_wire() {
         .collect();
     assert!(!waited.is_empty(), "the reset waits: {states:?}");
     let after = states.iter().find(|(t, _)| *t > waited[0]).unwrap();
-    let stopped = (waited[0] + 1, ChannelState::Stopped as u32);
+    let stopped = (waited[0] + 1, SequenceChannelState::Stopped.code());
     assert_eq!(*after, stopped, "remade the cycle after: {states:?}");
     assert!(
         c.systems()
@@ -240,7 +240,7 @@ fn reset_io_behind_a_channel_keeps_the_driver_going() {
         ("io", SequenceCommandKind::Reset),
     ]);
     steps(&mut c, 6, 9);
-    let stopped = ChannelState::Stopped as u32;
+    let stopped = SequenceChannelState::Stopped.code();
     assert!(
         seen.states
             .borrow()

@@ -23,9 +23,13 @@ pub(crate) fn fields(detail: &EventDetail) -> Vec<(String, String)> {
             ("severity".into(), format!("{:?}", event.severity)),
             ("detail".into(), event.detail.clone()),
         ],
-        EventDetail::Sequence(event) => vec![
-            ("channel".into(), event.channel_name.to_string()),
-            ("event".into(), event.label.to_string()),
+        EventDetail::Sequence(entry) => vec![
+            ("channel".into(), entry.channel.to_string()),
+            (
+                "state".into(),
+                crate::sequences::state_label(entry.state).into(),
+            ),
+            ("message".into(), entry.message.to_string()),
         ],
         EventDetail::Raw(len) => vec![(
             "payload".into(),

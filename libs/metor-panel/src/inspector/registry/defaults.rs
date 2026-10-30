@@ -97,7 +97,11 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::Gauge>();
         self.register_inspectable::<crate::views::SequenceControl>();
         self.register_inspectable::<crate::views::Map>();
-        self.register_inspectable::<crate::views::SamplesTable>();
+        self.register_entity_list::<crate::views::SamplesTable, crate::views::SampleSource>(
+            |t| &t.components,
+            |t| &mut t.components,
+            AddBehavior::Wizard(Arc::new(builders::build_sample_source_add_wizard)),
+        );
         self.register_inspectable::<crate::views::Label>();
         self.register_inspectable::<crate::views::StateImage>();
         self.register_inspectable::<crate::views::StateImageEntry>();

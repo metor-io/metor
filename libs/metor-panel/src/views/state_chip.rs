@@ -18,8 +18,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Hsla, IntoElement, MouseButton, SharedString,
-    Window, div, prelude::*,
+    AnyElement, App, Context, Entity, Hsla, IntoElement, SharedString, Window, div, prelude::*,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -27,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{self, CodeFeed};
 use super::monitor::{behavior_snapshot, edit_click};
+use super::switch::Switch;
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
 
 use crate::dynamic::tensor::TypedScalar;
@@ -284,100 +284,57 @@ impl StateChip {
         let size = toggle_text_size(self.text_size);
         let em = |n: f32| ui_px(n * size);
 
-        // Sized to its labels rather than the tile, so a wide widget doesn't
-        // stretch a two-position switch into a bar.
-        let mut track = div()
-            .flex()
-            .flex_row()
-            .flex_none()
-            .max_w_full()
-            .items_center()
-            .gap(em(0.15))
-            .p(em(0.15))
-            .rounded(em(0.35))
-            .bg(theme.bg_primary)
-            .border_1()
-            .border_color(theme.line_color)
-            .text_size(ui_px(size))
-            .when(!enabled, |track| track.opacity(0.55));
-
         if table.entries.is_empty() {
-            return track
-                .child(
-                    div()
-                        .px(em(0.6))
-                        .py(em(0.2))
-                        .text_center()
-                        .text_color(theme.text_tertiary)
-                        .child("No states"),
-                )
+            return div()
+                .flex_none()
+                .px(em(0.6))
+                .py(em(0.2))
+                .rounded(em(0.35))
+                .bg(theme.bg_elevated)
+                .text_size(ui_px(size))
+                .text_color(theme.text_tertiary)
+                .child("No states")
                 .into_any_element();
         }
 
-        for (i, (code, label, color)) in table.entries.iter().cloned().enumerate() {
-            let is_active = active == Some(i);
-            let accent = color.unwrap_or(theme.control_active);
-            let segment = div()
-                .id(("toggle-segment", i))
-                .flex_shrink_1()
-                .min_w_0()
-                .px(em(0.6))
-                .py(em(0.2))
-                .rounded(em(0.25))
-                .border_1()
-                .text_center()
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(label);
-            let segment = if is_active {
-                segment
-                    .bg(if stale {
-                        theme.stale_bg()
-                    } else {
-                        Theme::dim(accent, 0.25)
-                    })
-                    .border_color(if stale { theme.stale_text() } else { accent })
-                    .text_color(if stale {
-                        theme.stale_text()
-                    } else {
-                        theme.text_primary
-                    })
-                    .font_weight(FontWeight::SEMIBOLD)
-            } else {
-                segment
-                    .border_color(gpui::transparent_black())
-                    .text_color(theme.text_tertiary)
-            };
-            let segment = if enabled && !is_active {
-                let hover = theme.bg_secondary;
-                segment
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |chip, _, _window, cx| {
-                            chip.command(code, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-            } else {
-                segment
-            };
-            track = track.child(segment);
+        // The switch's labels are 11/24 of its height; this one is sized to
+        // the configured text, and to its labels rather than the tile, so a
+        // wide widget doesn't stretch a two-position switch into a bar.
+        let labels = table
+            .entries
+            .iter()
+            .map(|(_, label, _)| label.clone())
+            .collect();
+        let mut switch = Switch::choice(labels, active, size * 24.0 / 11.0, cx).scaled();
+        switch = match stale {
+            true => switch.knob(theme.stale_bg(), theme.stale_text()),
+            false => switch.colors(table.entries.iter().map(|(_, _, color)| *color).collect()),
+        };
+        if enabled {
+            let codes: Vec<f64> = table.entries.iter().map(|(code, _, _)| *code).collect();
+            let chip = cx.entity().downgrade();
+            switch = switch.on_pick(std::rc::Rc::new(move |i, _, cx| {
+                let _ = chip.update(cx, |chip, cx| chip.command(codes[i], cx));
+            }));
         }
+        // Read-only (commands locked, scrubbed, or bound to an expression),
+        // it shows the value at full strength and just doesn't take clicks,
+        // like a value strip's switch.
+        let mut track = switch.apply(div().id("toggle").max_w_full(), &theme);
 
         // A code the table doesn't list lights nothing; the unknown label,
-        // when set, says so in a segment of its own that can't be clicked.
+        // when set, says so beside the positions, and can't be clicked.
         if self.feed.value.is_some() && active.is_none() && !table.unknown_label.is_empty() {
             track = track.child(
                 div()
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .h_full()
                     .px(em(0.6))
-                    .py(em(0.2))
                     .rounded(em(0.25))
-                    .border_1()
-                    .border_color(theme.error_accent)
-                    .bg(Theme::dim(theme.error_accent, 0.18))
+                    .bg(Theme::dim(theme.error_accent, 0.35))
+                    .text_size(ui_px(size))
                     .text_color(theme.text_primary)
                     .whitespace_nowrap()
                     .child(table.unknown_label.clone()),

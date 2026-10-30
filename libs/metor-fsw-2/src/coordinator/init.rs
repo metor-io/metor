@@ -449,6 +449,7 @@ impl InitGraph {
                 SystemBind::Slot(slot_reg) => Some(SequenceChannelSpec {
                     name: sys.desc.name.to_string(),
                     available: slot_reg.allowed.iter().map(|a| a.name.clone()).collect(),
+                    ..Default::default()
                 }),
                 _ => None,
             })

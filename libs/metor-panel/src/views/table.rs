@@ -14,6 +14,10 @@ use crate::theme::{theme, ui_px, ui_scale};
 /// Height of the column header, shared with the chip headers of the log,
 /// sequence and alarm panels so a row of tabs lines up across panes.
 pub(crate) const HEADER_HEIGHT: f32 = 32.0;
+/// Height of the buttons and switches in those chip headers, so they line
+/// up. Tall enough that a switch's knob has room inside its track.
+pub(crate) const HEADER_CONTROL_HEIGHT: f32 = 24.0;
+
 /// Height of one body row in the panel's dense tables. The component outline
 /// sets the house style here; panes that only *look* like a table (the
 /// execution timeline's lanes) take the same number so rows line up when two
@@ -266,6 +270,13 @@ impl<D: TableDelegate> Table<D> {
     /// the reader's eye hold still.
     pub fn at_top(&self) -> bool {
         self.scroll_handle.0.borrow().base_handle.offset().y >= Pixels::ZERO
+    }
+
+    /// Whether the body is scrolled to within a few rows of its last, or
+    /// has too few rows to scroll at all.
+    pub fn near_bottom(&self) -> bool {
+        let handle = &self.scroll_handle.0.borrow().base_handle;
+        -handle.offset().y >= handle.max_offset().y - px(ROW_HEIGHT * 4.0)
     }
 
     #[cfg(test)]

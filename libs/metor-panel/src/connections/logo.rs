@@ -13,6 +13,39 @@ const ROWS: usize = 24;
 const BREATH_PERIOD: f64 = 8.;
 const GLYPHS: [char; 5] = [' ', '·', '∙', '•', '●'];
 
+/// Builds a consumer's splash logo each frame, in place of [`AsciiLogo`].
+pub(crate) type SplashLogoBuilder =
+    std::rc::Rc<dyn Fn(&mut Window, &mut gpui::App) -> gpui::AnyElement>;
+
+/// The consumer's splash logo, set by `PanelApp::splash_logo` before the
+/// startup screen opens.
+pub(crate) struct SplashLogo(pub SplashLogoBuilder);
+
+impl gpui::Global for SplashLogo {}
+
+/// What the splash sidebar shows.
+pub(super) enum Logo {
+    Builtin(gpui::Entity<AsciiLogo>),
+    Custom(SplashLogoBuilder),
+}
+
+impl Logo {
+    /// The consumer's logo when one was given, else the built-in one.
+    pub(super) fn for_splash(cx: &mut gpui::App) -> Self {
+        match cx.try_global::<SplashLogo>() {
+            Some(custom) => Self::Custom(custom.0.clone()),
+            None => Self::Builtin(cx.new(|_| AsciiLogo::new())),
+        }
+    }
+
+    pub(super) fn render(&self, window: &mut Window, cx: &mut gpui::App) -> gpui::AnyElement {
+        match self {
+            Self::Builtin(logo) => logo.clone().into_any_element(),
+            Self::Custom(build) => build(window, cx),
+        }
+    }
+}
+
 /// A separate view keeps the decorative animation from rerendering the picker.
 pub(super) struct AsciiLogo {
     started: Instant,
@@ -278,4 +311,22 @@ fn rasterize() -> Vec<GradientSample> {
         }
     }
     samples
+}
+
+#[cfg(test)]
+mod splash_tests {
+    use gpui::{IntoElement, div};
+
+    use super::{Logo, SplashLogo};
+
+    #[gpui::test]
+    fn a_consumer_logo_replaces_the_builtin_one(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert!(matches!(Logo::for_splash(cx), Logo::Builtin(_)));
+            cx.set_global(SplashLogo(std::rc::Rc::new(|_, _| {
+                div().into_any_element()
+            })));
+            assert!(matches!(Logo::for_splash(cx), Logo::Custom(_)));
+        });
+    }
 }

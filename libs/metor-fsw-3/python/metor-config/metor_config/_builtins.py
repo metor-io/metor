@@ -408,11 +408,39 @@ def _candidate(system: System) -> dict[str, Any]:
     }
 
 
+_CHANNEL_STATUS_FIELDS = (
+    "state",
+    "loaded",
+    "artifact",
+    "hash",
+    "accepts",
+    "elapsed",
+    "abort_elapsed",
+)
+"""The fields of a channel's ``channel_status``, each its own component."""
+
+
+def _channel_spec(name: str, system: System, namespace: str | None) -> dict[str, Any]:
+    """Returns one registry entry: the channel, what it can load, the wrapped
+    system's type, and the full component name of each field of its
+    ``channel_status``, plus ``message``, the text of its ``channel_message``."""
+    prefix = ".".join(part for part in (namespace, system._name) if part)
+    components = {field: f"{prefix}.channel_status.{field}" for field in _CHANNEL_STATUS_FIELDS}
+    components["message"] = f"{prefix}.channel_message.text"
+    return {
+        "name": name,
+        "available": system._names if isinstance(system, DlSlot) else [],
+        "system": system._ty,
+        "components": components,
+    }
+
+
 class ChannelRegistry(_generated.ChannelRegistry):
     """Publishes a list of the target's channels.
 
-    The list includes the candidates each slot can load. It is written on
-    the first cycle and then once a second.
+    The list includes the candidates each slot can load and names the
+    components carrying each channel's state. It is written on the first
+    cycle and then once a second.
     """
 
     def __init__(self) -> None:
@@ -420,7 +448,7 @@ class ChannelRegistry(_generated.ChannelRegistry):
 
     def _params_for(self, target: Any, index: int) -> Any:
         channels = [
-            {"name": name, "available": system._names if isinstance(system, DlSlot) else []}
+            _channel_spec(name, system, target.namespace)
             for name, system in target._channels()
         ]
         return {"channels": channels, "period": max(1, round(target.cycle_rate))}

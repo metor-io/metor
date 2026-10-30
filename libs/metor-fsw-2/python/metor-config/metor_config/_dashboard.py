@@ -533,22 +533,40 @@ class Map:
         return "map", self._state(namespace), (400.0, 300.0)
 
 
+_SEQUENCE_LAYOUTS = {
+    "slim": (460.0, 34.0),
+    "medium": (460.0, 56.0),
+    "square": (260.0, 132.0),
+}
+
+
 @dataclass(frozen=True)
 class SequenceControl:
     """Start/stop controls for one sequence channel. ``channel`` is the slot
     instance name, which is the address a command carries -- it is not
-    namespace-qualified."""
+    namespace-qualified.
+
+    ``layout`` arranges the control for its space: ``"slim"`` (state,
+    sequence, clocks and buttons in one thin row), ``"medium"`` (the status
+    line and clocks over the sequence and buttons) or ``"square"`` (status,
+    sequence, then clocks and buttons, each on its own row)."""
 
     channel: str
-    compact: bool = False
+    layout: str = "medium"
+
+    def __post_init__(self) -> None:
+        if self.layout not in _SEQUENCE_LAYOUTS:
+            raise ValueError(
+                f"layout must be one of {sorted(_SEQUENCE_LAYOUTS)}, got {self.layout!r}"
+            )
 
     def _widget(
         self, namespace: str | None
     ) -> tuple[str, dict[str, Any], tuple[float, float]]:
         return (
             "sequence_control",
-            {"channel": self.channel, "compact": self.compact},
-            (340.0, 48.0),
+            {"channel": self.channel, "layout": self.layout},
+            _SEQUENCE_LAYOUTS[self.layout],
         )
 
 
