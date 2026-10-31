@@ -60,7 +60,7 @@ pub struct Run {
     #[arg(long)]
     pub cycles: Option<u64>,
     /// Stop after this much clock time, such as `30s`, instead of on SIGINT.
-    #[arg(long = "for", value_name = "TIME", conflicts_with = "cycles", value_parser = units::duration)]
+    #[arg(long = "for", value_name = "TIME", conflicts_with = "cycles", value_parser = units::nonzero_duration)]
     pub run_for: Option<Duration>,
     /// Pace the loop at this wall rate, such as `100hz`, overriding the
     /// target's clock.
@@ -68,7 +68,7 @@ pub struct Run {
     pub wall: Option<WallRate>,
     /// Step a simulated clock by this much per cycle, such as `10ms`. A bare
     /// number is seconds.
-    #[arg(long, value_name = "TIME", value_parser = units::duration)]
+    #[arg(long, value_name = "TIME", value_parser = units::nonzero_duration)]
     pub sim_dt: Option<Duration>,
     /// Start the simulated clock at this UTC time, such as
     /// `2026-10-29T00:00Z`. A bare number is microseconds since the Unix
@@ -598,11 +598,11 @@ fn cycle_limit(config: &TargetConfig, args: &Run) -> Result<Option<u64>, RunErro
     let Some(span) = args.run_for else {
         return Ok(args.cycles);
     };
-    let period = match apply_overrides(config, args)?.coordinator.clock {
-        Clock::Wall { rate } => Duration::try_from_secs_f64(rate.get().recip()).unwrap_or_default(),
-        Clock::Simulated { dt, .. } => dt,
+    let cycles = match apply_overrides(config, args)?.coordinator.clock {
+        Clock::Wall { rate } => units::cycles_at(span, rate.get()),
+        Clock::Simulated { dt, .. } => units::cycles_in(span, dt),
     };
-    Ok(Some(units::cycles_in(span, period)))
+    Ok(Some(cycles))
 }
 
 /// The longest a cycle may take on `clock`: its period on a wall clock,
@@ -814,6 +814,18 @@ mod tests {
             ..one_second
         };
         assert_eq!(cycle_limit(&config, &walled).ok(), Some(Some(50)));
+        for (hz, expected) in [(30.0, 30), (120.0, 120), (3.0, 3)] {
+            let walled = Run {
+                wall: WallRate::try_from(hz).ok(),
+                run_for: Some(Duration::from_secs(1)),
+                ..Default::default()
+            };
+            assert_eq!(
+                cycle_limit(&config, &walled).ok(),
+                Some(Some(expected)),
+                "{hz} Hz"
+            );
+        }
         let counted = Run {
             cycles: Some(7),
             ..Default::default()

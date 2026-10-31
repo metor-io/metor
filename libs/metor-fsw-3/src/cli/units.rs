@@ -20,6 +20,14 @@ pub fn duration(arg: &str) -> Result<Duration, String> {
     Duration::try_from(signed).map_err(|_| format!("`{arg}` is negative"))
 }
 
+/// Parses a duration like [`duration`], refusing zero.
+pub fn nonzero_duration(arg: &str) -> Result<Duration, String> {
+    match duration(arg)? {
+        Duration::ZERO => Err(format!("`{arg}` is zero, or shorter than a nanosecond")),
+        span => Ok(span),
+    }
+}
+
 /// Parses `100hz` or bare hertz.
 pub fn rate(arg: &str) -> Result<WallRate, String> {
     let lower = arg.trim().to_ascii_lowercase();
@@ -40,6 +48,16 @@ pub fn epoch(arg: &str) -> Result<i64, String> {
         .parse()
         .map_err(|_| format!("`{arg}` is not a time like `2026-10-29T00:00Z`"))?;
     Ok(at.as_microsecond())
+}
+
+/// How many cycles at `hz` fit in `span`, at least one. Counted from the
+/// rate, since a period rounded to nanoseconds can lose a cycle's worth.
+pub fn cycles_at(span: Duration, hz: f64) -> u64 {
+    let cycles = (span.as_secs_f64() * hz).round();
+    if cycles >= u64::MAX as f64 {
+        return u64::MAX;
+    }
+    (cycles as u64).max(1)
 }
 
 /// How many cycles of `period` fit in `span`, at least one.
@@ -83,6 +101,24 @@ mod tests {
         assert_eq!(epoch("1970-01-01T00:00:01Z"), Ok(1_000_000));
         assert_eq!(epoch("2026-10-29T00:00Z"), Ok(1_793_232_000_000_000));
         assert!(epoch("yesterday").is_err());
+    }
+
+    #[test]
+    fn test_nonzero_duration() {
+        assert_eq!(nonzero_duration("10ms"), Ok(Duration::from_millis(10)));
+        assert!(nonzero_duration("0").is_err());
+        assert!(nonzero_duration("0s").is_err());
+        assert!(nonzero_duration("1e-10").is_err());
+    }
+
+    #[test]
+    fn test_cycles_at() {
+        let s = Duration::from_secs;
+        assert_eq!(cycles_at(s(1), 30.0), 30);
+        assert_eq!(cycles_at(s(60), 30.0), 1800);
+        assert_eq!(cycles_at(s(1), 1e10), 10_000_000_000);
+        assert_eq!(cycles_at(Duration::from_millis(1), 1.0), 1);
+        assert_eq!(cycles_at(s(1_000_000), 1e300), u64::MAX);
     }
 
     #[test]

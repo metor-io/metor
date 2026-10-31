@@ -104,8 +104,9 @@ pub enum PackCommand {
 /// Runs the command line. On failure, reports the error and exits with its
 /// status. An interrupted run's summary already says so.
 pub fn main() {
-    let probe = Probe::detect();
-    let cli = parse(&probe);
+    let early = Early::scan(std::env::args_os().skip(1));
+    let probe = Probe::detect(early.query);
+    let cli = parse(&probe, &early);
     let ui = Ui::new(&cli.output, &probe);
     let Err(error) = run(cli.command, &ui) else {
         return;
@@ -118,11 +119,60 @@ pub fn main() {
 
 /// Parses the command line, with help styled for the terminal `probe`
 /// describes.
-fn parse(probe: &Probe) -> Cli {
-    let caps = Caps::resolve(probe, ColorChoice::Auto, false);
-    let command = Cli::command().styles(styles(&Theme::new(&caps)));
+fn parse(probe: &Probe, early: &Early) -> Cli {
+    let caps = Caps::resolve(probe, early.color, early.ascii);
+    let color = match early.color {
+        ColorChoice::Auto => clap::ColorChoice::Auto,
+        ColorChoice::Always => clap::ColorChoice::Always,
+        ColorChoice::Never => clap::ColorChoice::Never,
+    };
+    let command = Cli::command()
+        .color(color)
+        .styles(styles(&Theme::new(&caps)));
     let matches = command.get_matches();
     Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+/// The output flags, read before clap parses, so help and the terminal
+/// probe honour them.
+#[derive(Debug, PartialEq, Eq)]
+struct Early {
+    color: ColorChoice,
+    ascii: bool,
+    /// Whether the terminal's background is worth asking for: not for JSON,
+    /// help, or the version.
+    query: bool,
+}
+
+impl Early {
+    fn scan(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let value = |flag: &str| {
+            let prefix = format!("{flag}=");
+            args.iter()
+                .enumerate()
+                .find_map(|(i, arg)| match arg.strip_prefix(&prefix) {
+                    Some(value) => Some(value.to_string()),
+                    None if arg == flag => args.get(i + 1).cloned(),
+                    None => None,
+                })
+        };
+        let color = match value("--color").as_deref() {
+            Some("always") => ColorChoice::Always,
+            Some("never") => ColorChoice::Never,
+            _ => ColorChoice::Auto,
+        };
+        let quick = ["-h", "--help", "-V", "--version", "help"];
+        let json = value("--format").as_deref() == Some("json");
+        Self {
+            color,
+            ascii: args.iter().any(|arg| arg == "--ascii"),
+            query: !json && !args.iter().any(|arg| quick.contains(&arg.as_str())),
+        }
+    }
 }
 
 /// Help's styles from `theme`.
@@ -153,6 +203,23 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan(args: &[&str]) -> Early {
+        Early::scan(args.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn test_early_reads_output_flags() {
+        let early = scan(&["run", "--color", "never", "--ascii"]);
+        assert_eq!(early.color, ColorChoice::Never);
+        assert!(early.ascii && early.query);
+        assert_eq!(scan(&["--color=always"]).color, ColorChoice::Always);
+        assert_eq!(scan(&["run", "--color"]).color, ColorChoice::Auto);
+        assert!(!scan(&["run", "--format", "json"]).query);
+        assert!(!scan(&["--format=json"]).query);
+        assert!(!scan(&["run", "--help"]).query);
+        assert!(!scan(&["-V"]).query);
+    }
 
     #[test]
     fn test_cli_is_well_formed() {

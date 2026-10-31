@@ -55,7 +55,10 @@ impl Probe {
     ///
     /// The background is queried from the terminal only on a TTY, then read
     /// from `COLORFGBG`.
-    pub fn detect() -> Self {
+    ///
+    /// `query` allows the terminal query, which costs up to 100 ms on a
+    /// terminal that does not answer.
+    pub fn detect(query: bool) -> Self {
         let stream = supports_color::Stream::Stderr;
         let tty = std::io::stderr().is_terminal();
         let env = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
@@ -74,12 +77,20 @@ impl Probe {
             unicode: supports_unicode::on(supports_unicode::Stream::Stderr),
             links: tty && supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr),
             width: terminal_size::terminal_size_of(std::io::stderr()).map(|(w, _)| w.0),
-            background: tty
+            background: (query && tty && foreground())
                 .then(query_background)
                 .flatten()
                 .or_else(|| env("COLORFGBG").and_then(|value| from_colorfgbg(&value))),
         }
     }
+}
+
+/// Whether this process owns the terminal, so querying it neither stops a
+/// background job nor reads another's input.
+fn foreground() -> bool {
+    // SAFETY: both calls only read the process's and the terminal's group
+    // ids.
+    unsafe { libc::tcgetpgrp(libc::STDERR_FILENO) == libc::getpgrp() }
 }
 
 fn query_background() -> Option<Background> {

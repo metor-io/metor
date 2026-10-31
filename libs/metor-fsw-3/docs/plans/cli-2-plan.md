@@ -28,9 +28,10 @@ as `jiff::SignedDuration` (friendly format) and convert to
 current meaning: seconds for `--sim-dt`, Hz for `--wall`, microseconds
 for `--epoch`. `--wall` takes an optional `hz` suffix.
 
-`--for` converts to a cycle count once the clock is known: its period on
-a wall clock, `dt` on a simulated one. Children get the converted
-`--cycles`.
+`--for` converts to a cycle count once the clock is known: from the rate
+on a wall clock, since a period rounded to nanoseconds can add a cycle,
+and from `dt` on a simulated one. Children get `--for` and convert with
+their own clock. `--for` and `--sim-dt` refuse zero.
 
 Tests: each parser over nominal, suffix, bare, negative, and garbage
 input; `--for` with each clock.
@@ -39,7 +40,7 @@ input; `--for` with each clock.
 
 Without a `FILE`, `metor` walks up from the working directory to the
 nearest `target.py`, as cargo finds `Cargo.toml`. The search stops at a
-directory holding `.git`. `M0206`'s help names where it looked.
+directory holding `.git`. Finding none is `M0209`.
 
 Tests: found in the cwd, found two levels up, stops at `.git`, missing.
 
@@ -79,7 +80,9 @@ fix on the next line:
 
 Each check is a function returning a `Check { name, status, detail, fix }`
 so `pack_dev` can run the wasm32 check before a wasm build and fail with
-its fix (`M0413`) instead of cargo's error.
+its fix (`M0413`) instead of cargo's error. rustup picks a toolchain by
+directory, so each probe runs where the build will: the pack's root, or
+for `doctor` the nearest `target.py`'s directory.
 
 Exits 1 if a required check fails.
 
@@ -88,7 +91,10 @@ failure.
 
 ### T6. Styled help
 
-`Cli` gets `clap::builder::Styles` built from `Theme`: headings in
+The output flags are read before clap parses, so help honours `--color`
+and `--ascii`, and the terminal is only asked for its background when a
+human will read the output and the process owns the terminal. `Cli` gets
+`clap::builder::Styles` built from `Theme`: headings in
 `Accent`, flags bold, placeholders `Muted`. Each command gets an
 `after_help` example. Output flags group under an `Output` heading.
 

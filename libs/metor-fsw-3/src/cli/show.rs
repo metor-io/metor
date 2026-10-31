@@ -3,7 +3,7 @@
 //! With no name it shows every target; `fsw` one target; `fsw.nav`, or
 //! `nav` in a deployment of one, one system with its params and grants.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use super::run::{RunError, prepare};
@@ -42,7 +42,9 @@ pub fn show(args: Show, ui: &Ui) -> Result<(), RunError> {
         return Ok(());
     }
     let caps = ui.stdout_caps();
-    let width = caps.live.then_some(usize::from(caps.width));
+    let width = std::io::stdout().is_terminal().then(|| {
+        terminal_size::terminal_size().map_or(usize::from(caps.width), |(w, _)| usize::from(w.0))
+    });
     let mut out = std::io::stdout().lock();
     render(&mut out, &config, selection, &Theme::new(&caps), width).map_err(|source| RunError::Io {
         path: PathBuf::from("stdout"),
@@ -50,15 +52,24 @@ pub fn show(args: Show, ui: &Ui) -> Result<(), RunError> {
     })
 }
 
-/// Splits `args` into a target file and a name. The first is the file when
-/// it names one.
+/// Splits `args` into a target file and a name. A lone argument is the
+/// file when it looks like a path: it has a separator, or ends in `.py` or
+/// `.json`.
 fn split_args(args: &[String]) -> (Option<PathBuf>, Option<String>) {
     match args {
         [file, name] => (Some(file.into()), Some(name.clone())),
-        [only] if Path::new(only).is_file() => (Some(only.into()), None),
+        [only] if is_path(only) => (Some(only.into()), None),
         [only] => (None, Some(only.clone())),
         _ => (None, None),
     }
+}
+
+fn is_path(arg: &str) -> bool {
+    let path = Path::new(arg);
+    arg.contains(std::path::MAIN_SEPARATOR)
+        || path
+            .extension()
+            .is_some_and(|ext| ext == "py" || ext == "json")
 }
 
 /// Finds what `name` names in `config`.
@@ -318,9 +329,15 @@ fn params(params: &serde_json::Value) -> Vec<Vec<String>> {
 /// `100 Hz wall` or `10 ms sim`.
 fn clock(clock: &Clock) -> String {
     match clock {
-        Clock::Wall { rate } => format!("{} Hz wall", rate.get()),
-        Clock::Simulated { dt, .. } => format!("{} ms sim", dt.as_secs_f64() * 1e3),
+        Clock::Wall { rate } => format!("{} Hz wall", short(rate.get())),
+        Clock::Simulated { dt, .. } => format!("{} ms sim", short(dt.as_secs_f64() * 1e3)),
     }
+}
+
+/// `x` to at most three decimals, without trailing zeros.
+fn short(x: f64) -> String {
+    let text = format!("{x:.3}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[cfg(test)]
@@ -391,13 +408,29 @@ mod tests {
     }
 
     #[test]
+    fn test_short() {
+        assert_eq!(short(100.0), "100");
+        assert_eq!(short(1000.0 / 30.0), "33.333");
+        assert_eq!(short(0.5), "0.5");
+    }
+
+    #[test]
     fn test_split_args() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let file = dir.path().join("t.py");
-        std::fs::write(&file, "").expect("writes");
-        let file = file.display().to_string();
+        let file = "sub/t.py".to_string();
         assert_eq!(split_args(&[]), (None, None));
         assert_eq!(split_args(&["fsw".into()]), (None, Some("fsw".into())));
+        assert_eq!(
+            split_args(&["missing.py".into()]),
+            (Some("missing.py".into()), None)
+        );
+        assert_eq!(
+            split_args(&["deploy.json".into()]),
+            (Some("deploy.json".into()), None)
+        );
+        assert_eq!(
+            split_args(&["fsw.nav".into()]),
+            (None, Some("fsw.nav".into()))
+        );
         assert_eq!(
             split_args(std::slice::from_ref(&file)),
             (Some(file.clone().into()), None)

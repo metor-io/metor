@@ -181,7 +181,7 @@ fn stage_module(
     library: &PackDef,
     watch: &mut Watch<'_>,
 ) -> Result<PathBuf, PackDevError> {
-    if super::doctor::wasm32().status != Status::Ok {
+    if super::doctor::wasm32(root).status != Status::Ok {
         return Err(PackDevError::NoWasmTarget);
     }
     let built = wasm_build(&config.krate, root, watch)?;

@@ -307,6 +307,14 @@ mod tests {
             member_argv(Path::new("d.json"), "fsw", &bare),
             ["run", "d.json", "--target", "fsw"].map(OsString::from)
         );
+        let timed = Run {
+            run_for: Some(Duration::from_millis(1500)),
+            ..Run::default()
+        };
+        assert_eq!(
+            member_argv(Path::new("d.json"), "fsw", &timed),
+            ["run", "d.json", "--target", "fsw", "--for", "1.5"].map(OsString::from)
+        );
         let overrides = Run {
             cycles: Some(3),
             wall: crate::WallRate::try_from(50.0).ok(),

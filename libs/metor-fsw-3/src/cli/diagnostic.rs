@@ -159,7 +159,7 @@ fn run_info(error: &RunError) -> Info {
         ),
         RunError::NoTargetFile(_) => (
             "M0206",
-            Some("run from the directory with target.py, or pass the target file".into()),
+            Some("check the path; without one, metor finds the nearest target.py".into()),
         ),
         RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, "names"))),
         RunError::Doctor(_) => ("M0105", Some("each fix is listed under its check".into())),

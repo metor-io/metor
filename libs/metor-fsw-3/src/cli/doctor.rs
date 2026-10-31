@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use super::run::{RunError, interpreter, python_path};
+use super::run::{RunError, find_target, interpreter, python_path};
 use super::ui::event::Event;
 use super::ui::theme::{Theme, Token};
 use super::ui::{Format, Ui};
@@ -57,7 +57,14 @@ impl Check {
 
 /// Runs every check and prints them. Fails if a required one failed.
 pub fn doctor(ui: &Ui) -> Result<(), RunError> {
-    let checks = [python(), metor_config(), uv(), cargo(), wasm32()];
+    let dir = project_dir()?;
+    let checks = [
+        python(&dir),
+        metor_config(),
+        uv(&dir),
+        cargo(&dir),
+        wasm32(&dir),
+    ];
     if ui.format == Format::Json {
         let value = json!(checks.iter().map(to_json).collect::<Vec<_>>());
         ui.emit(Event::Data("doctor", &value));
@@ -79,6 +86,16 @@ pub fn doctor(ui: &Ui) -> Result<(), RunError> {
         true => Ok(()),
         false => Err(RunError::Doctor(failed.join(", "))),
     }
+}
+
+/// The directory of the nearest `target.py`, or the working directory.
+fn project_dir() -> Result<PathBuf, RunError> {
+    let cwd = std::env::current_dir().map_err(|source| RunError::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let found = find_target(&cwd).and_then(|target| target.parent().map(Path::to_path_buf));
+    Ok(found.unwrap_or(cwd))
 }
 
 fn to_json(check: &Check) -> serde_json::Value {
@@ -115,9 +132,15 @@ pub fn render(out: &mut impl Write, checks: &[Check], theme: &Theme) -> io::Resu
     Ok(())
 }
 
-/// The first line `program args` prints, if it runs and succeeds.
-fn first_line(program: impl AsRef<OsStr>, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+/// The first line `program args` prints in `dir`, if it runs and succeeds.
+/// rustup picks a toolchain by directory, so a probe runs where the build
+/// will.
+fn first_line(dir: &Path, program: impl AsRef<OsStr>, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text.lines().next()?.trim().to_string();
     output.status.success().then_some(line)
@@ -128,10 +151,10 @@ fn version_number(line: &str) -> String {
     line.split_whitespace().nth(1).unwrap_or(line).to_string()
 }
 
-fn python() -> Check {
+fn python(dir: &Path) -> Check {
     let python = interpreter();
     let shown = Path::new(&python).display().to_string();
-    judge_python(first_line(&python, &["--version"]), &shown)
+    judge_python(first_line(dir, &python, &["--version"]), &shown)
 }
 
 fn judge_python(version: Option<String>, shown: &str) -> Check {
@@ -179,8 +202,8 @@ fn judge_metor_config(abi: Option<u32>) -> Check {
     }
 }
 
-fn uv() -> Check {
-    match first_line("uv", &["--version"]) {
+fn uv(dir: &Path) -> Check {
+    match first_line(dir, "uv", &["--version"]) {
         Some(version) => Check::ok("uv", version_number(&version)),
         None => Check {
             name: "uv",
@@ -191,19 +214,21 @@ fn uv() -> Check {
     }
 }
 
-fn cargo() -> Check {
+fn cargo(dir: &Path) -> Check {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    match first_line(cargo, &["--version"]) {
+    match first_line(dir, cargo, &["--version"]) {
         Some(version) => Check::ok("cargo", version_number(&version)),
         None => Check::failed("cargo", "not found", "install Rust from https://rustup.rs"),
     }
 }
 
-/// Checks that the wasm32 standard library is installed, which a pack
-/// built with `wasm = true` needs.
-pub fn wasm32() -> Check {
+/// Checks that the wasm32 standard library is installed for the toolchain
+/// cargo uses in `dir`, which a pack built with `wasm = true` needs.
+pub fn wasm32(dir: &Path) -> Check {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let libdir = first_line(
-        "rustc",
+        dir,
+        rustc,
         &["--print", "target-libdir", "--target", WASM_TRIPLE],
     );
     judge_wasm32(libdir.as_deref().is_some_and(has_rlib))
