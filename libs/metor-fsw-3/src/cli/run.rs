@@ -141,8 +141,12 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
 /// Runs `metor run`.
 ///
 /// Rebuilds every dev pack, evaluates the target file, and cycles the target
-/// until it is stopped.
+/// until it is stopped. A child of a multi-target run catches SIGINT from
+/// the start, so a stop during its build still reports.
 pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
+    if super::children::is_child() {
+        watch_sigint();
+    }
     let route = Arc::new(Mutex::new(Route::default()));
     install_logging(ConsoleLayer {
         ui: ui.clone(),
@@ -297,11 +301,11 @@ fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), 
         .map_err(RunError::Spawn);
     let _ = std::fs::remove_file(&path);
     end(ui, started, relay.rows());
-    waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
+    let failed = waited?;
     if interrupted() {
         return Err(RunError::Interrupted);
     }
-    Ok(())
+    failed.map_err(|failed| RunError::Children(failed.join(", ")))
 }
 
 /// Sets up tracing to print through `console` and to forward lines to `log`

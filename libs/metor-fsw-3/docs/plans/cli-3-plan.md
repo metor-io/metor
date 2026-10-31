@@ -49,10 +49,13 @@ JSON output stays one object per line.
 `metor watch [run flags]` runs `metor run` with the same flags as a child
 that owns the terminal, and restarts it when a source changes:
 
-- the target file's directory, for `*.py` and `pyproject.toml`;
-- each dev pack's `src/`, `Cargo.toml`, and `pyproject.toml`.
+- the target file's directory, recursively;
+- each dev pack, and each local crate it builds from per `cargo metadata`.
 
-`.metor/`, `target/`, and hidden directories are ignored. Changes are
+Directories are watched rather than files, so an editor's atomic save
+keeps its watch. Only `.py`, `.rs`, `.toml`, and `.json` files count, and
+`target/`, `__pycache__/`, and hidden directories below a watched root are
+ignored. Changes are
 debounced by 300 ms. On a change the parent sends the child SIGINT, waits,
 prints `↻ Changed <path>`, and starts it again. A child that exits on its
 own is not restarted until the next change. Ctrl-C reaches both, and the

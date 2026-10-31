@@ -16,7 +16,8 @@ use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 
 use super::run::{Run, RunError, dev_packs, find_target, interrupted, watch_sigint};
 use super::ui::Ui;
-use super::ui::event::Event;
+use super::ui::event::{Event, LogLine, Source};
+use metor_proto_wkt::LogLevel;
 
 /// How long changes settle before a rerun.
 const SETTLE: Duration = Duration::from_millis(300);
@@ -40,18 +41,35 @@ pub fn watch(args: Watch, ui: &Ui) -> Result<(), RunError> {
     let target = target_file(args.run.target.as_deref())?;
     let (tx, rx) = channel();
     let mut debouncer = new_debouncer(SETTLE, tx).map_err(watch_error)?;
-    for (path, mode) in watch_set(&target) {
-        let _ = debouncer.watcher().watch(&path, mode);
+    let roots = watch_roots(&target);
+    for root in &roots {
+        if let Err(error) = debouncer.watcher().watch(root, RecursiveMode::Recursive) {
+            warn(ui, &format!("cannot watch {}: {error}", root.display()));
+        }
     }
     watch_sigint();
     let argv = run_argv(std::env::args_os().skip(1));
     loop {
         let child = start(&argv)?;
-        let Some(changed) = wait_for_change(child, &rx) else {
+        let changed = wait_for_change(child, &rx, &roots);
+        let Some(changed) = changed.filter(|_| !interrupted()) else {
             return Err(RunError::Interrupted);
         };
         ui.emit(Event::Changed(&display(&changed)));
     }
+}
+
+fn warn(ui: &Ui, message: &str) {
+    ui.emit(Event::Log(&LogLine {
+        elapsed: None,
+        level: LogLevel::Warn,
+        source: Source {
+            target: None,
+            system: "watch",
+        },
+        message,
+        fields: &[],
+    }));
 }
 
 /// The target file named, or the nearest one.
@@ -66,26 +84,79 @@ fn target_file(named: Option<&Path>) -> Result<PathBuf, RunError> {
     find_target(&cwd).ok_or(RunError::NoProject(cwd))
 }
 
-/// What to watch for `target`: its directory, and each dev pack's sources
-/// and manifests.
-pub fn watch_set(target: &Path) -> Vec<(PathBuf, RecursiveMode)> {
+/// The directories to watch for `target`, each recursively: its own, and
+/// each local crate its dev packs build from. A root under another is
+/// left out. Roots are canonical, as the OS reports changed paths.
+pub fn watch_roots(target: &Path) -> Vec<PathBuf> {
     let dir = target
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let mut set = vec![(dir.to_path_buf(), RecursiveMode::NonRecursive)];
-    for pack in dev_packs(dir) {
-        set.push((pack.join("src"), RecursiveMode::Recursive));
-        set.push((pack.join("Cargo.toml"), RecursiveMode::NonRecursive));
-        set.push((pack.join("pyproject.toml"), RecursiveMode::NonRecursive));
-    }
-    set
+    let packs = dev_packs(dir);
+    let crates = packs.iter().flat_map(|pack| local_crates(pack));
+    let mut roots: Vec<PathBuf> = core::iter::once(dir.to_path_buf())
+        .chain(packs.iter().cloned())
+        .chain(crates)
+        .map(|root| root.canonicalize().unwrap_or(root))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let covered = |root: &PathBuf| {
+        roots
+            .iter()
+            .any(|other| other != root && root.starts_with(other))
+    };
+    let kept: Vec<PathBuf> = roots
+        .iter()
+        .filter(|root| !covered(root))
+        .cloned()
+        .collect();
+    kept
+}
+
+/// The directories of the local crates `pack` builds from, per
+/// `cargo metadata`. Empty if cargo cannot say.
+fn local_crates(pack: &Path) -> Vec<PathBuf> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(pack)
+        .args(["metadata", "--format-version", "1"])
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Some(output) = output.ok().filter(|output| output.status.success()) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    local_crate_dirs(&metadata)
+}
+
+/// The directory of each package in `metadata` with no registry or git
+/// source.
+fn local_crate_dirs(metadata: &serde_json::Value) -> Vec<PathBuf> {
+    let Some(packages) = metadata["packages"].as_array() else {
+        return Vec::new();
+    };
+    packages
+        .iter()
+        .filter(|package| package["source"].is_null())
+        .filter_map(|package| {
+            Path::new(package["manifest_path"].as_str()?)
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .collect()
 }
 
 /// Whether a change to `path` should rerun: a source or manifest, outside
-/// build output and hidden directories.
-pub fn relevant(path: &Path) -> bool {
-    let ignored = path.components().any(|component| match component {
+/// build output and hidden directories below the root it is under.
+pub fn relevant(path: &Path, roots: &[PathBuf]) -> bool {
+    let below = roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    let ignored = below.components().any(|component| match component {
         Component::Normal(name) => {
             let name = name.to_string_lossy();
             name.starts_with('.') || name == "target" || name == "__pycache__"
@@ -123,7 +194,11 @@ fn start(argv: &[OsString]) -> Result<Child, RunError> {
 /// Waits for a relevant change and stops the run for it, returning the
 /// changed path. Returns `None` once SIGINT has arrived and the run has
 /// stopped. A run that ends on its own waits for the next change.
-fn wait_for_change(mut child: Child, rx: &Receiver<DebounceEventResult>) -> Option<PathBuf> {
+fn wait_for_change(
+    mut child: Child,
+    rx: &Receiver<DebounceEventResult>,
+    roots: &[PathBuf],
+) -> Option<PathBuf> {
     loop {
         if interrupted() {
             stop(&mut child);
@@ -131,7 +206,10 @@ fn wait_for_change(mut child: Child, rx: &Receiver<DebounceEventResult>) -> Opti
         }
         match rx.recv_timeout(POLL) {
             Ok(Ok(events)) => {
-                if let Some(event) = events.into_iter().find(|event| relevant(&event.path)) {
+                if let Some(event) = events
+                    .into_iter()
+                    .find(|event| relevant(&event.path, roots))
+                {
                     stop(&mut child);
                     return Some(event.path);
                 }
@@ -184,14 +262,32 @@ mod tests {
 
     #[test]
     fn test_relevant() {
-        assert!(relevant(Path::new("proj/target.py")));
-        assert!(relevant(Path::new("proj/pack/src/lib.rs")));
-        assert!(relevant(Path::new("proj/pack/Cargo.toml")));
-        assert!(!relevant(Path::new("proj/pack/target/debug/build.rs")));
-        assert!(!relevant(Path::new("proj/pack/.metor/mod/__init__.py")));
-        assert!(!relevant(Path::new("proj/__pycache__/t.py")));
-        assert!(!relevant(Path::new("proj/notes.md")));
-        assert!(!relevant(Path::new("proj/.target.py.swp")));
+        let roots = [PathBuf::from("/home/me/.local/proj")];
+        let relevant = |path: &str| relevant(Path::new(path), &roots);
+        assert!(relevant("/home/me/.local/proj/target.py"));
+        assert!(relevant("/home/me/.local/proj/pack/src/lib.rs"));
+        assert!(relevant("/home/me/.local/proj/pack/Cargo.toml"));
+        assert!(!relevant("/home/me/.local/proj/pack/target/debug/build.rs"));
+        assert!(!relevant(
+            "/home/me/.local/proj/pack/.metor/mod/__init__.py"
+        ));
+        assert!(!relevant("/home/me/.local/proj/__pycache__/t.py"));
+        assert!(!relevant("/home/me/.local/proj/notes.md"));
+        assert!(!relevant("/home/me/.local/proj/.target.py.swp"));
+        assert!(
+            !relevant("/elsewhere/.hidden/x.py"),
+            "outside every root, judged whole"
+        );
+    }
+
+    #[test]
+    fn test_local_crate_dirs_keep_path_packages() {
+        let metadata = serde_json::json!({"packages": [
+            {"source": null, "manifest_path": "/p/contracts/Cargo.toml"},
+            {"source": "registry+https://github.com/rust-lang/crates.io-index", "manifest_path": "/r/serde/Cargo.toml"},
+        ]});
+        assert_eq!(local_crate_dirs(&metadata), [PathBuf::from("/p/contracts")]);
+        assert!(local_crate_dirs(&serde_json::json!({})).is_empty());
     }
 
     #[test]
@@ -208,25 +304,28 @@ mod tests {
     }
 
     #[test]
-    fn test_watch_set_covers_the_target_and_its_dev_packs() {
+    fn test_watch_roots_cover_the_target_and_its_dev_packs_once() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack");
-        let set = watch_set(&fixture.join("target.py"));
-        assert_eq!(set[0], (fixture.clone(), RecursiveMode::NonRecursive));
+        let roots = watch_roots(&fixture.join("target.py"));
         let root = fixture.canonicalize().expect("it exists");
+        assert!(roots.iter().any(|r| root.starts_with(r)), "{roots:?}");
+        let metor = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("it exists");
         assert!(
-            set.contains(&(root.join("src"), RecursiveMode::Recursive)),
-            "{set:?}"
+            roots.iter().any(|r| metor.starts_with(r)),
+            "the pack's path dependency: {roots:?}"
         );
-        assert!(set.contains(&(root.join("Cargo.toml"), RecursiveMode::NonRecursive)));
+        assert!(
+            !roots.iter().any(|r| r != &metor && r.starts_with(&metor)),
+            "nested roots are left out"
+        );
     }
 
     #[test]
-    fn test_watch_set_of_a_bare_target_is_its_directory() {
+    fn test_watch_roots_of_a_bare_target_is_its_directory() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let set = watch_set(&dir.path().join("target.py"));
-        assert_eq!(
-            set,
-            [(dir.path().to_path_buf(), RecursiveMode::NonRecursive)]
-        );
+        let roots = watch_roots(&dir.path().join("target.py"));
+        assert_eq!(roots, [dir.path().canonicalize().expect("it exists")]);
     }
 }

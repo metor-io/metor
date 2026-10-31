@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::relay::Relay;
 use super::run::Run;
@@ -25,6 +25,9 @@ pub fn is_child() -> bool {
 
 /// How often the parent checks whether a child has exited.
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long a child asked to stop has before it is killed.
+const GRACE: Duration = Duration::from_secs(5);
 
 /// A running target process. Dropping it kills the process.
 pub struct TargetProcess {
@@ -145,37 +148,47 @@ impl Drop for TargetProcess {
 }
 
 /// Calls `f` with each line `reader` gives, without its newline, until it
-/// ends.
+/// ends. Bytes that are not UTF-8 become replacement characters.
 pub fn each_line(reader: impl Read, mut f: impl FnMut(&str)) {
-    let reader = BufReader::new(reader);
-    for line in reader.lines().map_while(Result::ok) {
-        f(&line);
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    while reader
+        .read_until(b'\n', &mut line)
+        .is_ok_and(|read| read > 0)
+    {
+        let text = String::from_utf8_lossy(&line);
+        f(text.strip_suffix('\n').unwrap_or(&text));
+        line.clear();
     }
 }
 
 /// Waits for every child to exit.
 ///
-/// If any child exits with a failure, the rest are killed. A SIGINT to this
-/// process is forwarded to every child. On failure, returns the namespace of
-/// every child that did not exit successfully.
+/// When one fails, or this process gets SIGINT, the rest are asked to stop
+/// with SIGINT, and killed after [`GRACE`], so each still reports its
+/// summary. Returns the namespace of every child that failed on its own; a
+/// child stopped this way has not failed.
 pub fn wait_all(mut children: Vec<TargetProcess>) -> Result<(), Vec<String>> {
     let mut exits: Vec<Option<ExitStatus>> = vec![None; children.len()];
-    let mut forwarded = false;
+    let mut asked = vec![false; children.len()];
+    let mut stopping: Option<Instant> = None;
     while exits.iter().any(Option::is_none) {
-        let interrupt = !forwarded && super::run::interrupted();
-        forwarded |= interrupt;
-        let failing = exits.iter().flatten().any(|status| !status.success());
+        let failing = exits
+            .iter()
+            .zip(&asked)
+            .any(|(exit, asked)| !asked && exit.is_some_and(|status| !status.success()));
+        if stopping.is_none() && (failing || super::run::interrupted()) {
+            stopping = Some(Instant::now());
+            ask_to_stop(&children, &exits, &mut asked);
+        }
+        let overdue = stopping.is_some_and(|since| since.elapsed() > GRACE);
         for (child, exit) in children.iter_mut().zip(&mut exits) {
-            if exit.is_some() {
-                continue;
-            }
-            if interrupt {
-                child.interrupt();
-            }
-            if failing {
+            if exit.is_none() && overdue {
                 let _ = child.process.kill();
             }
-            *exit = child.process.try_wait().ok().flatten();
+            if exit.is_none() {
+                *exit = child.process.try_wait().ok().flatten();
+            }
         }
         if exits.iter().any(Option::is_none) {
             std::thread::sleep(POLL);
@@ -183,14 +196,23 @@ pub fn wait_all(mut children: Vec<TargetProcess>) -> Result<(), Vec<String>> {
     }
     let failed: Vec<String> = children
         .iter()
-        .zip(&exits)
-        .filter(|(_, exit)| !exit.is_some_and(|status| status.success()))
+        .zip(exits.iter().zip(&asked))
+        .filter(|(_, (exit, asked))| !**asked && !exit.is_some_and(|status| status.success()))
         .map(|(child, _)| child.namespace.clone())
         .collect();
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(failed)
+    match failed.is_empty() {
+        true => Ok(()),
+        false => Err(failed),
+    }
+}
+
+/// Sends SIGINT to every child still running, and marks it as asked.
+fn ask_to_stop(children: &[TargetProcess], exits: &[Option<ExitStatus>], asked: &mut [bool]) {
+    for ((child, exit), asked) in children.iter().zip(exits).zip(asked) {
+        if exit.is_none() {
+            child.interrupt();
+            *asked = true;
+        }
     }
 }
 
@@ -267,11 +289,22 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_all_reports_failures_and_kills_the_rest() {
+    fn test_wait_all_stops_the_rest_and_blames_only_the_failure() {
         assert_eq!(wait_all(vec![process("ok", "true", &[])]), Ok(()));
         assert_eq!(wait_all(Vec::new()), Ok(()));
+        let started = Instant::now();
         let failed = wait_all(vec![process("bad", "false", &[]), sleeper()]);
-        assert_eq!(failed, Err(vec!["bad".to_string(), "sleeper".to_string()]));
+        assert_eq!(failed, Err(vec!["bad".to_string()]));
+        assert!(started.elapsed() < GRACE, "sleep stops on SIGINT");
+    }
+
+    #[test]
+    fn test_each_line_survives_bytes_that_are_not_utf8() {
+        let mut lines = Vec::new();
+        each_line(&b"one\n\xff\ntwo\n"[..], |line| {
+            lines.push(line.to_string())
+        });
+        assert_eq!(lines, ["one", "\u{fffd}", "two"]);
     }
 
     #[test]
