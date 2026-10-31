@@ -33,17 +33,29 @@ pub enum Format {
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct OutputArgs {
     /// When to use colour.
-    #[arg(long, value_enum, default_value_t, global = true)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        global = true,
+        help_heading = "Output"
+    )]
     pub color: ColorChoice,
     /// How to write events: styled text, or one JSON object per line on
     /// stdout.
-    #[arg(long, value_enum, default_value_t, global = true)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        global = true,
+        help_heading = "Output"
+    )]
     pub format: Format,
     /// Draw with ASCII only.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Output")]
     pub ascii: bool,
     /// Show cargo's output and the files each step writes.
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, help_heading = "Output")]
     pub verbose: bool,
 }
 
@@ -74,9 +86,9 @@ impl Ui {
     ///
     /// A live terminal gets a thread that ticks its spinner. With
     /// `--verbose`, cargo writes to the terminal too, so nothing redraws.
-    pub fn new(args: &OutputArgs) -> Self {
+    pub fn new(args: &OutputArgs, probe: &Probe) -> Self {
         let mut caps = match args.format {
-            Format::Human => Caps::resolve(&Probe::detect(), args.color, args.ascii),
+            Format::Human => Caps::resolve(probe, args.color, args.ascii),
             Format::Json => Caps::plain(),
         };
         caps.live &= !args.verbose;
