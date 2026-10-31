@@ -10,6 +10,7 @@ pub mod module;
 pub mod pack_dev;
 mod port_class;
 pub mod run;
+pub mod ui;
 
 use std::path::PathBuf;
 

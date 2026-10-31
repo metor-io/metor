@@ -14,6 +14,7 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-stellar = { path = "../metor-proto/stellar", optional = true }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+anstyle = { version = "1", optional = true }
 blake3 = { version = "1.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 const-fnv1a-hash = "1.1.0"
@@ -24,6 +25,7 @@ indexmap = { version = "2", features = ["serde"] }
 libc = { version = "0.2", optional = true }
 libloading = { version = "0.8", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
+miette = { version = "7", features = ["fancy"], optional = true }
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"], optional = true }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
@@ -31,6 +33,12 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
+strsim = { version = "0.11", optional = true }
+supports-color = { version = "3", optional = true }
+supports-hyperlinks = { version = "3", optional = true }
+supports-unicode = { version = "3", optional = true }
+terminal-colorsaurus = { version = "1", optional = true }
+terminal_size = { version = "0.4", optional = true }
 thiserror = "2.0"
 toml = { version = "0.8", optional = true }
 tracing = "0.1"
@@ -52,22 +60,31 @@ io-uring = { version = "0.7.1", optional = true }
 default = ["host", "db"]
 host = [
     "threads",
+    "dep:anstyle",
     "dep:blake3",
     "dep:clap",
     "dep:libc",
     "dep:libloading",
     "dep:metor-proto-stellar",
+    "dep:miette",
     "dep:minijinja",
     "dep:polling",
     "dep:io-uring",
     "dep:toml",
     "dep:wasmi",
+    "dep:strsim",
+    "dep:supports-color",
+    "dep:supports-hyperlinks",
+    "dep:supports-unicode",
+    "dep:terminal-colorsaurus",
+    "dep:terminal_size",
 ]
 
 threads = ["dep:stellarator", "dep:thingbuf"]
 db = ["host", "dep:metor-db"]
 
 [dev-dependencies]
+insta = "1"
 tempfile = "3"
 trybuild = "1"
 wat = "1"

@@ -1,0 +1,10 @@
+---
+source: libs/metor-fsw-3/src/cli/ui/tests.rs
+expression: text
+---
+{"phase":"building","state":"started","subject":"adcs_pack","type":"phase","v":1}
+{"current":"nalgebra","done":41,"phase":"building","state":"progress","subject":"adcs_pack","type":"phase","v":1}
+{"phase":"building","secs":2.1,"state":"done","subject":"adcs_pack","type":"phase","v":1}
+{"phase":"evaluating","secs":0.005,"state":"done","subject":"target.py","type":"phase","v":1}
+{"targets":["plant","fsw"],"type":"running","v":1}
+{"code":"M0101","help":"did you mean `fsw`?","message":"no target `fws`","severity":"error","type":"diagnostic","v":1}
