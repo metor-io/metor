@@ -13,7 +13,8 @@ use crate::deploy::ConfigError;
 /// The arguments to `metor build`.
 #[derive(clap::Args, Debug, Default)]
 pub struct Build {
-    /// The target file to evaluate. Defaults to `./target.py`.
+    /// The target file to evaluate. Defaults to the nearest `target.py` in
+    /// this directory or one above it.
     pub target: Option<PathBuf>,
     /// Where to write the resolved config. Defaults to stdout.
     #[arg(short, long)]

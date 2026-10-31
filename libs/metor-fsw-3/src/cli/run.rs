@@ -43,10 +43,14 @@ use crate::dl::{Pack, PackError, PackRef};
 /// when it exists.
 const IN_REPO_CONFIG_PY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/python/metor-config");
 
+/// The file `metor` looks for when it is not given one.
+const TARGET_FILE: &str = "target.py";
+
 /// The arguments to `metor run`.
 #[derive(clap::Args, Debug, Default)]
 pub struct Run {
-    /// The target file to evaluate. Defaults to `./target.py`.
+    /// The target file to evaluate. Defaults to the nearest `target.py` in
+    /// this directory or one above it.
     pub target: Option<PathBuf>,
     /// The namespace of the target to run. Without it, a deployment with
     /// several targets runs all of them.
@@ -82,6 +86,8 @@ pub struct Run {
 pub enum RunError {
     #[error("no target file at {}", .0.display())]
     NoTargetFile(PathBuf),
+    #[error("no target.py in {} or a directory above it", .0.display())]
+    NoProject(PathBuf),
     #[error("running the target file: {0}")]
     Spawn(std::io::Error),
     #[error("the target file made no deployment")]
@@ -325,7 +331,15 @@ fn console_level(filter: LevelFilter) -> LogLevel {
 /// and a `.json` file is read as is. If the config still has peer references,
 /// every target's packs are opened to resolve them.
 pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, RunError> {
-    let target = target.unwrap_or(Path::new("target.py"));
+    let found;
+    let target = match target {
+        Some(target) => target,
+        None => {
+            let cwd = std::env::current_dir().map_err(io(Path::new(".")))?;
+            found = find_target(&cwd).ok_or(RunError::NoProject(cwd))?;
+            &found
+        }
+    };
     if !target.is_file() {
         return Err(RunError::NoTargetFile(target.to_path_buf()));
     }
@@ -346,6 +360,21 @@ pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, Run
         n => format!("{n} targets"),
     };
     phased(ui, Verb::Resolve, &subject, || resolve(config, target))
+}
+
+/// The nearest `target.py` in `start` or a directory above it, stopping at
+/// the root of a git repository.
+pub fn find_target(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let target = dir.join(TARGET_FILE);
+        if target.is_file() {
+            return Some(target);
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+    }
+    None
 }
 
 /// Runs `f` as a phase on `ui`. On failure, shows the output the failed
@@ -743,6 +772,25 @@ mod tests {
         assert_eq!(console_level(LevelFilter::DEBUG), LogLevel::Debug);
         assert_eq!(console_level(LevelFilter::INFO), LogLevel::Info);
         assert_eq!(console_level(LevelFilter::OFF), LogLevel::Error);
+    }
+
+    #[test]
+    fn test_find_target_walks_up_to_the_repo_root() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let repo = dir.path().join("repo");
+        let deep = repo.join("a/b");
+        std::fs::create_dir_all(&deep).expect("makes dirs");
+        std::fs::create_dir(repo.join(".git")).expect("makes .git");
+        assert_eq!(find_target(&deep), None, "stops at the repo root");
+
+        std::fs::write(dir.path().join("target.py"), "").expect("writes");
+        assert_eq!(find_target(&deep), None, "never looks above .git");
+
+        std::fs::write(repo.join("target.py"), "").expect("writes");
+        assert_eq!(find_target(&deep), Some(repo.join("target.py")));
+
+        std::fs::write(deep.join("target.py"), "").expect("writes");
+        assert_eq!(find_target(&deep), Some(deep.join("target.py")));
     }
 
     #[test]

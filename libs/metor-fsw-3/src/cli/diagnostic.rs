@@ -161,6 +161,10 @@ fn run_info(error: &RunError) -> Info {
             "M0206",
             Some("run from the directory with target.py, or pass the target file".into()),
         ),
+        RunError::NoProject(_) => (
+            "M0209",
+            Some("pass the target file, or run from a project directory".into()),
+        ),
         RunError::NoDeployment => (
             "M0207",
             Some("create a `Target` or a `Deployment` in the target file".into()),
