@@ -6,6 +6,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::completions;
 use super::run::{RunError, prepare};
 use super::ui::event::Event;
 use super::ui::table::{Align, Table};
@@ -19,7 +20,7 @@ use crate::deploy::{ResolvedDeployment, TargetConfig};
 pub struct Show {
     /// A target file, then a name: `fsw` for a target, `fsw.nav` for one of
     /// its systems. Without a file, the nearest `target.py` is shown.
-    #[arg(num_args = 0..=2, value_name = "FILE|NAME")]
+    #[arg(num_args = 0..=2, value_name = "FILE|NAME", add = completions::files_or_names())]
     pub args: Vec<String>,
 }
 
@@ -96,7 +97,7 @@ pub fn select(config: &ResolvedDeployment, name: Option<&str>) -> Result<Selecti
 }
 
 /// Every name `select` accepts.
-fn names(config: &ResolvedDeployment) -> Vec<String> {
+pub(crate) fn names(config: &ResolvedDeployment) -> Vec<String> {
     let several = config.targets.len() > 1;
     let mut names: Vec<String> = Vec::new();
     for (target, ns) in config.targets.iter().zip(config.namespaces()) {

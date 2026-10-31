@@ -15,6 +15,7 @@ use crate::deploy::ConfigError;
 pub struct Build {
     /// The target file to evaluate. Defaults to the nearest `target.py` in
     /// this directory or one above it.
+    #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
     /// Where to write the resolved config. Defaults to stdout.
     #[arg(short, long)]

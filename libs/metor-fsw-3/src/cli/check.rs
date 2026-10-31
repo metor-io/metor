@@ -14,6 +14,7 @@ use super::ui::event::Verb;
 pub struct Check {
     /// The target file to evaluate. Defaults to the nearest `target.py` in
     /// this directory or one above it.
+    #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
 }
 

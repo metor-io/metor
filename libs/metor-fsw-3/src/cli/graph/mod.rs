@@ -8,6 +8,7 @@ pub mod wiring;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use super::completions;
 use super::run::{RunError, prepare};
 use super::show::{self, Selection, select, split_args};
 use super::ui::event::Event;
@@ -21,7 +22,7 @@ use wiring::{At, Link, links};
 pub struct Graph {
     /// A target file, then a target's name. Without a file, the nearest
     /// `target.py` is drawn.
-    #[arg(num_args = 0..=2, value_name = "FILE|TARGET")]
+    #[arg(num_args = 0..=2, value_name = "FILE|TARGET", add = completions::files_or_targets())]
     pub args: Vec<String>,
     /// Write text for another tool instead of a picture.
     #[arg(long = "as", value_enum, value_name = "FORMAT")]

@@ -52,10 +52,11 @@ const TARGET_FILE: &str = "target.py";
 pub struct Run {
     /// The target file to evaluate. Defaults to the nearest `target.py` in
     /// this directory or one above it.
+    #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
     /// The namespace of the target to run. Without it, a deployment with
     /// several targets runs all of them.
-    #[arg(long = "target", value_name = "NS")]
+    #[arg(long = "target", value_name = "NS", add = super::completions::targets())]
     pub member: Option<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
@@ -373,7 +374,11 @@ pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, Run
         1 => "1 target".to_string(),
         n => format!("{n} targets"),
     };
-    phased(ui, Verb::Resolve, &subject, || resolve(config, target))
+    let config = phased(ui, Verb::Resolve, &subject, || resolve(config, target))?;
+    if target.extension().is_some_and(|ext| ext == "py") && !super::children::is_child() {
+        super::completions::write_cache(target, &config);
+    }
+    Ok(config)
 }
 
 /// The nearest `target.py` in `start` or a directory above it, stopping at

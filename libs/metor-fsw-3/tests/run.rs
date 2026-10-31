@@ -402,3 +402,46 @@ fn test_check_fails_with_the_errors_code() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("error[M0212]"), "{stderr}");
 }
+
+#[test]
+fn test_check_writes_the_names_completion_reads() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(dir.path(), "");
+    let output = metor()
+        .args(["check", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let names = std::fs::read_to_string(dir.path().join(".metor/names")).expect("check wrote it");
+    assert!(names.starts_with("target a\ntarget b\n"), "{names}");
+}
+
+/// A link's two ends are joined, in the picture and in Mermaid.
+#[test]
+fn test_graph_joins_a_link_across_targets() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(
+        dir.path(),
+        "from metor_config import Listen, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Listen(\"127.0.0.1:47811\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let graph = |args: &[&str]| {
+        let output = metor()
+            .arg("graph")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("metor runs");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        String::from_utf8(output.stdout).expect("utf-8")
+    };
+    let picture = graph(&["deploy.py"]);
+    assert!(picture.contains("b.mirror") && picture.contains("a.out"), "{picture}");
+    let mermaid = graph(&["deploy.py", "--as", "mermaid"]);
+    assert!(mermaid.contains("t1_0 <-.-> t0_0"), "{mermaid}");
+    let one = graph(&["deploy.py", "b"]);
+    assert!(!one.contains("  a  "), "one target: {one}");
+}
