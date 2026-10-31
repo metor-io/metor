@@ -1,0 +1,16 @@
+---
+source: libs/metor-fsw-3/src/cli/graph/export.rs
+expression: "mermaid(&targets(), &LINKS)"
+---
+flowchart TD
+  subgraph t0["plant"]
+    t0_0["plant<br/><small>adcs.Plant</small>"]
+    t0_1["pub<br/><small>fsw.publish</small>"]
+  end
+  subgraph t1["fsw"]
+    t1_0["plant<br/><small>fsw.subscribe</small>"]
+    t1_1["nav<br/><small>adcs.#quot;Nav#quot;</small>"]
+  end
+  t0_0 -->|sensors| t0_1
+  t1_0 -->|sensors → imu| t1_1
+  t1_0 <-.-> t0_1

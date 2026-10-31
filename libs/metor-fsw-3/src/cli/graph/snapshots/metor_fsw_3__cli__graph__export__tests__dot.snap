@@ -1,0 +1,20 @@
+---
+source: libs/metor-fsw-3/src/cli/graph/export.rs
+expression: "dot(&targets(), &LINKS)"
+---
+digraph deployment {
+  node [shape=box];
+  subgraph cluster_0 {
+    label="plant";
+    t0_0 [label="plant\nadcs.Plant"];
+    t0_1 [label="pub\nfsw.publish"];
+  }
+  subgraph cluster_1 {
+    label="fsw";
+    t1_0 [label="plant\nfsw.subscribe"];
+    t1_1 [label="nav\nadcs.\"Nav\""];
+  }
+  t0_0 -> t0_1 [label="sensors"];
+  t1_0 -> t1_1 [label="sensors → imu"];
+  t1_0 -> t0_1 [style=dashed, dir=both];
+}

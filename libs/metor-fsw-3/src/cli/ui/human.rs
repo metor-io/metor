@@ -239,6 +239,10 @@ impl<W: Write> Human<W> {
         if let Some(help) = diagnostic.help() {
             writeln!(self.buf, "    {muted}help:{muted:#} {help}")?;
         }
+        if let Some(code) = diagnostic.code() {
+            let faint = self.theme.style(Token::Faint);
+            writeln!(self.buf, "    {faint}more: metor explain {code}{faint:#}")?;
+        }
         Ok(())
     }
 

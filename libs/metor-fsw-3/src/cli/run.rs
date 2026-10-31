@@ -93,6 +93,8 @@ pub enum RunError {
     Doctor(String),
     #[error("nothing in the deployment is named `{name}`")]
     NoSuchName { name: String, known: Vec<String> },
+    #[error("no code is named `{code}`")]
+    NoSuchCode { code: String, known: Vec<String> },
     #[error("running the target file: {0}")]
     Spawn(std::io::Error),
     #[error("the target file made no deployment")]

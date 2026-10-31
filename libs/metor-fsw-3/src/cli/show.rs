@@ -3,7 +3,7 @@
 //! With no name it shows every target; `fsw` one target; `fsw.nav`, or
 //! `nav` in a deployment of one, one system with its params and grants.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::run::{RunError, prepare};
@@ -42,9 +42,7 @@ pub fn show(args: Show, ui: &Ui) -> Result<(), RunError> {
         return Ok(());
     }
     let caps = ui.stdout_caps();
-    let width = std::io::stdout().is_terminal().then(|| {
-        terminal_size::terminal_size().map_or(usize::from(caps.width), |(w, _)| usize::from(w.0))
-    });
+    let width = ui.stdout_width();
     let mut out = std::io::stdout().lock();
     render(&mut out, &config, selection, &Theme::new(&caps), width).map_err(|source| RunError::Io {
         path: PathBuf::from("stdout"),
@@ -55,7 +53,7 @@ pub fn show(args: Show, ui: &Ui) -> Result<(), RunError> {
 /// Splits `args` into a target file and a name. A lone argument is the
 /// file when it looks like a path: it has a separator, or ends in `.py` or
 /// `.json`.
-fn split_args(args: &[String]) -> (Option<PathBuf>, Option<String>) {
+pub(crate) fn split_args(args: &[String]) -> (Option<PathBuf>, Option<String>) {
     match args {
         [file, name] => (Some(file.into()), Some(name.clone())),
         [only] if is_path(only) => (Some(only.into()), None),
@@ -205,7 +203,7 @@ fn write_target(
 }
 
 /// `fsw  100 Hz wall`, the name in the target's hue.
-fn write_title(
+pub(crate) fn write_title(
     out: &mut impl Write,
     target: &TargetConfig,
     index: usize,

@@ -179,7 +179,8 @@ fn run_info(error: &RunError) -> Info {
             "M0206",
             Some("check the path; without one, metor finds the nearest target.py".into()),
         ),
-        RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, "names"))),
+        RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, SHOW_NAMES))),
+        RunError::NoSuchCode { code, known } => ("M0106", Some(suggest(code, known, CODES))),
         RunError::Doctor(_) => ("M0105", Some("each fix is listed under its check".into())),
         RunError::NoProject(_) => (
             "M0209",
@@ -210,7 +211,7 @@ fn run_info(error: &RunError) -> Info {
 fn config_info(error: &ConfigError) -> Info {
     match error {
         ConfigError::NoSuchTarget { name, known } => {
-            ("M0102", Some(suggest(name, known, "targets")))
+            ("M0102", Some(suggest(name, known, SHOW_TARGETS)))
         }
         ConfigError::SelectTarget(_) => ("M0103", None),
         ConfigError::Version { .. } => (
@@ -264,10 +265,7 @@ fn build_info(error: &BuildError) -> Info {
         BuildError::RingTooLarge { .. } => ("M0313", None),
         BuildError::DynamicFromLater { .. } => (
             "M0314",
-            Some(
-                "add the producer before the system that reads it, or read it through a loop"
-                    .into(),
-            ),
+            Some("add the producer before the system that reads it".into()),
         ),
         BuildError::RecordConflict { .. } => ("M0315", None),
         BuildError::RecordIdConflict { .. } => ("M0316", None),
@@ -346,9 +344,16 @@ fn pack_info(error: &PackError) -> Info {
 /// How many known names a help line lists in full.
 const LISTED: usize = 8;
 
+/// What a list of known names holds, and the command that lists them.
+type Noun = (&'static str, &'static str);
+
+const SHOW_NAMES: Noun = ("names", "metor show");
+const SHOW_TARGETS: Noun = ("targets", "metor show");
+const CODES: Noun = ("codes", "metor explain");
+
 /// A help line naming the closest of `known` to `name`, then all of them
 /// if there are few.
-fn suggest(name: &str, known: &[String], noun: &str) -> String {
+fn suggest(name: &str, known: &[String], (noun, lister): Noun) -> String {
     let closest = known
         .iter()
         .map(|candidate| (strsim::damerau_levenshtein(name, candidate), candidate))
@@ -356,7 +361,7 @@ fn suggest(name: &str, known: &[String], noun: &str) -> String {
         .min_by_key(|(distance, _)| *distance);
     let list = match known.len() {
         0..=LISTED => format!("{noun}: {}", known.join(", ")),
-        n => format!("{n} {noun}; `metor show` lists them"),
+        n => format!("{n} {noun}; `{lister}` lists them"),
     };
     match closest {
         Some((_, candidate)) => format!("did you mean `{candidate}`?  {list}"),
@@ -371,7 +376,7 @@ mod tests {
     #[test]
     fn test_suggest_names_the_closest_target() {
         let known = ["plant", "fsw", "gw"].map(String::from);
-        let suggest = |name| suggest(name, &known, "targets");
+        let suggest = |name| suggest(name, &known, SHOW_TARGETS);
         assert_eq!(
             suggest("fws"),
             "did you mean `fsw`?  targets: plant, fsw, gw"
@@ -387,7 +392,7 @@ mod tests {
     fn test_suggest_summarises_many_names() {
         let known: Vec<String> = (0..20).map(|i| format!("sys{i}")).collect();
         assert_eq!(
-            suggest("sys1x", &known, "names"),
+            suggest("sys1x", &known, SHOW_NAMES),
             "did you mean `sys1`?  20 names; `metor show` lists them"
         );
     }

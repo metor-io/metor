@@ -10,6 +10,8 @@ pub mod children;
 pub mod console;
 pub mod diagnostic;
 pub mod doctor;
+pub mod explain;
+pub mod graph;
 pub mod module;
 pub mod pack_dev;
 mod port_class;
@@ -65,6 +67,11 @@ pub enum Command {
     /// Prints the deployment's targets, systems, and wiring.
     #[command(after_help = SHOW_EXAMPLES)]
     Show(show::Show),
+    /// Draws the deployment's wiring.
+    #[command(
+        after_help = "Examples:\n  metor graph                  every target\n  metor graph fsw              one target\n  metor graph --as mermaid     text for docs; also --as dot"
+    )]
+    Graph(graph::Graph),
     /// Evaluates a target file and writes out the resolved deployment.
     #[command(
         after_help = "Examples:\n  metor build -o deploy.json   resolve once, run anywhere\n  metor run deploy.json"
@@ -72,6 +79,11 @@ pub enum Command {
     Build(build::Build),
     /// Checks the tools a project needs.
     Doctor,
+    /// Prints the long form of an error code, or lists every code.
+    #[command(
+        after_help = "Examples:\n  metor explain M0201          what a code means and how to fix it\n  metor explain                every code"
+    )]
+    Explain(explain::Explain),
     /// Commands for pack authors.
     #[command(subcommand)]
     Pack(PackCommand),
@@ -199,11 +211,13 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root, ui)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
         Command::Doctor => doctor::doctor(ui)?,
+        Command::Explain(args) => explain::explain(args, ui)?,
         Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args, ui)?,
         Command::Check(args) => check::check(args, ui)?,
         Command::Watch(args) => watch::watch(args, ui)?,
         Command::Show(args) => show::show(args, ui)?,
+        Command::Graph(args) => graph::graph(args, ui)?,
     }
     Ok(())
 }

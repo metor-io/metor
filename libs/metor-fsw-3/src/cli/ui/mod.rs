@@ -6,6 +6,7 @@ pub mod event;
 pub mod human;
 pub mod json;
 pub mod logline;
+pub mod markdown;
 pub mod table;
 pub mod theme;
 
@@ -127,6 +128,16 @@ impl Ui {
             links: false,
             ..self.caps
         }
+    }
+
+    /// The terminal's width when stdout is a terminal.
+    pub fn stdout_width(&self) -> Option<usize> {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal().then(|| {
+            terminal_size::terminal_size().map_or(usize::from(self.caps.width), |(width, _)| {
+                usize::from(width.0)
+            })
+        })
     }
 
     /// A handle that drops every event.

@@ -105,6 +105,26 @@ pub struct Glyphs {
     pub link: &'static str,
     pub dot: &'static str,
     pub again: &'static str,
+    pub bullet: &'static str,
+    pub lines: Lines,
+}
+
+/// Box-drawing characters for `graph`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Lines {
+    pub horizontal: char,
+    pub vertical: char,
+    pub down_right: char,
+    pub down_left: char,
+    pub up_right: char,
+    pub up_left: char,
+    /// A vertical line with a branch to the right.
+    pub tee_right: char,
+    /// A vertical line with a branch to the left.
+    pub tee_left: char,
+    pub cross: char,
+    pub arrow: char,
+    pub out: char,
 }
 
 pub static UNICODE: Glyphs = Glyphs {
@@ -119,6 +139,20 @@ pub static UNICODE: Glyphs = Glyphs {
     link: "⇄",
     dot: "·",
     again: "↻",
+    bullet: "•",
+    lines: Lines {
+        horizontal: '─',
+        vertical: '│',
+        down_right: '╭',
+        down_left: '╮',
+        up_right: '╰',
+        up_left: '╯',
+        tee_right: '├',
+        tee_left: '┤',
+        cross: '┼',
+        arrow: '▶',
+        out: '▸',
+    },
 };
 
 pub static ASCII: Glyphs = Glyphs {
@@ -133,6 +167,20 @@ pub static ASCII: Glyphs = Glyphs {
     link: "<>",
     dot: "-",
     again: "~",
+    bullet: "-",
+    lines: Lines {
+        horizontal: '-',
+        vertical: '|',
+        down_right: '+',
+        down_left: '+',
+        up_right: '+',
+        up_left: '+',
+        tee_right: '+',
+        tee_left: '+',
+        cross: '+',
+        arrow: '>',
+        out: '>',
+    },
 };
 
 /// The styles and glyphs for one terminal.
