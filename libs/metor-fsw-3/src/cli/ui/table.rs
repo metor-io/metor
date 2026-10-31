@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 
 use super::theme::{Theme, Token};
+use super::{pad, width};
 
 /// How a column aligns its cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,10 +58,14 @@ impl<'a> Table<'a> {
             let rest = self.line(rest, &widths, 1);
             let room = self
                 .width
-                .map(|width| width.saturating_sub(indent.chars().count() + widths[0] + GAP.len()));
+                .map(|room| room.saturating_sub(width(indent) + widths[0] + GAP.len()));
             let rest = cut(&rest, room, theme.glyphs.ellipsis);
-            let width = if rest.is_empty() { 0 } else { widths[0] };
-            write!(out, "{indent}{bold}{first:<width$}{bold:#}")?;
+            let padding = if rest.is_empty() {
+                String::new()
+            } else {
+                pad(first, widths[0])
+            };
+            write!(out, "{indent}{bold}{first}{bold:#}{padding}")?;
             if !rest.is_empty() {
                 write!(out, "{GAP}{rest}")?;
             }
@@ -74,11 +79,11 @@ impl<'a> Table<'a> {
     fn line(&self, cells: &[&str], widths: &[usize], from: usize) -> String {
         let mut line = String::new();
         let columns = self.headers.iter().zip(widths).skip(from);
-        for (index, (cell, ((_, align), width))) in cells.iter().zip(columns).enumerate() {
+        for (index, (cell, ((_, align), columns))) in cells.iter().zip(columns).enumerate() {
             if index > 0 {
                 line.push_str(GAP);
             }
-            let pad = " ".repeat(width.saturating_sub(cell.chars().count()));
+            let pad = pad(cell, *columns);
             match align {
                 Align::Left => line.extend([*cell, &pad]),
                 Align::Right => line.extend([pad.as_str(), cell]),
@@ -95,8 +100,8 @@ impl<'a> Table<'a> {
             .map(|(column, (header, _))| {
                 let cells = self.rows.iter().filter_map(|row| row.get(column));
                 cells
-                    .map(|cell| cell.chars().count())
-                    .chain([header.chars().count()])
+                    .map(|cell| width(cell))
+                    .chain([width(header)])
                     .max()
                     .unwrap_or(0)
             })
@@ -104,14 +109,20 @@ impl<'a> Table<'a> {
     }
 }
 
-/// `text` cut to `room` characters, ending in `ellipsis` if it was cut.
+/// `text` cut to `room` columns, ending in `ellipsis` if it was cut.
 fn cut(text: &str, room: Option<usize>, ellipsis: &str) -> String {
-    let Some(room) = room.filter(|room| text.chars().count() > *room) else {
+    let Some(room) = room.filter(|room| width(text) > *room) else {
         return text.to_string();
     };
+    let mut left = room.saturating_sub(width(ellipsis));
     let kept: String = text
         .chars()
-        .take(room.saturating_sub(ellipsis.chars().count()))
+        .take_while(|c| {
+            let size = unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
+            let fits = size <= left;
+            left = left.saturating_sub(size);
+            fits
+        })
         .collect();
     format!("{}{ellipsis}", kept.trim_end())
 }
@@ -168,6 +179,23 @@ mod tests {
             String::from_utf8(out).expect("utf-8"),
             "  NAME  INPUTS\n  pub   plant.senso~\n  nav   gps\n"
         );
+    }
+
+    #[test]
+    fn test_wide_cells_pad_and_cut_by_columns() {
+        let headers = [("NAME", Align::Left), ("KIND", Align::Left)];
+        let mut table = Table::new(&headers).fit(Some(14));
+        table.row(vec!["中文".into(), "x".into()]);
+        table.row(vec!["ab".into(), "日本語の名前".into()]);
+        let mut out = Vec::new();
+        table
+            .write(&mut out, &Theme::new(&Caps::plain()), "")
+            .expect("writes to a Vec");
+        let text = String::from_utf8(out).expect("utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "中文  x", "{text}");
+        assert!(lines.iter().all(|l| super::super::width(l) <= 14), "{text}");
+        assert!(lines[2].ends_with('~'), "{text}");
     }
 
     #[test]

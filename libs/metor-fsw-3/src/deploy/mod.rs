@@ -238,12 +238,12 @@ fn check_ports(envelope: &DeploymentConfig, listen: &Listeners) -> Result<(), De
     Ok(())
 }
 
-fn host<'a>(envelope: &'a DeploymentConfig, target: &str) -> &'a str {
+pub(crate) fn host<'a, S, R>(envelope: &'a DeploymentConfig<S, R>, target: &str) -> &'a str {
     envelope.hosts.get(target).map_or(LOOPBACK, String::as_str)
 }
 
 /// Formats `host:port`, wrapping an IPv6 host in brackets.
-fn address(host: &str, port: u16) -> String {
+pub(crate) fn address(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {

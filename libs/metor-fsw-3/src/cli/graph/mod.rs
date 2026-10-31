@@ -59,7 +59,7 @@ pub fn graph(args: Graph, ui: &Ui) -> Result<(), RunError> {
         }
         (None, Format::Human) => {
             let theme = Theme::new(&ui.stdout_caps());
-            return write_stdout(|out| draw(out, &config, &chosen, &links, &theme));
+            return write_stdout(|out| draw(out, &config, &chosen, &targets, &links, &theme));
         }
     };
     write_stdout(|out| out.write_all(text.as_bytes()))
@@ -74,23 +74,24 @@ fn write_stdout(
     })
 }
 
-/// Each target in `chosen`: its title line, then its picture.
+/// Each target in `chosen`, with its wiring in `targets`: its title line,
+/// then its picture.
 pub fn draw(
     out: &mut impl Write,
     config: &ResolvedDeployment,
     chosen: &[usize],
+    targets: &[export::Target<'_>],
     links: &[Link],
     theme: &Theme,
 ) -> io::Result<()> {
-    for (index, &t) in chosen.iter().enumerate() {
+    for (index, (&t, (_, wiring))) in chosen.iter().zip(targets).enumerate() {
         if index > 0 {
             writeln!(out)?;
         }
         show::write_title(out, &config.targets[t], t, theme)?;
         writeln!(out)?;
-        let wiring = wiring::wiring(&config.targets[t]);
         let notes = notes(config, links, t, theme.glyphs.link);
-        picture::render(out, &wiring, &notes, theme, "  ")?;
+        picture::render(out, wiring, &notes, theme, "  ")?;
     }
     Ok(())
 }

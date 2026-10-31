@@ -65,24 +65,36 @@ pub fn draw(height: usize, spans: &[Span], columns: &[usize], lines: &Lines) -> 
         }
     }
     for (span, &column) in spans.iter().zip(columns) {
-        for (row, sink) in span
-            .rows()
-            .zip(core::iter::once(false).chain(core::iter::repeat(true)))
-        {
+        for row in span.rows() {
+            if let Some(line) = grid.get_mut(row) {
+                line[x(column)] = corner(span, row, lines);
+            }
+        }
+    }
+    for (span, &column) in spans.iter().zip(columns) {
+        let sinks = core::iter::once(false).chain(core::iter::repeat(true));
+        for (row, sink) in span.rows().zip(sinks) {
             let Some(line) = grid.get_mut(row) else {
                 continue;
             };
-            line[x(column)] = corner(span, row, lines);
             for cell in &mut line[x(column) + 1..width - 1] {
-                *cell = match *cell == lines.vertical {
-                    true => lines.cross,
-                    false => lines.horizontal,
-                };
+                *cell = join(*cell, lines);
             }
             line[width - 1] = if sink { lines.arrow } else { lines.horizontal };
         }
     }
     grid
+}
+
+/// `cell` with a horizontal line drawn through it. Two edges into one input
+/// meet where the inner lane turns.
+fn join(cell: char, lines: &Lines) -> char {
+    match cell {
+        c if c == lines.vertical || c == lines.tee_right => lines.cross,
+        c if c == lines.up_right => lines.tee_up,
+        c if c == lines.down_right => lines.tee_down,
+        _ => lines.horizontal,
+    }
 }
 
 /// The lane's character where it turns into `row`.
@@ -137,6 +149,18 @@ mod tests {
     fn test_draw_forward_fan_out_and_crossing() {
         let spans = [span(0, &[2, 4]), span(1, &[3])];
         assert_eq!(picture(5, &spans), "╭────\n│ ╭──\n├─┼─▶\n│ ╰─▶\n╰───▶");
+    }
+
+    #[test]
+    fn test_draw_fan_in_joins_in_either_order() {
+        let joined = "╭────\n│ ╭──\n╰─┴─▶";
+        assert_eq!(picture(3, &[span(0, &[2]), span(1, &[2])]), joined);
+        assert_eq!(picture(3, &[span(1, &[2]), span(0, &[2])]), joined);
+        assert_eq!(
+            picture(3, &[span(2, &[0]), span(1, &[0])]),
+            "╭─┬─▶\n│ ╰──\n╰────",
+            "loops meet from below"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::io::{self, Write};
 
 use super::lanes::{self, Span};
 use super::wiring::Wiring;
+use crate::cli::ui::pad;
 use crate::cli::ui::theme::{Theme, Token};
 
 /// What one line of a box shows.
@@ -94,7 +95,7 @@ struct Size {
 
 impl Size {
     fn of(wiring: &Wiring<'_>) -> Self {
-        let width = |text: &str| text.chars().count();
+        let width = crate::cli::ui::width;
         let id = wiring.nodes.iter().map(|n| width(n.id)).max().unwrap_or(0);
         let title = wiring
             .nodes
@@ -147,13 +148,11 @@ fn write_part(
         Part::Title => {
             let bold = theme.bold(theme.style(Token::Text));
             let muted = theme.style(Token::Muted);
-            let kind_width = inner - size.id - 2;
+            let (id_pad, kind_pad) = (pad(id, size.id), pad(kind, inner - size.id - 2));
             write!(
                 out,
-                "{border}{}{border:#} {bold}{id:<id_width$}{bold:#}  {muted}{kind:<kind_width$}{muted:#} {border}{}{border:#}",
-                lines.vertical,
-                lines.vertical,
-                id_width = size.id,
+                "{border}{}{border:#} {bold}{id}{bold:#}{id_pad}  {muted}{kind}{muted:#}{kind_pad} {border}{}{border:#}",
+                lines.vertical, lines.vertical,
             )?;
             match note {
                 Some(note) => write!(out, "  {muted}{note}{muted:#}"),
@@ -162,16 +161,18 @@ fn write_part(
         }
         Part::Input(port) => write!(
             out,
-            "{border}{}{border:#} {port:<inner$} {border}{}{border:#}",
-            lines.tee_left, lines.vertical
+            "{border}{}{border:#} {port}{} {border}{}{border:#}",
+            lines.tee_left,
+            pad(port, inner),
+            lines.vertical
         ),
         Part::Output(port) => {
             let muted = theme.style(Token::Muted);
-            let pad = inner - port.chars().count() - 2;
+            let padding = pad(port, inner - 2);
             write!(
                 out,
-                "{border}{}{border:#} {muted}{port} {}{muted:#}{:pad$} {border}{}{border:#}",
-                lines.tee_left, lines.out, "", lines.vertical
+                "{border}{}{border:#} {muted}{port} {}{muted:#}{padding} {border}{}{border:#}",
+                lines.tee_left, lines.out, lines.vertical
             )
         }
     }
@@ -270,6 +271,19 @@ mod tests {
             },
             "gain loops and feeds pub"
         );
+    }
+
+    #[test]
+    fn test_render_pads_wide_names_by_columns() {
+        let wiring = Wiring {
+            nodes: vec![node("中文", "k", &[], &[]), node("ab", "k", &[], &[])],
+            edges: Vec::new(),
+        };
+        let mut out = Vec::new();
+        render(&mut out, &wiring, &[], &Theme::new(&unicode()), "").expect("writes to a Vec");
+        let text = String::from_utf8(out).expect("utf-8");
+        let widths: Vec<usize> = text.lines().map(crate::cli::ui::width).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{text}");
     }
 
     #[test]

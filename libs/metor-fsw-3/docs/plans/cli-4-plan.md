@@ -82,7 +82,8 @@ as `git log --graph` does:
   its span, so short edges hug the boxes. A tap that crosses an inner
   lane draws `┼`.
 - A link system shows `⇄ target.system` beside its box, found by port.
-- Lanes are `Muted`; each target's title is in its hue. ASCII mode uses
+- Lanes are `Accent` and box borders `Muted`; each target's title is in
+  its hue. ASCII mode uses
   `+-|>` and `<`/`>`.
 
 The layout is a pure function from a target to a grid of styled cells;

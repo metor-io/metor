@@ -34,7 +34,7 @@ metor run --target fsw
 
 ## M0104 Nothing in the deployment has that name
 
-`metor show` was given a name that is neither a target nor a system. A target is named by its namespace, such as `fsw`. A system is named `target.system`, such as `fsw.nav`. In a deployment of one target, the system's id alone also works.
+`metor show` or `metor graph` was given a name that is neither a target nor a system. A target is named by its namespace, such as `fsw`. A system is named `target.system`, such as `fsw.nav`. In a deployment of one target, the system's id alone also works.
 
 The help line suggests the closest name. Run `metor show` with no name to list every target and system.
 

@@ -56,10 +56,9 @@ pub enum Source {
 impl Source {
     /// The source tree, if it is still where this binary was built.
     pub fn detect() -> Self {
-        let tree = Path::new(SOURCE);
-        match tree.join("python/metor-config").is_dir() {
-            true => Self::Tree(tree.to_path_buf()),
-            false => Self::Git,
+        match Path::new(SOURCE).canonicalize() {
+            Ok(tree) if tree.join("python/metor-config").is_dir() => Self::Tree(tree),
+            _ => Self::Git,
         }
     }
 
@@ -123,12 +122,21 @@ pub fn identifier(name: &str) -> Result<String, &'static str> {
     if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
         return Err("it may hold only lowercase letters, digits, `-`, and `_`");
     }
+    if !name.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err("it must end with a letter or digit");
+    }
+    if TAKEN.contains(&name) {
+        return Err("a metor package has that name");
+    }
     let ident = name.replace('-', "_");
     match RESERVED.contains(&ident.as_str()) {
         true => Err("Python or Rust reserves it"),
         false => Ok(ident),
     }
 }
+
+/// The packages a new project depends on, which it cannot share a name with.
+const TAKEN: &[&str] = &["metor-config", "metor-build", "metor-fsw-3"];
 
 /// `template` with each `{{key}}` replaced by its value.
 fn fill(template: &str, values: &[(&str, &str)]) -> String {
@@ -236,7 +244,7 @@ pub fn files(kind: Kind, dir: &Path, source: &Source) -> Result<Vec<File>, RunEr
 /// Writes a new pack or target project at `args.path`.
 pub fn new(args: New, ui: &Ui) -> Result<(), RunError> {
     let cwd = std::env::current_dir().map_err(io(Path::new(".")))?;
-    let dir = normalize(&cwd.join(&args.path));
+    let dir = physical(&normalize(&cwd.join(&args.path)));
     if dir.exists() {
         return Err(RunError::Exists(args.path));
     }
@@ -251,6 +259,7 @@ pub fn new(args: New, ui: &Ui) -> Result<(), RunError> {
     };
     phase(PhaseState::Started);
     if let Err(error) = write(&dir, &files) {
+        let _ = std::fs::remove_dir_all(&dir);
         phase(PhaseState::Failed);
         return Err(error);
     }
@@ -274,6 +283,20 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// `path` with its longest existing ancestor resolved through symlinks, so
+/// paths relative to it hold for the OS too.
+fn physical(path: &Path) -> PathBuf {
+    let existing = path
+        .ancestors()
+        .find_map(|a| Some((a, a.canonicalize().ok()?)));
+    match existing {
+        Some((ancestor, real)) => real.join(path.strip_prefix(ancestor).unwrap_or(Path::new(""))),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Writes every file under `dir`. On failure, `dir` is removed, since it
+/// did not exist before.
 fn write(dir: &Path, files: &[File]) -> Result<(), RunError> {
     for file in files {
         let path = dir.join(&file.path);
@@ -327,6 +350,8 @@ mod tests {
         assert!(identifier("Sat").is_err());
         assert!(identifier("sat.v2").is_err());
         assert_eq!(identifier("import"), Err("Python or Rust reserves it"));
+        assert!(identifier("my-sat-").is_err() && identifier("my_").is_err());
+        assert!(identifier("metor-config").is_err());
     }
 
     #[test]
@@ -412,6 +437,19 @@ mod tests {
         };
         let exists = new(args, &Ui::silent()).expect_err("it exists");
         assert!(matches!(exists, RunError::Exists(_)), "{exists}");
+    }
+
+    #[test]
+    fn test_physical_resolves_symlinked_ancestors() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let real = dir.path().canonicalize().expect("it exists");
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("links");
+        assert_eq!(physical(&link.join("new/pack")), real.join("new/pack"));
+        assert_eq!(
+            physical(Path::new("/no-such-root/x")),
+            Path::new("/no-such-root/x")
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! targets.
 
 use crate::coordinator::SystemConfig;
-use crate::deploy::{ResolvedDeployment, TargetConfig};
+use crate::deploy::{ResolvedDeployment, TargetConfig, address, host};
 use crate::io::{Backing, RealKind};
 use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
 
@@ -83,10 +83,11 @@ pub struct Link {
     pub listen: At,
 }
 
-/// Each link in `config`, matched by port: resolving a deployment turns a
-/// link's peer into an address, so the port is what joins the two ends.
+/// Each link in `config`. Resolving a deployment turns a link's peer into
+/// the address of its listener, `host:port` with the host from
+/// `config.hosts`, so a dial joins the listener with that address.
 pub fn links(config: &ResolvedDeployment) -> Vec<Link> {
-    let ends: Vec<(At, Endpoint)> = config
+    let ends: Vec<(At, Endpoint<'_>)> = config
         .targets
         .iter()
         .enumerate()
@@ -95,31 +96,39 @@ pub fn links(config: &ResolvedDeployment) -> Vec<Link> {
             systems.filter_map(move |(s, system)| Some(((t, s), endpoint(target, system)?)))
         })
         .collect();
-    let listener = |target: usize, port: u16| {
+    let listener = |target: usize, addr: &str| {
         ends.iter().find_map(|(at, end)| match end {
-            Endpoint::Listen(p) if *p == port && at.0 != target => Some(*at),
+            Endpoint::Listen(port) if at.0 != target && addr == peer_addr(config, at.0, *port) => {
+                Some(*at)
+            }
             _ => None,
         })
     };
     ends.iter()
         .filter_map(|(at, end)| match end {
-            Endpoint::Dial(port) => Some(Link {
+            Endpoint::Dial(addr) => Some(Link {
                 dial: *at,
-                listen: listener(at.0, *port)?,
+                listen: listener(at.0, addr)?,
             }),
             Endpoint::Listen(_) => None,
         })
         .collect()
 }
 
-/// The port a link system dials or listens on.
+/// The address a peer dials to reach the listener on `port` of `target`.
+fn peer_addr(config: &ResolvedDeployment, target: usize, port: u16) -> String {
+    let ns = config.targets[target].namespace();
+    address(host(config, ns), port)
+}
+
+/// The address a link system dials, or the port it listens on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Endpoint {
-    Dial(u16),
+enum Endpoint<'a> {
+    Dial(&'a str),
     Listen(u16),
 }
 
-fn endpoint(target: &TargetConfig, system: &SystemConfig) -> Option<Endpoint> {
+fn endpoint<'a>(target: &'a TargetConfig, system: &SystemConfig) -> Option<Endpoint<'a>> {
     if system.ty != PUBLISH_TYPE && system.ty != SUBSCRIBE_TYPE {
         return None;
     }
@@ -128,10 +137,7 @@ fn endpoint(target: &TargetConfig, system: &SystemConfig) -> Option<Endpoint> {
         .grants
         .values()
         .find_map(|id| match resources.get(id)? {
-            Backing::Real(RealKind::TcpDial { addr }) => {
-                let port = addr.rsplit_once(':')?.1.parse().ok()?;
-                Some(Endpoint::Dial(port))
-            }
+            Backing::Real(RealKind::TcpDial { addr }) => Some(Endpoint::Dial(addr)),
             Backing::Real(RealKind::TcpListen { addr, .. }) => Some(Endpoint::Listen(addr.port())),
             _ => None,
         })
@@ -227,15 +233,29 @@ mod tests {
         let dial = |addr: &str| RealKind::TcpDial { addr: addr.into() };
         config.targets = vec![
             link_target("plant", "pub", listen(2240)),
-            link_target("fsw", "plant", dial("plant.local:2240")),
-            link_target("gw", "lost", dial("nowhere:9")),
+            link_target("twin", "pub", listen(2240)),
+            link_target("fsw", "plant", dial("10.0.0.2:2240")),
+            link_target("gw", "local", dial("127.0.0.1:2240")),
+            link_target("ext", "far", dial("ground.example:2240")),
         ];
+        config.hosts.insert("plant".into(), "10.0.0.1".into());
+        config.hosts.insert("twin".into(), "10.0.0.2".into());
         assert_eq!(
             links(&config),
             [Link {
-                dial: (1, 0),
+                dial: (2, 0),
+                listen: (1, 0)
+            }],
+            "the host picks between listeners on one port; no listener is on loopback"
+        );
+        config.hosts.remove("plant");
+        assert_eq!(
+            links(&config)[1],
+            Link {
+                dial: (3, 0),
                 listen: (0, 0)
-            }]
+            },
+            "an unlisted host is loopback"
         );
     }
 }

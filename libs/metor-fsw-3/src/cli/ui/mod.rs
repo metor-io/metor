@@ -17,6 +17,16 @@ use event::Event;
 use human::Human;
 use json::Json;
 
+/// The columns `text` takes in a terminal.
+pub fn width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// The spaces that pad `text` to `columns`.
+pub fn pad(text: &str, columns: usize) -> String {
+    " ".repeat(columns.saturating_sub(width(text)))
+}
+
 /// Takes events and renders them.
 pub trait Reporter: Send {
     fn event(&mut self, event: &Event<'_>);

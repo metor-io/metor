@@ -123,6 +123,10 @@ pub struct Lines {
     /// A vertical line with a branch to the left.
     pub tee_left: char,
     pub cross: char,
+    /// A horizontal line with a branch up.
+    pub tee_up: char,
+    /// A horizontal line with a branch down.
+    pub tee_down: char,
     pub arrow: char,
     pub out: char,
 }
@@ -150,6 +154,8 @@ pub static UNICODE: Glyphs = Glyphs {
         tee_right: '├',
         tee_left: '┤',
         cross: '┼',
+        tee_up: '┴',
+        tee_down: '┬',
         arrow: '▶',
         out: '▸',
     },
@@ -178,6 +184,8 @@ pub static ASCII: Glyphs = Glyphs {
         tee_right: '+',
         tee_left: '+',
         cross: '+',
+        tee_up: '+',
+        tee_down: '+',
         arrow: '>',
         out: '>',
     },
