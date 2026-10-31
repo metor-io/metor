@@ -96,6 +96,10 @@ pub enum RunError {
     NoSuchName { name: String, known: Vec<String> },
     #[error("no code is named `{code}`")]
     NoSuchCode { code: String, known: Vec<String> },
+    #[error("`{name}` cannot name a project: {why}")]
+    BadName { name: String, why: &'static str },
+    #[error("{} already exists", .0.display())]
+    Exists(PathBuf),
     #[error("running the target file: {0}")]
     Spawn(std::io::Error),
     #[error("the target file made no deployment")]

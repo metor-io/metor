@@ -1,0 +1,7 @@
+"""The {{name}} target: `hello` counts cycles and logs every tenth."""
+
+from metor_config import Target
+from {{pack_module}} import Hello
+
+fsw = Target(cycle_rate=10.0)
+fsw.add("hello", Hello(every=10))

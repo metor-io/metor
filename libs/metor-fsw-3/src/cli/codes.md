@@ -55,6 +55,18 @@ Each failed check prints its fix under it. The usual ones:
 
 Check the code against the diagnostic it came from. A code from a different version of metor may not exist in this one.
 
+## M0107 That name cannot name a project
+
+`metor new` names the pack, its Python module, and its crate after the last part of the path it is given, so that part must work as a Python and a Rust identifier once `-` becomes `_`. It must start with a lowercase letter, hold only lowercase letters, digits, `-`, and `_`, and not be a word either language reserves.
+
+```
+metor new target my-sat
+```
+
+## M0108 The directory already exists
+
+`metor new` writes into a new directory and does not touch an existing one, so nothing is overwritten. Pick a path that does not exist yet, or remove the old directory first.
+
 ## M0201 The target file failed
 
 The target file exited with a non-zero status. Usually it raised an exception, and the traceback is printed above the diagnostic.

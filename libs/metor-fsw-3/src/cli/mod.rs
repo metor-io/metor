@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod explain;
 pub mod graph;
 pub mod module;
+pub mod new;
 pub mod pack_dev;
 mod port_class;
 pub mod relay;
@@ -52,6 +53,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Makes a pack crate, or a target project that runs as is.
+    #[command(
+        after_help = "Examples:\n  metor new target my-sat       a project with a pack, ready for metor run\n  metor new pack systems/nav    a pack crate with one system"
+    )]
+    New(new::New),
     /// Evaluates a target file and runs its targets.
     #[command(after_help = RUN_EXAMPLES)]
     Run(run::Run),
@@ -228,6 +234,7 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Show(args) => show::show(args, ui)?,
         Command::Graph(args) => graph::graph(args, ui)?,
         Command::Completions(args) => completions::completions(args)?,
+        Command::New(args) => new::new(args, ui)?,
     }
     Ok(())
 }

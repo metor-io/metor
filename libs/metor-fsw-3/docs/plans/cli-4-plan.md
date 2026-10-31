@@ -129,7 +129,7 @@ cycles and logs every hundredth. Run inside a project, it prints the
 
 The metor dependencies point at the source tree this binary was built
 from, as relative paths, when it still exists, and otherwise at the git
-repository at this version's tag. Names are checked as Python and Rust
+repository's default branch; the repository has no release tags to pin. Names are checked as Python and Rust
 identifiers once hyphens become underscores; an existing directory is
 refused. Files are templates with `{name}`-style holes, embedded with
 `include_str!`.

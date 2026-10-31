@@ -181,6 +181,11 @@ fn run_info(error: &RunError) -> Info {
         ),
         RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, SHOW_NAMES))),
         RunError::NoSuchCode { code, known } => ("M0106", Some(suggest(code, known, CODES))),
+        RunError::BadName { .. } => (
+            "M0107",
+            Some("use lowercase letters, digits, and `-`, as in `my-sat`".into()),
+        ),
+        RunError::Exists(_) => ("M0108", Some("pick a new directory".into())),
         RunError::Doctor(_) => ("M0105", Some("each fix is listed under its check".into())),
         RunError::NoProject(_) => (
             "M0209",

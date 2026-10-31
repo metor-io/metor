@@ -452,3 +452,43 @@ fn test_graph_joins_a_link_across_targets() {
     let one = graph(&["deploy.py", "b"]);
     assert!(!one.contains("  a  "), "one target: {one}");
 }
+
+/// `metor new target` makes a project that checks as written. The
+/// workspace's lockfile and a shared target dir keep the pack build short.
+#[test]
+fn test_new_target_checks() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let new = metor()
+        .args(["new", "target", "my-sat"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    assert!(
+        new.status.success(),
+        "{}",
+        String::from_utf8_lossy(&new.stderr)
+    );
+    let project = dir.path().join("my-sat");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::copy(
+        workspace.join("Cargo.lock"),
+        project.join("systems/my-sat/Cargo.lock"),
+    )
+    .expect("copies the lockfile");
+    let check = metor()
+        .arg("check")
+        .current_dir(&project)
+        .env("CARGO_TARGET_DIR", workspace.join("target/scaffold"))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(check.status.success(), "{stderr}");
+    assert!(stderr.contains("Checked"), "{stderr}");
+    let again = metor()
+        .args(["new", "pack", "my-sat"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("M0108"));
+}
