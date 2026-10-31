@@ -22,6 +22,7 @@ cordyceps = { version = "0.3.4", default-features = false }
 futures-lite = "2"
 heapless = { version = "0.8", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
+jiff = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 libloading = { version = "0.8", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
@@ -63,6 +64,7 @@ host = [
     "dep:anstyle",
     "dep:blake3",
     "dep:clap",
+    "dep:jiff",
     "dep:libc",
     "dep:libloading",
     "dep:metor-proto-stellar",

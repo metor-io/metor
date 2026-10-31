@@ -9387,6 +9387,7 @@ dependencies = [
  "indexmap 2.14.0",
  "insta",
  "io-uring",
+ "jiff",
  "libc",
  "libloading",
  "maitake-sync 0.1.2",

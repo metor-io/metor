@@ -44,6 +44,10 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
             "--cycles",
             overrides.cycles.map(|cycles| cycles.to_string()),
         ),
+        (
+            "--for",
+            overrides.run_for.map(|span| span.as_secs_f64().to_string()),
+        ),
         ("--wall", overrides.wall.map(|rate| rate.get().to_string())),
         (
             "--sim-dt",

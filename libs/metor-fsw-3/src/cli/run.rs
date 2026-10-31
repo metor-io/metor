@@ -29,6 +29,7 @@ use super::console::{self, ConsoleLayer, Origin, Route, Settings, Tap};
 use super::pack_dev::{PackDevError, pack_dev};
 use super::ui::Ui;
 use super::ui::event::{Event, Phase, PhaseState, Summary, TargetSummary, Verb};
+use super::units;
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
 };
@@ -54,15 +55,21 @@ pub struct Run {
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
     pub cycles: Option<u64>,
-    /// Pace the loop at this wall rate in Hz, overriding the target's clock.
-    #[arg(long, conflicts_with = "sim_dt", value_parser = wall_rate)]
+    /// Stop after this much clock time, such as `30s`, instead of on SIGINT.
+    #[arg(long = "for", value_name = "TIME", conflicts_with = "cycles", value_parser = units::duration)]
+    pub run_for: Option<Duration>,
+    /// Pace the loop at this wall rate, such as `100hz`, overriding the
+    /// target's clock.
+    #[arg(long, value_name = "RATE", conflicts_with = "sim_dt", value_parser = units::rate)]
     pub wall: Option<WallRate>,
-    /// Step a simulated clock by this many seconds per cycle.
-    #[arg(long, value_parser = sim_dt)]
+    /// Step a simulated clock by this much per cycle, such as `10ms`. A bare
+    /// number is seconds.
+    #[arg(long, value_name = "TIME", value_parser = units::duration)]
     pub sim_dt: Option<Duration>,
-    /// Start the simulated clock at this time, in microseconds since the Unix
+    /// Start the simulated clock at this UTC time, such as
+    /// `2026-10-29T00:00Z`. A bare number is microseconds since the Unix
     /// epoch.
-    #[arg(long)]
+    #[arg(long, value_name = "TIME", value_parser = units::epoch)]
     pub epoch: Option<i64>,
     /// Turn every thread group on the coordinator thread, so a sim run gives
     /// the same results every time. Needs a simulated clock with an epoch.
@@ -118,18 +125,6 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
         path: path.to_path_buf(),
         source,
     }
-}
-
-/// Parses `--sim-dt` seconds into a [`Duration`].
-fn sim_dt(arg: &str) -> Result<Duration, String> {
-    let secs: f64 = arg.parse().map_err(|e| format!("{e}"))?;
-    Duration::try_from_secs_f64(secs).map_err(|e| e.to_string())
-}
-
-/// Parses `--wall` into a [`WallRate`].
-fn wall_rate(arg: &str) -> Result<WallRate, String> {
-    let rate: f64 = arg.parse().map_err(|e| format!("{e}"))?;
-    WallRate::try_from(rate).map_err(|e| e.to_string())
 }
 
 /// Runs `metor run`.
@@ -190,7 +185,8 @@ fn run_member(
         systems,
     };
     let started = Instant::now();
-    let (latched, cycles) = cycle(coordinator, args, origin, rx, tx, route, ui);
+    let limit = cycle_limit(&config.targets[member], args)?;
+    let (latched, cycles) = cycle(coordinator, limit, origin, rx, tx, route, ui);
     let target = TargetSummary {
         name,
         cycles,
@@ -215,7 +211,7 @@ fn end(ui: &Ui, started: Instant, targets: Vec<TargetSummary>) {
 /// run.
 fn cycle(
     coordinator: Coordinator,
-    args: &Run,
+    limit: Option<u64>,
     origin: Origin,
     rx: Receiver<console::Message>,
     tx: SyncSender<console::Message>,
@@ -227,10 +223,9 @@ fn cycle(
     lock(route).tx = Some(tx);
 
     watch_sigint();
-    let cycles = args.cycles;
     let coordinator = stellarator::run(move || async move {
         let mut coordinator = coordinator;
-        coordinator.run(stop(cycles)).await;
+        coordinator.run(stop(limit)).await;
         coordinator
     });
 
@@ -564,6 +559,19 @@ pub fn load(
     Ok((config.coordinator.build_with(&table, options)?, systems))
 }
 
+/// The cycles to run: `--cycles`, or `--for` in cycles of the target's
+/// clock after the overrides, or `None` to run until SIGINT.
+fn cycle_limit(config: &TargetConfig, args: &Run) -> Result<Option<u64>, RunError> {
+    let Some(span) = args.run_for else {
+        return Ok(args.cycles);
+    };
+    let period = match apply_overrides(config, args)?.coordinator.clock {
+        Clock::Wall { rate } => Duration::try_from_secs_f64(rate.get().recip()).unwrap_or_default(),
+        Clock::Simulated { dt, .. } => dt,
+    };
+    Ok(Some(units::cycles_in(span, period)))
+}
+
 /// The longest a cycle may take on `clock`: its period on a wall clock,
 /// none on a simulated one.
 fn budget(clock: &Clock) -> Option<Duration> {
@@ -738,11 +746,28 @@ mod tests {
     }
 
     #[test]
-    fn test_sim_dt_parses_seconds() {
-        assert_eq!(sim_dt("0.01"), Ok(Duration::from_millis(10)));
-        assert_eq!(sim_dt("0"), Ok(Duration::ZERO));
-        assert!(sim_dt("-1").is_err());
-        assert!(sim_dt("fast").is_err());
+    fn test_for_counts_cycles_of_the_clock() {
+        let mut config = TargetConfig::default();
+        config.coordinator.clock = Clock::Simulated {
+            dt: Duration::from_millis(10),
+            epoch: None,
+        };
+        let one_second = Run {
+            run_for: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert_eq!(cycle_limit(&config, &one_second).ok(), Some(Some(100)));
+        let walled = Run {
+            wall: WallRate::try_from(50.0).ok(),
+            ..one_second
+        };
+        assert_eq!(cycle_limit(&config, &walled).ok(), Some(Some(50)));
+        let counted = Run {
+            cycles: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(cycle_limit(&config, &counted).ok(), Some(Some(7)));
+        assert_eq!(cycle_limit(&config, &Run::default()).ok(), Some(None));
     }
 
     #[test]
