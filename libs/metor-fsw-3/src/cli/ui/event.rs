@@ -41,6 +41,7 @@ pub enum Verb {
     Build,
     Evaluate,
     Resolve,
+    Check,
 }
 
 impl Verb {
@@ -50,6 +51,7 @@ impl Verb {
             Self::Build => "Building",
             Self::Evaluate => "Evaluating",
             Self::Resolve => "Resolving",
+            Self::Check => "Checking",
         }
     }
 
@@ -59,6 +61,7 @@ impl Verb {
             Self::Build => "Built",
             Self::Evaluate => "Evaluated",
             Self::Resolve => "Resolved",
+            Self::Check => "Checked",
         }
     }
 }

@@ -379,7 +379,7 @@ pub fn find_target(start: &Path) -> Option<PathBuf> {
 
 /// Runs `f` as a phase on `ui`. On failure, shows the output the failed
 /// program left after the phase's line.
-fn phased<T>(
+pub(super) fn phased<T>(
     ui: &Ui,
     verb: Verb,
     subject: &str,

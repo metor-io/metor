@@ -5,6 +5,7 @@
 
 pub mod build;
 pub mod cargo;
+pub mod check;
 pub mod children;
 pub mod console;
 pub mod diagnostic;
@@ -43,6 +44,8 @@ pub enum Command {
     AbiVersion,
     /// Evaluates a target file and runs its targets.
     Run(run::Run),
+    /// Builds everything `run` would, and stops before the first cycle.
+    Check(check::Check),
     /// Evaluates a target file and writes out the resolved deployment.
     Build(build::Build),
 }
@@ -78,6 +81,7 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::AbiVersion => println!("{ABI_VERSION}"),
         Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args, ui)?,
+        Command::Check(args) => check::check(args, ui)?,
     }
     Ok(())
 }

@@ -336,3 +336,37 @@ fn test_wasm_pack_loads_and_runs() {
     assert_eq!(coordinator.cycle(), 3);
     assert_eq!(panicked(&coordinator).len(), 0);
 }
+
+#[test]
+fn test_check_builds_every_target_and_runs_none() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(dir.path(), "");
+    let output = metor()
+        .args(["check", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("Checked").count(), 2, "{stderr}");
+    assert!(!stderr.contains("Running"), "{stderr}");
+}
+
+#[test]
+fn test_check_fails_with_the_errors_code() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(
+        dir.path(),
+        "from metor_config import Connect, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Connect(\"127.0.0.1:1\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let output = metor()
+        .args(["check", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("error[M0212]"), "{stderr}");
+}
