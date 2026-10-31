@@ -8,14 +8,13 @@
 //! the terminal.
 
 use core::time::Duration;
+use std::borrow::Cow;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
-
-use std::borrow::Cow;
 
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
@@ -31,8 +30,8 @@ use crate::record::Payload;
 /// The type `fsw.console` is registered under.
 pub const CONSOLE_TYPE: &str = "fsw.console";
 
-/// The id of the appended system.
-pub const CONSOLE_ID: &str = "console";
+/// The id the appended system takes, unless a system already has it.
+const CONSOLE_ID: &str = "console";
 
 /// How many lines wait for the printer before new ones are dropped.
 const CAPACITY: usize = 1024;
@@ -40,13 +39,21 @@ const CAPACITY: usize = 1024;
 /// What the console sends the printer.
 #[derive(Debug)]
 pub enum Message {
-    /// A line from the `system`th input, `elapsed` after the first cycle.
+    /// A line from the `system`th input, drained in the cycle `elapsed`
+    /// after the first.
     Line {
         system: usize,
         elapsed: Duration,
         event: LogEvent,
     },
-    /// Lines lost to a full channel or a lapped ring.
+    /// A `tracing` event from outside any system.
+    Outside {
+        level: LogLevel,
+        system: Cow<'static, str>,
+        message: String,
+        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    },
+    /// Lines lost to a full channel or a record that did not decode.
     Dropped(u32),
 }
 
@@ -88,11 +95,13 @@ impl Console {
 /// Drains every log input and sends its lines to the printer.
 ///
 /// Drops from earlier steps are reported first, so the report gets the room
-/// the printer made.
+/// the printer made. Lines are timed by the cycle that drains them, since
+/// threaded systems stamp theirs with wall time.
 #[crate::system]
 pub fn console(#[state] s: &mut Console, now: Timestamp, inputs: &mut DynInputs) {
     s.report_dropped();
     let start = *s.start.get_or_insert(now);
+    let elapsed = Duration::from_micros(now.0.saturating_sub(start.0).max(0) as u64);
     for (system, (_, input)) in inputs.iter_mut().enumerate() {
         for record in input.drain() {
             let Ok(event) = record
@@ -104,8 +113,6 @@ pub fn console(#[state] s: &mut Console, now: Timestamp, inputs: &mut DynInputs)
             if event.level < s.min {
                 continue;
             }
-            let elapsed =
-                Duration::from_micros(event.timestamp.0.saturating_sub(start.0).max(0) as u64);
             s.send(Message::Line {
                 system,
                 elapsed,
@@ -115,8 +122,18 @@ pub fn console(#[state] s: &mut Console, now: Timestamp, inputs: &mut DynInputs)
     }
 }
 
-/// The config of the console for a target whose systems are `systems`.
-pub fn system_config<'a>(systems: impl IntoIterator<Item = &'a str>) -> SystemConfig {
+/// The console's id in a target whose systems are `systems`: `console`, or
+/// the first `console_N` no system has.
+pub fn console_id(systems: &[String]) -> String {
+    let taken = |id: &str| systems.iter().any(|system| system == id);
+    core::iter::once(CONSOLE_ID.to_string())
+        .chain((2..).map(|n| format!("{CONSOLE_ID}_{n}")))
+        .find(|id| !taken(id))
+        .unwrap_or_default()
+}
+
+/// The config of the console `id` reading `systems`.
+pub fn system_config<'a>(id: &str, systems: impl IntoIterator<Item = &'a str>) -> SystemConfig {
     let inputs = systems
         .into_iter()
         .map(|system| InputConfig {
@@ -129,7 +146,7 @@ pub fn system_config<'a>(systems: impl IntoIterator<Item = &'a str>) -> SystemCo
         .collect();
     SystemConfig {
         inputs,
-        ..SystemConfig::new(CONSOLE_ID, CONSOLE_TYPE)
+        ..SystemConfig::new(id, CONSOLE_TYPE)
     }
 }
 
@@ -149,10 +166,11 @@ pub fn attach(
         .iter()
         .map(|system| system.id.clone())
         .collect();
+    let id = console_id(&systems);
     config
         .coordinator
         .systems
-        .push(system_config(systems.iter().map(String::as_str)));
+        .push(system_config(&id, systems.iter().map(String::as_str)));
     table.register(CONSOLE_TYPE, console(), move || {
         Console::new(tx.clone(), min)
     })?;
@@ -171,6 +189,8 @@ pub struct Origin {
     pub target: Option<(String, usize)>,
     /// The system ids, in the console's input order.
     pub systems: Vec<String>,
+    /// The console's own id, the source of its drop reports.
+    pub console: String,
 }
 
 /// Prints every message from `rx` through `ui` until the console is
@@ -203,6 +223,18 @@ fn print(message: &Message, origin: &Origin, ui: &Ui) {
                 fields: &event.fields,
             }));
         }
+        Message::Outside {
+            level,
+            system,
+            message,
+            fields,
+        } => ui.emit(Event::Log(&LogLine {
+            elapsed: None,
+            level: *level,
+            source: Source { target, system },
+            message,
+            fields,
+        })),
         Message::Dropped(count) => {
             let count = count.to_string();
             ui.emit(Event::Log(&LogLine {
@@ -210,7 +242,7 @@ fn print(message: &Message, origin: &Origin, ui: &Ui) {
                 level: LogLevel::Warn,
                 source: Source {
                     target,
-                    system: CONSOLE_ID,
+                    system: &origin.console,
                 },
                 message: "log lines dropped",
                 fields: &[("dropped".into(), count.into())],
@@ -219,13 +251,24 @@ fn print(message: &Message, origin: &Origin, ui: &Ui) {
     }
 }
 
+/// Where [`ConsoleLayer`] sends its lines.
+#[derive(Debug, Default)]
+pub struct Route {
+    /// The target lines name, once the deployment is known.
+    pub target: Option<(String, usize)>,
+    /// The printer's channel while a run is on. Without it, lines print at
+    /// once.
+    pub tx: Option<SyncSender<Message>>,
+}
+
 /// A `tracing` layer that prints events from outside any system.
 ///
 /// Events inside a system reach the terminal through its `log` port and the
-/// console instead. Lines name `target` once it is set.
+/// console instead. While a run is on, lines go through the printer, so the
+/// thread that logged never waits on the terminal.
 pub struct ConsoleLayer {
     pub ui: Ui,
-    pub target: Arc<OnceLock<(String, usize)>>,
+    pub route: Arc<Mutex<Route>>,
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ConsoleLayer {
@@ -235,18 +278,24 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ConsoleLayer {
         }
         let mut fields = Fields::default();
         event.record(&mut fields);
-        let system = fields.system.take().unwrap_or(Cow::Borrowed("metor"));
-        let target = self.target.get().map(|(name, hue)| (name.as_str(), *hue));
-        self.ui.emit(Event::Log(&LogLine {
-            elapsed: None,
+        let message = Message::Outside {
             level: crate::log::level_of(event.metadata().level()),
-            source: Source {
-                target,
-                system: &system,
-            },
-            message: &fields.message,
-            fields: &fields.rest,
-        }));
+            system: fields.system.unwrap_or(Cow::Borrowed("metor")),
+            message: fields.message,
+            fields: fields.rest,
+        };
+        let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = &route.tx {
+            let _ = tx.try_send(message);
+            return;
+        }
+        let origin = Origin {
+            target: route.target.clone(),
+            systems: Vec::new(),
+            console: String::new(),
+        };
+        drop(route);
+        print(&message, &origin, &self.ui);
     }
 }
 
@@ -282,6 +331,7 @@ mod tests {
     use crate::Log;
     use crate::cli::ui::Reporter;
     use crate::cli::ui::caps::Caps;
+    use crate::log::LogEventExt;
 
     #[crate::system]
     fn chatty(log: &mut Log) {
@@ -322,7 +372,7 @@ mod tests {
                     elapsed,
                     event,
                 } => Some((system, elapsed, event.message.into_owned())),
-                Message::Dropped(_) => None,
+                Message::Outside { .. } | Message::Dropped(_) => None,
             })
             .collect()
     }
@@ -370,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_console_reads_no_systems_in_an_empty_target() {
-        let config = system_config([]);
+        let config = system_config("console", []);
         assert!(config.inputs.is_empty());
         assert_eq!(config.ty, CONSOLE_TYPE);
     }
@@ -393,7 +443,7 @@ mod tests {
         let ui = Ui::with(Box::new(Messages(seen.clone())), Caps::plain());
         let layer = ConsoleLayer {
             ui,
-            target: Arc::default(),
+            route: Arc::default(),
         };
         let (config, table) = target(&["a"]);
         let mut coordinator = config.coordinator.build(&table).expect("valid");
@@ -407,5 +457,68 @@ mod tests {
         });
         let seen = seen.lock().expect("not poisoned");
         assert_eq!(*seen, ["metor:outside", "link:named"]);
+    }
+
+    #[test]
+    fn test_console_id_avoids_taken_ids() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(console_id(&ids(&[])), "console");
+        assert_eq!(console_id(&ids(&["console"])), "console_2");
+        assert_eq!(console_id(&ids(&["console", "console_2"])), "console_3");
+    }
+
+    #[test]
+    fn test_a_system_named_console_still_builds() {
+        let (mut config, mut table) = target(&["console"]);
+        let (tx, rx) = channel();
+        attach(&mut config, &mut table, tx, LogLevel::Info).expect("attaches");
+        assert_eq!(config.coordinator.systems[1].id, "console_2");
+        step_all(&config, &table, &[0]);
+        assert!(lines(&rx).iter().all(|(system, _, _)| *system == 0));
+    }
+
+    #[test]
+    fn test_layer_routes_through_the_printer_during_a_run() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ui = Ui::with(Box::new(Messages(seen.clone())), Caps::plain());
+        let (tx, rx) = channel();
+        let route = Arc::new(Mutex::new(Route {
+            target: None,
+            tx: Some(tx),
+        }));
+        let layer = ConsoleLayer { ui, route };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || tracing::info!("queued"));
+        assert!(seen.lock().expect("not poisoned").is_empty());
+        let queued = rx.try_recv().expect("one message");
+        assert!(matches!(queued, Message::Outside { ref message, .. } if message == "queued"));
+    }
+
+    #[test]
+    fn test_printer_names_the_target_and_reports_drops() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ui = Ui::with(Box::new(Messages(seen.clone())), Caps::plain());
+        let origin = Origin {
+            target: Some(("fsw".into(), 1)),
+            systems: vec!["nav".into()],
+            console: "console".into(),
+        };
+        let (tx, rx) = channel();
+        let line = LogEvent::line(Timestamp(0), LogLevel::Info, "fix", Vec::new());
+        tx.send(Message::Line {
+            system: 0,
+            elapsed: Duration::ZERO,
+            event: line,
+        })
+        .expect("open");
+        tx.send(Message::Dropped(3)).expect("open");
+        drop(tx);
+        spawn_printer(rx, origin, ui)
+            .join()
+            .expect("the printer ends");
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            ["nav:fix", "console:log lines dropped"]
+        );
     }
 }

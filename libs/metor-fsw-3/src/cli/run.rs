@@ -13,7 +13,8 @@ use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::{Arc, OnceLock};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use metor_proto_wkt::LogLevel;
 use serde::Deserialize;
@@ -23,7 +24,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use std::sync::mpsc::SyncSender;
 
 use super::cargo::read_toml;
-use super::console::{self, ConsoleLayer, Origin};
+use super::console::{self, ConsoleLayer, Origin, Route};
 use super::pack_dev::{PackDevError, pack_dev};
 use super::ui::Ui;
 use super::ui::event::Event;
@@ -114,10 +115,10 @@ fn wall_rate(arg: &str) -> Result<WallRate, String> {
 /// Rebuilds every dev pack, evaluates the target file, and cycles the target
 /// until it is stopped.
 pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
-    let log_target = Arc::new(OnceLock::new());
+    let route = Arc::new(Mutex::new(Route::default()));
     install_logging(ConsoleLayer {
         ui: ui.clone(),
-        target: log_target.clone(),
+        route: route.clone(),
     });
     let config = prepare(args.target.as_deref())?;
     let namespaces = config.namespaces();
@@ -126,24 +127,41 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         return run_children(&config, &args, ui);
     }
     let member = config.target(args.member.as_deref())?;
+    let target = (namespaces.len() > 1).then(|| (namespaces[member].to_string(), member));
+    lock(&route).target = target.clone();
     let (tx, rx) = console::channel();
-    let (coordinator, systems) = load(&config.targets[member], &args, Some(tx))?;
+    let (coordinator, systems) = load(&config.targets[member], &args, Some(tx.clone()))?;
     ui.emit(Event::SourceWidth(source_width(&config)));
     if std::env::var_os(super::children::CHILD_ENV).is_none() {
-        ui.emit(Event::Running(&namespaces[member..=member]));
+        let shown = Some(namespaces[member]).filter(|ns| !ns.is_empty());
+        ui.emit(Event::Running(&[shown.unwrap_or("target")]));
     }
     let origin = Origin {
-        target: (namespaces.len() > 1).then(|| (namespaces[member].to_string(), member)),
+        target,
+        console: console::console_id(&systems),
         systems,
     };
-    if let Some(target) = &origin.target {
-        let _ = log_target.set(target.clone());
+    let latched = cycle(coordinator, &args, origin, rx, tx, &route, ui);
+    if latched.is_empty() {
+        return Ok(());
     }
-    let origin_target = origin
-        .target
-        .as_ref()
-        .map(|(namespace, _)| namespace.clone());
+    Err(RunError::Latched(latched.join(", ")))
+}
+
+/// Cycles `coordinator` until it stops, with its console printing through
+/// `ui`. Returns the path of every system that latched off.
+fn cycle(
+    coordinator: Coordinator,
+    args: &Run,
+    origin: Origin,
+    rx: Receiver<console::Message>,
+    tx: SyncSender<console::Message>,
+    route: &Mutex<Route>,
+    ui: &Ui,
+) -> Vec<String> {
+    let namespace = origin.target.as_ref().map(|(name, _)| name.clone());
     let printer = console::spawn_printer(rx, origin, ui.clone());
+    lock(route).tx = Some(tx);
 
     watch_sigint();
     let cycles = args.cycles;
@@ -153,21 +171,22 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         coordinator
     });
 
-    let path = |id: &str| match &origin_target {
-        Some(namespace) => format!("{namespace}.{id}"),
-        None => id.to_string(),
-    };
-    let latched: Vec<String> = coordinator
+    let latched = coordinator
         .systems()
         .filter(|(_, end)| *end == Some(&EndReason::Panicked))
-        .map(|(id, _)| path(id))
+        .map(|(id, _)| match &namespace {
+            Some(namespace) => format!("{namespace}.{id}"),
+            None => id.to_string(),
+        })
         .collect();
     drop(coordinator);
+    lock(route).tx = None;
     let _ = printer.join();
-    if latched.is_empty() {
-        return Ok(());
-    }
-    Err(RunError::Latched(latched.join(", ")))
+    latched
+}
+
+fn lock(route: &Mutex<Route>) -> std::sync::MutexGuard<'_, Route> {
+    route.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The widest `target.system` in `config`, or `system` in a deployment of
@@ -564,6 +583,13 @@ mod tests {
             ..Default::default()
         };
         assert!(load(&config, &simulated, None).is_ok());
+    }
+
+    #[test]
+    fn test_console_level_follows_the_filter() {
+        assert_eq!(console_level(LevelFilter::DEBUG), LogLevel::Debug);
+        assert_eq!(console_level(LevelFilter::INFO), LogLevel::Info);
+        assert_eq!(console_level(LevelFilter::OFF), LogLevel::Error);
     }
 
     #[test]

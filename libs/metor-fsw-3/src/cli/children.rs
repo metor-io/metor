@@ -64,7 +64,7 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
 
 /// The flags and environment that give a child the parent's output.
 ///
-/// The child writes to a pipe, so the parent's colour, glyphs, and
+/// The child writes to a pipe, so the parent's colour depth, glyphs, and
 /// background are passed down rather than detected.
 pub fn output_argv(ui: &Ui) -> (Vec<OsString>, Vec<(&'static str, OsString)>) {
     let color = if ui.caps.depth == Depth::None {
@@ -86,7 +86,14 @@ pub fn output_argv(ui: &Ui) -> (Vec<OsString>, Vec<(&'static str, OsString)>) {
         Background::Dark => "15;0",
         Background::Light => "0;15",
     };
-    let env = vec![(CHILD_ENV, "1".into()), ("COLORFGBG", colorfgbg.into())];
+    let mut env = vec![(CHILD_ENV, "1".into()), ("COLORFGBG", colorfgbg.into())];
+    let level = match ui.caps.depth {
+        Depth::None => None,
+        Depth::Ansi16 => Some("1"),
+        Depth::Ansi256 => Some("2"),
+        Depth::TrueColor => Some("3"),
+    };
+    env.extend(level.map(|level| ("FORCE_COLOR", level.into())));
     (args, env)
 }
 
@@ -384,5 +391,6 @@ mod tests {
         );
         assert!(env.contains(&("COLORFGBG", "0;15".into())));
         assert!(env.contains(&(CHILD_ENV, "1".into())));
+        assert!(env.contains(&("FORCE_COLOR", "3".into())));
     }
 }

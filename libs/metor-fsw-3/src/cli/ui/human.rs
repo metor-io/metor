@@ -18,8 +18,12 @@ const VERB_WIDTH: usize = 11;
 const MAX_SOURCE_WIDTH: usize = 28;
 
 /// Writes events as styled lines to `out`.
+///
+/// Each event renders into a reused buffer and reaches `out` in one write,
+/// so other writers to the same stream never split a line.
 pub struct Human<W> {
     out: W,
+    buf: Vec<u8>,
     theme: Theme,
     caps: Caps,
     /// Whether the last line written is a live phase line that the next
@@ -33,6 +37,7 @@ impl<W: Write> Human<W> {
     pub fn new(out: W, caps: Caps) -> Self {
         Self {
             out,
+            buf: Vec::with_capacity(512),
             theme: Theme::new(&caps),
             caps,
             live_line: false,
@@ -56,20 +61,20 @@ impl<W: Write> Human<W> {
         let glyph_style = self.theme.style(token);
         let muted = self.theme.style(Token::Muted);
         write!(
-            self.out,
+            self.buf,
             "  {glyph_style}{glyph}{glyph_style:#} {verb:<VERB_WIDTH$} {}",
             phase.subject
         )?;
         match phase.state {
             PhaseState::Progress { done, current } => {
                 write!(
-                    self.out,
+                    self.buf,
                     "  {muted}{done} {} {current}{muted:#}",
                     glyphs.dot
                 )?;
             }
             PhaseState::Done(took) if took.as_millis() >= 10 => {
-                write!(self.out, "  {muted}{:.1}s{muted:#}", took.as_secs_f64())?;
+                write!(self.buf, "  {muted}{:.1}s{muted:#}", took.as_secs_f64())?;
             }
             _ => {}
         }
@@ -78,7 +83,7 @@ impl<W: Write> Human<W> {
             PhaseState::Started | PhaseState::Progress { .. }
         );
         if !self.live_line {
-            writeln!(self.out)?;
+            writeln!(self.buf)?;
         }
         Ok(())
     }
@@ -88,32 +93,32 @@ impl<W: Write> Human<W> {
         let accent = self.theme.style(Token::Accent);
         let muted = self.theme.style(Token::Muted);
         write!(
-            self.out,
+            self.buf,
             "  {accent}{}{accent:#} {:<VERB_WIDTH$}",
             self.theme.glyphs.running, "Running"
         )?;
         for (i, namespace) in namespaces.iter().enumerate() {
             let hue = self.theme.bold(self.theme.hue(i));
             let gap = if i == 0 { " " } else { "  " };
-            write!(self.out, "{gap}{hue}{namespace}{hue:#}")?;
+            write!(self.buf, "{gap}{hue}{namespace}{hue:#}")?;
         }
         if self.caps.live {
-            write!(self.out, "    {muted}ctrl-c to stop{muted:#}")?;
+            write!(self.buf, "    {muted}ctrl-c to stop{muted:#}")?;
         }
-        writeln!(self.out)
+        writeln!(self.buf)
     }
 
     fn diagnostic(&mut self, diagnostic: &dyn miette::Diagnostic) -> std::io::Result<()> {
         self.clear_live()?;
         let error = self.theme.bold(self.theme.style(Token::Error));
         let muted = self.theme.style(Token::Muted);
-        write!(self.out, "  {error}{} error", self.theme.glyphs.fail)?;
+        write!(self.buf, "  {error}{} error", self.theme.glyphs.fail)?;
         if let Some(code) = diagnostic.code() {
-            write!(self.out, "[{code}]")?;
+            write!(self.buf, "[{code}]")?;
         }
-        writeln!(self.out, "{error:#}  {diagnostic}")?;
+        writeln!(self.buf, "{error:#}  {diagnostic}")?;
         if let Some(help) = diagnostic.help() {
-            writeln!(self.out, "    {muted}help:{muted:#} {help}")?;
+            writeln!(self.buf, "    {muted}help:{muted:#} {help}")?;
         }
         Ok(())
     }
@@ -121,13 +126,13 @@ impl<W: Write> Human<W> {
     fn log(&mut self, line: &LogLine<'_>) -> std::io::Result<()> {
         self.clear_live()?;
         self.source_width = self.source_width.max(logline::source_len(&line.source));
-        logline::write(&mut self.out, line, &self.theme, self.source_width)
+        logline::write(&mut self.buf, line, &self.theme, self.source_width)
     }
 
     /// Ends a live phase line so the next write starts on a clean line.
     fn clear_live(&mut self) -> std::io::Result<()> {
         if std::mem::take(&mut self.live_line) {
-            write!(self.out, "\r\x1b[2K")?;
+            write!(self.buf, "\r\x1b[2K")?;
         }
         Ok(())
     }
@@ -145,6 +150,12 @@ impl<W: Write + Send> Reporter for Human<W> {
                 Ok(())
             }
         };
-        let _ = written.and_then(|()| self.out.flush());
+        if written.is_ok() && !self.buf.is_empty() {
+            let _ = self
+                .out
+                .write_all(&self.buf)
+                .and_then(|()| self.out.flush());
+        }
+        self.buf.clear();
     }
 }

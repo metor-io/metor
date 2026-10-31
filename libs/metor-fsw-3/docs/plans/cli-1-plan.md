@@ -153,6 +153,10 @@ this.
 Decoding a `LogEvent` builds owned strings. That allocation is the open
 TODO in slice 3 ("Logging allocations") and is not fixed here.
 
+Open: lines written after the console's last step, such as threaded
+systems logging while they stop, are lost when the coordinator drops. A
+final drain needs a coordinator hook that steps the console once more.
+
 Tests: a target with one system that logs and one that faults prints both
 with the right source; an event outside a system prints once; an event
 inside a system prints once; a full ring reports the drop.
