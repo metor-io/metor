@@ -14,7 +14,7 @@ mod port_class;
 pub mod run;
 pub mod ui;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -58,15 +58,17 @@ pub enum PackCommand {
 }
 
 /// Runs the command line. On failure, reports the error and exits with its
-/// status.
+/// status. An interrupted run's summary already says so.
 pub fn main() {
     let cli = Cli::parse();
     let ui = Ui::new(&cli.output);
-    let base = project_dir(&cli.command);
-    if let Err(error) = run(cli.command, &ui) {
-        ui.emit(Event::Diagnostic(&Report::new(&error, &base)));
-        std::process::exit(exit_code(&error));
+    let Err(error) = run(cli.command, &ui) else {
+        return;
+    };
+    if !matches!(error, RunError::Interrupted) {
+        ui.emit(Event::Diagnostic(&Report::new(&error)));
     }
+    std::process::exit(exit_code(&error));
 }
 
 fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
@@ -77,18 +79,4 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Build(args) => build::build(args, ui)?,
     }
     Ok(())
-}
-
-/// The directory a command's target file paths are relative to.
-fn project_dir(command: &Command) -> PathBuf {
-    let target = match command {
-        Command::Run(args) => args.target.as_deref(),
-        Command::Build(args) => args.target.as_deref(),
-        Command::Pack(_) | Command::AbiVersion => None,
-    };
-    target
-        .and_then(Path::parent)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .to_path_buf()
 }

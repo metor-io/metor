@@ -87,8 +87,11 @@ pub fn wasm_build(
 }
 
 /// JSON messages on stdout, each diagnostic carrying its rendered text.
+/// Verbose, cargo renders diagnostics, warnings too, to its own stderr.
 fn message_format(watch: &Watch<'_>) -> &'static str {
-    if watch.color {
+    if watch.verbose {
+        "--message-format=json-render-diagnostics"
+    } else if watch.color {
         "--message-format=json-diagnostic-rendered-ansi"
     } else {
         "--message-format=json"

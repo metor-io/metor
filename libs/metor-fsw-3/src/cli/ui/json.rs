@@ -72,14 +72,30 @@ fn object(event: &Event<'_>) -> Option<Value> {
             "message": line.message,
             "fields": line.fields.iter().map(|(k, v)| (k.to_string(), Value::from(v.as_ref()))).collect::<serde_json::Map<_, _>>(),
         }),
-        Event::Diagnostic(diagnostic) => json!({
-            "type": "diagnostic",
-            "severity": "error",
-            "code": diagnostic.code().map(|code| code.to_string()),
-            "message": diagnostic.to_string(),
-            "help": diagnostic.help().map(|help| help.to_string()),
-        }),
+        Event::Diagnostic(diagnostic) => {
+            let (file, line) = location(*diagnostic).unzip();
+            json!({
+                "type": "diagnostic",
+                "severity": "error",
+                "code": diagnostic.code().map(|code| code.to_string()),
+                "message": diagnostic.to_string(),
+                "help": diagnostic.help().map(|help| help.to_string()),
+                "file": file,
+                "line": line,
+            })
+        }
+        Event::Config(config) => json!({ "type": "config", "config": config }),
     })
+}
+
+/// The file and 1-based line of `diagnostic`'s first label.
+fn location(diagnostic: &dyn miette::Diagnostic) -> Option<(String, usize)> {
+    let label = diagnostic.labels()?.next()?;
+    let contents = diagnostic
+        .source_code()?
+        .read_span(label.inner(), 0, 0)
+        .ok()?;
+    Some((contents.name()?.to_string(), contents.line() + 1))
 }
 
 fn merge(into: &mut Value, from: Value) {

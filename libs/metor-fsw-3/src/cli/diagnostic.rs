@@ -41,19 +41,35 @@ struct Snippet {
 
 impl Report {
     /// Builds the report for `error`. A located error reads its line from
-    /// the file, relative to `base`.
-    pub fn new(error: &RunError, base: &Path) -> Self {
+    /// the file, which the target file names relative to the working
+    /// directory. If the line cannot be read, the message keeps its location.
+    pub fn new(error: &RunError) -> Self {
         let (code, help) = run_info(error);
-        let (location, message) = match located(error) {
-            Some((location, inner)) => (Some(location), inner),
+        let located = located(error)
+            .and_then(|(location, inner)| Some((Snippet::read(location, Path::new("."))?, inner)));
+        let (snippet, message) = match located {
+            Some((snippet, inner)) => (Some(snippet), inner),
             None => (None, error.to_string()),
         };
         Self {
             code,
             message,
             help,
-            snippet: location.and_then(|location| Snippet::read(location, base)),
+            snippet,
         }
+    }
+
+    /// Reads `location`'s line relative to `base`.
+    #[cfg(test)]
+    fn in_dir(error: &RunError, base: &Path) -> Self {
+        let mut report = Self::new(error);
+        if let Some((location, inner)) = located(error)
+            && let Some(snippet) = Snippet::read(location, base)
+        {
+            report.snippet = Some(snippet);
+            report.message = inner;
+        }
+        report
     }
 }
 
@@ -145,6 +161,11 @@ fn run_info(error: &RunError) -> Info {
             "M0206",
             Some("run from the directory with target.py, or pass the target file".into()),
         ),
+        RunError::NoDeployment => (
+            "M0207",
+            Some("create a `Target` or a `Deployment` in the target file".into()),
+        ),
+        RunError::Io { .. } => ("M0208", None),
         RunError::Python { .. } => ("M0201", Some("the traceback above shows where".into())),
         RunError::PythonPath(_) => ("M0202", None),
         RunError::Spawn(_) => (
@@ -344,7 +365,7 @@ mod tests {
             },
             source: Box::new(BuildError::DuplicateId { id: "nav".into() }),
         });
-        let report = Report::new(&error, dir.path());
+        let report = Report::in_dir(&error, dir.path());
         assert_eq!(report.to_string(), "system id `nav` is used twice");
         assert_eq!(report.code, "M0304");
         let snippet = report.snippet.expect("the line exists");
@@ -366,9 +387,18 @@ mod tests {
                 },
                 source: Box::new(BuildError::DeterministicWall),
             });
-            Report::new(&error, dir.path()).snippet.is_some()
+            Report::in_dir(&error, dir.path()).snippet.is_some()
         };
         assert!(at("t.py", 1));
+        let missing = RunError::Build(BuildError::Located {
+            location: Location {
+                file: "gone.py".into(),
+                line: 3,
+            },
+            source: Box::new(BuildError::DeterministicWall),
+        });
+        let report = Report::in_dir(&missing, dir.path());
+        assert!(report.to_string().starts_with("gone.py:3: "), "{report}");
         assert!(!at("t.py", 5));
         assert!(!at("t.py", 0));
         assert!(!at("gone.py", 1));
@@ -392,7 +422,7 @@ mod tests {
                 system: "gps".into(),
             }),
         });
-        let report = Report::new(&error, dir.path());
+        let report = Report::in_dir(&error, dir.path());
         let mut out = Vec::new();
         Human::new(&mut out, Caps::plain()).event(&Event::Diagnostic(&report));
         insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"));

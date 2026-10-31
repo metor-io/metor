@@ -76,12 +76,19 @@ pub enum RunError {
     #[error("no target file at {}", .0.display())]
     NoTargetFile(PathBuf),
     #[error("running the target file: {0}")]
-    Spawn(#[from] std::io::Error),
+    Spawn(std::io::Error),
+    #[error("the target file made no deployment")]
+    NoDeployment,
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("the target file exited with {status}")]
     Python {
         status: ExitStatus,
-        /// What the target file wrote to stderr, for the caller to show.
-        stderr: Vec<u8>,
+        /// What the target file printed, for the caller to show.
+        output: Vec<u8>,
     },
     #[error("building PYTHONPATH: {0}")]
     PythonPath(#[from] JoinPathsError),
@@ -103,6 +110,14 @@ pub enum RunError {
     Children(String),
     #[error("interrupted")]
     Interrupted,
+}
+
+/// Returns a closure that turns an IO error into an `Io` error for `path`.
+fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
+    |source| RunError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 /// Parses `--sim-dt` seconds into a [`Duration`].
@@ -134,34 +149,48 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         return run_children(&config, &args, ui);
     }
     let member = config.target(args.member.as_deref())?;
+    let latched = run_member(&config, member, &args, &route, ui)?;
+    if !latched.is_empty() {
+        return Err(RunError::Latched(latched.join(", ")));
+    }
+    if interrupted() && !super::children::is_child() {
+        return Err(RunError::Interrupted);
+    }
+    Ok(())
+}
+
+/// Runs the `member`th target of `config` in this process until it stops,
+/// then shows the summary. Returns the systems that latched off.
+fn run_member(
+    config: &ResolvedDeployment,
+    member: usize,
+    args: &Run,
+    route: &Mutex<Route>,
+    ui: &Ui,
+) -> Result<Vec<String>, RunError> {
+    let namespaces = config.namespaces();
     let target = (namespaces.len() > 1).then(|| (namespaces[member].to_string(), member));
-    lock(&route).target = target.clone();
+    lock(route).target = target.clone();
     let (tx, rx) = console::channel();
     let tap = Tap {
         tx: tx.clone(),
         stats: Arc::default(),
     };
     let stats = tap.stats.clone();
-    let (coordinator, systems) = load(&config.targets[member], &args, Some(tap))?;
-    ui.emit(Event::SourceWidth(source_width(&config)));
+    let (coordinator, systems) = load(&config.targets[member], args, Some(tap))?;
     let name = Some(namespaces[member])
         .filter(|ns| !ns.is_empty())
         .unwrap_or("target")
         .to_string();
-    if std::env::var_os(super::children::CHILD_ENV).is_none() {
-        ui.emit(Event::Running(&[&name]));
-    }
-    let name = target
-        .as_ref()
-        .map_or("target", |(name, _)| name)
-        .to_string();
+    ui.emit(Event::SourceWidth(source_width(config)));
+    ui.emit(Event::Running(&[&name]));
     let origin = Origin {
         target,
         console: console::console_id(&systems),
         systems,
     };
     let started = Instant::now();
-    let (latched, cycles) = cycle(coordinator, &args, origin, rx, tx, &route, ui);
+    let (latched, cycles) = cycle(coordinator, args, origin, rx, tx, route, ui);
     let target = TargetSummary {
         name,
         cycles,
@@ -169,18 +198,11 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         overruns: stats.overruns(),
     };
     end(ui, started, vec![target]);
-    if latched.is_empty() {
-        return Ok(());
-    }
-    Err(RunError::Latched(latched.join(", ")))
+    Ok(latched)
 }
 
-/// Shows the summary of a run that started at `started`. A child leaves it
-/// to its parent.
+/// Shows the summary of a run that started at `started`.
 fn end(ui: &Ui, started: Instant, targets: Vec<TargetSummary>) {
-    if std::env::var_os(super::children::CHILD_ENV).is_some() {
-        return;
-    }
     ui.emit(Event::Ended(&Summary {
         took: started.elapsed(),
         interrupted: interrupted(),
@@ -257,14 +279,13 @@ fn source_width(config: &ResolvedDeployment) -> usize {
 /// Returns once every child has exited.
 fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
-    std::fs::write(
-        &path,
-        serde_json::to_vec(config).map_err(ConfigError::Decode)?,
-    )?;
+    let bytes = serde_json::to_vec(config).map_err(ConfigError::Decode)?;
+    std::fs::write(&path, bytes).map_err(io(&path))?;
     watch_sigint();
     let started = Instant::now();
     let waited = super::children::spawn_all(&path, &config.namespaces(), args, ui)
-        .map(super::children::wait_all);
+        .map(super::children::wait_all)
+        .map_err(RunError::Spawn);
     let _ = std::fs::remove_file(&path);
     end(ui, started, Vec::new());
     waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
@@ -318,7 +339,7 @@ pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, Run
         pack_dev(pack, ui)?;
     }
     let config = if target.extension().is_some_and(|ext| ext == "json") {
-        DeploymentConfig::from_slice(&std::fs::read(target)?)?
+        DeploymentConfig::from_slice(&std::fs::read(target).map_err(io(target))?)?
     } else {
         let name = target.file_name().unwrap_or_default().to_string_lossy();
         phased(ui, Verb::Evaluate, &name, || {
@@ -354,8 +375,8 @@ fn phased<T>(
         Ok(_) => phase(PhaseState::Done(started.elapsed())),
         Err(error) => {
             phase(PhaseState::Failed);
-            if let RunError::Python { stderr, .. } = error {
-                ui.emit(Event::Output(stderr));
+            if let RunError::Python { output, .. } = error {
+                ui.emit(Event::Output(output));
             }
         }
     }
@@ -372,7 +393,8 @@ fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeploy
             .map(table_for)
             .collect::<Result<_, _>>()?;
         let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
-        let dir = std::path::absolute(dir.unwrap_or(Path::new(".")))?;
+        let dir = dir.unwrap_or(Path::new("."));
+        let dir = std::path::absolute(dir).map_err(io(dir))?;
         pending.resolve(&mut config, &tables, &store::dir(&dir))?;
     }
     Ok(config.into_runtime()?)
@@ -452,31 +474,34 @@ struct PackMetor {
 
 /// Runs the target file as a script and reads the deployment it emitted.
 ///
-/// Its stderr is kept, so a traceback shows after the phase line. On
-/// success, anything it wrote there, such as a warning, is shown on `ui`.
+/// What it prints is kept, so a traceback shows after the phase line and
+/// never in `--format json`'s stream. On success, any of it, such as a
+/// warning, is shown on `ui`.
 pub fn eval_target(
     path: &Path,
     dev_packs: &[PathBuf],
     ui: &Ui,
 ) -> Result<DeploymentConfig, RunError> {
     let out = std::env::temp_dir().join(format!("metor-config-{}.json", std::process::id()));
-    let output = Command::new(interpreter())
+    let result = Command::new(interpreter())
         .arg(path)
         .env("PYTHONPATH", python_path(dev_packs)?)
         .env("METOR_CONFIG_OUT", &out)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !output.status.success() {
+        .stdin(Stdio::null())
+        .output()
+        .map_err(RunError::Spawn)?;
+    let mut output = result.stdout;
+    output.extend_from_slice(&result.stderr);
+    if !result.status.success() {
         return Err(RunError::Python {
-            status: output.status,
-            stderr: output.stderr,
+            status: result.status,
+            output,
         });
     }
-    if !output.stderr.is_empty() {
-        ui.emit(Event::Output(&output.stderr));
+    if !output.is_empty() {
+        ui.emit(Event::Output(&output));
     }
-    let bytes = std::fs::read(&out)?;
+    let bytes = std::fs::read(&out).map_err(|_| RunError::NoDeployment)?;
     let _ = std::fs::remove_file(&out);
     Ok(DeploymentConfig::from_slice(&bytes)?)
 }

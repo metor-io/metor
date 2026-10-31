@@ -64,6 +64,9 @@ pub struct Ui {
     pub caps: Caps,
     pub format: Format,
     pub verbose: bool,
+    /// Drop the deployment's own events, which the parent of a multi-target
+    /// run shows once.
+    child: bool,
 }
 
 impl Ui {
@@ -84,6 +87,7 @@ impl Ui {
         let ui = Self {
             format: args.format,
             verbose: args.verbose,
+            child: crate::cli::children::is_child(),
             ..Self::with(reporter, caps)
         };
         if caps.live {
@@ -109,11 +113,16 @@ impl Ui {
             caps,
             format: Format::Human,
             verbose: false,
+            child: false,
         }
     }
 
     /// Renders `event`.
     pub fn emit(&self, event: Event<'_>) {
+        let deployment = matches!(event, Event::Phase(_) | Event::Running(_) | Event::Ended(_));
+        if self.child && deployment {
+            return;
+        }
         let mut reporter = self.reporter.lock().unwrap_or_else(|e| e.into_inner());
         reporter.event(&event);
     }

@@ -114,7 +114,9 @@ in a buffer and replayed on failure or with `-v`. The total for a gauge is
 not known without `--unit-graph`, which is unstable, so the line shows the
 count and the current crate, no gauge.
 
-`pack_dev`'s path list moves to `-v`. `prepare` emits `Built`,
+`pack_dev`'s path list moves to `-v`. The target file's stdout and
+stderr are held until its phase ends, so a slow target file shows only
+its spinner until then. `prepare` emits `Built`,
 `Evaluated`, and `Resolved`; `run` emits `Running` with the namespaces.
 
 `Spinner` redraws at 10 Hz on its own thread inside DEC 2026, only while a
@@ -174,8 +176,12 @@ Tests: `member_argv` carries the colour and format flags.
 On exit, `run` emits `Ended(Summary)`: run time, and per target the
 cycles, max cycle time from `status`, and overruns. `fsw.console` reads
 `status` beside `log` to collect them. Latched systems print below the
-table. Multi-target summaries wait for phase 3 (children over NDJSON);
-here each child prints its own.
+table.
+
+Open: a multi-target run shows only its run time. The children's rows
+need their stats sent to the parent, which phase 3 (children over NDJSON)
+adds. A child drops its deployment events (phases, `Running`, the
+summary) so the parent shows each once.
 
 A cycle's time is the latest end, offset plus execute, among its
 systems' statuses. On a wall clock, a cycle longer than its period is an

@@ -19,6 +19,11 @@ use super::ui::{Format, Ui};
 /// `Running`, to the parent.
 pub const CHILD_ENV: &str = "METOR_CHILD";
 
+/// Returns whether this process is a child of a multi-target run.
+pub fn is_child() -> bool {
+    std::env::var_os(CHILD_ENV).is_some()
+}
+
 /// How often the parent checks whether a child has exited.
 const POLL: Duration = Duration::from_millis(50);
 

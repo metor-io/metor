@@ -173,13 +173,14 @@ impl<W: Write> Human<W> {
             self.theme.style(Token::Accent),
             self.theme.style(Token::Muted),
         );
-        let used = 2 + 2 + VERB_WIDTH + 1 + live.subject.chars().count() + 2;
-        let room = usize::from(self.caps.width).saturating_sub(used + 1);
+        let room = usize::from(self.caps.width).saturating_sub(2 + 2 + VERB_WIDTH + 1 + 1);
+        let subject = truncate(&live.subject, room);
+        let room = room.saturating_sub(subject.chars().count() + 2);
         let detail = truncate(&live.detail, room);
         write!(
             self.buf,
-            "{SYNC_BEGIN}\r{CLEAR_LINE}  {accent}{frame}{accent:#} {:<VERB_WIDTH$} {}",
-            live.verb, live.subject
+            "{SYNC_BEGIN}\r{CLEAR_LINE}  {accent}{frame}{accent:#} {:<VERB_WIDTH$} {subject}",
+            live.verb
         )?;
         if !detail.is_empty() {
             write!(self.buf, "  {muted}{detail}{muted:#}")?;
@@ -332,6 +333,7 @@ impl<W: Write + Send> Reporter for Human<W> {
             Event::Output(bytes) => self.clear_live().and_then(|()| self.buf.write_all(bytes)),
             Event::Tick => self.tick(),
             Event::Ended(summary) => self.ended(summary),
+            Event::Config(config) => writeln!(self.buf, "{config:#}"),
         };
         if written.is_ok() && !self.buf.is_empty() {
             let _ = self

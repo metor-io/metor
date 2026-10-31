@@ -92,6 +92,71 @@ fn test_build_error_cites_the_target_file() {
     );
 }
 
+/// The target file names itself relative to the working directory, so its
+/// line shows from a parent directory too.
+#[test]
+fn test_build_error_cites_the_target_file_from_a_parent_dir() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).expect("makes sub");
+    two_targets(
+        &sub,
+        "from metor_config import Connect, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Connect(\"127.0.0.1:1\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let output = metor()
+        .args(["build", "sub/deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("--> sub/deploy.py:6"), "{stderr}");
+    assert!(stderr.contains("b.add(\"mirror\""), "{stderr}");
+}
+
+#[test]
+fn test_target_without_a_deployment_says_so() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(dir.path().join("target.py"), "x = 1\n").expect("writes");
+    let output = metor()
+        .args(["build", "target.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("error[M0207]"), "{stderr}");
+}
+
+/// With `--format json`, stdout is one versioned object per line, even when
+/// the target file prints.
+#[test]
+fn test_json_stdout_is_one_object_per_line() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(dir.path(), "print(\"hello from stdout\")");
+    for command in [
+        vec!["build", "deploy.py"],
+        vec!["run", "deploy.py", "--cycles", "2"],
+    ] {
+        let output = metor()
+            .args(&command)
+            .args(["--format", "json"])
+            .current_dir(dir.path())
+            .output()
+            .expect("metor runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{command:?}: {stdout}");
+        for line in stdout.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+            assert_eq!(value["v"], 1, "{line}");
+        }
+        assert!(stdout.contains("hello from stdout"), "{stdout}");
+    }
+}
+
 #[test]
 fn test_deployment_runs_every_target_as_a_child() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -102,6 +167,7 @@ fn test_deployment_runs_every_target_as_a_child() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("Resolved").count(), 1, "{stderr}");
     let expected = ["Evaluated", "Resolved", "Running", "Finished after"];
     assert!(
         stderr
