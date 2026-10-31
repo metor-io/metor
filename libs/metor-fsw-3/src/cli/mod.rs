@@ -18,6 +18,7 @@ pub mod run;
 pub mod show;
 pub mod ui;
 pub mod units;
+pub mod watch;
 
 use std::path::PathBuf;
 
@@ -51,6 +52,11 @@ pub enum Command {
     /// Evaluates a target file and runs its targets.
     #[command(after_help = RUN_EXAMPLES)]
     Run(run::Run),
+    /// Runs the target, and runs it again when a source changes.
+    #[command(
+        after_help = "Examples:\n  metor watch                  rerun the nearest target.py on change\n  metor watch --sim-dt 10ms    with run's flags"
+    )]
+    Watch(watch::Watch),
     /// Builds everything `run` would, and stops before the first cycle.
     #[command(
         after_help = "Examples:\n  metor check                  the nearest target.py\n  metor check deploy.py"
@@ -196,6 +202,7 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args, ui)?,
         Command::Check(args) => check::check(args, ui)?,
+        Command::Watch(args) => watch::watch(args, ui)?,
         Command::Show(args) => show::show(args, ui)?,
     }
     Ok(())

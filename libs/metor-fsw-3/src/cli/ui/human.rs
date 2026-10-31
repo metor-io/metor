@@ -333,6 +333,15 @@ impl<W: Write + Send> Reporter for Human<W> {
             Event::Output(bytes) => self.clear_live().and_then(|()| self.buf.write_all(bytes)),
             Event::Tick => self.tick(),
             Event::Ended(summary) => self.ended(summary),
+            Event::Changed(path) => {
+                let accent = self.theme.style(Token::Accent);
+                let again = self.theme.glyphs.again;
+                writeln!(
+                    self.buf,
+                    "\n  {accent}{again}{accent:#} {:<VERB_WIDTH$} {path}\n",
+                    "Changed"
+                )
+            }
             Event::Data(_, value) => writeln!(self.buf, "{value:#}"),
         };
         if written.is_ok() && !self.buf.is_empty() {

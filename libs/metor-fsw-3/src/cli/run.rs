@@ -666,7 +666,7 @@ pub fn interrupted() -> bool {
 }
 
 /// Makes SIGINT flip [`INTERRUPTED`] instead of killing the process.
-fn watch_sigint() {
+pub(super) fn watch_sigint() {
     // SAFETY: the handler only stores to an `AtomicBool`, which is
     // async-signal-safe, and no other code installs a SIGINT handler.
     unsafe { libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t) };

@@ -104,6 +104,7 @@ pub struct Glyphs {
     pub from: &'static str,
     pub link: &'static str,
     pub dot: &'static str,
+    pub again: &'static str,
 }
 
 pub static UNICODE: Glyphs = Glyphs {
@@ -117,6 +118,7 @@ pub static UNICODE: Glyphs = Glyphs {
     from: "←",
     link: "⇄",
     dot: "·",
+    again: "↻",
 };
 
 pub static ASCII: Glyphs = Glyphs {
@@ -130,6 +132,7 @@ pub static ASCII: Glyphs = Glyphs {
     from: "<-",
     link: "<>",
     dot: "-",
+    again: "~",
 };
 
 /// The styles and glyphs for one terminal.
@@ -275,6 +278,7 @@ mod tests {
             glyphs.from,
             glyphs.link,
             glyphs.dot,
+            glyphs.again,
         ];
         assert!(
             all.iter()

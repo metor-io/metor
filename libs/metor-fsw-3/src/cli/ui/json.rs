@@ -40,6 +40,7 @@ fn object(event: &Event<'_>) -> Option<Value> {
                 "overruns": target.overruns,
             })).collect::<Vec<_>>(),
         }),
+        Event::Changed(path) => json!({ "type": "changed", "path": path }),
         Event::Output(bytes) => json!({
             "type": "output",
             "text": String::from_utf8_lossy(bytes),

@@ -24,6 +24,8 @@ pub enum Event<'a> {
     Tick,
     /// The run is over.
     Ended(&'a Summary),
+    /// A watched file changed, so the run starts again.
+    Changed(&'a str),
     /// A command's result as data: `config` for a resolved deployment,
     /// `doctor` for the checks.
     Data(&'a str, &'a serde_json::Value),
