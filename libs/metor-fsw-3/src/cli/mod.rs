@@ -7,17 +7,20 @@ pub mod build;
 pub mod cargo;
 pub mod children;
 pub mod console;
+pub mod diagnostic;
 pub mod module;
 pub mod pack_dev;
 mod port_class;
 pub mod run;
 pub mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
 use crate::pack::ABI_VERSION;
+use diagnostic::{Report, exit_code};
+use run::RunError;
 use ui::event::Event;
 use ui::{OutputArgs, Ui};
 
@@ -54,18 +57,19 @@ pub enum PackCommand {
     },
 }
 
-/// Runs the command line. On failure, reports the error and exits with
-/// status 1.
+/// Runs the command line. On failure, reports the error and exits with its
+/// status.
 pub fn main() {
     let cli = Cli::parse();
     let ui = Ui::new(&cli.output);
+    let base = project_dir(&cli.command);
     if let Err(error) = run(cli.command, &ui) {
-        ui.emit(Event::Diagnostic(&Failure(error)));
-        std::process::exit(1);
+        ui.emit(Event::Diagnostic(&Report::new(&error, &base)));
+        std::process::exit(exit_code(&error));
     }
 }
 
-fn run(command: Command, ui: &Ui) -> Result<(), Box<dyn std::error::Error>> {
+fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
     match command {
         Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
@@ -75,7 +79,16 @@ fn run(command: Command, ui: &Ui) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// An error that has no diagnostic of its own yet.
-#[derive(Debug, thiserror::Error, miette::Diagnostic)]
-#[error(transparent)]
-struct Failure(Box<dyn std::error::Error>);
+/// The directory a command's target file paths are relative to.
+fn project_dir(command: &Command) -> PathBuf {
+    let target = match command {
+        Command::Run(args) => args.target.as_deref(),
+        Command::Build(args) => args.target.as_deref(),
+        Command::Pack(_) | Command::AbiVersion => None,
+    };
+    target
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf()
+}

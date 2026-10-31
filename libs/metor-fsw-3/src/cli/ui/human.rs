@@ -117,10 +117,47 @@ impl<W: Write> Human<W> {
             write!(self.buf, "[{code}]")?;
         }
         writeln!(self.buf, "{error:#}  {diagnostic}")?;
+        self.snippet(diagnostic)?;
         if let Some(help) = diagnostic.help() {
             writeln!(self.buf, "    {muted}help:{muted:#} {help}")?;
         }
         Ok(())
+    }
+
+    /// Writes the first labelled line of `diagnostic`'s source, rustc style.
+    fn snippet(&mut self, diagnostic: &dyn miette::Diagnostic) -> std::io::Result<()> {
+        let (Some(source), Some(label)) = (
+            diagnostic.source_code(),
+            diagnostic.labels().and_then(|mut labels| labels.next()),
+        ) else {
+            return Ok(());
+        };
+        let Ok(contents) = source.read_span(label.inner(), 0, 0) else {
+            return Ok(());
+        };
+        let line = contents.line() + 1;
+        let text = String::from_utf8_lossy(contents.data());
+        let gutter = line.to_string().len();
+        let (faint, accent) = (
+            self.theme.style(Token::Faint),
+            self.theme.style(Token::Error),
+        );
+        let muted = self.theme.style(Token::Muted);
+        let name = contents.name().unwrap_or("");
+        writeln!(self.buf, "    {muted}-->{muted:#} {name}:{line}")?;
+        writeln!(self.buf, "    {faint}{:gutter$} │{faint:#}", "")?;
+        writeln!(self.buf, "    {faint}{line} │{faint:#} {text}")?;
+        let marks = "^".repeat(text.chars().count().max(1));
+        write!(
+            self.buf,
+            "    {faint}{:gutter$} │{faint:#} {accent}{marks}",
+            ""
+        )?;
+        if let Some(label) = label.label() {
+            write!(self.buf, " {label}")?;
+        }
+        writeln!(self.buf, "{accent:#}")?;
+        writeln!(self.buf)
     }
 
     fn log(&mut self, line: &LogLine<'_>) -> std::io::Result<()> {

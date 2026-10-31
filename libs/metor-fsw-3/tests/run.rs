@@ -44,9 +44,8 @@ fn test_missing_target_returns_error() {
         .expect("metor runs");
     assert_eq!(output.status.code(), Some(1));
     let message = String::from_utf8_lossy(&output.stderr);
-    // Python's traceback goes to stderr first, then the host's error line.
     assert!(
-        message.contains("error  the target file exited"),
+        message.contains("no target file at no-such-target.py"),
         "{message}"
     );
 }
@@ -87,7 +86,8 @@ fn test_build_error_cites_the_target_file() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("error  deploy.py:6: `b.mirror` names link `a.out`, which does not listen on a fixed port"),
+        stderr.contains("`b.mirror` names link `a.out`, which does not listen on a fixed port")
+            && stderr.contains("--> deploy.py:6"),
         "{stderr}"
     );
 }
@@ -124,7 +124,7 @@ fn test_every_child_names_its_target() {
         .output()
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
     let failed = stderr
         .lines()
         .find_map(|line| line.split_once("these targets did not exit cleanly: "))
@@ -152,7 +152,7 @@ fn test_latched_child_fails_the_deployment() {
         .output()
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
     assert!(stderr.contains("did not exit cleanly: b"), "{stderr}");
     assert!(
         stderr.contains("these systems latched off: b.boom"),
@@ -221,7 +221,7 @@ fn test_sigint_ends_every_child() {
     let status = wait_bounded(&mut parent).expect("the deployment ends on SIGINT");
     let output = parent.wait_with_output().expect("its output is ours");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert_eq!(status.code(), Some(130), "{stderr}");
     assert!(
         !stderr.contains("did not exit cleanly"),
         "an interrupted child is not a failed one: {stderr}"

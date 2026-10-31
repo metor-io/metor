@@ -25,8 +25,8 @@ pub enum ConfigError {
     Decode(#[from] serde_json::Error),
     #[error("the deployment has several targets; pick one with --target: {0}")]
     SelectTarget(String),
-    #[error("no target is named `{0}`")]
-    NoSuchTarget(String),
+    #[error("no target is named `{name}`")]
+    NoSuchTarget { name: String, known: Vec<String> },
 }
 
 /// A port on a link of another target in the same deployment.
@@ -182,7 +182,10 @@ impl<S, R> DeploymentConfig<S, R> {
                 .targets
                 .iter()
                 .position(|target| target.namespace() == name)
-                .ok_or_else(|| ConfigError::NoSuchTarget(name.to_string())),
+                .ok_or_else(|| ConfigError::NoSuchTarget {
+                    name: name.to_string(),
+                    known: self.namespaces().into_iter().map(String::from).collect(),
+                }),
             None if self.targets.len() == 1 => Ok(0),
             None => Err(ConfigError::SelectTarget(self.namespaces().join(", "))),
         }
@@ -299,7 +302,7 @@ mod tests {
         let config = envelope(vec![member("a"), member("b")]);
         assert_eq!(config.target(Some("b")).expect("named"), 1);
         assert!(
-            matches!(config.target(Some("c")), Err(ConfigError::NoSuchTarget(name)) if name == "c")
+            matches!(config.target(Some("c")), Err(ConfigError::NoSuchTarget { name, .. }) if name == "c")
         );
         let Err(ConfigError::SelectTarget(names)) = config.target(None) else {
             panic!("two targets need a name")

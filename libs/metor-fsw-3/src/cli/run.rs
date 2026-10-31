@@ -72,6 +72,8 @@ pub struct Run {
 /// An error running a target.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
+    #[error("no target file at {}", .0.display())]
+    NoTargetFile(PathBuf),
     #[error("running the target file: {0}")]
     Spawn(#[from] std::io::Error),
     #[error("the target file exited with {0}")]
@@ -266,6 +268,9 @@ fn console_level(filter: LevelFilter) -> LogLevel {
 /// every target's packs are opened to resolve them.
 pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
     let target = target.unwrap_or(Path::new("target.py"));
+    if !target.is_file() {
+        return Err(RunError::NoTargetFile(target.to_path_buf()));
+    }
     let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
     for pack in &packs {
         pack_dev(pack)?;
