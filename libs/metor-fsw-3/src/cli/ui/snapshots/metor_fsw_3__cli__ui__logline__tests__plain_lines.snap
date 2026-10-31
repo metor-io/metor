@@ -1,0 +1,9 @@
+---
+source: libs/metor-fsw-3/src/cli/ui/logline.rs
+expression: "render(Caps::plain())"
+---
+  +00:01.500     plant.pub       listening on [::]:2240
+  +00:01.500  !  fsw.ctrl        saturated  axis=z  note="two words"  empty=""
+  +00:01.500  x  fsw.commission  latched off
+  +00:01.500  -  nav             converged
+                 metor           outside the run

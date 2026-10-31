@@ -1,7 +1,8 @@
 //! Runs each target of a deployment as a child process.
 //!
-//! Each child runs `metor run <config> --target NS`. Its output is copied to
-//! this process's stderr, with every line prefixed by the target's namespace.
+//! Each child runs `metor run <config> --target NS` with the parent's output
+//! settings. Its stdout and stderr are copied line by line to the parent's,
+//! and its log lines already name their target.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,6 +12,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::run::Run;
+use super::ui::caps::{Background, Depth};
+use super::ui::{Format, Ui};
+
+/// Set in a child's environment so it leaves the deployment's lines, such as
+/// `Running`, to the parent.
+pub const CHILD_ENV: &str = "METOR_CHILD";
 
 /// How often the parent checks whether a child has exited.
 const POLL: Duration = Duration::from_millis(50);
@@ -55,23 +62,59 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
     .collect()
 }
 
+/// The flags and environment that give a child the parent's output.
+///
+/// The child writes to a pipe, so the parent's colour, glyphs, and
+/// background are passed down rather than detected.
+pub fn output_argv(ui: &Ui) -> (Vec<OsString>, Vec<(&'static str, OsString)>) {
+    let color = if ui.caps.depth == Depth::None {
+        "never"
+    } else {
+        "always"
+    };
+    let format = match ui.format {
+        Format::Human => "human",
+        Format::Json => "json",
+    };
+    let mut args: Vec<OsString> = ["--color", color, "--format", format]
+        .map(OsString::from)
+        .into();
+    if !ui.caps.unicode {
+        args.push("--ascii".into());
+    }
+    let colorfgbg = match ui.caps.background {
+        Background::Dark => "15;0",
+        Background::Light => "0;15",
+    };
+    let env = vec![(CHILD_ENV, "1".into()), ("COLORFGBG", colorfgbg.into())];
+    (args, env)
+}
+
 /// Starts the target `namespace` from `envelope` as a child process.
 ///
-/// The child's stdout and stderr are both copied to this process's stderr,
-/// with each line prefixed by `NS │ `.
-pub fn spawn(envelope: &Path, namespace: &str, overrides: &Run) -> std::io::Result<TargetProcess> {
+/// The child's stdout and stderr are copied to this process's, a line at a
+/// time.
+pub fn spawn(
+    envelope: &Path,
+    namespace: &str,
+    overrides: &Run,
+    ui: &Ui,
+) -> std::io::Result<TargetProcess> {
+    let (output, env) = output_argv(ui);
     let mut process = Command::new(std::env::current_exe()?)
         .args(member_argv(envelope, namespace, overrides))
+        .args(output)
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let mut drains = Vec::with_capacity(2);
     if let Some(stdout) = process.stdout.take() {
-        drains.push(drain(stdout, namespace.to_string()));
+        drains.push(std::thread::spawn(move || relay(stdout, std::io::stdout())));
     }
     if let Some(stderr) = process.stderr.take() {
-        drains.push(drain(stderr, namespace.to_string()));
+        drains.push(std::thread::spawn(move || relay(stderr, std::io::stderr())));
     }
     Ok(TargetProcess {
         namespace: namespace.to_string(),
@@ -88,10 +131,11 @@ pub fn spawn_all(
     envelope: &Path,
     namespaces: &[&str],
     overrides: &Run,
+    ui: &Ui,
 ) -> std::io::Result<Vec<TargetProcess>> {
     namespaces
         .iter()
-        .map(|namespace| spawn(envelope, namespace, overrides))
+        .map(|namespace| spawn(envelope, namespace, overrides, ui))
         .collect()
 }
 
@@ -115,18 +159,20 @@ impl Drop for TargetProcess {
     }
 }
 
-fn drain(reader: impl Read + Send + 'static, namespace: String) -> JoinHandle<()> {
-    std::thread::spawn(move || prefix(reader, &namespace, std::io::stderr()))
-}
-
-/// Copies `reader` to `sink` line by line, prefixing each line with
-/// `namespace`.
+/// Copies `reader` to `sink` line by line.
 ///
 /// Each line is written in one call, so a sink that locks, like stderr, only
-/// holds the lock while writing and never while waiting on the reader.
-pub fn prefix(reader: impl Read, namespace: &str, mut sink: impl Write) {
-    for line in BufReader::new(reader).lines().map_while(Result::ok) {
-        let _ = writeln!(sink, "{namespace} │ {line}");
+/// holds the lock while writing and never while waiting on the reader, and
+/// lines from several children never interleave.
+pub fn relay(reader: impl Read, mut sink: impl Write) {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    while reader
+        .read_until(b'\n', &mut line)
+        .is_ok_and(|read| read > 0)
+    {
+        let _ = sink.write_all(&line).and_then(|()| sink.flush());
+        line.clear();
     }
 }
 
@@ -275,11 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_frees_the_sink_while_blocked() {
+    fn test_relay_frees_the_sink_while_blocked() {
         let (lines, reader): (Sender<Vec<u8>>, _) = channel();
         let sink = Locking(Arc::new(Mutex::new(Vec::new())));
         let (out, copy) = (sink.0.clone(), sink.clone());
-        let drain = std::thread::spawn(move || prefix(Channel(reader, Vec::new()), "gw", copy));
+        let drain = std::thread::spawn(move || relay(Channel(reader, Vec::new()), copy));
 
         lines.send(b"one\n".to_vec()).expect("the drain reads");
         let mut held = out.lock().expect("no writer panics");
@@ -288,7 +334,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
             held = out.lock().expect("no writer panics");
         }
-        assert_eq!(&*held, b"gw \xe2\x94\x82 one\n");
+        assert_eq!(&*held, b"one\n");
         drop(held);
 
         drop(lines);
@@ -313,12 +359,30 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_each_line() {
+    fn test_relay_keeps_lines_and_styles() {
         let mut out = Vec::new();
-        prefix("one\ntwo\n".as_bytes(), "gw", &mut out);
-        assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
-            "gw │ one\ngw │ two\n"
+        relay("one\n\x1b[1mtwo\x1b[0m\nend".as_bytes(), &mut out);
+        assert_eq!(out, b"one\n\x1b[1mtwo\x1b[0m\nend");
+    }
+
+    #[test]
+    fn test_output_argv_passes_the_parents_terminal() {
+        use crate::cli::ui::caps::Caps;
+        let caps = Caps {
+            depth: Depth::TrueColor,
+            background: Background::Light,
+            ..Caps::plain()
+        };
+        let ui = Ui::with(
+            Box::new(super::super::ui::human::Human::new(Vec::new(), caps)),
+            caps,
         );
+        let (args, env) = output_argv(&ui);
+        assert_eq!(
+            args,
+            ["--color", "always", "--format", "human", "--ascii"].map(OsString::from)
+        );
+        assert!(env.contains(&("COLORFGBG", "0;15".into())));
+        assert!(env.contains(&(CHILD_ENV, "1".into())));
     }
 }

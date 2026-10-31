@@ -249,6 +249,12 @@ impl Drop for RestorePort {
     }
 }
 
+/// Returns whether a log port is current on this thread, which is true
+/// while a system runs.
+pub fn has_port() -> bool {
+    CURRENT_PORT.get().is_some()
+}
+
 fn with_port(f: impl FnOnce(&mut LogPort)) {
     let Some(mut port) = CURRENT_PORT.take() else {
         return;
@@ -286,7 +292,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
     }
 }
 
-fn level_of(level: &tracing::Level) -> LogLevel {
+pub(crate) fn level_of(level: &tracing::Level) -> LogLevel {
     match *level {
         tracing::Level::TRACE => LogLevel::Trace,
         tracing::Level::DEBUG => LogLevel::Debug,

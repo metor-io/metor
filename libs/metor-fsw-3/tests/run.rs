@@ -46,7 +46,7 @@ fn test_missing_target_returns_error() {
     let message = String::from_utf8_lossy(&output.stderr);
     // Python's traceback goes to stderr first, then the host's error line.
     assert!(
-        message.contains("metor: the target file exited"),
+        message.contains("error  the target file exited"),
         "{message}"
     );
 }
@@ -87,7 +87,7 @@ fn test_build_error_cites_the_target_file() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("metor: deploy.py:6: `b.mirror` names link `a.out`, which does not listen on a fixed port"),
+        stderr.contains("error  deploy.py:6: `b.mirror` names link `a.out`, which does not listen on a fixed port"),
         "{stderr}"
     );
 }
@@ -102,14 +102,16 @@ fn test_deployment_runs_every_target_as_a_child() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(stderr.is_empty(), "a clean target prints nothing: {stderr}");
+    assert!(
+        stderr.lines().all(|line| line.contains("Running")),
+        "a clean deployment prints only what it runs: {stderr}"
+    );
 }
 
-/// A system's log lines go to its log port, not stderr. The only thing a
-/// child prints is its final CLI error, which the parent prefixes with the
-/// child's name.
+/// A child's lines name its target, since the parent relays them as they
+/// are.
 #[test]
-fn test_every_child_is_prefixed() {
+fn test_every_child_names_its_target() {
     let fixture = fixture_dir();
     let dir = tempfile::tempdir().expect("a temp dir");
     let target = two_targets(
@@ -125,12 +127,13 @@ fn test_every_child_is_prefixed() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     let failed = stderr
         .lines()
-        .find_map(|line| line.strip_prefix("metor: these targets did not exit cleanly: "))
+        .find_map(|line| line.split_once("these targets did not exit cleanly: "))
+        .map(|(_, failed)| failed)
         .unwrap_or_default();
     assert!(failed.contains('a') && failed.contains('b'), "{stderr}");
     assert!(
-        stderr.contains("a │ metor: these systems latched off: boom")
-            || stderr.contains("b │ metor: these systems latched off: boom"),
+        stderr.contains("these systems latched off: a.boom")
+            || stderr.contains("these systems latched off: b.boom"),
         "{stderr}"
     );
 }
@@ -152,7 +155,7 @@ fn test_latched_child_fails_the_deployment() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("did not exit cleanly: b"), "{stderr}");
     assert!(
-        stderr.contains("b │ metor: these systems latched off: boom"),
+        stderr.contains("these systems latched off: b.boom"),
         "{stderr}"
     );
 }
@@ -256,7 +259,7 @@ fn test_wasm_pack_loads_and_runs() {
         }],
         coordinator: chain(),
     };
-    let mut coordinator = load(&config, &Run::default()).expect("loads");
+    let (mut coordinator, _) = load(&config, &Run::default(), None).expect("loads");
     for cycle in 1..=3 {
         coordinator.step(Timestamp(cycle));
     }

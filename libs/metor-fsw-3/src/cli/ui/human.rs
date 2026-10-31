@@ -6,11 +6,16 @@ use std::io::Write;
 
 use super::Reporter;
 use super::caps::Caps;
-use super::event::{Event, Phase, PhaseState};
+use super::event::{Event, LogLine, Phase, PhaseState};
+use super::logline;
 use super::theme::{Theme, Token};
 
 /// The column phase subjects start at, after the margin, glyph, and verb.
 const VERB_WIDTH: usize = 11;
+
+/// The widest a source column is set up front. A longer source still
+/// widens it.
+const MAX_SOURCE_WIDTH: usize = 28;
 
 /// Writes events as styled lines to `out`.
 pub struct Human<W> {
@@ -20,6 +25,8 @@ pub struct Human<W> {
     /// Whether the last line written is a live phase line that the next
     /// phase line replaces.
     live_line: bool,
+    /// The widest log source so far. Sources pad to it.
+    source_width: usize,
 }
 
 impl<W: Write> Human<W> {
@@ -29,6 +36,7 @@ impl<W: Write> Human<W> {
             theme: Theme::new(&caps),
             caps,
             live_line: false,
+            source_width: 0,
         }
     }
 
@@ -110,6 +118,12 @@ impl<W: Write> Human<W> {
         Ok(())
     }
 
+    fn log(&mut self, line: &LogLine<'_>) -> std::io::Result<()> {
+        self.clear_live()?;
+        self.source_width = self.source_width.max(logline::source_len(&line.source));
+        logline::write(&mut self.out, line, &self.theme, self.source_width)
+    }
+
     /// Ends a live phase line so the next write starts on a clean line.
     fn clear_live(&mut self) -> std::io::Result<()> {
         if std::mem::take(&mut self.live_line) {
@@ -125,6 +139,11 @@ impl<W: Write + Send> Reporter for Human<W> {
             Event::Phase(phase) => self.phase(phase),
             Event::Running(namespaces) => self.running(namespaces),
             Event::Diagnostic(diagnostic) => self.diagnostic(*diagnostic),
+            Event::Log(line) => self.log(line),
+            Event::SourceWidth(width) => {
+                self.source_width = (*width).min(MAX_SOURCE_WIDTH);
+                Ok(())
+            }
         };
         let _ = written.and_then(|()| self.out.flush());
     }

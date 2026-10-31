@@ -5,6 +5,7 @@ pub mod caps;
 pub mod event;
 pub mod human;
 pub mod json;
+pub mod logline;
 pub mod theme;
 
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,7 @@ pub struct OutputArgs {
 pub struct Ui {
     reporter: Arc<Mutex<Box<dyn Reporter>>>,
     pub caps: Caps,
+    pub format: Format,
 }
 
 impl Ui {
@@ -60,13 +62,17 @@ impl Ui {
             Format::Human => Box::new(Human::new(std::io::stderr(), caps)),
             Format::Json => Box::new(Json::new(std::io::stdout())),
         };
-        Self::with(reporter, caps)
+        Self {
+            format: args.format,
+            ..Self::with(reporter, caps)
+        }
     }
 
     pub fn with(reporter: Box<dyn Reporter>, caps: Caps) -> Self {
         Self {
             reporter: Arc::new(Mutex::new(reporter)),
             caps,
+            format: Format::Human,
         }
     }
 

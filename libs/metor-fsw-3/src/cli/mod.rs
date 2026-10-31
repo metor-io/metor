@@ -6,6 +6,7 @@
 pub mod build;
 pub mod cargo;
 pub mod children;
+pub mod console;
 pub mod module;
 pub mod pack_dev;
 mod port_class;
@@ -17,12 +18,16 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::pack::ABI_VERSION;
+use ui::event::Event;
+use ui::{OutputArgs, Ui};
 
 #[derive(Parser)]
 #[command(name = "metor", about = "Build and run metor flight software")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 #[derive(Subcommand)]
@@ -49,21 +54,28 @@ pub enum PackCommand {
     },
 }
 
-/// Runs the command line. On failure, prints the error to stderr and exits
-/// with status 1.
+/// Runs the command line. On failure, reports the error and exits with
+/// status 1.
 pub fn main() {
-    if let Err(message) = run(Cli::parse()) {
-        eprintln!("metor: {message}");
+    let cli = Cli::parse();
+    let ui = Ui::new(&cli.output);
+    if let Err(error) = run(cli.command, &ui) {
+        ui.emit(Event::Diagnostic(&Failure(error)));
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match cli.command {
+fn run(command: Command, ui: &Ui) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
-        Command::Run(args) => run::run(args)?,
+        Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args)?,
     }
     Ok(())
 }
+
+/// An error that has no diagnostic of its own yet.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error(transparent)]
+struct Failure(Box<dyn std::error::Error>);

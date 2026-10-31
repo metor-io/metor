@@ -13,13 +13,20 @@ use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use metor_proto_wkt::LogLevel;
 use serde::Deserialize;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 
+use std::sync::mpsc::SyncSender;
+
 use super::cargo::read_toml;
+use super::console::{self, ConsoleLayer, Origin};
 use super::pack_dev::{PackDevError, pack_dev};
+use super::ui::Ui;
+use super::ui::event::Event;
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
 };
@@ -106,14 +113,37 @@ fn wall_rate(arg: &str) -> Result<WallRate, String> {
 ///
 /// Rebuilds every dev pack, evaluates the target file, and cycles the target
 /// until it is stopped.
-pub fn run(args: Run) -> Result<(), RunError> {
-    install_logging();
+pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
+    let log_target = Arc::new(OnceLock::new());
+    install_logging(ConsoleLayer {
+        ui: ui.clone(),
+        target: log_target.clone(),
+    });
     let config = prepare(args.target.as_deref())?;
-    if config.targets.len() > 1 && args.member.is_none() {
-        return run_children(&config, &args);
+    let namespaces = config.namespaces();
+    if namespaces.len() > 1 && args.member.is_none() {
+        ui.emit(Event::Running(&namespaces));
+        return run_children(&config, &args, ui);
     }
     let member = config.target(args.member.as_deref())?;
-    let coordinator = load(&config.targets[member], &args)?;
+    let (tx, rx) = console::channel();
+    let (coordinator, systems) = load(&config.targets[member], &args, Some(tx))?;
+    ui.emit(Event::SourceWidth(source_width(&config)));
+    if std::env::var_os(super::children::CHILD_ENV).is_none() {
+        ui.emit(Event::Running(&namespaces[member..=member]));
+    }
+    let origin = Origin {
+        target: (namespaces.len() > 1).then(|| (namespaces[member].to_string(), member)),
+        systems,
+    };
+    if let Some(target) = &origin.target {
+        let _ = log_target.set(target.clone());
+    }
+    let origin_target = origin
+        .target
+        .as_ref()
+        .map(|(namespace, _)| namespace.clone());
+    let printer = console::spawn_printer(rx, origin, ui.clone());
 
     watch_sigint();
     let cycles = args.cycles;
@@ -123,29 +153,55 @@ pub fn run(args: Run) -> Result<(), RunError> {
         coordinator
     });
 
-    let latched: Vec<&str> = coordinator
+    let path = |id: &str| match &origin_target {
+        Some(namespace) => format!("{namespace}.{id}"),
+        None => id.to_string(),
+    };
+    let latched: Vec<String> = coordinator
         .systems()
         .filter(|(_, end)| *end == Some(&EndReason::Panicked))
-        .map(|(id, _)| id)
+        .map(|(id, _)| path(id))
         .collect();
+    drop(coordinator);
+    let _ = printer.join();
     if latched.is_empty() {
         return Ok(());
     }
     Err(RunError::Latched(latched.join(", ")))
 }
 
+/// The widest `target.system` in `config`, or `system` in a deployment of
+/// one.
+fn source_width(config: &ResolvedDeployment) -> usize {
+    let several = config.targets.len() > 1;
+    config
+        .targets
+        .iter()
+        .zip(config.namespaces())
+        .flat_map(|(target, namespace)| {
+            let prefix = if several { namespace.len() + 1 } else { 0 };
+            target
+                .coordinator
+                .systems
+                .iter()
+                .map(move |system| prefix + system.id.len())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Runs every target in `config` as a child process.
 ///
 /// The resolved config is written to a temp file for the children to read.
 /// Returns once every child has exited.
-fn run_children(config: &ResolvedDeployment, args: &Run) -> Result<(), RunError> {
+fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
     std::fs::write(
         &path,
         serde_json::to_vec(config).map_err(ConfigError::Decode)?,
     )?;
     watch_sigint();
-    let waited = super::children::spawn_all(&path, &config.namespaces(), args)
+    let waited = super::children::spawn_all(&path, &config.namespaces(), args, ui)
         .map(super::children::wait_all);
     let _ = std::fs::remove_file(&path);
     waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
@@ -155,20 +211,33 @@ fn run_children(config: &ResolvedDeployment, args: &Run) -> Result<(), RunError>
     Ok(())
 }
 
-/// Sets up tracing to print to stderr and to forward lines to `log` ports.
+/// Sets up tracing to print through `console` and to forward lines to `log`
+/// ports.
 ///
 /// The level comes from `$RUST_LOG`, and defaults to `INFO`.
-fn install_logging() {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|level| level.parse().ok())
-        .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
+fn install_logging(console: ConsoleLayer) {
+    let level = log_level();
     let subscriber = tracing_subscriber::registry()
         .with(level)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(console)
         .with(crate::log::LogLayer);
     // If the host already installed a subscriber, keep it.
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// The level from `$RUST_LOG`, or `INFO`.
+fn log_level() -> LevelFilter {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|level| level.parse().ok())
+        .unwrap_or(LevelFilter::INFO)
+}
+
+/// The lowest level the console prints for `filter`. `OFF` prints errors.
+fn console_level(filter: LevelFilter) -> LogLevel {
+    filter
+        .into_level()
+        .map_or(LogLevel::Error, |level| crate::log::level_of(&level))
 }
 
 /// Loads a target file and returns its resolved deployment.
@@ -320,14 +389,24 @@ fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
 /// Builds a target's coordinator.
 ///
 /// Applies the clock overrides from the command line, then opens the target's
-/// packs.
-pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
-    let config = apply_overrides(config, overrides)?;
-    let table = table_for(&config)?;
+/// packs. With `console`, appends the console sending to it. Returns the ids
+/// of the systems the console reads.
+pub fn load(
+    config: &TargetConfig,
+    overrides: &Run,
+    console: Option<SyncSender<console::Message>>,
+) -> Result<(Coordinator, Vec<String>), RunError> {
+    let min = console_level(log_level());
+    let mut config = apply_overrides(config, overrides)?;
+    let mut table = table_for(&config)?;
+    let systems = match console {
+        Some(tx) => console::attach(&mut config, &mut table, tx, min)?,
+        None => Vec::new(),
+    };
     let options = BuildOptions {
         deterministic: overrides.deterministic,
     };
-    Ok(config.coordinator.build_with(&table, options)?)
+    Ok((config.coordinator.build_with(&table, options)?, systems))
 }
 
 /// `config` with the clock overrides from the command line applied.
@@ -466,13 +545,16 @@ mod tests {
             epoch: Some(0),
             ..Default::default()
         };
-        assert!(matches!(load(&config, &epoch), Err(RunError::EpochWall)));
+        assert!(matches!(
+            load(&config, &epoch, None),
+            Err(RunError::EpochWall)
+        ));
         let deterministic = Run {
             deterministic: true,
             ..Default::default()
         };
         assert!(matches!(
-            load(&config, &deterministic),
+            load(&config, &deterministic, None),
             Err(RunError::Build(BuildError::DeterministicWall))
         ));
         let simulated = Run {
@@ -481,7 +563,7 @@ mod tests {
             epoch: Some(0),
             ..Default::default()
         };
-        assert!(load(&config, &simulated).is_ok());
+        assert!(load(&config, &simulated, None).is_ok());
     }
 
     #[test]

@@ -24,9 +24,11 @@ impl<W: Write> Json<W> {
     }
 }
 
-/// The JSON object for `event`, without the version.
-fn object(event: &Event<'_>) -> Value {
-    match event {
+/// The JSON object for `event`, without the version, or `None` for an
+/// event that only shapes text.
+fn object(event: &Event<'_>) -> Option<Value> {
+    Some(match event {
+        Event::SourceWidth(_) => return None,
         Event::Phase(phase) => {
             let (state, extra) = match phase.state {
                 PhaseState::Started => ("started", json!({})),
@@ -46,6 +48,15 @@ fn object(event: &Event<'_>) -> Value {
             value
         }
         Event::Running(namespaces) => json!({ "type": "running", "targets": namespaces }),
+        Event::Log(line) => json!({
+            "type": "log",
+            "secs": line.elapsed.map(|elapsed| elapsed.as_secs_f64()),
+            "level": format!("{:?}", line.level).to_lowercase(),
+            "target": line.source.target.map(|(name, _)| name),
+            "system": line.source.system,
+            "message": line.message,
+            "fields": line.fields.iter().map(|(k, v)| (k.to_string(), Value::from(v.as_ref()))).collect::<serde_json::Map<_, _>>(),
+        }),
         Event::Diagnostic(diagnostic) => json!({
             "type": "diagnostic",
             "severity": "error",
@@ -53,7 +64,7 @@ fn object(event: &Event<'_>) -> Value {
             "message": diagnostic.to_string(),
             "help": diagnostic.help().map(|help| help.to_string()),
         }),
-    }
+    })
 }
 
 fn merge(into: &mut Value, from: Value) {
@@ -64,8 +75,11 @@ fn merge(into: &mut Value, from: Value) {
 
 impl<W: Write + Send> Reporter for Json<W> {
     fn event(&mut self, event: &Event<'_>) {
+        let Some(object) = object(event) else {
+            return;
+        };
         let mut value = json!({ "v": VERSION });
-        merge(&mut value, object(event));
+        merge(&mut value, object);
         let _ = writeln!(self.out, "{value}").and_then(|()| self.out.flush());
     }
 }

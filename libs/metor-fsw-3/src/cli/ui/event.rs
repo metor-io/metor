@@ -1,6 +1,9 @@
 //! What commands report. Renderers decide how it looks.
 
 use core::time::Duration;
+use std::borrow::Cow;
+
+use metor_proto_wkt::LogLevel;
 
 /// One thing a command reports.
 #[derive(Clone, Copy, Debug)]
@@ -10,6 +13,10 @@ pub enum Event<'a> {
     /// picks its hue.
     Running(&'a [&'a str]),
     Diagnostic(&'a dyn miette::Diagnostic),
+    Log(&'a LogLine<'a>),
+    /// The widest log source the run can produce, so every line, from every
+    /// target, aligns.
+    SourceWidth(usize),
 }
 
 /// A step before the first cycle.
@@ -57,4 +64,25 @@ pub enum PhaseState<'a> {
     },
     Done(Duration),
     Failed,
+}
+
+/// Where a log line comes from: `target.system`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Source<'a> {
+    /// The target's namespace and hue index, or `None` in a deployment of
+    /// one target.
+    pub target: Option<(&'a str, usize)>,
+    pub system: &'a str,
+}
+
+/// One log line.
+#[derive(Clone, Copy, Debug)]
+pub struct LogLine<'a> {
+    /// Time since the first cycle, or `None` for a line from outside the
+    /// run.
+    pub elapsed: Option<Duration>,
+    pub level: LogLevel,
+    pub source: Source<'a>,
+    pub message: &'a str,
+    pub fields: &'a [(Cow<'static, str>, Cow<'static, str>)],
 }
