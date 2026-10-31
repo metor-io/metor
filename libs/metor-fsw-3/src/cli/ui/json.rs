@@ -84,7 +84,12 @@ fn object(event: &Event<'_>) -> Option<Value> {
                 "line": line,
             })
         }
-        Event::Config(config) => json!({ "type": "config", "config": config }),
+        Event::Data(kind, value) => {
+            let mut object = serde_json::Map::new();
+            object.insert("type".into(), json!(kind));
+            object.insert((*kind).into(), (*value).clone());
+            Value::Object(object)
+        }
     })
 }
 

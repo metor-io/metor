@@ -102,6 +102,21 @@ impl Ui {
         ui
     }
 
+    /// What stdout can show: the terminal's caps on a terminal, otherwise no
+    /// colour and no redraws, with the same glyphs.
+    pub fn stdout_caps(&self) -> Caps {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            return self.caps;
+        }
+        Caps {
+            live: false,
+            depth: caps::Depth::None,
+            links: false,
+            ..self.caps
+        }
+    }
+
     /// A handle that drops every event.
     pub fn silent() -> Self {
         Self::with(Box::new(Silent), Caps::plain())

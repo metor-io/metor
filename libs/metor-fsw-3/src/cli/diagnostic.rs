@@ -162,6 +162,7 @@ fn run_info(error: &RunError) -> Info {
             Some("run from the directory with target.py, or pass the target file".into()),
         ),
         RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, "names"))),
+        RunError::Doctor(_) => ("M0105", Some("each fix is listed under its check".into())),
         RunError::NoProject(_) => (
             "M0209",
             Some("pass the target file, or run from a project directory".into()),
@@ -290,6 +291,10 @@ fn pack_dev_info(error: &PackDevError) -> Info {
         PackDevError::Template(_) => ("M0406", None),
         PackDevError::AlreadyLoaded(_) => ("M0407", None),
         PackDevError::DescriptorMismatch => ("M0408", None),
+        PackDevError::NoWasmTarget => (
+            "M0413",
+            Some(format!("rustup target add {}", crate::dl::WASM_TRIPLE)),
+        ),
     }
 }
 

@@ -33,7 +33,7 @@ pub fn build(args: Build, ui: &Ui) -> Result<(), RunError> {
         (Some(path), _) => {
             std::fs::write(&path, text()? + "\n").map_err(|source| RunError::Io { path, source })?
         }
-        (None, Format::Json) => ui.emit(Event::Config(&value)),
+        (None, Format::Json) => ui.emit(Event::Data("config", &value)),
         (None, Format::Human) => println!("{}", text()?),
     }
     Ok(())

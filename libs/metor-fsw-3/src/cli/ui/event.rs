@@ -24,8 +24,9 @@ pub enum Event<'a> {
     Tick,
     /// The run is over.
     Ended(&'a Summary),
-    /// A resolved deployment, as `metor build` writes it.
-    Config(&'a serde_json::Value),
+    /// A command's result as data: `config` for a resolved deployment,
+    /// `doctor` for the checks.
+    Data(&'a str, &'a serde_json::Value),
 }
 
 /// A step before the first cycle.

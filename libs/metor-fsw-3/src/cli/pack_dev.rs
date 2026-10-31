@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::cargo::{CargoError, PackConfig, Watch, cargo_build, wasm_build};
+use super::doctor::Status;
 use super::module::render;
 use super::ui::Ui;
 use super::ui::caps::Depth;
@@ -58,6 +59,8 @@ pub enum PackDevError {
     AlreadyLoaded(PathBuf),
     #[error("the module describes other systems than the library")]
     DescriptorMismatch,
+    #[error("the pack builds as wasm, and the wasm32 target is not installed")]
+    NoWasmTarget,
 }
 
 impl PackDevError {
@@ -178,6 +181,9 @@ fn stage_module(
     library: &PackDef,
     watch: &mut Watch<'_>,
 ) -> Result<PathBuf, PackDevError> {
+    if super::doctor::wasm32().status != Status::Ok {
+        return Err(PackDevError::NoWasmTarget);
+    }
     let built = wasm_build(&config.krate, root, watch)?;
     let staged = reference.artifact();
     if let Some(dir) = staged.parent() {

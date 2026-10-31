@@ -9,6 +9,7 @@ pub mod check;
 pub mod children;
 pub mod console;
 pub mod diagnostic;
+pub mod doctor;
 pub mod module;
 pub mod pack_dev;
 mod port_class;
@@ -43,6 +44,8 @@ pub enum Command {
     Pack(PackCommand),
     /// Prints the pack ABI version this binary supports.
     AbiVersion,
+    /// Checks the tools a project needs.
+    Doctor,
     /// Evaluates a target file and runs its targets.
     Run(run::Run),
     /// Builds everything `run` would, and stops before the first cycle.
@@ -82,6 +85,7 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
     match command {
         Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root, ui)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
+        Command::Doctor => doctor::doctor(ui)?,
         Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args, ui)?,
         Command::Check(args) => check::check(args, ui)?,

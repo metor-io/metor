@@ -333,7 +333,7 @@ impl<W: Write + Send> Reporter for Human<W> {
             Event::Output(bytes) => self.clear_live().and_then(|()| self.buf.write_all(bytes)),
             Event::Tick => self.tick(),
             Event::Ended(summary) => self.ended(summary),
-            Event::Config(config) => writeln!(self.buf, "{config:#}"),
+            Event::Data(_, value) => writeln!(self.buf, "{value:#}"),
         };
         if written.is_ok() && !self.buf.is_empty() {
             let _ = self

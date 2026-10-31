@@ -88,6 +88,8 @@ pub enum RunError {
     NoTargetFile(PathBuf),
     #[error("no target.py in {} or a directory above it", .0.display())]
     NoProject(PathBuf),
+    #[error("these checks failed: {0}")]
+    Doctor(String),
     #[error("nothing in the deployment is named `{name}`")]
     NoSuchName { name: String, known: Vec<String> },
     #[error("running the target file: {0}")]
@@ -534,7 +536,7 @@ pub fn eval_target(
 
 /// Returns the Python interpreter to use: `$METOR_PYTHON`, then the active
 /// virtualenv's, then `python3`.
-fn interpreter() -> OsString {
+pub(super) fn interpreter() -> OsString {
     if let Some(python) = std::env::var_os("METOR_PYTHON") {
         return python;
     }
@@ -548,7 +550,7 @@ fn interpreter() -> OsString {
 ///
 /// It lists `metor-config` and every dev pack's generated module, followed
 /// by the inherited `PYTHONPATH`.
-fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
+pub(super) fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
     let mut entries: Vec<PathBuf> = match std::env::var_os("METOR_CONFIG_PY") {
         Some(config_py) => vec![config_py.into()],
         None if Path::new(IN_REPO_CONFIG_PY).is_dir() => vec![IN_REPO_CONFIG_PY.into()],

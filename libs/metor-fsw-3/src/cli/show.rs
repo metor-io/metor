@@ -3,11 +3,10 @@
 //! With no name it shows every target; `fsw` one target; `fsw.nav`, or
 //! `nav` in a deployment of one, one system with its params and grants.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::run::{RunError, prepare};
-use super::ui::caps::Caps;
 use super::ui::event::Event;
 use super::ui::table::{Align, Table};
 use super::ui::theme::{Theme, Token};
@@ -39,13 +38,10 @@ pub fn show(args: Show, ui: &Ui) -> Result<(), RunError> {
     let selection = select(&config, name.as_deref())?;
     if ui.format == Format::Json {
         let value = selected_json(&config, selection)?;
-        ui.emit(Event::Config(&value));
+        ui.emit(Event::Data("config", &value));
         return Ok(());
     }
-    let caps = match std::io::stdout().is_terminal() {
-        true => ui.caps,
-        false => Caps::plain(),
-    };
+    let caps = ui.stdout_caps();
     let width = caps.live.then_some(usize::from(caps.width));
     let mut out = std::io::stdout().lock();
     render(&mut out, &config, selection, &Theme::new(&caps), width).map_err(|source| RunError::Io {
@@ -330,6 +326,7 @@ fn clock(clock: &Clock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ui::caps::Caps;
 
     fn deployment() -> ResolvedDeployment {
         let json = serde_json::json!({
