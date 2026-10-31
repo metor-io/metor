@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(split_args(&[]), (None, None));
         assert_eq!(split_args(&["fsw".into()]), (None, Some("fsw".into())));
         assert_eq!(
-            split_args(&[file.clone()]),
+            split_args(std::slice::from_ref(&file)),
             (Some(file.clone().into()), None)
         );
         assert_eq!(
