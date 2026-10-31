@@ -76,8 +76,8 @@ pub struct Ui {
     pub caps: Caps,
     pub format: Format,
     pub verbose: bool,
-    /// Drop the deployment's own events, which the parent of a multi-target
-    /// run shows once.
+    /// Drop the deployment's phases and `Running`, which the parent of a
+    /// multi-target run shows once.
     child: bool,
 }
 
@@ -146,7 +146,7 @@ impl Ui {
 
     /// Renders `event`.
     pub fn emit(&self, event: Event<'_>) {
-        let deployment = matches!(event, Event::Phase(_) | Event::Running(_) | Event::Ended(_));
+        let deployment = matches!(event, Event::Phase(_) | Event::Running(_));
         if self.child && deployment {
             return;
         }

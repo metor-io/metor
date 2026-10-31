@@ -13,6 +13,7 @@ pub mod doctor;
 pub mod module;
 pub mod pack_dev;
 mod port_class;
+pub mod relay;
 pub mod run;
 pub mod show;
 pub mod ui;

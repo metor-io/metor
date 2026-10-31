@@ -9,6 +9,7 @@
 //! and the deployment, `M03xx` the coordinator build, `M04xx` packs and
 //! cargo, `M05xx` the run.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use miette::{LabeledSpan, NamedSource, SourceCode, SourceSpan};
@@ -26,7 +27,7 @@ type Info = (&'static str, Option<String>);
 /// An error ready to render.
 #[derive(Debug)]
 pub struct Report {
-    code: &'static str,
+    code: Cow<'static, str>,
     message: String,
     help: Option<String>,
     snippet: Option<Snippet>,
@@ -52,7 +53,24 @@ impl Report {
             None => (None, error.to_string()),
         };
         Self {
-            code,
+            code: code.into(),
+            message,
+            help,
+            snippet,
+        }
+    }
+
+    /// Rebuilds a report from the parts `--format json` writes, reading the
+    /// target file's line again if it names one.
+    pub fn from_parts(
+        code: String,
+        message: String,
+        help: Option<String>,
+        at: Option<Location>,
+    ) -> Self {
+        let snippet = at.as_ref().and_then(|at| Snippet::read(at, Path::new(".")));
+        Self {
+            code: code.into(),
             message,
             help,
             snippet,
@@ -83,7 +101,7 @@ impl std::error::Error for Report {}
 
 impl miette::Diagnostic for Report {
     fn code<'a>(&'a self) -> Option<Box<dyn core::fmt::Display + 'a>> {
-        Some(Box::new(self.code))
+        Some(Box::new(&self.code))
     }
 
     fn help<'a>(&'a self) -> Option<Box<dyn core::fmt::Display + 'a>> {

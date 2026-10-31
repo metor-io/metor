@@ -27,6 +27,7 @@ use std::sync::mpsc::SyncSender;
 use super::cargo::read_toml;
 use super::console::{self, ConsoleLayer, Origin, Route, Settings, Tap};
 use super::pack_dev::{PackDevError, pack_dev};
+use super::relay::Relay;
 use super::ui::Ui;
 use super::ui::event::{Event, Phase, PhaseState, Summary, TargetSummary, Verb};
 use super::units;
@@ -288,11 +289,14 @@ fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), 
     std::fs::write(&path, bytes).map_err(io(&path))?;
     watch_sigint();
     let started = Instant::now();
-    let waited = super::children::spawn_all(&path, &config.namespaces(), args, ui)
+    let namespaces = config.namespaces();
+    let relay = Relay::new(ui.clone(), &namespaces);
+    ui.emit(Event::SourceWidth(source_width(config)));
+    let waited = super::children::spawn_all(&path, &namespaces, args, &relay)
         .map(super::children::wait_all)
         .map_err(RunError::Spawn);
     let _ = std::fs::remove_file(&path);
-    end(ui, started, Vec::new());
+    end(ui, started, relay.rows());
     waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
     if interrupted() {
         return Err(RunError::Interrupted);

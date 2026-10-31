@@ -1,19 +1,18 @@
 //! Runs each target of a deployment as a child process.
 //!
-//! Each child runs `metor run <config> --target NS` with the parent's output
-//! settings. Its stdout and stderr are copied line by line to the parent's,
-//! and its log lines already name their target.
+//! Each child runs `metor run <config> --target NS --format json`. The
+//! parent reads its events and shows them as its own, so every target's
+//! lines share one look and one summary.
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use super::relay::Relay;
 use super::run::Run;
-use super::ui::caps::{Background, Depth};
-use super::ui::{Format, Ui};
 
 /// Set in a child's environment so it leaves the deployment's lines, such as
 /// `Running`, to the parent.
@@ -71,66 +70,36 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
     .collect()
 }
 
-/// The flags and environment that give a child the parent's output.
-///
-/// The child writes to a pipe, so the parent's colour depth, glyphs, and
-/// background are passed down rather than detected.
-pub fn output_argv(ui: &Ui) -> (Vec<OsString>, Vec<(&'static str, OsString)>) {
-    let color = if ui.caps.depth == Depth::None {
-        "never"
-    } else {
-        "always"
-    };
-    let format = match ui.format {
-        Format::Human => "human",
-        Format::Json => "json",
-    };
-    let mut args: Vec<OsString> = ["--color", color, "--format", format]
-        .map(OsString::from)
-        .into();
-    if !ui.caps.unicode {
-        args.push("--ascii".into());
-    }
-    let colorfgbg = match ui.caps.background {
-        Background::Dark => "15;0",
-        Background::Light => "0;15",
-    };
-    let mut env = vec![(CHILD_ENV, "1".into()), ("COLORFGBG", colorfgbg.into())];
-    let level = match ui.caps.depth {
-        Depth::None => None,
-        Depth::Ansi16 => Some("1"),
-        Depth::Ansi256 => Some("2"),
-        Depth::TrueColor => Some("3"),
-    };
-    env.extend(level.map(|level| ("FORCE_COLOR", level.into())));
-    (args, env)
-}
-
 /// Starts the target `namespace` from `envelope` as a child process.
 ///
-/// The child's stdout and stderr are copied to this process's, a line at a
-/// time.
+/// The child writes `--format json`; each line of its stdout goes to
+/// `relay`, and each line of its stderr is shown as it is.
 pub fn spawn(
     envelope: &Path,
     namespace: &str,
     overrides: &Run,
-    ui: &Ui,
+    relay: &Relay,
 ) -> std::io::Result<TargetProcess> {
-    let (output, env) = output_argv(ui);
     let mut process = Command::new(std::env::current_exe()?)
         .args(member_argv(envelope, namespace, overrides))
-        .args(output)
-        .envs(env)
+        .args(["--format", "json"])
+        .env(CHILD_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let mut drains = Vec::with_capacity(2);
     if let Some(stdout) = process.stdout.take() {
-        drains.push(std::thread::spawn(move || relay(stdout, std::io::stdout())));
+        let relay = relay.clone();
+        drains.push(std::thread::spawn(move || {
+            each_line(stdout, |line| relay.line(line))
+        }));
     }
     if let Some(stderr) = process.stderr.take() {
-        drains.push(std::thread::spawn(move || relay(stderr, std::io::stderr())));
+        let relay = relay.clone();
+        drains.push(std::thread::spawn(move || {
+            each_line(stderr, |line| relay.output(line))
+        }));
     }
     Ok(TargetProcess {
         namespace: namespace.to_string(),
@@ -147,11 +116,11 @@ pub fn spawn_all(
     envelope: &Path,
     namespaces: &[&str],
     overrides: &Run,
-    ui: &Ui,
+    relay: &Relay,
 ) -> std::io::Result<Vec<TargetProcess>> {
     namespaces
         .iter()
-        .map(|namespace| spawn(envelope, namespace, overrides, ui))
+        .map(|namespace| spawn(envelope, namespace, overrides, relay))
         .collect()
 }
 
@@ -175,20 +144,12 @@ impl Drop for TargetProcess {
     }
 }
 
-/// Copies `reader` to `sink` line by line.
-///
-/// Each line is written in one call, so a sink that locks, like stderr, only
-/// holds the lock while writing and never while waiting on the reader, and
-/// lines from several children never interleave.
-pub fn relay(reader: impl Read, mut sink: impl Write) {
-    let mut reader = BufReader::new(reader);
-    let mut line = Vec::new();
-    while reader
-        .read_until(b'\n', &mut line)
-        .is_ok_and(|read| read > 0)
-    {
-        let _ = sink.write_all(&line).and_then(|()| sink.flush());
-        line.clear();
+/// Calls `f` with each line `reader` gives, without its newline, until it
+/// ends.
+pub fn each_line(reader: impl Read, mut f: impl FnMut(&str)) {
+    let reader = BufReader::new(reader);
+    for line in reader.lines().map_while(Result::ok) {
+        f(&line);
     }
 }
 
@@ -235,47 +196,8 @@ pub fn wait_all(mut children: Vec<TargetProcess>) -> Result<(), Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{Receiver, Sender, channel};
-    use std::sync::{Arc, Mutex};
 
     use super::*;
-
-    /// A reader that returns whatever the sender pushes, and blocks until
-    /// then.
-    struct Channel(Receiver<Vec<u8>>, Vec<u8>);
-
-    impl Read for Channel {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.1.is_empty() {
-                match self.0.recv() {
-                    Ok(next) => self.1 = next,
-                    Err(_) => return Ok(0),
-                }
-            }
-            let take = self.1.len().min(buf.len());
-            buf[..take].copy_from_slice(&self.1[..take]);
-            self.1.drain(..take);
-            Ok(take)
-        }
-    }
-
-    /// A sink that takes a lock on every write, like `Stderr` does.
-    #[derive(Clone)]
-    struct Locking(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Locking {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("no writer panics")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
 
     fn process(namespace: &str, program: &str, args: &[&str]) -> TargetProcess {
         let process = Command::new(program)
@@ -345,27 +267,6 @@ mod tests {
     }
 
     #[test]
-    fn test_relay_frees_the_sink_while_blocked() {
-        let (lines, reader): (Sender<Vec<u8>>, _) = channel();
-        let sink = Locking(Arc::new(Mutex::new(Vec::new())));
-        let (out, copy) = (sink.0.clone(), sink.clone());
-        let drain = std::thread::spawn(move || relay(Channel(reader, Vec::new()), copy));
-
-        lines.send(b"one\n".to_vec()).expect("the drain reads");
-        let mut held = out.lock().expect("no writer panics");
-        while held.is_empty() {
-            drop(held);
-            std::thread::sleep(Duration::from_millis(1));
-            held = out.lock().expect("no writer panics");
-        }
-        assert_eq!(&*held, b"one\n");
-        drop(held);
-
-        drop(lines);
-        drain.join().expect("the drain ends");
-    }
-
-    #[test]
     fn test_wait_all_reports_failures_and_kills_the_rest() {
         assert_eq!(wait_all(vec![process("ok", "true", &[])]), Ok(()));
         assert_eq!(wait_all(Vec::new()), Ok(()));
@@ -383,31 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn test_relay_keeps_lines_and_styles() {
-        let mut out = Vec::new();
-        relay("one\n\x1b[1mtwo\x1b[0m\nend".as_bytes(), &mut out);
-        assert_eq!(out, b"one\n\x1b[1mtwo\x1b[0m\nend");
-    }
-
-    #[test]
-    fn test_output_argv_passes_the_parents_terminal() {
-        use crate::cli::ui::caps::Caps;
-        let caps = Caps {
-            depth: Depth::TrueColor,
-            background: Background::Light,
-            ..Caps::plain()
-        };
-        let ui = Ui::with(
-            Box::new(super::super::ui::human::Human::new(Vec::new(), caps)),
-            caps,
-        );
-        let (args, env) = output_argv(&ui);
-        assert_eq!(
-            args,
-            ["--color", "always", "--format", "human", "--ascii"].map(OsString::from)
-        );
-        assert!(env.contains(&("COLORFGBG", "0;15".into())));
-        assert!(env.contains(&(CHILD_ENV, "1".into())));
-        assert!(env.contains(&("FORCE_COLOR", "3".into())));
+    fn test_each_line_keeps_text_and_styles() {
+        let mut lines = Vec::new();
+        each_line("one\n\x1b[1mtwo\x1b[0m\nend".as_bytes(), |line| {
+            lines.push(line.to_string())
+        });
+        assert_eq!(lines, ["one", "\x1b[1mtwo\x1b[0m", "end"]);
+        each_line(&b""[..], |_| panic!("no lines in an empty stream"));
     }
 }

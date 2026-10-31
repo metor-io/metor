@@ -155,6 +155,25 @@ fn test_json_stdout_is_one_object_per_line() {
         }
         assert!(stdout.contains("hello from stdout"), "{stdout}");
     }
+    let ended: serde_json::Value = {
+        let output = metor()
+            .args(["run", "deploy.py", "--cycles", "2", "--format", "json"])
+            .current_dir(dir.path())
+            .output()
+            .expect("metor runs");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(r#""type":"ended""#))
+            .unwrap_or_else(|| panic!("an ended event: {stdout}"))
+            .to_string();
+        serde_json::from_str(&line).expect("JSON")
+    };
+    assert_eq!(
+        ended["targets"].as_array().map(Vec::len),
+        Some(2),
+        "{ended}"
+    );
 }
 
 #[test]
@@ -168,14 +187,27 @@ fn test_deployment_runs_every_target_as_a_child() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(stderr.matches("Resolved").count(), 1, "{stderr}");
-    let expected = ["Evaluated", "Resolved", "Running", "Finished after"];
+    let expected = [
+        "Evaluated",
+        "Resolved",
+        "Running",
+        "Finished after",
+        "TARGET",
+    ];
+    let row = |line: &str| {
+        ["a ", "b "]
+            .iter()
+            .any(|name| line.trim_start().starts_with(name))
+    };
     assert!(
         stderr
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .all(|line| expected.iter().any(|phase| line.contains(phase))),
+            .all(|line| row(line) || expected.iter().any(|phase| line.contains(phase))),
         "a clean deployment prints only its phases and summary: {stderr}"
     );
+    let rows: Vec<&str> = stderr.lines().filter(|line| row(line)).collect();
+    assert_eq!(rows.len(), 2, "one summary row per target: {stderr}");
 }
 
 /// A child's lines name its target, since the parent relays them as they

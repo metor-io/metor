@@ -178,10 +178,8 @@ cycles, max cycle time from `status`, and overruns. `fsw.console` reads
 `status` beside `log` to collect them. Latched systems print below the
 table.
 
-Open: a multi-target run shows only its run time. The children's rows
-need their stats sent to the parent, which phase 3 (children over NDJSON)
-adds. A child drops its deployment events (phases, `Running`, the
-summary) so the parent shows each once.
+A multi-target run's rows come from its children over NDJSON
+(`docs/plans/cli-3-plan.md`, T1).
 
 A cycle's time is the latest end, offset plus execute, among its
 systems' statuses. On a wall clock, a cycle longer than its period is an
