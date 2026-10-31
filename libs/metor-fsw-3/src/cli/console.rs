@@ -9,6 +9,7 @@
 
 use core::time::Duration;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -18,13 +19,17 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
+use zerocopy::FromBytes;
 
 use super::ui::Ui;
 use super::ui::event::{Event, LogLine, Source};
-use crate::coordinator::{BuildError, InputConfig, PortRef, SystemConfig, SystemTable};
+use crate::coordinator::{
+    BuildError, InputConfig, PortRef, STATUS_PORT, SystemConfig, SystemStatus, SystemTable,
+};
 use crate::deploy::TargetConfig;
 use crate::fn_system::LOG_PORT;
-use crate::port::DynInputs;
+use crate::port::{DynInputs, Input, RecvError};
+use crate::record::Bytes;
 use crate::record::Payload;
 
 /// The type `fsw.console` is registered under.
@@ -57,20 +62,67 @@ pub enum Message {
     Dropped(u32),
 }
 
+/// Where a console sends its lines and counts its cycles.
+#[derive(Clone, Debug)]
+pub struct Tap {
+    pub tx: SyncSender<Message>,
+    pub stats: Arc<RunStats>,
+}
+
+/// What the console prints and measures.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// Lines below this level are skipped.
+    pub min: LogLevel,
+    /// A cycle longer than this is an overrun. `None` on a simulated clock.
+    pub budget: Option<Duration>,
+    pub stats: Arc<RunStats>,
+}
+
+/// Cycle timing the console measures for the summary.
+#[derive(Debug, Default)]
+pub struct RunStats {
+    max_cycle_ns: AtomicU64,
+    overruns: AtomicU64,
+}
+
+impl RunStats {
+    /// Counts one cycle that took `cycle`.
+    fn record(&self, cycle: Duration, budget: Option<Duration>) {
+        let ns = u64::try_from(cycle.as_nanos()).unwrap_or(u64::MAX);
+        self.max_cycle_ns.fetch_max(ns, Ordering::Relaxed);
+        if budget.is_some_and(|budget| cycle > budget) {
+            self.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The longest cycle so far.
+    pub fn max_cycle(&self) -> Duration {
+        Duration::from_nanos(self.max_cycle_ns.load(Ordering::Relaxed))
+    }
+
+    /// The cycles that ran past their budget.
+    pub fn overruns(&self) -> u64 {
+        self.overruns.load(Ordering::Relaxed)
+    }
+}
+
 /// The state of `fsw.console`.
 pub struct Console {
     tx: SyncSender<Message>,
-    /// Lines below this level are skipped.
-    min: LogLevel,
+    settings: Settings,
+    /// How many inputs are `log` outputs. The `status` outputs follow.
+    logs: usize,
     start: Option<Timestamp>,
     dropped: u32,
 }
 
 impl Console {
-    pub fn new(tx: SyncSender<Message>, min: LogLevel) -> Self {
+    pub fn new(tx: SyncSender<Message>, settings: Settings, logs: usize) -> Self {
         Self {
             tx,
-            min,
+            settings,
+            logs,
             start: None,
             dropped: 0,
         }
@@ -92,7 +144,8 @@ impl Console {
     }
 }
 
-/// Drains every log input and sends its lines to the printer.
+/// Sends each system's log lines to the printer and times the cycle from
+/// their statuses.
 ///
 /// Drops from earlier steps are reported first, so the report gets the room
 /// the printer made. Lines are timed by the cycle that drains them, since
@@ -102,24 +155,48 @@ pub fn console(#[state] s: &mut Console, now: Timestamp, inputs: &mut DynInputs)
     s.report_dropped();
     let start = *s.start.get_or_insert(now);
     let elapsed = Duration::from_micros(now.0.saturating_sub(start.0).max(0) as u64);
-    for (system, (_, input)) in inputs.iter_mut().enumerate() {
-        for record in input.drain() {
-            let Ok(event) = record
-                .and_then(|bytes| LogEvent::decode(bytes).map_err(crate::port::RecvError::Decode))
-            else {
-                s.dropped = s.dropped.saturating_add(1);
-                continue;
-            };
-            if event.level < s.min {
-                continue;
-            }
-            s.send(Message::Line {
-                system,
-                elapsed,
-                event,
-            });
+    let mut cycle_end = None;
+    for (index, (_, input)) in inputs.iter_mut().enumerate() {
+        if index < s.logs {
+            drain_log(s, index, elapsed, input);
+        } else {
+            cycle_end = cycle_end.max(latest_end(input));
         }
     }
+    if let Some(end) = cycle_end {
+        s.settings.stats.record(end, s.settings.budget);
+    }
+}
+
+/// Sends the lines waiting on the `system`th log input.
+fn drain_log(s: &mut Console, system: usize, elapsed: Duration, input: &mut Input<Bytes>) {
+    for record in input.drain() {
+        let Ok(event) = record.and_then(|bytes| LogEvent::decode(bytes).map_err(RecvError::Decode))
+        else {
+            s.dropped = s.dropped.saturating_add(1);
+            continue;
+        };
+        if event.level < s.settings.min {
+            continue;
+        }
+        s.send(Message::Line {
+            system,
+            elapsed,
+            event,
+        });
+    }
+}
+
+/// When the system behind a `status` input finished in its latest cycle,
+/// from the cycle's start.
+fn latest_end(input: &mut Input<Bytes>) -> Option<Duration> {
+    input
+        .drain()
+        .filter_map(|record| SystemStatus::read_from_bytes(record.ok()?).ok())
+        .map(|status| {
+            Duration::from_nanos(status.exec_offset_ns.saturating_add(status.exec_time_ns))
+        })
+        .last()
 }
 
 /// The console's id in a target whose systems are `systems`: `console`, or
@@ -132,18 +209,23 @@ pub fn console_id(systems: &[String]) -> String {
         .unwrap_or_default()
 }
 
-/// The config of the console `id` reading `systems`.
-pub fn system_config<'a>(id: &str, systems: impl IntoIterator<Item = &'a str>) -> SystemConfig {
-    let inputs = systems
-        .into_iter()
-        .map(|system| InputConfig {
-            port: system.to_string(),
-            from: vec![PortRef {
-                system: system.to_string(),
-                port: LOG_PORT.to_string(),
-            }],
-        })
-        .collect();
+/// The config of the console `id` reading `systems`: each one's `log`, named
+/// after it, then each one's `status`.
+pub fn system_config(id: &str, systems: &[String]) -> SystemConfig {
+    let input = |port: &str, name: String, system: &str| InputConfig {
+        port: name,
+        from: vec![PortRef {
+            system: system.to_string(),
+            port: port.to_string(),
+        }],
+    };
+    let logs = systems
+        .iter()
+        .map(|system| input(LOG_PORT, system.clone(), system));
+    let statuses = systems
+        .iter()
+        .map(|system| input(STATUS_PORT, format!("{system}.{STATUS_PORT}"), system));
+    let inputs = logs.chain(statuses).collect();
     SystemConfig {
         inputs,
         ..SystemConfig::new(id, CONSOLE_TYPE)
@@ -151,14 +233,14 @@ pub fn system_config<'a>(id: &str, systems: impl IntoIterator<Item = &'a str>) -
 }
 
 /// Appends the console to `config` and registers it in `table`, sending
-/// lines at `min` and above to `tx`.
+/// lines to `tx`.
 ///
 /// Returns the ids of the systems it reads, in input order.
 pub fn attach(
     config: &mut TargetConfig,
     table: &mut SystemTable,
     tx: SyncSender<Message>,
-    min: LogLevel,
+    settings: Settings,
 ) -> Result<Vec<String>, BuildError> {
     let systems: Vec<String> = config
         .coordinator
@@ -170,9 +252,10 @@ pub fn attach(
     config
         .coordinator
         .systems
-        .push(system_config(&id, systems.iter().map(String::as_str)));
+        .push(system_config(&id, &systems));
+    let logs = systems.len();
     table.register(CONSOLE_TYPE, console(), move || {
-        Console::new(tx.clone(), min)
+        Console::new(tx.clone(), settings.clone(), logs)
     })?;
     Ok(systems)
 }
@@ -341,6 +424,14 @@ mod tests {
         tracing::info!(k = 1, "traced");
     }
 
+    fn settings(min: LogLevel, budget: Option<Duration>) -> Settings {
+        Settings {
+            min,
+            budget,
+            stats: Arc::default(),
+        }
+    }
+
     fn target(ids: &[&str]) -> (TargetConfig, SystemTable) {
         let mut config = TargetConfig::default();
         config.coordinator.systems = ids
@@ -381,7 +472,8 @@ mod tests {
     fn test_lines_carry_their_system_and_elapsed_time() {
         let (mut config, mut table) = target(&["a", "b"]);
         let (tx, rx) = channel();
-        let systems = attach(&mut config, &mut table, tx, LogLevel::Info).expect("attaches");
+        let systems =
+            attach(&mut config, &mut table, tx, settings(LogLevel::Info, None)).expect("attaches");
         assert_eq!(systems, ["a", "b"]);
         step_all(&config, &table, &[10, 30]);
         let seen = lines(&rx);
@@ -399,7 +491,7 @@ mod tests {
     fn test_lines_below_the_level_are_skipped() {
         let (mut config, mut table) = target(&["a"]);
         let (tx, rx) = channel();
-        attach(&mut config, &mut table, tx, LogLevel::Warn).expect("attaches");
+        attach(&mut config, &mut table, tx, settings(LogLevel::Warn, None)).expect("attaches");
         step_all(&config, &table, &[0]);
         let messages: Vec<_> = lines(&rx).into_iter().map(|(_, _, m)| m).collect();
         assert_eq!(messages, ["careful"]);
@@ -409,7 +501,7 @@ mod tests {
     fn test_full_channel_reports_the_drop_once_it_has_room() {
         let (mut config, mut table) = target(&["a"]);
         let (tx, rx) = sync_channel(1);
-        attach(&mut config, &mut table, tx, LogLevel::Info).expect("attaches");
+        attach(&mut config, &mut table, tx, settings(LogLevel::Info, None)).expect("attaches");
         let mut coordinator = config.coordinator.build(&table).expect("valid");
         coordinator.step(Timestamp(0));
         assert_eq!(lines(&rx).len(), 1, "one of two lines fits");
@@ -420,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_console_reads_no_systems_in_an_empty_target() {
-        let config = system_config("console", []);
+        let config = system_config("console", &[]);
         assert!(config.inputs.is_empty());
         assert_eq!(config.ty, CONSOLE_TYPE);
     }
@@ -471,7 +563,7 @@ mod tests {
     fn test_a_system_named_console_still_builds() {
         let (mut config, mut table) = target(&["console"]);
         let (tx, rx) = channel();
-        attach(&mut config, &mut table, tx, LogLevel::Info).expect("attaches");
+        attach(&mut config, &mut table, tx, settings(LogLevel::Info, None)).expect("attaches");
         assert_eq!(config.coordinator.systems[1].id, "console_2");
         step_all(&config, &table, &[0]);
         assert!(lines(&rx).iter().all(|(system, _, _)| *system == 0));
@@ -520,5 +612,40 @@ mod tests {
             *seen.lock().expect("not poisoned"),
             ["nav:fix", "console:log lines dropped"]
         );
+    }
+
+    #[test]
+    fn test_console_reads_each_log_then_each_status() {
+        let config = system_config("console", &["a".into(), "b".into()]);
+        let names: Vec<_> = config
+            .inputs
+            .iter()
+            .map(|input| input.port.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b", "a.status", "b.status"]);
+        assert_eq!(config.inputs[3].from[0].port, STATUS_PORT);
+    }
+
+    #[test]
+    fn test_cycles_past_the_budget_are_overruns() {
+        let (mut config, mut table) = target(&["a", "b"]);
+        let (tx, _rx) = channel();
+        let budgeted = settings(LogLevel::Error, Some(Duration::ZERO));
+        let stats = budgeted.stats.clone();
+        attach(&mut config, &mut table, tx, budgeted).expect("attaches");
+        step_all(&config, &table, &[0, 1, 2]);
+        assert!(stats.max_cycle() > Duration::ZERO);
+        assert_eq!(stats.overruns(), 3);
+    }
+
+    #[test]
+    fn test_no_budget_counts_no_overruns() {
+        let stats = RunStats::default();
+        stats.record(Duration::from_millis(5), None);
+        stats.record(Duration::from_millis(2), Some(Duration::from_millis(3)));
+        assert_eq!(stats.overruns(), 0);
+        assert_eq!(stats.max_cycle(), Duration::from_millis(5));
+        stats.record(Duration::from_millis(4), Some(Duration::from_millis(3)));
+        assert_eq!(stats.overruns(), 1);
     }
 }

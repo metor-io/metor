@@ -177,7 +177,13 @@ cycles, max cycle time from `status`, and overruns. `fsw.console` reads
 table. Multi-target summaries wait for phase 3 (children over NDJSON);
 here each child prints its own.
 
-Tests: snapshot of a summary with an overrun and a latched system.
+A cycle's time is the latest end, offset plus execute, among its
+systems' statuses. On a wall clock, a cycle longer than its period is an
+overrun; a simulated clock has none. Latched systems are named by the
+`M0501` error that follows the summary.
+
+Tests: snapshot of a summary with an overrun; overrun counting with and
+without a budget.
 
 ## Order
 

@@ -29,6 +29,17 @@ impl<W: Write> Json<W> {
 fn object(event: &Event<'_>) -> Option<Value> {
     Some(match event {
         Event::SourceWidth(_) | Event::Tick => return None,
+        Event::Ended(summary) => json!({
+            "type": "ended",
+            "secs": summary.took.as_secs_f64(),
+            "interrupted": summary.interrupted,
+            "targets": summary.targets.iter().map(|target| json!({
+                "name": target.name,
+                "cycles": target.cycles,
+                "max_cycle_secs": target.max_cycle.as_secs_f64(),
+                "overruns": target.overruns,
+            })).collect::<Vec<_>>(),
+        }),
         Event::Output(bytes) => json!({
             "type": "output",
             "text": String::from_utf8_lossy(bytes),

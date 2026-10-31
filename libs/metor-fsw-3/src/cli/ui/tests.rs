@@ -149,3 +149,29 @@ fn test_output_clears_the_live_line_first() {
         "{text:?}"
     );
 }
+
+#[test]
+fn test_summary_table() {
+    use super::event::{Summary, TargetSummary};
+    let summary = Summary {
+        took: Duration::from_millis(12_040),
+        interrupted: true,
+        targets: vec![
+            TargetSummary {
+                name: "plant".into(),
+                cycles: 1440,
+                max_cycle: Duration::from_micros(520),
+                overruns: 0,
+            },
+            TargetSummary {
+                name: "fsw".into(),
+                cycles: 1200,
+                max_cycle: Duration::from_micros(1100),
+                overruns: 2,
+            },
+        ],
+    };
+    let mut out = Vec::new();
+    Human::new(&mut out, Caps::plain()).event(&Event::Ended(&summary));
+    insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"));
+}

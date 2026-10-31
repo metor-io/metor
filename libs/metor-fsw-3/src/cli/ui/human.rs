@@ -9,8 +9,9 @@ use std::time::Instant;
 
 use super::Reporter;
 use super::caps::Caps;
-use super::event::{Event, LogLine, Phase, PhaseState};
+use super::event::{Event, LogLine, Phase, PhaseState, Summary};
 use super::logline;
+use super::table::{Align, Table, group};
 use super::theme::{Theme, Token};
 
 /// The column phase subjects start at, after the margin, glyph, and verb.
@@ -18,6 +19,14 @@ const VERB_WIDTH: usize = 11;
 
 /// The width phase subjects pad to, so durations align.
 const SUBJECT_WIDTH: usize = 24;
+
+/// The summary table's columns.
+const SUMMARY_COLUMNS: [(&str, Align); 4] = [
+    ("TARGET", Align::Left),
+    ("CYCLES", Align::Right),
+    ("MAX CYCLE", Align::Right),
+    ("OVERRUNS", Align::Right),
+];
 
 /// How long a phase runs before its live line appears.
 const REVEAL_AFTER: Duration = Duration::from_millis(200);
@@ -268,6 +277,40 @@ impl<W: Write> Human<W> {
         writeln!(self.buf)
     }
 
+    fn ended(&mut self, summary: &Summary) -> io::Result<()> {
+        self.end_live()?;
+        let accent = self.theme.style(Token::Accent);
+        let how = if summary.interrupted {
+            "Stopped"
+        } else {
+            "Finished"
+        };
+        writeln!(
+            self.buf,
+            "\n  {accent}{}{accent:#} {how} after {:.1} s",
+            self.theme.glyphs.stopped,
+            summary.took.as_secs_f64()
+        )?;
+        if summary.targets.is_empty() {
+            return Ok(());
+        }
+        let mut table = Table::new(&SUMMARY_COLUMNS);
+        for target in &summary.targets {
+            let overruns = match target.overruns {
+                0 => String::new(),
+                n => group(n),
+            };
+            table.row(vec![
+                target.name.clone(),
+                group(target.cycles),
+                format!("{:.2} ms", target.max_cycle.as_secs_f64() * 1e3),
+                overruns,
+            ]);
+        }
+        writeln!(self.buf)?;
+        table.write(&mut self.buf, &self.theme, "    ")
+    }
+
     fn log(&mut self, line: &LogLine<'_>) -> io::Result<()> {
         self.clear_live()?;
         self.source_width = self.source_width.max(logline::source_len(&line.source));
@@ -288,6 +331,7 @@ impl<W: Write + Send> Reporter for Human<W> {
             }
             Event::Output(bytes) => self.clear_live().and_then(|()| self.buf.write_all(bytes)),
             Event::Tick => self.tick(),
+            Event::Ended(summary) => self.ended(summary),
         };
         if written.is_ok() && !self.buf.is_empty() {
             let _ = self

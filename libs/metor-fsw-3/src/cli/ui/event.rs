@@ -22,6 +22,8 @@ pub enum Event<'a> {
     Output(&'a [u8]),
     /// Time passed; a live line may redraw.
     Tick,
+    /// The run is over.
+    Ended(&'a Summary),
 }
 
 /// A step before the first cycle.
@@ -90,4 +92,25 @@ pub struct LogLine<'a> {
     pub source: Source<'a>,
     pub message: &'a str,
     pub fields: &'a [(Cow<'static, str>, Cow<'static, str>)],
+}
+
+/// How a run went.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summary {
+    /// Wall time from the first cycle to the stop.
+    pub took: Duration,
+    /// Whether SIGINT stopped the run, rather than its cycle count.
+    pub interrupted: bool,
+    /// One row per target this process ran.
+    pub targets: Vec<TargetSummary>,
+}
+
+/// How one target's cycles went.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TargetSummary {
+    pub name: String,
+    pub cycles: u64,
+    pub max_cycle: Duration,
+    /// Cycles past their period. A simulated clock has none.
+    pub overruns: u64,
 }

@@ -25,10 +25,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use std::sync::mpsc::SyncSender;
 
 use super::cargo::read_toml;
-use super::console::{self, ConsoleLayer, Origin, Route};
+use super::console::{self, ConsoleLayer, Origin, Route, Settings, Tap};
 use super::pack_dev::{PackDevError, pack_dev};
 use super::ui::Ui;
-use super::ui::event::{Event, Phase, PhaseState, Verb};
+use super::ui::event::{Event, Phase, PhaseState, Summary, TargetSummary, Verb};
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
 };
@@ -137,26 +137,60 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
     let target = (namespaces.len() > 1).then(|| (namespaces[member].to_string(), member));
     lock(&route).target = target.clone();
     let (tx, rx) = console::channel();
-    let (coordinator, systems) = load(&config.targets[member], &args, Some(tx.clone()))?;
+    let tap = Tap {
+        tx: tx.clone(),
+        stats: Arc::default(),
+    };
+    let stats = tap.stats.clone();
+    let (coordinator, systems) = load(&config.targets[member], &args, Some(tap))?;
     ui.emit(Event::SourceWidth(source_width(&config)));
+    let name = Some(namespaces[member])
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or("target")
+        .to_string();
     if std::env::var_os(super::children::CHILD_ENV).is_none() {
-        let shown = Some(namespaces[member]).filter(|ns| !ns.is_empty());
-        ui.emit(Event::Running(&[shown.unwrap_or("target")]));
+        ui.emit(Event::Running(&[&name]));
     }
+    let name = target
+        .as_ref()
+        .map_or("target", |(name, _)| name)
+        .to_string();
     let origin = Origin {
         target,
         console: console::console_id(&systems),
         systems,
     };
-    let latched = cycle(coordinator, &args, origin, rx, tx, &route, ui);
+    let started = Instant::now();
+    let (latched, cycles) = cycle(coordinator, &args, origin, rx, tx, &route, ui);
+    let target = TargetSummary {
+        name,
+        cycles,
+        max_cycle: stats.max_cycle(),
+        overruns: stats.overruns(),
+    };
+    end(ui, started, vec![target]);
     if latched.is_empty() {
         return Ok(());
     }
     Err(RunError::Latched(latched.join(", ")))
 }
 
+/// Shows the summary of a run that started at `started`. A child leaves it
+/// to its parent.
+fn end(ui: &Ui, started: Instant, targets: Vec<TargetSummary>) {
+    if std::env::var_os(super::children::CHILD_ENV).is_some() {
+        return;
+    }
+    ui.emit(Event::Ended(&Summary {
+        took: started.elapsed(),
+        interrupted: interrupted(),
+        targets,
+    }));
+}
+
 /// Cycles `coordinator` until it stops, with its console printing through
-/// `ui`. Returns the path of every system that latched off.
+/// `ui`. Returns the path of every system that latched off, and the cycles
+/// run.
 fn cycle(
     coordinator: Coordinator,
     args: &Run,
@@ -165,7 +199,7 @@ fn cycle(
     tx: SyncSender<console::Message>,
     route: &Mutex<Route>,
     ui: &Ui,
-) -> Vec<String> {
+) -> (Vec<String>, u64) {
     let namespace = origin.target.as_ref().map(|(name, _)| name.clone());
     let printer = console::spawn_printer(rx, origin, ui.clone());
     lock(route).tx = Some(tx);
@@ -186,10 +220,11 @@ fn cycle(
             None => id.to_string(),
         })
         .collect();
+    let cycles = coordinator.cycle();
     drop(coordinator);
     lock(route).tx = None;
     let _ = printer.join();
-    latched
+    (latched, cycles)
 }
 
 fn lock(route: &Mutex<Route>) -> std::sync::MutexGuard<'_, Route> {
@@ -227,9 +262,11 @@ fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), 
         serde_json::to_vec(config).map_err(ConfigError::Decode)?,
     )?;
     watch_sigint();
+    let started = Instant::now();
     let waited = super::children::spawn_all(&path, &config.namespaces(), args, ui)
         .map(super::children::wait_all);
     let _ = std::fs::remove_file(&path);
+    end(ui, started, Vec::new());
     waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
     if interrupted() {
         return Err(RunError::Interrupted);
@@ -481,19 +518,34 @@ fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
 pub fn load(
     config: &TargetConfig,
     overrides: &Run,
-    console: Option<SyncSender<console::Message>>,
+    console: Option<Tap>,
 ) -> Result<(Coordinator, Vec<String>), RunError> {
-    let min = console_level(log_level());
     let mut config = apply_overrides(config, overrides)?;
     let mut table = table_for(&config)?;
     let systems = match console {
-        Some(tx) => console::attach(&mut config, &mut table, tx, min)?,
+        Some(Tap { tx, stats }) => {
+            let settings = Settings {
+                min: console_level(log_level()),
+                budget: budget(&config.coordinator.clock),
+                stats,
+            };
+            console::attach(&mut config, &mut table, tx, settings)?
+        }
         None => Vec::new(),
     };
     let options = BuildOptions {
         deterministic: overrides.deterministic,
     };
     Ok((config.coordinator.build_with(&table, options)?, systems))
+}
+
+/// The longest a cycle may take on `clock`: its period on a wall clock,
+/// none on a simulated one.
+fn budget(clock: &Clock) -> Option<Duration> {
+    match clock {
+        Clock::Wall { rate } => Duration::try_from_secs_f64(rate.get().recip()).ok(),
+        Clock::Simulated { .. } => None,
+    }
 }
 
 /// `config` with the clock overrides from the command line applied.
