@@ -2,6 +2,7 @@
 //!
 //! A pack builds as a native cdylib, and optionally as a wasm module too.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -16,18 +17,46 @@ use crate::dl::WASM_TRIPLE;
 pub enum CargoError {
     #[error("running cargo: {0}")]
     Spawn(#[from] std::io::Error),
-    #[error("cargo build failed: {0}")]
-    Cargo(ExitStatus),
+    #[error("cargo build failed: {status}")]
+    Cargo {
+        status: ExitStatus,
+        /// The compiler's errors as cargo renders them, or cargo's stderr
+        /// if it reported none, for the caller to show.
+        output: Vec<u8>,
+    },
     #[error("cargo built no {0} for `{1}`")]
     NoArtifact(&'static str, String),
 }
 
+/// How a cargo run reports as it goes.
+pub struct Watch<'a> {
+    /// Pass cargo's stderr through instead of keeping it.
+    pub verbose: bool,
+    /// Render compiler errors with colour.
+    pub color: bool,
+    /// Called with each crate cargo finishes.
+    pub artifact: Box<dyn FnMut(&str) + 'a>,
+}
+
+impl Watch<'_> {
+    /// Keeps cargo's stderr and reports no progress.
+    pub fn quiet() -> Self {
+        Self {
+            verbose: false,
+            color: false,
+            artifact: Box::new(|_| {}),
+        }
+    }
+}
+
 /// Builds `package` from `manifest_dir` and returns the path of its cdylib.
-///
-/// Cargo's stderr is passed through, so the user sees its progress.
-pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
-    let args = ["build", "-p", package, "--message-format=json"];
-    let stdout = cargo(manifest_dir, &args)?;
+pub fn cargo_build(
+    package: &str,
+    manifest_dir: &Path,
+    watch: &mut Watch<'_>,
+) -> Result<PathBuf, CargoError> {
+    let args = ["build", "-p", package, message_format(watch)];
+    let stdout = cargo(manifest_dir, &args, watch)?;
     cdylib(&stdout).ok_or_else(|| CargoError::NoArtifact("cdylib", package.to_string()))
 }
 
@@ -36,7 +65,11 @@ pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoE
 /// The module imports its memory from the host. This uses `cargo rustc` so
 /// the `--import-memory` link flag applies only to the pack crate, and its
 /// dependencies stay cached.
-pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
+pub fn wasm_build(
+    package: &str,
+    manifest_dir: &Path,
+    watch: &mut Watch<'_>,
+) -> Result<PathBuf, CargoError> {
     let args = [
         "rustc",
         "-p",
@@ -44,30 +77,93 @@ pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoEr
         "--target",
         WASM_TRIPLE,
         "--release",
-        "--message-format=json",
+        message_format(watch),
         "--",
         "-C",
         "link-arg=--import-memory",
     ];
-    let stdout = cargo(manifest_dir, &args)?;
+    let stdout = cargo(manifest_dir, &args, watch)?;
     module(&stdout).ok_or_else(|| CargoError::NoArtifact("module", package.to_string()))
+}
+
+/// JSON messages on stdout, each diagnostic carrying its rendered text.
+fn message_format(watch: &Watch<'_>) -> &'static str {
+    if watch.color {
+        "--message-format=json-diagnostic-rendered-ansi"
+    } else {
+        "--message-format=json"
+    }
 }
 
 /// Runs cargo with `args` in `dir` and returns its stdout.
 ///
-/// Cargo's stderr is passed through, so the user sees its progress.
-fn cargo(dir: &Path, args: &[&str]) -> Result<Vec<u8>, CargoError> {
+/// Each finished crate is reported to `watch` as it arrives. Compiler
+/// errors and cargo's stderr are kept, and returned with the error if the
+/// build fails.
+fn cargo(dir: &Path, args: &[&str], watch: &mut Watch<'_>) -> Result<Vec<u8>, CargoError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
+    let mut child = Command::new(cargo)
         .current_dir(dir)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()?;
-    if !output.status.success() {
-        return Err(CargoError::Cargo(output.status));
+        .stderr(if watch.verbose {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .spawn()?;
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let _ = pipe.read_to_end(&mut kept);
+            kept
+        })
+    });
+    let mut stdout = Vec::new();
+    let mut errors = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        for line in BufReader::new(pipe).split(b'\n').map_while(Result::ok) {
+            if let Some(name) = artifact_name(&line) {
+                (watch.artifact)(&name);
+            }
+            if let Some(rendered) = rendered_error(&line) {
+                errors.extend_from_slice(rendered.as_bytes());
+            }
+            stdout.extend_from_slice(&line);
+            stdout.push(b'\n');
+        }
     }
-    Ok(output.stdout)
+    let status = child.wait()?;
+    let stderr = stderr.and_then(|kept| kept.join().ok()).unwrap_or_default();
+    if !status.success() {
+        let output = if errors.is_empty() { stderr } else { errors };
+        return Err(CargoError::Cargo { status, output });
+    }
+    Ok(stdout)
+}
+
+/// The rendered text of a compiler error, or `None` for any other message.
+fn rendered_error(line: &[u8]) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let diagnostic = &message["message"];
+    if message["reason"] != "compiler-message" || diagnostic["level"] != "error" {
+        return None;
+    }
+    diagnostic["rendered"].as_str().map(str::to_string)
+}
+
+/// The crate name of a `compiler-artifact` message, or `None` for any
+/// other message or a build script.
+fn artifact_name(line: &[u8]) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let target = &message["target"];
+    let script = target["kind"]
+        .as_array()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"));
+    if message["reason"] != "compiler-artifact" || script {
+        return None;
+    }
+    target["name"].as_str().map(str::to_string)
 }
 
 /// Finds the native library of the last cdylib in cargo's JSON output.
@@ -235,6 +331,28 @@ fn identifier(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_artifact_name_skips_build_scripts_and_other_messages() {
+        let lib = br#"{"reason":"compiler-artifact","target":{"name":"nalgebra","kind":["lib"]}}"#;
+        let script = br#"{"reason":"compiler-artifact","target":{"name":"build-script-build","kind":["custom-build"]}}"#;
+        let note = br#"{"reason":"compiler-message","target":{"name":"nalgebra","kind":["lib"]}}"#;
+        assert_eq!(artifact_name(lib).as_deref(), Some("nalgebra"));
+        assert_eq!(artifact_name(script), None);
+        assert_eq!(artifact_name(note), None);
+        assert_eq!(artifact_name(b"not json"), None);
+    }
+
+    #[test]
+    fn test_rendered_error_keeps_only_errors() {
+        let error =
+            br#"{"reason":"compiler-message","message":{"level":"error","rendered":"error: nope\n"}}"#;
+        let warning =
+            br#"{"reason":"compiler-message","message":{"level":"warning","rendered":"warning: hm\n"}}"#;
+        assert_eq!(rendered_error(error).as_deref(), Some("error: nope\n"));
+        assert_eq!(rendered_error(warning), None);
+        assert_eq!(rendered_error(b"{}"), None);
+    }
 
     const ARTIFACT: &str = r#"{"reason":"compiler-artifact",
         "target":{"name":"echo_pack","kind":["cdylib"]},

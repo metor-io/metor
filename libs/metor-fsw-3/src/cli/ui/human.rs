@@ -2,7 +2,10 @@
 //!
 //! With [`Caps::plain`] it is also the renderer for pipes and logs.
 
-use std::io::Write;
+use core::fmt::Write as _;
+use core::time::Duration;
+use std::io::{self, Write};
+use std::time::Instant;
 
 use super::Reporter;
 use super::caps::Caps;
@@ -12,6 +15,17 @@ use super::theme::{Theme, Token};
 
 /// The column phase subjects start at, after the margin, glyph, and verb.
 const VERB_WIDTH: usize = 11;
+
+/// The width phase subjects pad to, so durations align.
+const SUBJECT_WIDTH: usize = 24;
+
+/// How long a phase runs before its live line appears.
+const REVEAL_AFTER: Duration = Duration::from_millis(200);
+
+/// Synchronized output: the terminal shows what is between these at once.
+const SYNC_BEGIN: &str = "\x1b[?2026h";
+const SYNC_END: &str = "\x1b[?2026l";
+const CLEAR_LINE: &str = "\x1b[2K";
 
 /// The widest a source column is set up front. A longer source still
 /// widens it.
@@ -26,11 +40,23 @@ pub struct Human<W> {
     buf: Vec<u8>,
     theme: Theme,
     caps: Caps,
-    /// Whether the last line written is a live phase line that the next
-    /// phase line replaces.
-    live_line: bool,
+    /// The phase in progress, redrawn in place on a live terminal.
+    live: Option<Live>,
+    /// How long a phase runs before its live line appears.
+    reveal_after: Duration,
     /// The widest log source so far. Sources pad to it.
     source_width: usize,
+}
+
+/// A phase line that redraws in place until its phase ends.
+struct Live {
+    verb: &'static str,
+    subject: String,
+    detail: String,
+    since: Instant,
+    frame: usize,
+    /// Whether the line is on screen now.
+    shown: bool,
 }
 
 impl<W: Write> Human<W> {
@@ -40,55 +66,137 @@ impl<W: Write> Human<W> {
             buf: Vec::with_capacity(512),
             theme: Theme::new(&caps),
             caps,
-            live_line: false,
+            live: None,
+            reveal_after: REVEAL_AFTER,
             source_width: 0,
         }
     }
 
-    fn phase(&mut self, phase: &Phase<'_>) -> std::io::Result<()> {
+    /// Shows live lines as soon as their phase starts.
+    #[cfg(test)]
+    pub(crate) fn reveal_at_once(mut self) -> Self {
+        self.reveal_after = Duration::ZERO;
+        self
+    }
+
+    fn phase(&mut self, phase: &Phase<'_>) -> io::Result<()> {
         let glyphs = self.theme.glyphs;
-        let (glyph, token, verb) = match phase.state {
-            PhaseState::Started | PhaseState::Progress { .. } if !self.caps.live => {
-                return Ok(());
+        match phase.state {
+            PhaseState::Started => {
+                self.clear_live()?;
+                self.live = Some(Live {
+                    verb: phase.verb.doing(),
+                    subject: phase.subject.to_string(),
+                    detail: String::new(),
+                    since: Instant::now(),
+                    frame: 0,
+                    shown: false,
+                });
+                self.draw_live()
             }
-            PhaseState::Started | PhaseState::Progress { .. } => {
-                (glyphs.spinner[0], Token::Accent, phase.verb.doing())
+            PhaseState::Progress { done, current } => {
+                if let Some(live) = &mut self.live {
+                    live.detail.clear();
+                    let _ = write!(live.detail, "{done} {} {current}", glyphs.dot);
+                }
+                self.draw_live()
             }
-            PhaseState::Done(_) => (glyphs.ok, Token::Ok, phase.verb.done()),
-            PhaseState::Failed => (glyphs.fail, Token::Error, phase.verb.doing()),
-        };
-        self.clear_live()?;
-        let glyph_style = self.theme.style(token);
+            PhaseState::Done(took) => {
+                self.end_live()?;
+                let took = (took.as_millis() >= 10).then_some(took);
+                self.phase_line(glyphs.ok, Token::Ok, phase.verb.done(), phase.subject, took)
+            }
+            PhaseState::Failed => {
+                self.end_live()?;
+                self.phase_line(
+                    glyphs.fail,
+                    Token::Error,
+                    phase.verb.doing(),
+                    phase.subject,
+                    None,
+                )
+            }
+        }
+    }
+
+    /// Writes a finished phase's line.
+    fn phase_line(
+        &mut self,
+        glyph: &str,
+        token: Token,
+        verb: &str,
+        subject: &str,
+        took: Option<Duration>,
+    ) -> io::Result<()> {
+        let style = self.theme.style(token);
         let muted = self.theme.style(Token::Muted);
+        write!(self.buf, "  {style}{glyph}{style:#} {verb:<VERB_WIDTH$} ")?;
+        let Some(took) = took else {
+            return writeln!(self.buf, "{subject}");
+        };
+        write!(self.buf, "{subject:<SUBJECT_WIDTH$}  {muted}")?;
+        match took.as_millis() {
+            ms @ 0..1000 => write!(self.buf, "{ms:>4}ms")?,
+            _ => write!(self.buf, "{:>5.1}s", took.as_secs_f64())?,
+        }
+        writeln!(self.buf, "{muted:#}")
+    }
+
+    /// Advances the spinner and redraws the live line.
+    fn tick(&mut self) -> io::Result<()> {
+        if let Some(live) = &mut self.live {
+            live.frame += 1;
+        }
+        self.draw_live()
+    }
+
+    /// Draws the live line in place, once its phase has run long enough.
+    fn draw_live(&mut self) -> io::Result<()> {
+        let Some(live) = &mut self.live else {
+            return Ok(());
+        };
+        if !self.caps.live || live.since.elapsed() < self.reveal_after {
+            return Ok(());
+        }
+        let glyphs = self.theme.glyphs;
+        let frame = glyphs.spinner[live.frame % glyphs.spinner.len()];
+        let (accent, muted) = (
+            self.theme.style(Token::Accent),
+            self.theme.style(Token::Muted),
+        );
+        let used = 2 + 2 + VERB_WIDTH + 1 + live.subject.chars().count() + 2;
+        let room = usize::from(self.caps.width).saturating_sub(used + 1);
+        let detail = truncate(&live.detail, room);
         write!(
             self.buf,
-            "  {glyph_style}{glyph}{glyph_style:#} {verb:<VERB_WIDTH$} {}",
-            phase.subject
+            "{SYNC_BEGIN}\r{CLEAR_LINE}  {accent}{frame}{accent:#} {:<VERB_WIDTH$} {}",
+            live.verb, live.subject
         )?;
-        match phase.state {
-            PhaseState::Progress { done, current } => {
-                write!(
-                    self.buf,
-                    "  {muted}{done} {} {current}{muted:#}",
-                    glyphs.dot
-                )?;
-            }
-            PhaseState::Done(took) if took.as_millis() >= 10 => {
-                write!(self.buf, "  {muted}{:.1}s{muted:#}", took.as_secs_f64())?;
-            }
-            _ => {}
+        if !detail.is_empty() {
+            write!(self.buf, "  {muted}{detail}{muted:#}")?;
         }
-        self.live_line = matches!(
-            phase.state,
-            PhaseState::Started | PhaseState::Progress { .. }
-        );
-        if !self.live_line {
-            writeln!(self.buf)?;
+        write!(self.buf, "{SYNC_END}")?;
+        live.shown = true;
+        Ok(())
+    }
+
+    /// Takes the live line off the screen; the next tick draws it again.
+    fn clear_live(&mut self) -> io::Result<()> {
+        if let Some(live) = &mut self.live
+            && std::mem::take(&mut live.shown)
+        {
+            write!(self.buf, "\r{CLEAR_LINE}")?;
         }
         Ok(())
     }
 
-    fn running(&mut self, namespaces: &[&str]) -> std::io::Result<()> {
+    fn end_live(&mut self) -> io::Result<()> {
+        self.clear_live()?;
+        self.live = None;
+        Ok(())
+    }
+
+    fn running(&mut self, namespaces: &[&str]) -> io::Result<()> {
         self.clear_live()?;
         let accent = self.theme.style(Token::Accent);
         let muted = self.theme.style(Token::Muted);
@@ -108,7 +216,7 @@ impl<W: Write> Human<W> {
         writeln!(self.buf)
     }
 
-    fn diagnostic(&mut self, diagnostic: &dyn miette::Diagnostic) -> std::io::Result<()> {
+    fn diagnostic(&mut self, diagnostic: &dyn miette::Diagnostic) -> io::Result<()> {
         self.clear_live()?;
         let error = self.theme.bold(self.theme.style(Token::Error));
         let muted = self.theme.style(Token::Muted);
@@ -125,7 +233,7 @@ impl<W: Write> Human<W> {
     }
 
     /// Writes the first labelled line of `diagnostic`'s source, rustc style.
-    fn snippet(&mut self, diagnostic: &dyn miette::Diagnostic) -> std::io::Result<()> {
+    fn snippet(&mut self, diagnostic: &dyn miette::Diagnostic) -> io::Result<()> {
         let (Some(source), Some(label)) = (
             diagnostic.source_code(),
             diagnostic.labels().and_then(|mut labels| labels.next()),
@@ -160,18 +268,10 @@ impl<W: Write> Human<W> {
         writeln!(self.buf)
     }
 
-    fn log(&mut self, line: &LogLine<'_>) -> std::io::Result<()> {
+    fn log(&mut self, line: &LogLine<'_>) -> io::Result<()> {
         self.clear_live()?;
         self.source_width = self.source_width.max(logline::source_len(&line.source));
         logline::write(&mut self.buf, line, &self.theme, self.source_width)
-    }
-
-    /// Ends a live phase line so the next write starts on a clean line.
-    fn clear_live(&mut self) -> std::io::Result<()> {
-        if std::mem::take(&mut self.live_line) {
-            write!(self.buf, "\r\x1b[2K")?;
-        }
-        Ok(())
     }
 }
 
@@ -186,6 +286,8 @@ impl<W: Write + Send> Reporter for Human<W> {
                 self.source_width = (*width).min(MAX_SOURCE_WIDTH);
                 Ok(())
             }
+            Event::Output(bytes) => self.clear_live().and_then(|()| self.buf.write_all(bytes)),
+            Event::Tick => self.tick(),
         };
         if written.is_ok() && !self.buf.is_empty() {
             let _ = self
@@ -195,4 +297,11 @@ impl<W: Write + Send> Reporter for Human<W> {
         }
         self.buf.clear();
     }
+}
+
+/// The first `room` characters of `text`.
+fn truncate(text: &str, room: usize) -> &str {
+    text.char_indices()
+        .nth(room)
+        .map_or(text, |(end, _)| &text[..end])
 }

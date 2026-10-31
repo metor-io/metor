@@ -28,7 +28,11 @@ impl<W: Write> Json<W> {
 /// event that only shapes text.
 fn object(event: &Event<'_>) -> Option<Value> {
     Some(match event {
-        Event::SourceWidth(_) => return None,
+        Event::SourceWidth(_) | Event::Tick => return None,
+        Event::Output(bytes) => json!({
+            "type": "output",
+            "text": String::from_utf8_lossy(bytes),
+        }),
         Event::Phase(phase) => {
             let (state, extra) = match phase.state {
                 PhaseState::Started => ("started", json!({})),

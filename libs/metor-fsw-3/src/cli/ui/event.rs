@@ -17,6 +17,11 @@ pub enum Event<'a> {
     /// The widest log source the run can produce, so every line, from every
     /// target, aligns.
     SourceWidth(usize),
+    /// Another program's output, shown as it was written, such as cargo's
+    /// errors or a target file's traceback.
+    Output(&'a [u8]),
+    /// Time passed; a live line may redraw.
+    Tick,
 }
 
 /// A step before the first cycle.

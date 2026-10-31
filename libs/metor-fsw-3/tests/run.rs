@@ -102,9 +102,12 @@ fn test_deployment_runs_every_target_as_a_child() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
+    let phases = ["Evaluated", "Resolved", "Running"];
     assert!(
-        stderr.lines().all(|line| line.contains("Running")),
-        "a clean deployment prints only what it runs: {stderr}"
+        stderr
+            .lines()
+            .all(|line| phases.iter().any(|phase| line.contains(phase))),
+        "a clean deployment prints only its phases: {stderr}"
     );
 }
 

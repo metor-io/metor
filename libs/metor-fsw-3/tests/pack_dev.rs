@@ -9,8 +9,9 @@ use std::process::Command;
 
 use common::fixture_dir;
 use metor_fsw_3::DlPack;
-use metor_fsw_3::cli::cargo::{PackConfig, cargo_build};
+use metor_fsw_3::cli::cargo::{PackConfig, Watch, cargo_build};
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
+use metor_fsw_3::cli::ui::Ui;
 use metor_fsw_3::dl::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
@@ -122,7 +123,8 @@ fn run_pack_dev(root: &Path) {
 
 #[test]
 fn test_pack_dev_rejects_loaded_destination() {
-    let built = cargo_build("echo-pack", &fixture_dir()).expect("fixture builds");
+    let built =
+        cargo_build("echo-pack", &fixture_dir(), &mut Watch::quiet()).expect("fixture builds");
     let temp = tempfile::tempdir().expect("temporary staging root");
     for name in ["pyproject.toml", "Cargo.toml"] {
         std::fs::copy(fixture_dir().join(name), temp.path().join(name)).expect("copy config");
@@ -140,7 +142,7 @@ fn test_pack_dev_rejects_loaded_destination() {
     drop(unsafe { DlPack::open(&dylib) }.expect("load staged fixture"));
 
     assert!(matches!(
-        pack_dev(temp.path()),
+        pack_dev(temp.path(), &Ui::silent()),
         Err(PackDevError::AlreadyLoaded(path)) if path == dylib
     ));
     let after = dylib.metadata().expect("library remains present");
@@ -180,7 +182,7 @@ fn test_wasm_pack_dev_stages_async_pack() {
     let root = root_in_target();
     let pyproject = wasm_pyproject("echo-pack");
     std::fs::write(root.path().join("pyproject.toml"), pyproject).expect("writes");
-    pack_dev(root.path()).expect("pack dev lays out both");
+    pack_dev(root.path(), &Ui::silent()).expect("pack dev lays out both");
     let module = root.path().join(".metor/echo_pack");
     assert!(module.join("__init__.py").is_file());
     let staged = module
@@ -193,7 +195,7 @@ fn test_wasm_pack_dev_stages_async_pack() {
 #[test]
 fn test_wasm_pack_dev_stages_module() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sync-pack");
-    pack_dev(&root).expect("pack dev lays out both");
+    pack_dev(&root, &Ui::silent()).expect("pack dev lays out both");
     let module = root.join(".metor/sync_pack");
     let staged = module
         .join("_libs")

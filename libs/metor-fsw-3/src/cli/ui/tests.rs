@@ -40,7 +40,7 @@ fn script(reporter: &mut dyn Reporter) {
 
 fn human(caps: Caps) -> String {
     let mut out = Vec::new();
-    script(&mut Human::new(&mut out, caps));
+    script(&mut Human::new(&mut out, caps).reveal_at_once());
     String::from_utf8(out).expect("utf-8")
 }
 
@@ -87,4 +87,65 @@ fn test_ui_shares_one_renderer() {
     ui.clone().emit(Event::Running(&[]));
     ui.emit(Event::Running(&[]));
     assert_eq!(*count.lock().expect("not poisoned"), 2);
+}
+
+fn live_caps() -> Caps {
+    Caps {
+        live: true,
+        unicode: true,
+        ..Caps::plain()
+    }
+}
+
+fn evaluate(state: PhaseState<'static>) -> Event<'static> {
+    Event::Phase(Phase {
+        verb: Verb::Evaluate,
+        subject: "target.py",
+        state,
+    })
+}
+
+#[test]
+fn test_ticks_advance_the_spinner_in_place() {
+    let mut out = Vec::new();
+    let mut human = Human::new(&mut out, live_caps()).reveal_at_once();
+    human.event(&evaluate(PhaseState::Started));
+    human.event(&Event::Tick);
+    human.event(&Event::Tick);
+    human.event(&evaluate(PhaseState::Done(Duration::from_millis(1500))));
+    let text = String::from_utf8(out).expect("utf-8");
+    let frames: Vec<_> = ["⠋", "⠙", "⠹"].iter().map(|f| text.find(f)).collect();
+    assert!(frames.iter().all(Option::is_some), "{text:?}");
+    assert!(frames.windows(2).all(|w| w[0] < w[1]), "frames in order");
+    assert!(
+        text.ends_with("✓ Evaluated   target.py                   1.5s\n"),
+        "{text:?}"
+    );
+    assert_eq!(text.matches('\n').count(), 1, "the live line never scrolls");
+}
+
+#[test]
+fn test_a_quick_phase_never_shows_its_live_line() {
+    let mut out = Vec::new();
+    let mut human = Human::new(&mut out, live_caps());
+    human.event(&evaluate(PhaseState::Started));
+    human.event(&Event::Tick);
+    human.event(&evaluate(PhaseState::Done(Duration::from_millis(3))));
+    let text = String::from_utf8(out).expect("utf-8");
+    assert_eq!(text, "  ✓ Evaluated   target.py\n");
+}
+
+#[test]
+fn test_output_clears_the_live_line_first() {
+    let mut out = Vec::new();
+    let mut human = Human::new(&mut out, live_caps()).reveal_at_once();
+    human.event(&evaluate(PhaseState::Started));
+    human.event(&evaluate(PhaseState::Failed));
+    human.event(&Event::Output(b"Traceback\n"));
+    let text = String::from_utf8(out).expect("utf-8");
+    let failed = text.find("✗ Evaluating").expect("a failed line");
+    assert!(
+        text[failed..].ends_with("target.py\nTraceback\n"),
+        "{text:?}"
+    );
 }

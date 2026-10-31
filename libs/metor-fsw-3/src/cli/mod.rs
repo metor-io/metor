@@ -71,10 +71,10 @@ pub fn main() {
 
 fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
     match command {
-        Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root)?,
+        Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root, ui)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
         Command::Run(args) => run::run(args, ui)?,
-        Command::Build(args) => build::build(args)?,
+        Command::Build(args) => build::build(args, ui)?,
     }
     Ok(())
 }

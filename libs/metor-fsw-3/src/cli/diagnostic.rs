@@ -145,7 +145,7 @@ fn run_info(error: &RunError) -> Info {
             "M0206",
             Some("run from the directory with target.py, or pass the target file".into()),
         ),
-        RunError::Python(_) => ("M0201", Some("the traceback above shows where".into())),
+        RunError::Python { .. } => ("M0201", Some("the traceback above shows where".into())),
         RunError::PythonPath(_) => ("M0202", None),
         RunError::Spawn(_) => (
             "M0203",
@@ -268,7 +268,7 @@ fn pack_dev_info(error: &PackDevError) -> Info {
 fn cargo_info(error: &CargoError) -> Info {
     match error {
         CargoError::Spawn(_) => ("M0410", Some("is cargo on your PATH?".into())),
-        CargoError::Cargo(_) => ("M0411", Some("cargo's errors are above".into())),
+        CargoError::Cargo { .. } => ("M0411", Some("cargo's errors are above".into())),
         CargoError::NoArtifact(..) => (
             "M0412",
             Some("set `crate-type = [\"cdylib\"]` in the pack's Cargo.toml".into()),

@@ -41,6 +41,19 @@ pub struct OutputArgs {
     /// Draw with ASCII only.
     #[arg(long, global = true)]
     pub ascii: bool,
+    /// Show cargo's output and the files each step writes.
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
+}
+
+/// How often a live line redraws.
+const TICK: core::time::Duration = core::time::Duration::from_millis(100);
+
+/// Drops every event.
+struct Silent;
+
+impl Reporter for Silent {
+    fn event(&mut self, _event: &Event<'_>) {}
 }
 
 /// A handle commands report through. Clones share one renderer.
@@ -49,23 +62,44 @@ pub struct Ui {
     reporter: Arc<Mutex<Box<dyn Reporter>>>,
     pub caps: Caps,
     pub format: Format,
+    pub verbose: bool,
 }
 
 impl Ui {
     /// Detects the terminal and picks the renderer for `args`.
+    ///
+    /// A live terminal gets a thread that ticks its spinner. With
+    /// `--verbose`, cargo writes to the terminal too, so nothing redraws.
     pub fn new(args: &OutputArgs) -> Self {
-        let caps = match args.format {
+        let mut caps = match args.format {
             Format::Human => Caps::resolve(&Probe::detect(), args.color, args.ascii),
             Format::Json => Caps::plain(),
         };
+        caps.live &= !args.verbose;
         let reporter: Box<dyn Reporter> = match args.format {
             Format::Human => Box::new(Human::new(std::io::stderr(), caps)),
             Format::Json => Box::new(Json::new(std::io::stdout())),
         };
-        Self {
+        let ui = Self {
             format: args.format,
+            verbose: args.verbose,
             ..Self::with(reporter, caps)
+        };
+        if caps.live {
+            let ticker = ui.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(TICK);
+                    ticker.emit(Event::Tick);
+                }
+            });
         }
+        ui
+    }
+
+    /// A handle that drops every event.
+    pub fn silent() -> Self {
+        Self::with(Box::new(Silent), Caps::plain())
     }
 
     pub fn with(reporter: Box<dyn Reporter>, caps: Caps) -> Self {
@@ -73,6 +107,7 @@ impl Ui {
             reporter: Arc::new(Mutex::new(reporter)),
             caps,
             format: Format::Human,
+            verbose: false,
         }
     }
 

@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::run::{RunError, prepare};
+use super::ui::Ui;
 use crate::deploy::ConfigError;
 
 /// The arguments to `metor build`.
@@ -19,8 +20,8 @@ pub struct Build {
 }
 
 /// Evaluates and resolves the deployment, then writes it out as JSON.
-pub fn build(args: Build) -> Result<(), RunError> {
-    let config = prepare(args.target.as_deref())?;
+pub fn build(args: Build, ui: &Ui) -> Result<(), RunError> {
+    let config = prepare(args.target.as_deref(), ui)?;
     let text = serde_json::to_string_pretty(&config).map_err(ConfigError::Decode)?;
     match args.out {
         Some(path) => std::fs::write(path, text + "\n")?,

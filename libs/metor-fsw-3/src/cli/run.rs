@@ -12,9 +12,10 @@ use std::env::JoinPathsError;
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use metor_proto_wkt::LogLevel;
 use serde::Deserialize;
@@ -27,7 +28,7 @@ use super::cargo::read_toml;
 use super::console::{self, ConsoleLayer, Origin, Route};
 use super::pack_dev::{PackDevError, pack_dev};
 use super::ui::Ui;
-use super::ui::event::Event;
+use super::ui::event::{Event, Phase, PhaseState, Verb};
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
 };
@@ -76,8 +77,12 @@ pub enum RunError {
     NoTargetFile(PathBuf),
     #[error("running the target file: {0}")]
     Spawn(#[from] std::io::Error),
-    #[error("the target file exited with {0}")]
-    Python(ExitStatus),
+    #[error("the target file exited with {status}")]
+    Python {
+        status: ExitStatus,
+        /// What the target file wrote to stderr, for the caller to show.
+        stderr: Vec<u8>,
+    },
     #[error("building PYTHONPATH: {0}")]
     PythonPath(#[from] JoinPathsError),
     #[error(transparent)]
@@ -122,7 +127,7 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         ui: ui.clone(),
         route: route.clone(),
     });
-    let config = prepare(args.target.as_deref())?;
+    let config = prepare(args.target.as_deref(), ui)?;
     let namespaces = config.namespaces();
     if namespaces.len() > 1 && args.member.is_none() {
         ui.emit(Event::Running(&namespaces));
@@ -266,20 +271,63 @@ fn console_level(filter: LevelFilter) -> LogLevel {
 /// Rebuilds every dev pack next to `target` first. A `.py` file is evaluated,
 /// and a `.json` file is read as is. If the config still has peer references,
 /// every target's packs are opened to resolve them.
-pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
+pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, RunError> {
     let target = target.unwrap_or(Path::new("target.py"));
     if !target.is_file() {
         return Err(RunError::NoTargetFile(target.to_path_buf()));
     }
     let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
     for pack in &packs {
-        pack_dev(pack)?;
+        pack_dev(pack, ui)?;
     }
-    let mut config = if target.extension().is_some_and(|ext| ext == "json") {
+    let config = if target.extension().is_some_and(|ext| ext == "json") {
         DeploymentConfig::from_slice(&std::fs::read(target)?)?
     } else {
-        eval_target(target, &packs)?
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        phased(ui, Verb::Evaluate, &name, || {
+            eval_target(target, &packs, ui)
+        })?
     };
+    let subject = match config.targets.len() {
+        1 => "1 target".to_string(),
+        n => format!("{n} targets"),
+    };
+    phased(ui, Verb::Resolve, &subject, || resolve(config, target))
+}
+
+/// Runs `f` as a phase on `ui`. On failure, shows the output the failed
+/// program left after the phase's line.
+fn phased<T>(
+    ui: &Ui,
+    verb: Verb,
+    subject: &str,
+    f: impl FnOnce() -> Result<T, RunError>,
+) -> Result<T, RunError> {
+    let phase = |state| {
+        ui.emit(Event::Phase(Phase {
+            verb,
+            subject,
+            state,
+        }))
+    };
+    let started = Instant::now();
+    phase(PhaseState::Started);
+    let result = f();
+    match &result {
+        Ok(_) => phase(PhaseState::Done(started.elapsed())),
+        Err(error) => {
+            phase(PhaseState::Failed);
+            if let RunError::Python { stderr, .. } = error {
+                ui.emit(Event::Output(stderr));
+            }
+        }
+    }
+    result
+}
+
+/// Resolves the peer references in `config`, opening every target's packs
+/// if any are left.
+fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeployment, RunError> {
     if let Some(pending) = deploy::pending(&config)? {
         let tables: Vec<SystemTable> = config
             .targets
@@ -366,15 +414,30 @@ struct PackMetor {
 }
 
 /// Runs the target file as a script and reads the deployment it emitted.
-pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfig, RunError> {
+///
+/// Its stderr is kept, so a traceback shows after the phase line. On
+/// success, anything it wrote there, such as a warning, is shown on `ui`.
+pub fn eval_target(
+    path: &Path,
+    dev_packs: &[PathBuf],
+    ui: &Ui,
+) -> Result<DeploymentConfig, RunError> {
     let out = std::env::temp_dir().join(format!("metor-config-{}.json", std::process::id()));
-    let status = Command::new(interpreter())
+    let output = Command::new(interpreter())
         .arg(path)
         .env("PYTHONPATH", python_path(dev_packs)?)
         .env("METOR_CONFIG_OUT", &out)
-        .status()?;
-    if !status.success() {
-        return Err(RunError::Python(status));
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        return Err(RunError::Python {
+            status: output.status,
+            stderr: output.stderr,
+        });
+    }
+    if !output.stderr.is_empty() {
+        ui.emit(Event::Output(&output.stderr));
     }
     let bytes = std::fs::read(&out)?;
     let _ = std::fs::remove_file(&out);
@@ -535,7 +598,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let target = dir.path().join("target.py");
         std::fs::write(&target, "raise SystemExit(3)\n").expect("writes");
-        let Err(RunError::Python(status)) = eval_target(&target, &[]) else {
+        let Err(RunError::Python { status, .. }) = eval_target(&target, &[], &Ui::silent()) else {
             panic!("a raising target is an error")
         };
         assert_eq!(status.code(), Some(3));
