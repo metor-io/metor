@@ -412,7 +412,11 @@ fn test_check_writes_the_names_completion_reads() {
         .current_dir(dir.path())
         .output()
         .expect("metor runs");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let names = std::fs::read_to_string(dir.path().join(".metor/names")).expect("check wrote it");
     assert!(names.starts_with("target a\ntarget b\n"), "{names}");
 }
@@ -439,7 +443,10 @@ fn test_graph_joins_a_link_across_targets() {
         String::from_utf8(output.stdout).expect("utf-8")
     };
     let picture = graph(&["deploy.py"]);
-    assert!(picture.contains("b.mirror") && picture.contains("a.out"), "{picture}");
+    assert!(
+        picture.contains("b.mirror") && picture.contains("a.out"),
+        "{picture}"
+    );
     let mermaid = graph(&["deploy.py", "--as", "mermaid"]);
     assert!(mermaid.contains("t1_0 <-.-> t0_0"), "{mermaid}");
     let one = graph(&["deploy.py", "b"]);

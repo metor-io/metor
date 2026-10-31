@@ -136,9 +136,10 @@ fn complete(current: &OsStr, kinds: &[Kind], files: bool) -> Vec<CompletionCandi
     let names = candidates(&cache, kinds, &prefix)
         .into_iter()
         .map(CompletionCandidate::new);
-    let files = files
-        .then(|| target_files().complete(current))
-        .unwrap_or_default();
+    let files = match files {
+        true => target_files().complete(current),
+        false => Vec::new(),
+    };
     names.chain(files).collect()
 }
 
