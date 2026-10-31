@@ -21,7 +21,11 @@ pub struct Check {
 pub fn check(args: Check, ui: &Ui) -> Result<(), RunError> {
     let config = prepare(args.target.as_deref(), ui)?;
     for (target, namespace) in config.targets.iter().zip(config.namespaces()) {
-        let name = if namespace.is_empty() { "target" } else { namespace };
+        let name = if namespace.is_empty() {
+            "target"
+        } else {
+            namespace
+        };
         phased(ui, Verb::Check, name, || {
             load(target, &Run::default(), None).map(drop)
         })?;

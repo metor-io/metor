@@ -88,6 +88,8 @@ pub enum RunError {
     NoTargetFile(PathBuf),
     #[error("no target.py in {} or a directory above it", .0.display())]
     NoProject(PathBuf),
+    #[error("nothing in the deployment is named `{name}`")]
+    NoSuchName { name: String, known: Vec<String> },
     #[error("running the target file: {0}")]
     Spawn(std::io::Error),
     #[error("the target file made no deployment")]

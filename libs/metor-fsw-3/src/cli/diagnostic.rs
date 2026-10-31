@@ -161,6 +161,7 @@ fn run_info(error: &RunError) -> Info {
             "M0206",
             Some("run from the directory with target.py, or pass the target file".into()),
         ),
+        RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, "names"))),
         RunError::NoProject(_) => (
             "M0209",
             Some("pass the target file, or run from a project directory".into()),
@@ -189,7 +190,9 @@ fn run_info(error: &RunError) -> Info {
 
 fn config_info(error: &ConfigError) -> Info {
     match error {
-        ConfigError::NoSuchTarget { name, known } => ("M0102", Some(suggest(name, known))),
+        ConfigError::NoSuchTarget { name, known } => {
+            ("M0102", Some(suggest(name, known, "targets")))
+        }
         ConfigError::SelectTarget(_) => ("M0103", None),
         ConfigError::Version { .. } => (
             "M0204",
@@ -317,17 +320,24 @@ fn pack_info(error: &PackError) -> Info {
     }
 }
 
-/// A help line naming the closest of `known` to `name`, then all of them.
-fn suggest(name: &str, known: &[String]) -> String {
+/// How many known names a help line lists in full.
+const LISTED: usize = 8;
+
+/// A help line naming the closest of `known` to `name`, then all of them
+/// if there are few.
+fn suggest(name: &str, known: &[String], noun: &str) -> String {
     let closest = known
         .iter()
         .map(|candidate| (strsim::damerau_levenshtein(name, candidate), candidate))
         .filter(|(distance, candidate)| *distance <= candidate.len().div_ceil(3))
         .min_by_key(|(distance, _)| *distance);
-    let list = known.join(", ");
+    let list = match known.len() {
+        0..=LISTED => format!("{noun}: {}", known.join(", ")),
+        n => format!("{n} {noun}; `metor show` lists them"),
+    };
     match closest {
-        Some((_, candidate)) => format!("did you mean `{candidate}`?  targets: {list}"),
-        None => format!("targets: {list}"),
+        Some((_, candidate)) => format!("did you mean `{candidate}`?  {list}"),
+        None => list,
     }
 }
 
@@ -338,16 +348,25 @@ mod tests {
     #[test]
     fn test_suggest_names_the_closest_target() {
         let known = ["plant", "fsw", "gw"].map(String::from);
+        let suggest = |name| suggest(name, &known, "targets");
         assert_eq!(
-            suggest("fws", &known),
+            suggest("fws"),
             "did you mean `fsw`?  targets: plant, fsw, gw"
         );
         assert_eq!(
-            suggest("palnt", &known),
+            suggest("palnt"),
             "did you mean `plant`?  targets: plant, fsw, gw"
         );
-        assert_eq!(suggest("zzz", &known), "targets: plant, fsw, gw");
-        assert_eq!(suggest("x", &[]), "targets: ");
+        assert_eq!(suggest("zzz"), "targets: plant, fsw, gw");
+    }
+
+    #[test]
+    fn test_suggest_summarises_many_names() {
+        let known: Vec<String> = (0..20).map(|i| format!("sys{i}")).collect();
+        assert_eq!(
+            suggest("sys1x", &known, "names"),
+            "did you mean `sys1`?  20 names; `metor show` lists them"
+        );
     }
 
     #[test]

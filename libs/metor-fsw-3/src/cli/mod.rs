@@ -13,6 +13,7 @@ pub mod module;
 pub mod pack_dev;
 mod port_class;
 pub mod run;
+pub mod show;
 pub mod ui;
 pub mod units;
 
@@ -46,6 +47,8 @@ pub enum Command {
     Run(run::Run),
     /// Builds everything `run` would, and stops before the first cycle.
     Check(check::Check),
+    /// Prints the deployment's targets, systems, and wiring.
+    Show(show::Show),
     /// Evaluates a target file and writes out the resolved deployment.
     Build(build::Build),
 }
@@ -82,6 +85,7 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args, ui)?,
         Command::Check(args) => check::check(args, ui)?,
+        Command::Show(args) => show::show(args, ui)?,
     }
     Ok(())
 }

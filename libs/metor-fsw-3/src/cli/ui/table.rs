@@ -16,6 +16,8 @@ pub enum Align {
 pub struct Table<'a> {
     headers: &'a [(&'a str, Align)],
     rows: Vec<Vec<String>>,
+    /// The widest a line may be. The last column is cut to fit.
+    width: Option<usize>,
 }
 
 /// The gap between columns.
@@ -26,7 +28,14 @@ impl<'a> Table<'a> {
         Self {
             headers,
             rows: Vec::new(),
+            width: None,
         }
+    }
+
+    /// Cuts the last column so each line, with its indent, fits `width`.
+    pub fn fit(mut self, width: Option<usize>) -> Self {
+        self.width = width;
+        self
     }
 
     /// Adds a row. Missing cells are blank.
@@ -46,6 +55,10 @@ impl<'a> Table<'a> {
             let cells: Vec<&str> = row.iter().map(String::as_str).collect();
             let (first, rest) = cells.split_first().unwrap_or((&"", &[]));
             let rest = self.line(rest, &widths, 1);
+            let room = self
+                .width
+                .map(|width| width.saturating_sub(indent.chars().count() + widths[0] + GAP.len()));
+            let rest = cut(&rest, room, theme.glyphs.ellipsis);
             let width = if rest.is_empty() { 0 } else { widths[0] };
             write!(out, "{indent}{bold}{first:<width$}{bold:#}")?;
             if !rest.is_empty() {
@@ -91,6 +104,18 @@ impl<'a> Table<'a> {
     }
 }
 
+/// `text` cut to `room` characters, ending in `ellipsis` if it was cut.
+fn cut(text: &str, room: Option<usize>, ellipsis: &str) -> String {
+    let Some(room) = room.filter(|room| text.chars().count() > *room) else {
+        return text.to_string();
+    };
+    let kept: String = text
+        .chars()
+        .take(room.saturating_sub(ellipsis.chars().count()))
+        .collect();
+    format!("{}{ellipsis}", kept.trim_end())
+}
+
 /// `n` with its digits grouped in threes by spaces: `1 440`.
 pub fn group(n: u64) -> String {
     let digits = n.to_string();
@@ -126,6 +151,22 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("utf-8"),
             "    TARGET  CYCLES  NOTE\n    plant    1 440\n    fsw         12  slow\n"
+        );
+    }
+
+    #[test]
+    fn test_fit_cuts_the_last_column() {
+        let headers = [("NAME", Align::Left), ("INPUTS", Align::Left)];
+        let mut table = Table::new(&headers).fit(Some(20));
+        table.row(vec!["pub".into(), "plant.sensors, plant.gps".into()]);
+        table.row(vec!["nav".into(), "gps".into()]);
+        let mut out = Vec::new();
+        table
+            .write(&mut out, &Theme::new(&Caps::plain()), "  ")
+            .expect("writes to a Vec");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "  NAME  INPUTS\n  pub   plant.senso~\n  nav   gps\n"
         );
     }
 
