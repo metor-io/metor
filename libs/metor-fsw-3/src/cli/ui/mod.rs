@@ -11,7 +11,8 @@ pub mod theme;
 
 use std::sync::{Arc, Mutex};
 
-use caps::{Caps, ColorChoice};
+use caps::Caps;
+use clap::ColorChoice;
 use event::Event;
 use human::Human;
 use json::Json;

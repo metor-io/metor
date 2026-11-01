@@ -4,7 +4,9 @@
 use anstyle::{Color, RgbColor, Style};
 use anstyle_lossy::{palette::VGA, rgb_to_ansi, rgb_to_xterm};
 
-use super::caps::{Background, Caps, Depth};
+use terminal_colorsaurus::ThemeMode;
+
+use super::caps::{Caps, Depth};
 
 /// The number of distinct target hues.
 pub const HUES: usize = 8;
@@ -47,8 +49,8 @@ pub struct Theme {
 impl Theme {
     pub fn new(caps: &Caps) -> Self {
         let (tokens, hues) = match caps.background {
-            Background::Dark => DARK,
-            Background::Light => LIGHT,
+            ThemeMode::Dark => DARK,
+            ThemeMode::Light => LIGHT,
         };
         let [muted, faint, accent, ok, warn, error] = tokens.map(|rgb| paint(rgb, caps.depth));
         Self {
@@ -91,7 +93,7 @@ fn paint(rgb: u32, depth: Depth) -> Style {
 mod tests {
     use super::*;
 
-    fn theme(depth: Depth, background: Background) -> Theme {
+    fn theme(depth: Depth, background: ThemeMode) -> Theme {
         Theme::new(&Caps {
             depth,
             background,
@@ -113,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_each_depth_stays_in_its_colour_space() {
-        for background in [Background::Dark, Background::Light] {
+        for background in [ThemeMode::Dark, ThemeMode::Light] {
             for depth in [Depth::None, Depth::Ansi16, Depth::Ansi256, Depth::TrueColor] {
                 for style in styles(&theme(depth, background)) {
                     let fits = matches!(
@@ -131,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_no_depth_has_no_styles_or_bold() {
-        let theme = theme(Depth::None, Background::Dark);
+        let theme = theme(Depth::None, ThemeMode::Dark);
         assert!(styles(&theme).all(|style| style == Style::new()));
         assert_eq!(theme.bold(theme.accent), Style::new());
     }
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn test_hues_are_distinct_and_wrap() {
         for depth in [Depth::Ansi256, Depth::TrueColor] {
-            let theme = theme(depth, Background::Dark);
+            let theme = theme(depth, ThemeMode::Dark);
             for i in 0..HUES {
                 for j in i + 1..HUES {
                     assert_ne!(theme.hue(i), theme.hue(j), "{depth:?}");

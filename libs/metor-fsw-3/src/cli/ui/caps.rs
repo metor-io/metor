@@ -2,16 +2,9 @@
 
 use std::io::IsTerminal;
 
+use clap::ColorChoice;
 use supports_color::Stream;
-
-/// The `--color` flag.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum ColorChoice {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
+use terminal_colorsaurus::ThemeMode;
 
 /// How many colours the terminal shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,14 +15,6 @@ pub enum Depth {
     TrueColor,
 }
 
-/// The terminal's background.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Background {
-    #[default]
-    Dark,
-    Light,
-}
-
 /// What the renderers may use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
@@ -37,7 +22,8 @@ pub struct Caps {
     pub live: bool,
     pub depth: Depth,
     pub width: u16,
-    pub background: Background,
+    /// The terminal's background.
+    pub background: ThemeMode,
 }
 
 impl Caps {
@@ -82,7 +68,7 @@ impl Caps {
             live: false,
             depth: Depth::None,
             width: Self::DEFAULT_WIDTH,
-            background: Background::Dark,
+            background: ThemeMode::Dark,
         }
     }
 }
@@ -112,27 +98,23 @@ fn foreground() -> bool {
     unsafe { libc::tcgetpgrp(libc::STDERR_FILENO) == libc::getpgrp() }
 }
 
-/// The background the terminal reports when `query`, else `COLORFGBG`'s.
-fn background(query: bool) -> Background {
-    use terminal_colorsaurus::{QueryOptions, ThemeMode, theme_mode};
-    let mut options = QueryOptions::default();
+/// The background the terminal reports when `query`, else `COLORFGBG`'s,
+/// else dark.
+fn background(query: bool) -> ThemeMode {
+    let mut options = terminal_colorsaurus::QueryOptions::default();
     options.timeout = std::time::Duration::from_millis(100);
-    let asked = query.then(|| theme_mode(options).ok()).flatten();
+    let asked = query.then(|| terminal_colorsaurus::theme_mode(options).ok());
     let env = || from_colorfgbg(&std::env::var("COLORFGBG").ok()?);
-    match asked {
-        Some(ThemeMode::Light) => Background::Light,
-        Some(ThemeMode::Dark) => Background::Dark,
-        None => env().unwrap_or_default(),
-    }
+    asked.flatten().or_else(env).unwrap_or(ThemeMode::Dark)
 }
 
 /// Reads the background from `COLORFGBG`, which is `fg;bg` in ANSI colour
 /// numbers.
-fn from_colorfgbg(value: &str) -> Option<Background> {
+fn from_colorfgbg(value: &str) -> Option<ThemeMode> {
     let bg: u8 = value.rsplit(';').next()?.parse().ok()?;
     Some(match bg {
-        7 | 9..=15 => Background::Light,
-        _ => Background::Dark,
+        7 | 9..=15 => ThemeMode::Light,
+        _ => ThemeMode::Dark,
     })
 }
 
@@ -158,9 +140,9 @@ mod tests {
 
     #[test]
     fn test_colorfgbg() {
-        assert_eq!(from_colorfgbg("15;0"), Some(Background::Dark));
-        assert_eq!(from_colorfgbg("0;15"), Some(Background::Light));
-        assert_eq!(from_colorfgbg("0;default;7"), Some(Background::Light));
+        assert_eq!(from_colorfgbg("15;0"), Some(ThemeMode::Dark));
+        assert_eq!(from_colorfgbg("0;15"), Some(ThemeMode::Light));
+        assert_eq!(from_colorfgbg("0;default;7"), Some(ThemeMode::Light));
         assert_eq!(from_colorfgbg("garbage"), None);
         assert_eq!(from_colorfgbg(""), None);
     }

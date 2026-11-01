@@ -31,9 +31,10 @@ use clap::builder::Styles;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::pack::ABI_VERSION;
+use clap::ColorChoice;
 use diagnostic::{Report, exit_code};
 use run::RunError;
-use ui::caps::{Caps, ColorChoice};
+use ui::caps::Caps;
 use ui::event::Event;
 use ui::theme::Theme;
 use ui::{OutputArgs, Ui};
@@ -154,11 +155,6 @@ pub fn main() {
 
 /// Parses the command line, with help styled for `caps`.
 fn parse(caps: &Caps, color: ColorChoice) -> Cli {
-    let color = match color {
-        ColorChoice::Auto => clap::ColorChoice::Auto,
-        ColorChoice::Always => clap::ColorChoice::Always,
-        ColorChoice::Never => clap::ColorChoice::Never,
-    };
     let command = Cli::command()
         .color(color)
         .styles(styles(&Theme::new(caps)));

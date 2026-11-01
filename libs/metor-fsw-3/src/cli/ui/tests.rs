@@ -1,6 +1,8 @@
 use core::time::Duration;
 
-use super::caps::{Background, Caps, Depth};
+use terminal_colorsaurus::ThemeMode;
+
+use super::caps::{Caps, Depth};
 use super::event::{Event, Phase, PhaseState, Verb};
 use super::human::Human;
 use super::json::Json;
@@ -53,7 +55,7 @@ fn test_plain_skips_live_lines() {
 fn test_truecolor() {
     let caps = Caps {
         depth: Depth::TrueColor,
-        background: Background::Dark,
+        background: ThemeMode::Dark,
         ..Caps::plain()
     };
     insta::assert_snapshot!(human(caps));
