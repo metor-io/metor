@@ -1,4 +1,4 @@
-//! Colours and glyphs.
+//! Colours.
 //!
 //! Renderers style text through a [`Theme`] by [`Token`], never by colour.
 //! Each token has a designed swatch per background and colour depth.
@@ -91,113 +91,12 @@ const LIGHT: Palette = Palette {
     ],
 };
 
-/// The glyphs the renderers draw with.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Glyphs {
-    pub ok: &'static str,
-    pub fail: &'static str,
-    pub warn: &'static str,
-    pub running: &'static str,
-    pub stopped: &'static str,
-    pub spinner: &'static [&'static str],
-    pub ellipsis: &'static str,
-    pub from: &'static str,
-    pub link: &'static str,
-    pub dot: &'static str,
-    pub again: &'static str,
-    pub bullet: &'static str,
-    pub lines: Lines,
-}
-
-/// Box-drawing characters for `graph`.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Lines {
-    pub horizontal: char,
-    pub vertical: char,
-    pub down_right: char,
-    pub down_left: char,
-    pub up_right: char,
-    pub up_left: char,
-    /// A vertical line with a branch to the right.
-    pub tee_right: char,
-    /// A vertical line with a branch to the left.
-    pub tee_left: char,
-    pub cross: char,
-    /// A horizontal line with a branch up.
-    pub tee_up: char,
-    /// A horizontal line with a branch down.
-    pub tee_down: char,
-    pub arrow: char,
-    pub out: char,
-}
-
-pub static UNICODE: Glyphs = Glyphs {
-    ok: "✓",
-    fail: "✗",
-    warn: "▲",
-    running: "●",
-    stopped: "■",
-    spinner: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-    ellipsis: "…",
-    from: "←",
-    link: "⇄",
-    dot: "·",
-    again: "↻",
-    bullet: "•",
-    lines: Lines {
-        horizontal: '─',
-        vertical: '│',
-        down_right: '╭',
-        down_left: '╮',
-        up_right: '╰',
-        up_left: '╯',
-        tee_right: '├',
-        tee_left: '┤',
-        cross: '┼',
-        tee_up: '┴',
-        tee_down: '┬',
-        arrow: '▶',
-        out: '▸',
-    },
-};
-
-pub static ASCII: Glyphs = Glyphs {
-    ok: "+",
-    fail: "x",
-    warn: "!",
-    running: "*",
-    stopped: "#",
-    spinner: &["-", "\\", "|", "/"],
-    ellipsis: "~",
-    from: "<-",
-    link: "<>",
-    dot: "-",
-    again: "~",
-    bullet: "-",
-    lines: Lines {
-        horizontal: '-',
-        vertical: '|',
-        down_right: '+',
-        down_left: '+',
-        up_right: '+',
-        up_left: '+',
-        tee_right: '+',
-        tee_left: '+',
-        cross: '+',
-        tee_up: '+',
-        tee_down: '+',
-        arrow: '>',
-        out: '>',
-    },
-};
-
-/// The styles and glyphs for one terminal.
+/// The styles for one terminal.
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     tokens: [Style; 6],
     hues: [Style; HUES],
     effects: bool,
-    pub glyphs: &'static Glyphs,
 }
 
 impl Theme {
@@ -211,7 +110,6 @@ impl Theme {
             tokens: palette.tokens.each_ref().map(style),
             hues: palette.hues.each_ref().map(style),
             effects: caps.depth != Depth::None,
-            glyphs: if caps.unicode { &UNICODE } else { &ASCII },
         }
     }
 
@@ -264,11 +162,10 @@ mod tests {
         Token::Error,
     ];
 
-    fn theme(depth: Depth, background: Background, unicode: bool) -> Theme {
+    fn theme(depth: Depth, background: Background) -> Theme {
         Theme::new(&Caps {
             depth,
             background,
-            unicode,
             ..Caps::plain()
         })
     }
@@ -284,7 +181,7 @@ mod tests {
     fn test_each_depth_stays_in_its_colour_space() {
         for background in [Background::Dark, Background::Light] {
             for depth in [Depth::None, Depth::Ansi16, Depth::Ansi256, Depth::TrueColor] {
-                for style in styles(&theme(depth, background, true)) {
+                for style in styles(&theme(depth, background)) {
                     let fits = matches!(
                         (style.get_fg_color(), depth),
                         (None, _)
@@ -300,46 +197,24 @@ mod tests {
 
     #[test]
     fn test_no_depth_has_no_styles() {
-        let theme = theme(Depth::None, Background::Dark, true);
+        let theme = theme(Depth::None, Background::Dark);
         assert!(styles(&theme).all(|style| style == Style::new()));
     }
 
     #[test]
     fn test_text_keeps_the_terminal_foreground() {
-        let theme = theme(Depth::TrueColor, Background::Light, true);
+        let theme = theme(Depth::TrueColor, Background::Light);
         assert_eq!(theme.style(Token::Text), Style::new());
     }
 
     #[test]
     fn test_hues_are_distinct_and_wrap() {
-        let theme = theme(Depth::TrueColor, Background::Dark, true);
+        let theme = theme(Depth::TrueColor, Background::Dark);
         for i in 0..HUES {
             for j in i + 1..HUES {
                 assert_ne!(theme.hue(i), theme.hue(j));
             }
         }
         assert_eq!(theme.hue(HUES + 2), theme.hue(2));
-    }
-
-    #[test]
-    fn test_ascii_glyphs_are_ascii() {
-        let glyphs = theme(Depth::None, Background::Dark, false).glyphs;
-        let all = [
-            glyphs.ok,
-            glyphs.fail,
-            glyphs.warn,
-            glyphs.running,
-            glyphs.stopped,
-            glyphs.ellipsis,
-            glyphs.from,
-            glyphs.link,
-            glyphs.dot,
-            glyphs.again,
-        ];
-        assert!(
-            all.iter()
-                .chain(glyphs.spinner)
-                .all(|glyph| glyph.is_ascii())
-        );
     }
 }

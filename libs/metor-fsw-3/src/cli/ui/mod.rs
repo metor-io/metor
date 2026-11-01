@@ -3,6 +3,7 @@
 
 pub mod caps;
 pub mod event;
+pub mod glyph;
 pub mod human;
 pub mod json;
 pub mod logline;
@@ -62,9 +63,6 @@ pub struct OutputArgs {
         help_heading = "Output"
     )]
     pub format: Format,
-    /// Draw with ASCII only.
-    #[arg(long, global = true, help_heading = "Output")]
-    pub ascii: bool,
     /// Show cargo's output and the files each step writes.
     #[arg(short, long, global = true, help_heading = "Output")]
     pub verbose: bool,
@@ -99,7 +97,7 @@ impl Ui {
     /// `--verbose`, cargo writes to the terminal too, so nothing redraws.
     pub fn new(args: &OutputArgs, probe: &Probe) -> Self {
         let mut caps = match args.format {
-            Format::Human => Caps::resolve(probe, args.color, args.ascii),
+            Format::Human => Caps::resolve(probe, args.color),
             Format::Json => Caps::plain(),
         };
         caps.live &= !args.verbose;
@@ -126,7 +124,7 @@ impl Ui {
     }
 
     /// What stdout can show: the terminal's caps on a terminal, otherwise no
-    /// colour and no redraws, with the same glyphs.
+    /// colour and no redraws.
     pub fn stdout_caps(&self) -> Caps {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {

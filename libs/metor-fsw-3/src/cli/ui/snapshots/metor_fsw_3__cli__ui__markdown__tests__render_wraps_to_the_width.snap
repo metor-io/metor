@@ -8,8 +8,8 @@ expression: rendered(40)
   target file, so there is no
   deployment.
 
-  - a typo in `target.py`, or
-  - an import that failed: the module is
+  • a typo in `target.py`, or
+  • an import that failed: the module is
     not installed
 
     fsw = Target(cycle_rate=100.0)

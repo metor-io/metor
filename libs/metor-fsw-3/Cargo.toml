@@ -40,7 +40,6 @@ serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 strsim = { version = "0.11", optional = true }
 supports-color = { version = "3", optional = true }
-supports-unicode = { version = "3", optional = true }
 terminal-colorsaurus = { version = "1", optional = true }
 terminal_size = { version = "0.4", optional = true }
 thiserror = "2.0"
@@ -83,7 +82,6 @@ host = [
     "dep:wasmi",
     "dep:strsim",
     "dep:supports-color",
-    "dep:supports-unicode",
     "dep:terminal-colorsaurus",
     "dep:terminal_size",
 ]

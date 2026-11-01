@@ -2,7 +2,7 @@
 source: libs/metor-fsw-3/src/cli/show.rs
 expression: "rendered(Selection::All)"
 ---
-  2 targets - 0 packs
+  2 targets · 0 packs
 
   plant  120 Hz wall
     SYSTEM  KIND        INPUTS
@@ -10,4 +10,4 @@ expression: "rendered(Selection::All)"
 
   fsw  10 ms sim
     SYSTEM  KIND      INPUTS
-    nav     adcs.Nav  sensors <- plant.sensors
+    nav     adcs.Nav  sensors ← plant.sensors

@@ -54,7 +54,6 @@ fn test_live_truecolor() {
     let caps = Caps {
         live: true,
         depth: Depth::TrueColor,
-        unicode: true,
         background: Background::Dark,
         ..Caps::plain()
     };
@@ -92,7 +91,6 @@ fn test_ui_shares_one_renderer() {
 fn live_caps() -> Caps {
     Caps {
         live: true,
-        unicode: true,
         ..Caps::plain()
     }
 }

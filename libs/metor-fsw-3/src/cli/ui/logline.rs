@@ -8,6 +8,7 @@ use anstyle::Style;
 use metor_proto_wkt::LogLevel;
 
 use super::event::{LogLine, Source};
+use super::glyph;
 use super::theme::{Theme, Token};
 
 /// The width of the time column, `+00:00.000`.
@@ -59,13 +60,12 @@ fn write_source(out: &mut impl Write, source: &Source<'_>, theme: &Theme) -> io:
 
 /// The glyph for `level`, and the style of it and the message.
 fn level(level: LogLevel, theme: &Theme) -> (&'static str, Style) {
-    let glyphs = theme.glyphs;
     let (glyph, token) = match level {
-        LogLevel::Error => (glyphs.fail, Token::Error),
-        LogLevel::Warn => (glyphs.warn, Token::Warn),
+        LogLevel::Error => (glyph::FAIL, Token::Error),
+        LogLevel::Warn => (glyph::WARN, Token::Warn),
         LogLevel::Info => (" ", Token::Text),
-        LogLevel::Debug => (glyphs.dot, Token::Muted),
-        LogLevel::Trace => (glyphs.dot, Token::Faint),
+        LogLevel::Debug => (glyph::DOT, Token::Muted),
+        LogLevel::Trace => (glyph::DOT, Token::Faint),
     };
     (glyph, theme.style(token))
 }
@@ -167,7 +167,6 @@ mod tests {
     fn test_styled_lines() {
         let caps = Caps {
             depth: Depth::TrueColor,
-            unicode: true,
             ..Caps::plain()
         };
         insta::assert_snapshot!(render(caps));

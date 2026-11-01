@@ -14,6 +14,7 @@ use super::run::{RunError, find_target, interpreter, io, print, python_path};
 use super::ui::event::Event;
 use super::ui::theme::{Theme, Token};
 use super::ui::{Format, Ui};
+use crate::cli::ui::glyph;
 use crate::dl::WASM_TRIPLE;
 use crate::pack::ABI_VERSION;
 
@@ -109,9 +110,9 @@ pub fn render(out: &mut impl Write, checks: &[Check], theme: &Theme) -> io::Resu
     let muted = theme.style(Token::Muted);
     for check in checks {
         let (glyph, token) = match check.status {
-            Status::Ok => (theme.glyphs.ok, Token::Ok),
-            Status::Optional => (theme.glyphs.warn, Token::Warn),
-            Status::Failed => (theme.glyphs.fail, Token::Error),
+            Status::Ok => (glyph::OK, Token::Ok),
+            Status::Optional => (glyph::WARN, Token::Warn),
+            Status::Failed => (glyph::FAIL, Token::Error),
         };
         let style = theme.style(token);
         let name = format!("{:width$}", check.name);

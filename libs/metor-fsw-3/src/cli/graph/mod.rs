@@ -13,6 +13,7 @@ use super::show::{self, Selection, select, split_args, target_name};
 use super::ui::event::Event;
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
+use crate::cli::ui::glyph;
 use crate::deploy::ResolvedDeployment;
 use picture::Detail;
 use wiring::{At, Link, links};
@@ -90,7 +91,7 @@ fn draw(
         }
         show::write_title(out, &config.targets[t], t, theme)?;
         writeln!(out)?;
-        let notes = notes(config, links, t, theme.glyphs.link);
+        let notes = notes(config, links, t, glyph::LINK);
         let wiring = wiring::wiring(&config.targets[t]);
         picture::render(out, &wiring, &notes, theme, "  ", detail)?;
     }

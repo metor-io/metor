@@ -2,6 +2,7 @@
 
 use std::io::{self, Write};
 
+use super::glyph;
 use super::theme::{Theme, Token};
 use super::{pad, width};
 
@@ -59,7 +60,7 @@ impl<'a> Table<'a> {
             let room = self
                 .width
                 .map(|room| room.saturating_sub(width(indent) + widths[0] + GAP.len()));
-            let rest = cut(&rest, room, theme.glyphs.ellipsis);
+            let rest = cut(&rest, room, glyph::ELLIPSIS);
             let padding = if rest.is_empty() {
                 String::new()
             } else {
@@ -177,7 +178,7 @@ mod tests {
             .expect("writes to a Vec");
         assert_eq!(
             String::from_utf8(out).expect("utf-8"),
-            "  NAME  INPUTS\n  pub   plant.senso~\n  nav   gps\n"
+            "  NAME  INPUTS\n  pub   plant.senso…\n  nav   gps\n"
         );
     }
 
@@ -195,7 +196,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1], "中文  x", "{text}");
         assert!(lines.iter().all(|l| super::super::width(l) <= 14), "{text}");
-        assert!(lines[2].ends_with('~'), "{text}");
+        assert!(lines[2].ends_with('…'), "{text}");
     }
 
     #[test]

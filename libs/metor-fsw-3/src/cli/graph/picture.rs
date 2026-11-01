@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use super::lanes::{self, Span};
 use super::wiring::{Node, Wiring};
 use crate::cli::ui::theme::{Theme, Token};
+use crate::cli::ui::{glyph, glyph::line};
 use crate::cli::ui::{pad, width};
 
 /// How finely a picture draws edges.
@@ -71,17 +72,17 @@ impl Layout {
 
     /// The rows of `node` for `detail`. By system, its feeders run in
     /// ascending `rank`.
-    fn add(&mut self, wiring: &Wiring<'_>, node: usize, detail: Detail, rank: &[usize], out: char) {
+    fn add(&mut self, wiring: &Wiring<'_>, node: usize, detail: Detail, rank: &[usize]) {
         self.push(node, Part::Top);
         self.push(node, Part::Title);
         match detail {
-            Detail::Systems => self.add_systems(wiring, node, rank, out),
-            Detail::Ports => self.add_ports(wiring, node, out),
+            Detail::Systems => self.add_systems(wiring, node, rank),
+            Detail::Ports => self.add_ports(wiring, node),
         }
         self.push(node, Part::Bottom);
     }
 
-    fn add_systems(&mut self, wiring: &Wiring<'_>, node: usize, rank: &[usize], out: char) {
+    fn add_systems(&mut self, wiring: &Wiring<'_>, node: usize, rank: &[usize]) {
         let mut feeders = feeders(wiring, node);
         feeders.sort_by_key(|&f| rank.get(f).copied().unwrap_or(0));
         for source in feeders {
@@ -90,12 +91,15 @@ impl Layout {
         }
         let outputs = &wiring.nodes[node].outputs;
         if !outputs.is_empty() {
-            let row = self.push(node, Part::Output(format!("{out} {}", fold(outputs, LIST))));
+            let row = self.push(
+                node,
+                Part::Output(format!("{} {}", line::OUT, fold(outputs, LIST))),
+            );
             self.sources.push(((node, 0), row));
         }
     }
 
-    fn add_ports(&mut self, wiring: &Wiring<'_>, node: usize, out: char) {
+    fn add_ports(&mut self, wiring: &Wiring<'_>, node: usize) {
         for (input, port) in wiring.nodes[node].inputs.iter().enumerate() {
             let part = Part::Input {
                 ports: port.to_string(),
@@ -109,7 +113,7 @@ impl Layout {
             self.sinks.extend(edges.map(|e| ((e.from, e.output), row)));
         }
         for (output, port) in wiring.nodes[node].outputs.iter().enumerate() {
-            let row = self.push(node, Part::Output(format!("{port} {out}")));
+            let row = self.push(node, Part::Output(format!("{port} {}", line::OUT)));
             self.sources.push(((node, output), row));
         }
     }
@@ -123,19 +127,13 @@ fn is_idle(wiring: &Wiring<'_>, notes: &[Option<String>], node: usize) -> bool {
 }
 
 /// A box per system that isn't idle, its rows for `detail`.
-fn layout(
-    wiring: &Wiring<'_>,
-    notes: &[Option<String>],
-    out: char,
-    detail: Detail,
-    rank: &[usize],
-) -> Layout {
+fn layout(wiring: &Wiring<'_>, notes: &[Option<String>], detail: Detail, rank: &[usize]) -> Layout {
     let mut layout = Layout::default();
     for node in 0..wiring.nodes.len() {
         if is_idle(wiring, notes, node) {
             layout.idle.push(node);
         } else {
-            layout.add(wiring, node, detail, rank, out);
+            layout.add(wiring, node, detail, rank);
         }
     }
     layout
@@ -147,15 +145,14 @@ fn layout(
 fn lay_out(
     wiring: &Wiring<'_>,
     notes: &[Option<String>],
-    out: char,
     detail: Detail,
 ) -> (Layout, Vec<Span>, Vec<usize>) {
-    let first = layout(wiring, notes, out, detail, &[]);
+    let first = layout(wiring, notes, detail, &[]);
     let mut rank = vec![0; wiring.nodes.len()];
     for (((node, _), _), column) in first.sources.iter().zip(lanes::pack(&first.spans())) {
         rank[*node] = column;
     }
-    let layout = layout(wiring, notes, out, detail, &rank);
+    let layout = layout(wiring, notes, detail, &rank);
     let spans = layout.spans();
     let columns = lanes::pack(&spans);
     (layout, spans, columns)
@@ -234,10 +231,9 @@ pub fn render(
     indent: &str,
     detail: Detail,
 ) -> io::Result<()> {
-    let lines = &theme.glyphs.lines;
-    let (layout, spans, columns) = lay_out(wiring, notes, lines.out, detail);
-    let grid = lanes::draw(layout.parts.len(), &spans, &columns, lines);
-    let size = Size::of(wiring, &layout, theme.glyphs.from);
+    let (layout, spans, columns) = lay_out(wiring, notes, detail);
+    let grid = lanes::draw(layout.parts.len(), &spans, &columns);
+    let size = Size::of(wiring, &layout);
     let lane = theme.style(Token::Accent);
     for ((node, part), lanes) in layout.parts.iter().zip(&grid) {
         let lanes: String = lanes.iter().collect();
@@ -287,7 +283,7 @@ struct Size {
 }
 
 impl Size {
-    fn of(wiring: &Wiring<'_>, layout: &Layout, glyph: &str) -> Self {
+    fn of(wiring: &Wiring<'_>, layout: &Layout) -> Self {
         let widest = |f: &dyn Fn(&Node<'_>, &Part) -> usize| {
             let parts = layout.parts.iter();
             parts
@@ -302,7 +298,7 @@ impl Size {
             _ => 0,
         });
         let rest = widest(&|_, part| match part {
-            Part::Input { from, .. } => width(&source(glyph, from.as_deref())),
+            Part::Input { from, .. } => width(&source(from.as_deref())),
             Part::Output(text) => width(text).saturating_sub(ports),
             _ => 0,
         });
@@ -315,8 +311,8 @@ impl Size {
 }
 
 /// `  ← from`, written after an input row's ports.
-fn source(glyph: &str, from: Option<&str>) -> String {
-    from.map(|from| format!("  {glyph} {from}"))
+fn source(from: Option<&str>) -> String {
+    from.map(|from| format!("  {} {from}", glyph::FROM))
         .unwrap_or_default()
 }
 
@@ -328,22 +324,23 @@ fn write_part(
     size: Size,
     theme: &Theme,
 ) -> io::Result<()> {
-    let lines = &theme.glyphs.lines;
     let muted = theme.style(Token::Muted);
-    let bar = format!("{muted}{}{muted:#}", lines.vertical);
-    let tee = format!("{muted}{}{muted:#}", lines.tee_left);
-    let rule = lines.horizontal.to_string().repeat(size.inner + 2);
+    let bar = format!("{muted}{}{muted:#}", line::VERTICAL);
+    let tee = format!("{muted}{}{muted:#}", line::TEE_LEFT);
+    let rule = line::HORIZONTAL.to_string().repeat(size.inner + 2);
     let inner = size.inner;
     match part {
         Part::Top => write!(
             out,
             "{muted}{}{rule}{}{muted:#}",
-            lines.down_right, lines.down_left
+            line::DOWN_RIGHT,
+            line::DOWN_LEFT
         ),
         Part::Bottom => write!(
             out,
             "{muted}{}{rule}{}{muted:#}",
-            lines.up_right, lines.up_left
+            line::UP_RIGHT,
+            line::UP_LEFT
         ),
         Part::Title => {
             let bold = theme.bold(theme.style(Token::Text));
@@ -359,7 +356,7 @@ fn write_part(
             }
         }
         Part::Input { ports, from } => {
-            let from = source(theme.glyphs.from, from.as_deref());
+            let from = source(from.as_deref());
             let gap = pad(ports, size.ports);
             let rest = pad(&from, inner - size.ports);
             write!(out, "{tee} {ports}{gap}{muted}{from}{muted:#}{rest} {bar}")
@@ -469,46 +466,22 @@ mod tests {
     }
 
     fn plain(wiring: &Wiring<'_>, notes: &[Option<String>], detail: Detail) -> String {
-        drawn(wiring, notes, &unicode(), "", detail)
-    }
-
-    fn unicode() -> Caps {
-        Caps {
-            unicode: true,
-            ..Caps::plain()
-        }
-    }
-
-    fn ascii() -> Caps {
-        Caps {
-            unicode: false,
-            ..Caps::plain()
-        }
+        drawn(wiring, notes, &Caps::plain(), "", detail)
     }
 
     #[test]
     fn test_render_unicode() {
-        insta::assert_snapshot!(rendered(&fixture(), &unicode(), Detail::Ports));
-    }
-
-    #[test]
-    fn test_render_ascii() {
-        insta::assert_snapshot!(rendered(&fixture(), &ascii(), Detail::Ports));
+        insta::assert_snapshot!(rendered(&fixture(), &Caps::plain(), Detail::Ports));
     }
 
     #[test]
     fn test_render_systems_unicode() {
-        insta::assert_snapshot!(rendered(&busy(), &unicode(), Detail::Systems));
-    }
-
-    #[test]
-    fn test_render_systems_ascii() {
-        insta::assert_snapshot!(rendered(&busy(), &ascii(), Detail::Systems));
+        insta::assert_snapshot!(rendered(&busy(), &Caps::plain(), Detail::Systems));
     }
 
     #[test]
     fn test_ports_spans_group_an_output_s_edges() {
-        let spans = layout(&fixture(), &[], '>', Detail::Ports, &[]).spans();
+        let spans = layout(&fixture(), &[], Detail::Ports, &[]).spans();
         assert_eq!(spans.len(), 3);
         assert_eq!(
             spans[1],
@@ -522,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_systems_have_a_lane_per_source_system() {
-        let layout = layout(&busy(), &[], '>', Detail::Systems, &[]);
+        let layout = layout(&busy(), &[], Detail::Systems, &[]);
         let spans = layout.spans();
         assert_eq!(spans.len(), 3, "plant, nav, and cmds");
         assert_eq!(spans[0].sinks.len(), 3, "plant feeds nav, ctrl, pub");
@@ -563,7 +536,7 @@ mod tests {
         };
         let edge = |c| c == '│' || c == '╮' || c == '╯';
         for detail in [Detail::Systems, Detail::Ports] {
-            let text = rendered(&wiring, &unicode(), detail);
+            let text = rendered(&wiring, &Caps::plain(), detail);
             let widths: Vec<usize> = text
                 .lines()
                 .map(|line| width(line.trim_end_matches(|c| !edge(c))))
@@ -593,7 +566,7 @@ mod tests {
             ],
             edges: vec![edge(0, 0, 0, 0), edge(0, 0, 2, 0), edge(1, 0, 2, 0)],
         };
-        let layout = layout(&wiring, &[], '>', Detail::Systems, &[]);
+        let layout = layout(&wiring, &[], Detail::Systems, &[]);
         let spans = layout.spans();
         let span = |source| spans.iter().find(|s| s.source == source);
         assert_eq!(

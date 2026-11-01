@@ -44,7 +44,6 @@ pub struct Probe {
     pub force: bool,
     /// `COLORTERM` names truecolor.
     pub truecolor_env: bool,
-    pub unicode: bool,
     pub width: Option<u16>,
     pub background: Option<Background>,
 }
@@ -73,7 +72,6 @@ impl Probe {
             force: forced("CLICOLOR_FORCE") || forced("FORCE_COLOR"),
             truecolor_env: env("COLORTERM")
                 .is_some_and(|value| value == "truecolor" || value == "24bit"),
-            unicode: supports_unicode::on(supports_unicode::Stream::Stderr),
             width: terminal_size::terminal_size_of(std::io::stderr()).map(|(w, _)| w.0),
             background: (query && tty && foreground())
                 .then(query_background)
@@ -117,7 +115,6 @@ pub struct Caps {
     /// Whether lines may be redrawn in place.
     pub live: bool,
     pub depth: Depth,
-    pub unicode: bool,
     pub width: u16,
     pub background: Background,
 }
@@ -130,7 +127,7 @@ impl Caps {
     ///
     /// `--color` wins over the environment, `NO_COLOR` wins over a TTY, and
     /// `CLICOLOR_FORCE` wins over a pipe.
-    pub fn resolve(probe: &Probe, color: ColorChoice, ascii: bool) -> Self {
+    pub fn resolve(probe: &Probe, color: ColorChoice) -> Self {
         let colored = match color {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
@@ -145,18 +142,16 @@ impl Caps {
         Self {
             live: probe.tty,
             depth,
-            unicode: probe.unicode && !ascii,
             width: probe.width.unwrap_or(Self::DEFAULT_WIDTH),
             background: probe.background.unwrap_or_default(),
         }
     }
 
-    /// Plain output: no colour, no redraws, ASCII.
+    /// Plain output: no colour and no redraws.
     pub fn plain() -> Self {
         Self {
             live: false,
             depth: Depth::None,
-            unicode: false,
             width: Self::DEFAULT_WIDTH,
             background: Background::Dark,
         }
@@ -171,7 +166,6 @@ mod tests {
         Probe {
             tty: true,
             level: Some(Depth::TrueColor),
-            unicode: true,
             width: Some(80),
             ..Probe::default()
         }
@@ -179,9 +173,9 @@ mod tests {
 
     #[test]
     fn test_tty_gets_its_reported_depth() {
-        let caps = Caps::resolve(&tty(), ColorChoice::Auto, false);
+        let caps = Caps::resolve(&tty(), ColorChoice::Auto);
         assert_eq!(caps.depth, Depth::TrueColor);
-        assert!(caps.live && caps.unicode);
+        assert!(caps.live);
         assert_eq!(caps.width, 80);
     }
 
@@ -191,10 +185,7 @@ mod tests {
             no_color: true,
             ..tty()
         };
-        assert_eq!(
-            Caps::resolve(&probe, ColorChoice::Auto, false).depth,
-            Depth::None
-        );
+        assert_eq!(Caps::resolve(&probe, ColorChoice::Auto).depth, Depth::None);
     }
 
     #[test]
@@ -203,7 +194,7 @@ mod tests {
             no_color: true,
             ..Probe::default()
         };
-        let caps = Caps::resolve(&probe, ColorChoice::Always, false);
+        let caps = Caps::resolve(&probe, ColorChoice::Always);
         assert_eq!(caps.depth, Depth::Ansi256);
         assert!(!caps.live);
     }
@@ -216,24 +207,23 @@ mod tests {
             ..Probe::default()
         };
         assert_eq!(
-            Caps::resolve(&probe, ColorChoice::Auto, false).depth,
+            Caps::resolve(&probe, ColorChoice::Auto).depth,
             Depth::TrueColor
         );
     }
 
     #[test]
     fn test_pipe_is_plain() {
-        let caps = Caps::resolve(&Probe::default(), ColorChoice::Auto, false);
+        let caps = Caps::resolve(&Probe::default(), ColorChoice::Auto);
         assert_eq!(caps.depth, Depth::None);
-        assert!(!caps.live && !caps.unicode);
+        assert!(!caps.live);
         assert_eq!(caps.width, Caps::DEFAULT_WIDTH);
     }
 
     #[test]
-    fn test_never_and_ascii() {
-        let caps = Caps::resolve(&tty(), ColorChoice::Never, true);
+    fn test_never() {
+        let caps = Caps::resolve(&tty(), ColorChoice::Never);
         assert_eq!(caps.depth, Depth::None);
-        assert!(!caps.unicode);
     }
 
     #[test]

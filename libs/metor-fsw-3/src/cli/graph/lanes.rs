@@ -1,7 +1,7 @@
 //! Edges drawn as vertical lanes beside a column of boxes, as
 //! `git log --graph` draws branches.
 
-use crate::cli::ui::theme::Lines;
+use crate::cli::ui::glyph::line;
 
 /// One output's edges: the row it leaves from and the rows it enters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,34 +151,34 @@ pub fn width(columns: &[usize]) -> usize {
 }
 
 /// The lanes for `height` rows, one line each, every line [`width`] wide.
-pub fn draw(height: usize, spans: &[Span], columns: &[usize], lines: &Lines) -> Vec<Vec<char>> {
+pub fn draw(height: usize, spans: &[Span], columns: &[usize]) -> Vec<Vec<char>> {
     let width = width(columns);
     let mut grid = vec![vec![' '; width]; height];
     let x = |column: usize| width - 1 - 2 * (column + 1);
     for (span, &column) in spans.iter().zip(columns) {
         for row in grid.iter_mut().take(span.bottom() + 1).skip(span.top()) {
-            row[x(column)] = lines.vertical;
+            row[x(column)] = line::VERTICAL;
         }
     }
     for (span, &column) in spans.iter().zip(columns) {
         for row in span.rows() {
-            if let Some(line) = grid.get_mut(row) {
-                line[x(column)] = corner(span, row, lines);
+            if let Some(cells) = grid.get_mut(row) {
+                cells[x(column)] = corner(span, row);
             }
         }
     }
     for (span, &column) in spans.iter().zip(columns) {
         for (index, row) in span.rows().enumerate() {
-            let Some(line) = grid.get_mut(row) else {
+            let Some(cells) = grid.get_mut(row) else {
                 continue;
             };
-            for cell in &mut line[x(column) + 1..width - 1] {
-                *cell = join(*cell, lines);
+            for cell in &mut cells[x(column) + 1..width - 1] {
+                *cell = join(*cell);
             }
-            line[width - 1] = if index > 0 {
-                lines.arrow
+            cells[width - 1] = if index > 0 {
+                line::ARROW
             } else {
-                lines.horizontal
+                line::HORIZONTAL
             };
         }
     }
@@ -187,29 +187,28 @@ pub fn draw(height: usize, spans: &[Span], columns: &[usize], lines: &Lines) -> 
 
 /// `cell` with a horizontal line drawn through it. Two edges into one input
 /// meet where the inner lane turns.
-fn join(cell: char, lines: &Lines) -> char {
+fn join(cell: char) -> char {
     match cell {
-        c if c == lines.vertical || c == lines.tee_right => lines.cross,
-        c if c == lines.up_right => lines.tee_up,
-        c if c == lines.down_right => lines.tee_down,
-        _ => lines.horizontal,
+        c if c == line::VERTICAL || c == line::TEE_RIGHT => line::CROSS,
+        c if c == line::UP_RIGHT => line::TEE_UP,
+        c if c == line::DOWN_RIGHT => line::TEE_DOWN,
+        _ => line::HORIZONTAL,
     }
 }
 
 /// The lane's character where it turns into `row`.
-fn corner(span: &Span, row: usize, lines: &Lines) -> char {
+fn corner(span: &Span, row: usize) -> char {
     match (row > span.top(), row < span.bottom()) {
-        (true, true) => lines.tee_right,
-        (false, true) => lines.down_right,
-        (true, false) => lines.up_right,
-        (false, false) => lines.horizontal,
+        (true, true) => line::TEE_RIGHT,
+        (false, true) => line::DOWN_RIGHT,
+        (true, false) => line::UP_RIGHT,
+        (false, false) => line::HORIZONTAL,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ui::theme::{ASCII, UNICODE};
 
     fn span(source: usize, sinks: &[usize]) -> Span {
         Span {
@@ -220,7 +219,7 @@ mod tests {
 
     fn picture(height: usize, spans: &[Span]) -> String {
         let columns = pack(spans);
-        let grid = draw(height, spans, &columns, &UNICODE.lines);
+        let grid = draw(height, spans, &columns);
         let lines: Vec<String> = grid
             .iter()
             .map(|line| line.iter().collect::<String>().trim_end().to_string())
@@ -306,11 +305,8 @@ mod tests {
     }
 
     #[test]
-    fn test_draw_ascii_and_nothing() {
-        let spans = [span(0, &[1])];
-        let grid = draw(2, &spans, &pack(&spans), &ASCII.lines);
-        assert_eq!(grid, [vec!['+', '-', '-'], vec!['+', '-', '>']]);
+    fn test_draw_nothing() {
         assert_eq!(width(&[]), 0);
-        assert!(draw(2, &[], &[], &UNICODE.lines).iter().all(Vec::is_empty));
+        assert!(draw(2, &[], &[]).iter().all(Vec::is_empty));
     }
 }

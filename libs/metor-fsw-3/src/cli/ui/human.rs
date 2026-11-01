@@ -10,6 +10,7 @@ use std::time::Instant;
 use super::Reporter;
 use super::caps::Caps;
 use super::event::{Event, LogLine, Phase, PhaseState, Summary};
+use super::glyph;
 use super::logline;
 use super::table::{Align, Table, group};
 use super::theme::{Theme, Token};
@@ -89,7 +90,6 @@ impl<W: Write> Human<W> {
     }
 
     fn phase(&mut self, phase: &Phase<'_>) -> io::Result<()> {
-        let glyphs = self.theme.glyphs;
         match phase.state {
             PhaseState::Started => {
                 self.clear_live()?;
@@ -106,19 +106,19 @@ impl<W: Write> Human<W> {
             PhaseState::Progress { done, current } => {
                 if let Some(live) = &mut self.live {
                     live.detail.clear();
-                    let _ = write!(live.detail, "{done} {} {current}", glyphs.dot);
+                    let _ = write!(live.detail, "{done} {} {current}", glyph::DOT);
                 }
                 self.draw_live()
             }
             PhaseState::Done(took) => {
                 self.end_live()?;
                 let took = (took.as_millis() >= 10).then_some(took);
-                self.phase_line(glyphs.ok, Token::Ok, phase.verb.done(), phase.subject, took)
+                self.phase_line(glyph::OK, Token::Ok, phase.verb.done(), phase.subject, took)
             }
             PhaseState::Failed => {
                 self.end_live()?;
                 self.phase_line(
-                    glyphs.fail,
+                    glyph::FAIL,
                     Token::Error,
                     phase.verb.doing(),
                     phase.subject,
@@ -167,8 +167,7 @@ impl<W: Write> Human<W> {
         if !self.caps.live || live.since.elapsed() < self.reveal_after {
             return Ok(());
         }
-        let glyphs = self.theme.glyphs;
-        let frame = glyphs.spinner[live.frame % glyphs.spinner.len()];
+        let frame = glyph::SPINNER[live.frame % glyph::SPINNER.len()];
         let (accent, muted) = (
             self.theme.style(Token::Accent),
             self.theme.style(Token::Muted),
@@ -213,7 +212,8 @@ impl<W: Write> Human<W> {
         write!(
             self.buf,
             "  {accent}{}{accent:#} {:<VERB_WIDTH$}",
-            self.theme.glyphs.running, "Running"
+            glyph::RUNNING,
+            "Running"
         )?;
         for (i, namespace) in namespaces.iter().enumerate() {
             let hue = self.theme.bold(self.theme.hue(i));
@@ -230,7 +230,7 @@ impl<W: Write> Human<W> {
         self.clear_live()?;
         let error = self.theme.bold(self.theme.style(Token::Error));
         let muted = self.theme.style(Token::Muted);
-        write!(self.buf, "  {error}{} error", self.theme.glyphs.fail)?;
+        write!(self.buf, "  {error}{} error", glyph::FAIL)?;
         if let Some(code) = diagnostic.code() {
             write!(self.buf, "[{code}]")?;
         }
@@ -293,7 +293,7 @@ impl<W: Write> Human<W> {
         writeln!(
             self.buf,
             "\n  {accent}{}{accent:#} {how} after {:.1} s",
-            self.theme.glyphs.stopped,
+            glyph::STOPPED,
             summary.took.as_secs_f64()
         )?;
         if summary.targets.is_empty() {
@@ -339,7 +339,7 @@ impl<W: Write + Send> Reporter for Human<W> {
             Event::Ended(summary) => self.ended(summary),
             Event::Changed(path) => {
                 let accent = self.theme.style(Token::Accent);
-                let again = self.theme.glyphs.again;
+                let again = glyph::AGAIN;
                 writeln!(
                     self.buf,
                     "\n  {accent}{again}{accent:#} {:<VERB_WIDTH$} {path}\n",

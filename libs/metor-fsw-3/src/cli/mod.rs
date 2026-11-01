@@ -154,7 +154,7 @@ pub fn main() {
 /// Parses the command line, with help styled for the terminal `probe`
 /// describes.
 fn parse(probe: &Probe, early: &Early) -> Cli {
-    let caps = Caps::resolve(probe, early.color, early.ascii);
+    let caps = Caps::resolve(probe, early.color);
     let color = match early.color {
         ColorChoice::Auto => clap::ColorChoice::Auto,
         ColorChoice::Always => clap::ColorChoice::Always,
@@ -172,7 +172,6 @@ fn parse(probe: &Probe, early: &Early) -> Cli {
 #[derive(Debug, PartialEq, Eq)]
 struct Early {
     color: ColorChoice,
-    ascii: bool,
     /// Whether the terminal's background is worth asking for: not for JSON,
     /// help, or the version.
     query: bool,
@@ -203,7 +202,6 @@ impl Early {
         let json = value("--format").as_deref() == Some("json");
         Self {
             color,
-            ascii: args.iter().any(|arg| arg == "--ascii"),
             query: !json && !args.iter().any(|arg| quick.contains(&arg.as_str())),
         }
     }
@@ -249,9 +247,9 @@ mod tests {
 
     #[test]
     fn test_early_reads_output_flags() {
-        let early = scan(&["run", "--color", "never", "--ascii"]);
+        let early = scan(&["run", "--color", "never"]);
         assert_eq!(early.color, ColorChoice::Never);
-        assert!(early.ascii && early.query);
+        assert!(early.query);
         assert_eq!(scan(&["--color=always"]).color, ColorChoice::Always);
         assert_eq!(scan(&["run", "--color"]).color, ColorChoice::Auto);
         assert!(!scan(&["run", "--format", "json"]).query);

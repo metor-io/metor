@@ -3,6 +3,7 @@
 
 use std::io::{self, Write};
 
+use super::glyph;
 use super::theme::{Theme, Token};
 
 /// One block of a document.
@@ -84,7 +85,7 @@ pub fn render(
             }
             Block::Paragraph(text) => wrap(out, text, theme, width, "  ", "  ")?,
             Block::List(items) => {
-                let first = format!("  {} ", theme.glyphs.bullet);
+                let first = format!("  {} ", glyph::BULLET);
                 for item in items {
                     wrap(out, item, theme, width, &first, "    ")?;
                 }

@@ -12,6 +12,7 @@ use super::ui::event::Event;
 use super::ui::table::{Align, Table};
 use super::ui::theme::{Theme, Token};
 use super::ui::{Format, Ui};
+use crate::cli::ui::glyph;
 use crate::coordinator::{Clock, InputConfig, SystemConfig};
 use crate::deploy::{ResolvedDeployment, TargetConfig};
 
@@ -169,7 +170,7 @@ fn write_overview(
     theme: &Theme,
 ) -> io::Result<()> {
     let muted = theme.style(Token::Muted);
-    let dot = theme.glyphs.dot;
+    let dot = glyph::DOT;
     let targets = config.targets.len();
     let mut packs: Vec<&str> = config
         .targets
@@ -198,11 +199,7 @@ fn write_target(
     write_title(out, target, index, theme)?;
     let mut table = Table::new(&SYSTEM_COLUMNS).fit(width);
     for system in &target.coordinator.systems {
-        table.row(vec![
-            system.id.clone(),
-            system.ty.clone(),
-            inputs(system, theme),
-        ]);
+        table.row(vec![system.id.clone(), system.ty.clone(), inputs(system)]);
     }
     table.write(out, theme, "    ")
 }
@@ -289,8 +286,8 @@ const GRANT_COLUMNS: [(&str, Align); 2] = [("GRANT", Align::Left), ("RESOURCE", 
 
 /// `sensors ← plant.sensors, plant.gps`: an input named after its source,
 /// as a link's are, shows the source alone.
-fn inputs(system: &SystemConfig, theme: &Theme) -> String {
-    let from = theme.glyphs.from;
+fn inputs(system: &SystemConfig) -> String {
+    let from = glyph::FROM;
     let inputs: Vec<String> = system
         .inputs
         .iter()
