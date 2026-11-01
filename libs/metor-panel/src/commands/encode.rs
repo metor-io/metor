@@ -13,7 +13,9 @@
 use gpui::SharedString;
 use metor_proto::types::{PrimType, Timestamp};
 use metor_proto_wkt::{CommandInfo, CommandKind, ComponentMetadata};
-use postcard_schema::schema::owned::{OwnedDataModelType, OwnedDataModelVariant, OwnedNamedType};
+use postcard_schema::schema::owned::{
+    OwnedDataModelType, OwnedDataModelVariant, OwnedNamedType, OwnedNamedVariant,
+};
 use serde_json::{Map, Value};
 
 use super::frame::FrameLayout;
@@ -135,26 +137,25 @@ fn default_value(ty: &OwnedDataModelType) -> Value {
                 .map(|field| (field.name.clone(), default_value(&field.ty.ty)))
                 .collect(),
         ),
-        T::Enum(variants) => match variants.first() {
-            None => Value::Null,
-            Some(variant) => match &variant.ty {
-                OwnedDataModelVariant::UnitVariant => Value::String(variant.name.clone()),
-                payload => {
-                    let payload = match payload {
-                        OwnedDataModelVariant::UnitVariant => Value::Null,
-                        OwnedDataModelVariant::NewtypeVariant(inner) => default_value(&inner.ty),
-                        OwnedDataModelVariant::TupleVariant(items) => {
-                            default_value(&OwnedDataModelType::Tuple(items.clone()))
-                        }
-                        OwnedDataModelVariant::StructVariant(fields) => {
-                            default_value(&OwnedDataModelType::Struct(fields.clone()))
-                        }
-                    };
-                    Value::Object(Map::from_iter([(variant.name.clone(), payload)]))
-                }
-            },
-        },
+        T::Enum(variants) => variants.first().map_or(Value::Null, variant_default),
     }
+}
+
+/// The value of enum variant `variant` with a default payload, in
+/// postcard-dyn's JSON: a bare name for a unit variant, `{name: payload}`
+/// otherwise.
+pub(crate) fn variant_default(variant: &OwnedNamedVariant) -> Value {
+    let payload = match &variant.ty {
+        OwnedDataModelVariant::UnitVariant => return Value::String(variant.name.clone()),
+        OwnedDataModelVariant::NewtypeVariant(inner) => default_value(&inner.ty),
+        OwnedDataModelVariant::TupleVariant(items) => {
+            default_value(&OwnedDataModelType::Tuple(items.clone()))
+        }
+        OwnedDataModelVariant::StructVariant(fields) => {
+            default_value(&OwnedDataModelType::Struct(fields.clone()))
+        }
+    };
+    Value::Object(Map::from_iter([(variant.name.clone(), payload)]))
 }
 
 fn display_field(field: &str) -> String {

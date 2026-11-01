@@ -21,6 +21,11 @@ pub struct NavRow {
     summary: Box<dyn Fn(&App) -> SharedString>,
     pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
     tag: Option<SharedString>,
+    /// A tag read on every render, for one that follows shared state.
+    live_tag: Option<Box<dyn Fn(&App) -> Option<SharedString>>>,
+    /// Run on activation, before the child page is built: the one chance a
+    /// row has to change state on the way in.
+    on_enter: Option<Box<dyn Fn(&mut App)>>,
     accessory: Option<Box<dyn Fn(&mut App) -> Option<super::AccessorySpec>>>,
     /// Text the child page opens with in its search field, when the page
     /// edits something that already has one.
@@ -40,6 +45,8 @@ impl NavRow {
             summary: Box::new(move |_| summary.clone()),
             build_children,
             tag: None,
+            live_tag: None,
+            on_enter: None,
             accessory: None,
             query: None,
         }
@@ -56,6 +63,8 @@ impl NavRow {
             identity: None,
             build_children,
             tag: None,
+            live_tag: None,
+            on_enter: None,
             accessory: None,
             query: None,
         }
@@ -72,6 +81,19 @@ impl NavRow {
 
     pub fn with_tag(mut self, tag: impl Into<SharedString>) -> Self {
         self.tag = Some(tag.into());
+        self
+    }
+
+    /// Show the tag `tag` answers, read on every render.
+    pub fn with_live_tag(mut self, tag: Box<dyn Fn(&App) -> Option<SharedString>>) -> Self {
+        self.live_tag = Some(tag);
+        self
+    }
+
+    /// Run `enter` each time the row is activated, before its page is
+    /// built, so the page reflects what entering it changed.
+    pub fn with_on_enter(mut self, enter: Box<dyn Fn(&mut App)>) -> Self {
+        self.on_enter = Some(enter);
         self
     }
 
@@ -110,20 +132,23 @@ impl InspectorRow for NavRow {
         let theme = theme(cx);
 
         let summary = (self.summary)(cx);
+        let tag = match &self.live_tag {
+            Some(live) => live(cx),
+            None => self.tag.clone(),
+        };
         // What the right side takes is what the label cannot have: the
         // summary up to its cap, the tag, and the chevron.
         let budget = super::label_budget(cx).map(|width| {
             let summary_w = super::measure(&summary, px(12.0), window).min(px(260.0));
-            let tag_w = self
-                .tag
+            let tag_w = tag
                 .as_ref()
                 .map(|tag| super::measure(tag, px(10.0), window) + px(18.0))
                 .unwrap_or_default();
             width - summary_w - tag_w - px(26.0)
         });
         let mut right = div().flex().flex_row().items_center().gap(px(6.0));
-        if let Some(tag) = &self.tag {
-            right = right.child(super::tag_pill(tag.clone(), cx));
+        if let Some(tag) = tag {
+            right = right.child(super::tag_pill(tag, cx));
         }
         right = right
             .child(
@@ -152,6 +177,9 @@ impl InspectorRow for NavRow {
     }
 
     fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
+        if let Some(enter) = &self.on_enter {
+            enter(cx);
+        }
         let rows = (self.build_children)(cx);
         match &self.query {
             Some(query) => RowAction::CascadeWith {

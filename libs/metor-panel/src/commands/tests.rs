@@ -145,7 +145,7 @@ fn values_the_wire_type_cannot_hold_are_refused_by_field() {
 }
 
 /// The command the ADCS example's ground sends: a text field beside an enum
-/// with payloads, which the form edits as JSON.
+/// with payloads.
 #[test]
 fn a_sequence_command_encodes_with_its_payload_variant() {
     use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
@@ -361,16 +361,109 @@ fn sent(reader: &mut metor_db::disruptor::Reader) -> Vec<Vec<u8>> {
 }
 
 fn send_page(cx: &App) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>> {
+    command_page("Point", cx)
+}
+
+fn command_page(name: &str, cx: &App) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>> {
     let send = Category::Custom("Send".into());
     ItemRegistry::snapshot(cx)
         .into_iter()
         .filter(|(category, _)| *category == send)
         .flat_map(|(_, items)| items)
         .find_map(|item| match item {
-            InspectionItem::SubMenu { label, build, .. } if label == "Point" => Some(build(cx)),
+            InspectionItem::SubMenu { label, build, .. } if label == name => Some(build(cx)),
             _ => None,
         })
         .expect("the palette offers the command")
+}
+
+type Rows = Vec<Box<dyn crate::inspector::rows::InspectorRow>>;
+
+/// Activates the row labelled `label` and returns the page it opens.
+fn enter(rows: &mut Rows, label: &str, window: &mut gpui::Window, cx: &mut App) -> Rows {
+    let row = rows.iter_mut().find(|row| row.label() == label).unwrap();
+    match row.activate(window, cx) {
+        RowAction::Cascade(rows) => rows,
+        _ => panic!("`{label}` opens a page"),
+    }
+}
+
+/// Types `text` into the row labelled `label`.
+fn type_into(rows: &mut Rows, label: &str, text: &str, window: &mut gpui::Window, cx: &mut App) {
+    let row = rows.iter_mut().find(|row| row.label() == label).unwrap();
+    let RowAction::StartEdit { on_commit, .. } = row.activate(window, cx) else {
+        panic!("`{label}` edits inline");
+    };
+    on_commit(text.into(), window, cx);
+}
+
+/// An enum with payloads is a page of its variants: entering one switches
+/// the draft to it and edits its payload, re-entering the current one keeps
+/// what was typed, and a unit variant is set by choosing it.
+#[gpui::test]
+fn a_payload_enum_is_edited_through_its_variants(cx: &mut gpui::TestAppContext) {
+    use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+    const SEQ: [u8; 2] = [7, 2];
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+    db.add_commands(&[msg_info(
+        SEQ,
+        "sequence_command",
+        SequenceCommand::SCHEMA.into(),
+        None,
+    )]);
+    let mut log = db
+        .with_state_mut(|s| s.get_or_insert_msg_log(SEQ, &db.path).cloned())
+        .unwrap()
+        .wal_reader();
+    let catalog = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        ItemRegistry::init(cx);
+        let catalog = CommandCatalog::install(
+            db.clone(),
+            Arc::new(|_| vec![ConnectionStatus::Connected]),
+            cx,
+        );
+        CommandCatalog::register_provider(cx);
+        catalog
+    });
+    let cx = cx.add_empty_window();
+
+    cx.update(|window, cx| {
+        let field = |cx: &App| catalog.read(cx).field(SEQ, "/command").cloned();
+        let mut page = command_page("sequence_command", cx);
+        type_into(&mut page, "channel", "commission", window, cx);
+
+        let mut variants = enter(&mut page, "command", window, cx);
+        let mut load = enter(&mut variants, "Load", window, cx);
+        assert_eq!(field(cx), Some(json!({"Load": {"name": ""}})));
+        type_into(&mut load, "name", "detumble", window, cx);
+        assert_eq!(field(cx), Some(json!({"Load": {"name": "detumble"}})));
+        enter(&mut variants, "Load", window, cx);
+        assert_eq!(
+            field(cx),
+            Some(json!({"Load": {"name": "detumble"}})),
+            "re-entering the current variant keeps its payload"
+        );
+
+        let start = variants
+            .iter_mut()
+            .find(|row| row.label() == "Start")
+            .unwrap();
+        assert!(matches!(start.activate(window, cx), RowAction::Pop));
+        assert_eq!(field(cx), Some(json!("Start")));
+
+        let mut load = enter(&mut variants, "Load", window, cx);
+        assert_eq!(field(cx), Some(json!({"Load": {"name": ""}})));
+        type_into(&mut load, "name", "commission", window, cx);
+        let send = page.iter_mut().find(|row| row.label() == "Send").unwrap();
+        send.activate(window, cx);
+    });
+    let records = sent(&mut log);
+    assert_eq!(records.len(), 1);
+    let sent: SequenceCommand = postcard::from_bytes(&records[0]).unwrap();
+    assert_eq!(sent.channel, "commission");
+    assert!(matches!(sent.command, SequenceCommandKind::Load { name } if name == "commission"));
 }
 
 /// Opening a command's Send page, editing a field and activating Send puts

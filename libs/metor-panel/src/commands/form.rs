@@ -3,16 +3,19 @@
 //!
 //! Unlike the facet registry, which reflects a Rust type the panel compiled,
 //! these rows come from a schema the remote announced at runtime. Shapes
-//! with a natural row get one: numbers, bools, text, unit-only enums, and
-//! structs as a drill-in page. Everything else (options, sequences, maps,
-//! enums with payloads, tuples) is edited as JSON text for that subtree,
-//! checked against its schema as it is entered.
+//! with a natural row get one: numbers, bools, text, unit-only enums,
+//! structs as a drill-in page, and enums with payloads as a page of their
+//! variants. Everything else (options, sequences, maps, tuples) is edited
+//! as JSON text for that subtree, checked against its schema as it is
+//! entered.
 
 use std::sync::Arc;
 
 use gpui::{App, Entity, SharedString};
 use metor_proto::types::{PacketId, PrimType};
-use postcard_schema::schema::owned::{OwnedDataModelType, OwnedDataModelVariant, OwnedNamedType};
+use postcard_schema::schema::owned::{
+    OwnedDataModelType, OwnedDataModelVariant, OwnedNamedType, OwnedNamedValue, OwnedNamedVariant,
+};
 use serde_json::Value;
 
 use super::encode::{self, Form, prim_type};
@@ -140,17 +143,7 @@ fn outcome_row(slot: Slot) -> Box<dyn InspectorRow> {
 /// for any other root.
 fn schema_rows(schema: &OwnedNamedType, slot: &Slot, cx: &App) -> Rows {
     match &schema.ty {
-        OwnedDataModelType::Struct(fields) => fields
-            .iter()
-            .filter_map(|field| {
-                field_row(
-                    &field.ty,
-                    field.name.clone().into(),
-                    slot.child(&field.name),
-                    cx,
-                )
-            })
-            .collect(),
+        OwnedDataModelType::Struct(fields) => fields_rows(fields, slot, cx),
         OwnedDataModelType::NewtypeStruct(inner) => schema_rows(inner, slot, cx),
         _ => field_row(schema, schema.name.clone().into(), slot.clone(), cx)
             .into_iter()
@@ -207,21 +200,10 @@ fn field_row(
             Box::new(NavRow::with_dynamic_summary(
                 label,
                 Box::new(move |cx| summary.compact(cx)),
-                Box::new(move |cx| {
-                    fields
-                        .iter()
-                        .filter_map(|field| {
-                            field_row(
-                                &field.ty,
-                                field.name.clone().into(),
-                                slot.child(&field.name),
-                                cx,
-                            )
-                        })
-                        .collect()
-                }),
+                Box::new(move |cx| fields_rows(&fields, &slot, cx)),
             ))
         }
+        T::Enum(variants) => variants_row(label, variants.clone(), slot),
         T::NewtypeStruct(inner) => return field_row(inner, label, slot, cx),
         T::Tuple(items) | T::TupleStruct(items) if items.len() == 1 => {
             return field_row(&items[0], label, slot, cx);
@@ -231,6 +213,125 @@ fn field_row(
             None => json_row(label, Some(schema.clone()), slot, cx),
         },
     })
+}
+
+fn fields_rows(fields: &[OwnedNamedValue], slot: &Slot, cx: &App) -> Rows {
+    fields
+        .iter()
+        .filter_map(|field| {
+            field_row(
+                &field.ty,
+                field.name.clone().into(),
+                slot.child(&field.name),
+                cx,
+            )
+        })
+        .collect()
+}
+
+/// An enum with payloads, as a page of its variants: the current one is
+/// tagged, choosing a unit variant sets it and returns, and entering one
+/// with a payload switches to it and edits that payload with the usual
+/// rows. Picking a variant and filling it in are then one gesture, and no
+/// page has to rebuild when the variant changes.
+fn variants_row(
+    label: SharedString,
+    variants: Vec<OwnedNamedVariant>,
+    slot: Slot,
+) -> Box<dyn InspectorRow> {
+    let summary = slot.clone();
+    Box::new(NavRow::with_dynamic_summary(
+        label,
+        Box::new(move |cx| describe(summary.read(cx).as_ref())),
+        Box::new(move |_| {
+            variants
+                .iter()
+                .map(|variant| variant_row(variant.clone(), slot.clone()))
+                .collect()
+        }),
+    ))
+}
+
+fn variant_row(variant: OwnedNamedVariant, slot: Slot) -> Box<dyn InspectorRow> {
+    let name = SharedString::from(variant.name.clone());
+    let current = {
+        let (slot, name) = (slot.clone(), name.clone());
+        move |cx: &App| {
+            (variant_of(slot.read(cx).as_ref()) == Some(name.as_ref()))
+                .then(|| SharedString::new_static("current"))
+        }
+    };
+    if variant.ty == OwnedDataModelVariant::UnitVariant {
+        return Box::new(
+            CommandRow::action(
+                name,
+                Arc::new(move |_, cx| {
+                    slot.write(Value::String(variant.name.clone()), cx);
+                    RowAction::Pop
+                }),
+            )
+            .with_live_tag(Arc::new(current)),
+        );
+    }
+    let payload = slot.child(&variant.name);
+    let summary = {
+        let (slot, name) = (slot.clone(), name.clone());
+        let payload = payload.clone();
+        move |cx: &App| match variant_of(slot.read(cx).as_ref()) == Some(name.as_ref()) {
+            true => payload.compact(cx),
+            false => SharedString::default(),
+        }
+    };
+    let ty = variant.ty.clone();
+    Box::new(
+        NavRow::with_dynamic_summary(
+            name.clone(),
+            Box::new(summary),
+            Box::new(move |cx| match &ty {
+                OwnedDataModelVariant::UnitVariant => Vec::new(),
+                OwnedDataModelVariant::NewtypeVariant(inner) => schema_rows(inner, &payload, cx),
+                OwnedDataModelVariant::StructVariant(fields) => fields_rows(fields, &payload, cx),
+                OwnedDataModelVariant::TupleVariant(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, item)| {
+                        let ix = ix.to_string();
+                        field_row(item, ix.clone().into(), payload.child(&ix), cx)
+                    })
+                    .collect(),
+            }),
+        )
+        .with_live_tag(Box::new(current))
+        .with_on_enter(Box::new(move |cx| {
+            // Entering the current variant keeps what was typed into it.
+            if variant_of(slot.read(cx).as_ref()) != Some(name.as_ref()) {
+                slot.write(encode::variant_default(&variant), cx);
+            }
+        })),
+    )
+}
+
+/// The variant an enum's value holds: a bare name, or the one key of
+/// `{name: payload}`.
+fn variant_of(value: Option<&Value>) -> Option<&str> {
+    match value? {
+        Value::String(name) => Some(name),
+        Value::Object(map) if map.len() == 1 => map.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
+/// An enum's value as a summary: the variant's name, then its payload.
+fn describe(value: Option<&Value>) -> SharedString {
+    match value {
+        Some(Value::Object(map)) if map.len() == 1 => {
+            let (name, payload) = map.iter().next().expect("one entry");
+            format!("{name} {payload}").into()
+        }
+        Some(Value::String(name)) => name.clone().into(),
+        Some(value) => value.to_string().into(),
+        None => SharedString::default(),
+    }
 }
 
 fn text_of(slot: &Slot, cx: &App) -> SharedString {

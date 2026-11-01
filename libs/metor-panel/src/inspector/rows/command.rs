@@ -17,6 +17,8 @@ pub struct CommandRow {
     pub label: SharedString,
     callback: Arc<dyn Fn(&mut Window, &mut App) -> RowAction>,
     tag: Option<SharedString>,
+    /// A tag read on every render, for one that follows shared state.
+    live_tag: Option<Arc<dyn Fn(&App) -> Option<SharedString>>>,
     consumes_search: bool,
 }
 
@@ -32,6 +34,7 @@ impl CommandRow {
                 RowAction::Dismiss
             }),
             tag: None,
+            live_tag: None,
             consumes_search: false,
         }
     }
@@ -44,6 +47,7 @@ impl CommandRow {
             label: label.into(),
             callback,
             tag: None,
+            live_tag: None,
             consumes_search: false,
         }
     }
@@ -57,6 +61,12 @@ impl CommandRow {
 
     pub fn with_tag(mut self, tag: impl Into<SharedString>) -> Self {
         self.tag = Some(tag.into());
+        self
+    }
+
+    /// Show the tag `tag` answers, read on every render.
+    pub fn with_live_tag(mut self, tag: Arc<dyn Fn(&App) -> Option<SharedString>>) -> Self {
+        self.live_tag = Some(tag);
         self
     }
 }
@@ -82,15 +92,11 @@ impl InspectorRow for CommandRow {
         cx: &mut App,
     ) -> AnyElement {
         let color = theme(cx).text_primary;
-        render_label_row(
-            row_ix,
-            selected,
-            self.label.clone(),
-            self.tag.clone(),
-            color,
-            window,
-            cx,
-        )
+        let tag = match &self.live_tag {
+            Some(live) => live(cx),
+            None => self.tag.clone(),
+        };
+        render_label_row(row_ix, selected, self.label.clone(), tag, color, window, cx)
     }
 
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
