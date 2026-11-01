@@ -9,7 +9,7 @@ use metor_proto_wkt::LogLevel;
 
 use super::event::{LogLine, Source};
 use super::glyph;
-use super::theme::{Theme, Token};
+use super::theme::Theme;
 
 /// The width of the time column, `+00:00.000`.
 const TIME_WIDTH: usize = 10;
@@ -21,7 +21,7 @@ pub fn write(
     theme: &Theme,
     source_width: usize,
 ) -> io::Result<()> {
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     match line.elapsed {
         Some(elapsed) => write!(out, "  {muted}{}{muted:#}", Elapsed(elapsed))?,
         None => write!(out, "  {:TIME_WIDTH$}", "")?,
@@ -60,14 +60,13 @@ fn write_source(out: &mut impl Write, source: &Source<'_>, theme: &Theme) -> io:
 
 /// The glyph for `level`, and the style of it and the message.
 fn level(level: LogLevel, theme: &Theme) -> (&'static str, Style) {
-    let (glyph, token) = match level {
-        LogLevel::Error => (glyph::FAIL, Token::Error),
-        LogLevel::Warn => (glyph::WARN, Token::Warn),
-        LogLevel::Info => (" ", Token::Text),
-        LogLevel::Debug => (glyph::DOT, Token::Muted),
-        LogLevel::Trace => (glyph::DOT, Token::Faint),
-    };
-    (glyph, theme.style(token))
+    match level {
+        LogLevel::Error => (glyph::FAIL, theme.error),
+        LogLevel::Warn => (glyph::WARN, theme.warn),
+        LogLevel::Info => (" ", Style::new()),
+        LogLevel::Debug => (glyph::DOT, theme.muted),
+        LogLevel::Trace => (glyph::DOT, theme.faint),
+    }
 }
 
 /// Formats as `+MM:SS.mmm`, [`TIME_WIDTH`] wide, or `+H:MM:SS.mmm` from an

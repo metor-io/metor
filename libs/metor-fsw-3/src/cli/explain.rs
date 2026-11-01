@@ -1,5 +1,6 @@
 //! `metor explain` prints the long form of a diagnostic code.
 
+use anstyle::Style;
 use std::io::{self, Write};
 
 use serde_json::json;
@@ -8,7 +9,7 @@ use super::run::{RunError, print};
 use super::ui::event::Event;
 use super::ui::markdown;
 use super::ui::table::{Align, Table};
-use super::ui::theme::{Theme, Token};
+use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 
 /// One `## M0201 Title` section per code.
@@ -99,8 +100,8 @@ pub fn render(
     theme: &Theme,
     width: usize,
 ) -> io::Result<()> {
-    let code = theme.bold(theme.style(Token::Error));
-    let title = theme.bold(theme.style(Token::Text));
+    let code = theme.bold(theme.error);
+    let title = theme.bold(Style::new());
     writeln!(
         out,
         "  {code}{}{code:#}  {title}{}{title:#}",

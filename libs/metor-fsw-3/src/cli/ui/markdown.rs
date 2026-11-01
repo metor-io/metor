@@ -4,7 +4,7 @@
 use std::io::{self, Write};
 
 use super::glyph;
-use super::theme::{Theme, Token};
+use super::theme::Theme;
 
 /// One block of a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub fn render(
         }
         match block {
             Block::Heading(text) => {
-                let style = theme.bold(theme.style(Token::Accent));
+                let style = theme.bold(theme.accent);
                 writeln!(out, "  {style}{text}{style:#}")?;
             }
             Block::Paragraph(text) => wrap(out, text, theme, width, "  ", "  ")?,
@@ -91,7 +91,7 @@ pub fn render(
                 }
             }
             Block::Code(lines) => {
-                let muted = theme.style(Token::Muted);
+                let muted = theme.muted;
                 for line in lines {
                     writeln!(out, "    {muted}{line}{muted:#}")?;
                 }
@@ -150,7 +150,7 @@ fn wrap(
     first: &str,
     rest: &str,
 ) -> io::Result<()> {
-    let code = theme.style(Token::Accent);
+    let code = theme.accent;
     let marked = code == anstyle::Style::new();
     let mut column = first.chars().count();
     write!(out, "{first}")?;

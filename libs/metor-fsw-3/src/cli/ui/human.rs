@@ -7,13 +7,15 @@ use core::time::Duration;
 use std::io::{self, Write};
 use std::time::Instant;
 
+use anstyle::Style;
+
 use super::Reporter;
 use super::caps::Caps;
 use super::event::{Event, LogLine, Phase, PhaseState, Summary};
 use super::glyph;
 use super::logline;
 use super::table::{Align, Table, group};
-use super::theme::{Theme, Token};
+use super::theme::Theme;
 
 /// The column phase subjects start at, after the margin, glyph, and verb.
 const VERB_WIDTH: usize = 11;
@@ -113,13 +115,19 @@ impl<W: Write> Human<W> {
             PhaseState::Done(took) => {
                 self.end_live()?;
                 let took = (took.as_millis() >= 10).then_some(took);
-                self.phase_line(glyph::OK, Token::Ok, phase.verb.done(), phase.subject, took)
+                self.phase_line(
+                    glyph::OK,
+                    self.theme.ok,
+                    phase.verb.done(),
+                    phase.subject,
+                    took,
+                )
             }
             PhaseState::Failed => {
                 self.end_live()?;
                 self.phase_line(
                     glyph::FAIL,
-                    Token::Error,
+                    self.theme.error,
                     phase.verb.doing(),
                     phase.subject,
                     None,
@@ -132,13 +140,12 @@ impl<W: Write> Human<W> {
     fn phase_line(
         &mut self,
         glyph: &str,
-        token: Token,
+        style: Style,
         verb: &str,
         subject: &str,
         took: Option<Duration>,
     ) -> io::Result<()> {
-        let style = self.theme.style(token);
-        let muted = self.theme.style(Token::Muted);
+        let muted = self.theme.muted;
         write!(self.buf, "  {style}{glyph}{style:#} {verb:<VERB_WIDTH$} ")?;
         let Some(took) = took else {
             return writeln!(self.buf, "{subject}");
@@ -168,10 +175,7 @@ impl<W: Write> Human<W> {
             return Ok(());
         }
         let frame = glyph::SPINNER[live.frame % glyph::SPINNER.len()];
-        let (accent, muted) = (
-            self.theme.style(Token::Accent),
-            self.theme.style(Token::Muted),
-        );
+        let (accent, muted) = (self.theme.accent, self.theme.muted);
         let room = usize::from(self.caps.width).saturating_sub(2 + 2 + VERB_WIDTH + 1 + 1);
         let subject = truncate(&live.subject, room);
         let room = room.saturating_sub(subject.chars().count() + 2);
@@ -207,8 +211,8 @@ impl<W: Write> Human<W> {
 
     fn running(&mut self, namespaces: &[&str]) -> io::Result<()> {
         self.clear_live()?;
-        let accent = self.theme.style(Token::Accent);
-        let muted = self.theme.style(Token::Muted);
+        let accent = self.theme.accent;
+        let muted = self.theme.muted;
         write!(
             self.buf,
             "  {accent}{}{accent:#} {:<VERB_WIDTH$}",
@@ -228,8 +232,8 @@ impl<W: Write> Human<W> {
 
     fn diagnostic(&mut self, diagnostic: &dyn miette::Diagnostic) -> io::Result<()> {
         self.clear_live()?;
-        let error = self.theme.bold(self.theme.style(Token::Error));
-        let muted = self.theme.style(Token::Muted);
+        let error = self.theme.bold(self.theme.error);
+        let muted = self.theme.muted;
         write!(self.buf, "  {error}{} error", glyph::FAIL)?;
         if let Some(code) = diagnostic.code() {
             write!(self.buf, "[{code}]")?;
@@ -240,7 +244,7 @@ impl<W: Write> Human<W> {
             writeln!(self.buf, "    {muted}help:{muted:#} {help}")?;
         }
         if let Some(code) = diagnostic.code() {
-            let faint = self.theme.style(Token::Faint);
+            let faint = self.theme.faint;
             writeln!(self.buf, "    {faint}more: metor explain {code}{faint:#}")?;
         }
         Ok(())
@@ -260,11 +264,8 @@ impl<W: Write> Human<W> {
         let line = contents.line() + 1;
         let text = String::from_utf8_lossy(contents.data());
         let gutter = line.to_string().len();
-        let (faint, accent) = (
-            self.theme.style(Token::Faint),
-            self.theme.style(Token::Error),
-        );
-        let muted = self.theme.style(Token::Muted);
+        let (faint, accent) = (self.theme.faint, self.theme.error);
+        let muted = self.theme.muted;
         let name = contents.name().unwrap_or("");
         writeln!(self.buf, "    {muted}-->{muted:#} {name}:{line}")?;
         writeln!(self.buf, "    {faint}{:gutter$} │{faint:#}", "")?;
@@ -284,7 +285,7 @@ impl<W: Write> Human<W> {
 
     fn ended(&mut self, summary: &Summary) -> io::Result<()> {
         self.end_live()?;
-        let accent = self.theme.style(Token::Accent);
+        let accent = self.theme.accent;
         let how = if summary.interrupted {
             "Stopped"
         } else {
@@ -338,7 +339,7 @@ impl<W: Write + Send> Reporter for Human<W> {
             Event::Tick => self.tick(),
             Event::Ended(summary) => self.ended(summary),
             Event::Changed(path) => {
-                let accent = self.theme.style(Token::Accent);
+                let accent = self.theme.accent;
                 let again = glyph::AGAIN;
                 writeln!(
                     self.buf,

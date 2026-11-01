@@ -1,9 +1,10 @@
 //! A borderless table: a muted header row, then aligned rows.
 
+use anstyle::Style;
 use std::io::{self, Write};
 
 use super::glyph;
-use super::theme::{Theme, Token};
+use super::theme::Theme;
 use super::{pad, width};
 
 /// How a column aligns its cells.
@@ -48,11 +49,11 @@ impl<'a> Table<'a> {
     /// Writes the table, indented by `indent`, with the first column bold.
     pub fn write(&self, out: &mut impl Write, theme: &Theme, indent: &str) -> io::Result<()> {
         let widths = self.widths();
-        let muted = theme.style(Token::Muted);
+        let muted = theme.muted;
         let headers: Vec<&str> = self.headers.iter().map(|(header, _)| *header).collect();
         let header = self.line(&headers, &widths, 0);
         writeln!(out, "{indent}{muted}{header}{muted:#}")?;
-        let bold = theme.bold(theme.style(Token::Text));
+        let bold = theme.bold(Style::new());
         for row in &self.rows {
             let cells: Vec<&str> = row.iter().map(String::as_str).collect();
             let (first, rest) = cells.split_first().unwrap_or((&"", &[]));

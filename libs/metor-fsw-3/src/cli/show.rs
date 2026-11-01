@@ -3,6 +3,7 @@
 //! With no name it shows every target; `fsw` one target; `fsw.nav`, or
 //! `nav` in a deployment of one, one system with its params and grants.
 
+use anstyle::Style;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,7 @@ use super::completions;
 use super::run::{RunError, prepare, print};
 use super::ui::event::Event;
 use super::ui::table::{Align, Table};
-use super::ui::theme::{Theme, Token};
+use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 use crate::cli::ui::glyph;
 use crate::coordinator::{Clock, InputConfig, SystemConfig};
@@ -169,7 +170,7 @@ fn write_overview(
     config: &ResolvedDeployment,
     theme: &Theme,
 ) -> io::Result<()> {
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     let dot = glyph::DOT;
     let targets = config.targets.len();
     let mut packs: Vec<&str> = config
@@ -212,7 +213,7 @@ pub(crate) fn write_title(
     theme: &Theme,
 ) -> io::Result<()> {
     let hue = theme.bold(theme.hue(index));
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     let name = target_name(target);
     let clock = clock(&target.coordinator.clock);
     writeln!(out, "  {hue}{name}{hue:#}  {muted}{clock}{muted:#}")
@@ -229,14 +230,14 @@ fn write_system(
     let config_target = &config.targets[target];
     let system = &config_target.coordinator.systems[system];
     let hue = theme.bold(theme.hue(target));
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     let ns = config_target.namespace();
     let prefix = if config.targets.len() > 1 {
         format!("{hue}{ns}{hue:#}.")
     } else {
         String::new()
     };
-    let bold = theme.bold(theme.style(Token::Text));
+    let bold = theme.bold(Style::new());
     write!(
         out,
         "  {prefix}{bold}{}{bold:#}  {muted}{}",

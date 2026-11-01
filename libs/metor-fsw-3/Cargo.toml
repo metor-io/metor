@@ -15,6 +15,7 @@ metor-proto-stellar = { path = "../metor-proto/stellar", optional = true }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 anstyle = { version = "1", optional = true }
+anstyle-lossy = { version = "1", optional = true }
 blake3 = { version = "1.8", optional = true }
 clap = { version = "4", features = ["derive", "wrap_help"], optional = true }
 clap_complete = { version = "4.5", features = ["unstable-dynamic"], optional = true }
@@ -64,6 +65,7 @@ default = ["host", "db"]
 host = [
     "threads",
     "dep:anstyle",
+    "dep:anstyle-lossy",
     "dep:blake3",
     "dep:clap",
     "dep:clap_complete",

@@ -1,11 +1,12 @@
 //! A target's wiring as boxes in step order, with edges in lanes to their
 //! left.
 
+use anstyle::Style;
 use std::io::{self, Write};
 
 use super::lanes::{self, Span};
 use super::wiring::{Node, Wiring};
-use crate::cli::ui::theme::{Theme, Token};
+use crate::cli::ui::theme::Theme;
 use crate::cli::ui::{glyph, glyph::line};
 use crate::cli::ui::{pad, width};
 
@@ -234,7 +235,7 @@ pub fn render(
     let (layout, spans, columns) = lay_out(wiring, notes, detail);
     let grid = lanes::draw(layout.parts.len(), &spans, &columns);
     let size = Size::of(wiring, &layout);
-    let lane = theme.style(Token::Accent);
+    let lane = theme.accent;
     for ((node, part), lanes) in layout.parts.iter().zip(&grid) {
         let lanes: String = lanes.iter().collect();
         write!(out, "{indent}{lane}{lanes}{lane:#}")?;
@@ -254,7 +255,7 @@ fn write_idle(
     theme: &Theme,
     indent: &str,
 ) -> io::Result<()> {
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     let mut kinds: Vec<&str> = Vec::new();
     for &node in idle {
         let kind = wiring.nodes[node].kind;
@@ -324,7 +325,7 @@ fn write_part(
     size: Size,
     theme: &Theme,
 ) -> io::Result<()> {
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     let bar = format!("{muted}{}{muted:#}", line::VERTICAL);
     let tee = format!("{muted}{}{muted:#}", line::TEE_LEFT);
     let rule = line::HORIZONTAL.to_string().repeat(size.inner + 2);
@@ -343,7 +344,7 @@ fn write_part(
             line::UP_LEFT
         ),
         Part::Title => {
-            let bold = theme.bold(theme.style(Token::Text));
+            let bold = theme.bold(Style::new());
             let (id, kind) = (node.id, node.kind);
             let (id_pad, kind_pad) = (pad(id, size.id), pad(kind, inner - size.id - 2));
             write!(

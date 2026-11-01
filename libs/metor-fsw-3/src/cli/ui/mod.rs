@@ -13,7 +13,7 @@ pub mod theme;
 
 use std::sync::{Arc, Mutex};
 
-use caps::{Caps, ColorChoice, Probe};
+use caps::{Caps, ColorChoice};
 use event::Event;
 use human::Human;
 use json::Json;
@@ -83,6 +83,7 @@ impl Reporter for Silent {
 pub struct Ui {
     reporter: Arc<Mutex<Box<dyn Reporter>>>,
     pub caps: Caps,
+    color: ColorChoice,
     pub format: Format,
     pub verbose: bool,
     /// Drop the deployment's phases and `Running`, which the parent of a
@@ -91,13 +92,13 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// Detects the terminal and picks the renderer for `args`.
+    /// Picks the renderer for `args` on a `terminal`.
     ///
     /// A live terminal gets a thread that ticks its spinner. With
     /// `--verbose`, cargo writes to the terminal too, so nothing redraws.
-    pub fn new(args: &OutputArgs, probe: &Probe) -> Self {
+    pub fn new(args: &OutputArgs, terminal: Caps) -> Self {
         let mut caps = match args.format {
-            Format::Human => Caps::resolve(probe, args.color),
+            Format::Human => terminal,
             Format::Json => Caps::plain(),
         };
         caps.live &= !args.verbose;
@@ -106,6 +107,7 @@ impl Ui {
             Format::Json => Box::new(Json::new(std::io::stdout())),
         };
         let ui = Self {
+            color: args.color,
             format: args.format,
             verbose: args.verbose,
             child: crate::cli::children::is_child(),
@@ -123,17 +125,11 @@ impl Ui {
         ui
     }
 
-    /// What stdout can show: the terminal's caps on a terminal, otherwise no
-    /// colour and no redraws.
+    /// What stdout can show, under the same `--color`.
     pub fn stdout_caps(&self) -> Caps {
-        use std::io::IsTerminal;
-        if std::io::stdout().is_terminal() {
-            return self.caps;
-        }
-        Caps {
-            live: false,
-            depth: caps::Depth::None,
-            ..self.caps
+        match self.format {
+            Format::Human => Caps::stdout(self.color, self.caps),
+            Format::Json => Caps::plain(),
         }
     }
 
@@ -156,6 +152,7 @@ impl Ui {
         Self {
             reporter: Arc::new(Mutex::new(reporter)),
             caps,
+            color: ColorChoice::Auto,
             format: Format::Human,
             verbose: false,
             child: false,

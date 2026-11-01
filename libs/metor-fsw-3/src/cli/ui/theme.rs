@@ -1,128 +1,65 @@
-//! Colours.
-//!
-//! Renderers style text through a [`Theme`] by [`Token`], never by colour.
-//! Each token has a designed swatch per background and colour depth.
+//! Colours. Each role has an RGB colour per background, converted down to
+//! what the terminal shows.
 
-use anstyle::{Ansi256Color, AnsiColor, Color, RgbColor, Style};
+use anstyle::{Color, RgbColor, Style};
+use anstyle_lossy::{palette::VGA, rgb_to_ansi, rgb_to_xterm};
 
 use super::caps::{Background, Caps, Depth};
-
-/// A role a piece of text plays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Token {
-    /// Primary content, in the terminal's own foreground.
-    Text,
-    /// Labels, field names, timing.
-    Muted,
-    /// Rules and anything that should recede.
-    Faint,
-    /// The one highlight.
-    Accent,
-    Ok,
-    Warn,
-    Error,
-}
-
-/// One colour at each depth.
-#[derive(Clone, Copy, Debug)]
-struct Swatch {
-    rgb: [u8; 3],
-    ansi256: u8,
-    ansi16: AnsiColor,
-}
-
-const fn swatch(rgb: [u8; 3], ansi256: u8, ansi16: AnsiColor) -> Swatch {
-    Swatch {
-        rgb,
-        ansi256,
-        ansi16,
-    }
-}
-
-/// The swatches for one background: muted, faint, accent, ok, warn, error,
-/// then the target hues.
-struct Palette {
-    tokens: [Swatch; 6],
-    hues: [Swatch; HUES],
-}
 
 /// The number of distinct target hues.
 pub const HUES: usize = 8;
 
-const DARK: Palette = Palette {
-    tokens: [
-        swatch([0x8a, 0x8f, 0x98], 245, AnsiColor::BrightBlack),
-        swatch([0x4e, 0x53, 0x5c], 239, AnsiColor::BrightBlack),
-        swatch([0xb4, 0x8e, 0xff], 141, AnsiColor::Magenta),
-        swatch([0x7f, 0xd8, 0x8f], 114, AnsiColor::Green),
-        swatch([0xf5, 0xc2, 0x6b], 221, AnsiColor::Yellow),
-        swatch([0xff, 0x6b, 0x6b], 203, AnsiColor::Red),
-    ],
-    hues: [
-        swatch([0x56, 0xb4, 0xe9], 75, AnsiColor::Blue),
-        swatch([0xe6, 0x9f, 0x00], 214, AnsiColor::Yellow),
-        swatch([0x3c, 0xc4, 0x9a], 43, AnsiColor::Green),
-        swatch([0xcc, 0x79, 0xa7], 175, AnsiColor::Magenta),
-        swatch([0x6f, 0xd6, 0xe0], 80, AnsiColor::Cyan),
-        swatch([0xf0, 0x7a, 0x4a], 209, AnsiColor::Red),
-        swatch([0x9a, 0xa8, 0xff], 111, AnsiColor::BrightBlue),
-        swatch([0xd8, 0xd2, 0x5e], 185, AnsiColor::BrightYellow),
-    ],
-};
+/// One background's colours: muted, faint, accent, ok, warn, error, then the
+/// target hues.
+type Palette = ([u32; 6], [u32; HUES]);
 
-const LIGHT: Palette = Palette {
-    tokens: [
-        swatch([0x6b, 0x70, 0x78], 243, AnsiColor::BrightBlack),
-        swatch([0xb8, 0xbc, 0xc4], 250, AnsiColor::BrightBlack),
-        swatch([0x6e, 0x40, 0xc9], 98, AnsiColor::Magenta),
-        swatch([0x1a, 0x7f, 0x37], 28, AnsiColor::Green),
-        swatch([0x9a, 0x67, 0x00], 136, AnsiColor::Yellow),
-        swatch([0xc9, 0x25, 0x2c], 160, AnsiColor::Red),
+const DARK: Palette = (
+    [0x8a8f98, 0x4e535c, 0xb48eff, 0x7fd88f, 0xf5c26b, 0xff6b6b],
+    [
+        0x56b4e9, 0xe69f00, 0x3cc49a, 0xcc79a7, 0x6fd6e0, 0xf07a4a, 0x9aa8ff, 0xd8d25e,
     ],
-    hues: [
-        swatch([0x00, 0x72, 0xb2], 25, AnsiColor::Blue),
-        swatch([0xb0, 0x6a, 0x00], 130, AnsiColor::Yellow),
-        swatch([0x00, 0x87, 0x5f], 29, AnsiColor::Green),
-        swatch([0xa8, 0x3c, 0x7c], 132, AnsiColor::Magenta),
-        swatch([0x00, 0x7f, 0x8c], 30, AnsiColor::Cyan),
-        swatch([0xc0, 0x4a, 0x10], 166, AnsiColor::Red),
-        swatch([0x4a, 0x5c, 0xd0], 62, AnsiColor::BrightBlue),
-        swatch([0x7a, 0x70, 0x00], 100, AnsiColor::BrightYellow),
-    ],
-};
+);
 
-/// The styles for one terminal.
+const LIGHT: Palette = (
+    [0x6b7078, 0xb8bcc4, 0x6e40c9, 0x1a7f37, 0x9a6700, 0xc9252c],
+    [
+        0x0072b2, 0xb06a00, 0x00875f, 0xa83c7c, 0x007f8c, 0xc04a10, 0x4a5cd0, 0x7a7000,
+    ],
+);
+
+/// The styles for one terminal. Primary text keeps the terminal's own
+/// foreground, so it has no style.
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
-    tokens: [Style; 6],
+    /// Labels, field names, timing.
+    pub muted: Style,
+    /// Rules and anything that should recede.
+    pub faint: Style,
+    /// The one highlight.
+    pub accent: Style,
+    pub ok: Style,
+    pub warn: Style,
+    pub error: Style,
     hues: [Style; HUES],
     effects: bool,
 }
 
 impl Theme {
     pub fn new(caps: &Caps) -> Self {
-        let palette = match caps.background {
-            Background::Dark => &DARK,
-            Background::Light => &LIGHT,
+        let (tokens, hues) = match caps.background {
+            Background::Dark => DARK,
+            Background::Light => LIGHT,
         };
-        let style = |swatch: &Swatch| paint(swatch, caps.depth);
+        let [muted, faint, accent, ok, warn, error] = tokens.map(|rgb| paint(rgb, caps.depth));
         Self {
-            tokens: palette.tokens.each_ref().map(style),
-            hues: palette.hues.each_ref().map(style),
+            muted,
+            faint,
+            accent,
+            ok,
+            warn,
+            error,
+            hues: hues.map(|rgb| paint(rgb, caps.depth)),
             effects: caps.depth != Depth::None,
-        }
-    }
-
-    /// The style for `token`.
-    pub fn style(&self, token: Token) -> Style {
-        match token {
-            Token::Text => Style::new(),
-            Token::Muted => self.tokens[0],
-            Token::Faint => self.tokens[1],
-            Token::Accent => self.tokens[2],
-            Token::Ok => self.tokens[3],
-            Token::Warn => self.tokens[4],
-            Token::Error => self.tokens[5],
         }
     }
 
@@ -137,13 +74,15 @@ impl Theme {
     }
 }
 
-fn paint(swatch: &Swatch, depth: Depth) -> Style {
-    let [r, g, b] = swatch.rgb;
+/// `rgb` as a foreground at `depth`.
+fn paint(rgb: u32, depth: Depth) -> Style {
+    let [_, r, g, b] = rgb.to_be_bytes();
+    let rgb = RgbColor(r, g, b);
     let color = match depth {
         Depth::None => return Style::new(),
-        Depth::Ansi16 => Color::Ansi(swatch.ansi16),
-        Depth::Ansi256 => Color::Ansi256(Ansi256Color(swatch.ansi256)),
-        Depth::TrueColor => Color::Rgb(RgbColor(r, g, b)),
+        Depth::Ansi16 => Color::Ansi(rgb_to_ansi(rgb, VGA)),
+        Depth::Ansi256 => Color::Ansi256(rgb_to_xterm(rgb)),
+        Depth::TrueColor => Color::Rgb(rgb),
     };
     Style::new().fg_color(Some(color))
 }
@@ -151,16 +90,6 @@ fn paint(swatch: &Swatch, depth: Depth) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TOKENS: [Token; 7] = [
-        Token::Text,
-        Token::Muted,
-        Token::Faint,
-        Token::Accent,
-        Token::Ok,
-        Token::Warn,
-        Token::Error,
-    ];
 
     fn theme(depth: Depth, background: Background) -> Theme {
         Theme::new(&Caps {
@@ -171,10 +100,15 @@ mod tests {
     }
 
     fn styles(theme: &Theme) -> impl Iterator<Item = Style> + '_ {
-        TOKENS
-            .iter()
-            .map(|token| theme.style(*token))
-            .chain((0..HUES).map(|i| theme.hue(i)))
+        let tokens = [
+            theme.muted,
+            theme.faint,
+            theme.accent,
+            theme.ok,
+            theme.warn,
+            theme.error,
+        ];
+        tokens.into_iter().chain((0..HUES).map(|i| theme.hue(i)))
     }
 
     #[test]
@@ -184,7 +118,7 @@ mod tests {
                 for style in styles(&theme(depth, background)) {
                     let fits = matches!(
                         (style.get_fg_color(), depth),
-                        (None, _)
+                        (None, Depth::None)
                             | (Some(Color::Ansi(_)), Depth::Ansi16)
                             | (Some(Color::Ansi256(_)), Depth::Ansi256)
                             | (Some(Color::Rgb(_)), Depth::TrueColor)
@@ -196,25 +130,22 @@ mod tests {
     }
 
     #[test]
-    fn test_no_depth_has_no_styles() {
+    fn test_no_depth_has_no_styles_or_bold() {
         let theme = theme(Depth::None, Background::Dark);
         assert!(styles(&theme).all(|style| style == Style::new()));
-    }
-
-    #[test]
-    fn test_text_keeps_the_terminal_foreground() {
-        let theme = theme(Depth::TrueColor, Background::Light);
-        assert_eq!(theme.style(Token::Text), Style::new());
+        assert_eq!(theme.bold(theme.accent), Style::new());
     }
 
     #[test]
     fn test_hues_are_distinct_and_wrap() {
-        let theme = theme(Depth::TrueColor, Background::Dark);
-        for i in 0..HUES {
-            for j in i + 1..HUES {
-                assert_ne!(theme.hue(i), theme.hue(j));
+        for depth in [Depth::Ansi256, Depth::TrueColor] {
+            let theme = theme(depth, Background::Dark);
+            for i in 0..HUES {
+                for j in i + 1..HUES {
+                    assert_ne!(theme.hue(i), theme.hue(j), "{depth:?}");
+                }
             }
+            assert_eq!(theme.hue(HUES + 2), theme.hue(2));
         }
-        assert_eq!(theme.hue(HUES + 2), theme.hue(2));
     }
 }

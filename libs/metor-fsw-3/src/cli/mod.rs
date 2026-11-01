@@ -24,6 +24,7 @@ pub mod ui;
 pub mod units;
 pub mod watch;
 
+use anstyle::Style;
 use std::path::PathBuf;
 
 use clap::builder::Styles;
@@ -32,9 +33,9 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::pack::ABI_VERSION;
 use diagnostic::{Report, exit_code};
 use run::RunError;
-use ui::caps::{Caps, ColorChoice, Probe};
+use ui::caps::{Caps, ColorChoice};
 use ui::event::Event;
-use ui::theme::{Theme, Token};
+use ui::theme::Theme;
 use ui::{OutputArgs, Ui};
 
 #[derive(Parser)]
@@ -139,9 +140,9 @@ pub fn main() {
         .var(completions::VAR)
         .complete();
     let early = Early::scan(std::env::args_os().skip(1));
-    let probe = Probe::detect(early.query);
-    let cli = parse(&probe, &early);
-    let ui = Ui::new(&cli.output, &probe);
+    let caps = Caps::detect(early.color, early.query);
+    let cli = parse(&caps, early.color);
+    let ui = Ui::new(&cli.output, caps);
     let Err(error) = run(cli.command, &ui) else {
         return;
     };
@@ -151,18 +152,16 @@ pub fn main() {
     std::process::exit(exit_code(&error));
 }
 
-/// Parses the command line, with help styled for the terminal `probe`
-/// describes.
-fn parse(probe: &Probe, early: &Early) -> Cli {
-    let caps = Caps::resolve(probe, early.color);
-    let color = match early.color {
+/// Parses the command line, with help styled for `caps`.
+fn parse(caps: &Caps, color: ColorChoice) -> Cli {
+    let color = match color {
         ColorChoice::Auto => clap::ColorChoice::Auto,
         ColorChoice::Always => clap::ColorChoice::Always,
         ColorChoice::Never => clap::ColorChoice::Never,
     };
     let command = Cli::command()
         .color(color)
-        .styles(styles(&Theme::new(&caps)));
+        .styles(styles(&Theme::new(caps)));
     let matches = command.get_matches();
     Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
@@ -210,13 +209,13 @@ impl Early {
 /// Help's styles from `theme`.
 fn styles(theme: &Theme) -> Styles {
     Styles::styled()
-        .header(theme.bold(theme.style(Token::Accent)))
-        .usage(theme.bold(theme.style(Token::Accent)))
-        .literal(theme.bold(theme.style(Token::Text)))
-        .placeholder(theme.style(Token::Muted))
-        .error(theme.bold(theme.style(Token::Error)))
-        .valid(theme.style(Token::Ok))
-        .invalid(theme.style(Token::Warn))
+        .header(theme.bold(theme.accent))
+        .usage(theme.bold(theme.accent))
+        .literal(theme.bold(Style::new()))
+        .placeholder(theme.muted)
+        .error(theme.bold(theme.error))
+        .valid(theme.ok)
+        .invalid(theme.warn)
 }
 
 fn run(command: Command, ui: &Ui) -> Result<(), RunError> {

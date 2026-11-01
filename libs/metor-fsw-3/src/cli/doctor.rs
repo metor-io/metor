@@ -12,7 +12,7 @@ use serde_json::json;
 
 use super::run::{RunError, find_target, interpreter, io, print, python_path};
 use super::ui::event::Event;
-use super::ui::theme::{Theme, Token};
+use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 use crate::cli::ui::glyph;
 use crate::dl::WASM_TRIPLE;
@@ -107,14 +107,13 @@ pub fn render(out: &mut impl Write, checks: &[Check], theme: &Theme) -> io::Resu
         .map(|check| check.name.len())
         .max()
         .unwrap_or(0);
-    let muted = theme.style(Token::Muted);
+    let muted = theme.muted;
     for check in checks {
-        let (glyph, token) = match check.status {
-            Status::Ok => (glyph::OK, Token::Ok),
-            Status::Optional => (glyph::WARN, Token::Warn),
-            Status::Failed => (glyph::FAIL, Token::Error),
+        let (glyph, style) = match check.status {
+            Status::Ok => (glyph::OK, theme.ok),
+            Status::Optional => (glyph::WARN, theme.warn),
+            Status::Failed => (glyph::FAIL, theme.error),
         };
-        let style = theme.style(token);
         let name = format!("{:width$}", check.name);
         writeln!(out, "  {style}{glyph}{style:#} {name}   {}", check.detail)?;
         if let Some(fix) = &check.fix {
