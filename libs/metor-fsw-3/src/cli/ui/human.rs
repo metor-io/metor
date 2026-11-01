@@ -2,12 +2,11 @@
 //!
 //! With [`Caps::plain`] it is also the renderer for pipes and logs.
 
-use core::fmt::Write as _;
 use core::time::Duration;
 use std::io::{self, Write};
-use std::time::Instant;
 
 use anstyle::Style;
+use indicatif::{ProgressBar, ProgressStyle};
 use miette::{GraphicalReportHandler, GraphicalTheme};
 
 use super::Reporter;
@@ -32,13 +31,8 @@ const SUMMARY_COLUMNS: [(&str, Align); 4] = [
     ("OVERRUNS", Align::Right),
 ];
 
-/// How long a phase runs before its live line appears.
-const REVEAL_AFTER: Duration = Duration::from_millis(200);
-
-/// Synchronized output: the terminal shows what is between these at once.
-const SYNC_BEGIN: &str = "\x1b[?2026h";
-const SYNC_END: &str = "\x1b[?2026l";
-const CLEAR_LINE: &str = "\x1b[2K";
+/// How often the spinner turns.
+const TICK: Duration = Duration::from_millis(100);
 
 /// The widest a source column is set up front. A longer source still
 /// widens it.
@@ -53,23 +47,10 @@ pub struct Human<W> {
     buf: Vec<u8>,
     theme: Theme,
     caps: Caps,
-    /// The phase in progress, redrawn in place on a live terminal.
-    live: Option<Live>,
-    /// How long a phase runs before its live line appears.
-    reveal_after: Duration,
+    /// The phase in progress, spinning on stderr while it runs.
+    spinner: Option<ProgressBar>,
     /// The widest log source so far. Sources pad to it.
     source_width: usize,
-}
-
-/// A phase line that redraws in place until its phase ends.
-struct Live {
-    verb: &'static str,
-    subject: String,
-    detail: String,
-    since: Instant,
-    frame: usize,
-    /// Whether the line is on screen now.
-    shown: bool,
 }
 
 impl<W: Write> Human<W> {
@@ -79,42 +60,28 @@ impl<W: Write> Human<W> {
             buf: Vec::with_capacity(512),
             theme: Theme::new(&caps),
             caps,
-            live: None,
-            reveal_after: REVEAL_AFTER,
+            spinner: None,
             source_width: 0,
         }
-    }
-
-    /// Shows live lines as soon as their phase starts.
-    #[cfg(test)]
-    pub(crate) fn reveal_at_once(mut self) -> Self {
-        self.reveal_after = Duration::ZERO;
-        self
     }
 
     fn phase(&mut self, phase: &Phase<'_>) -> io::Result<()> {
         match phase.state {
             PhaseState::Started => {
-                self.clear_live()?;
-                self.live = Some(Live {
-                    verb: phase.verb.doing(),
-                    subject: phase.subject.to_string(),
-                    detail: String::new(),
-                    since: Instant::now(),
-                    frame: 0,
-                    shown: false,
-                });
-                self.draw_live()
+                self.stop_spinner();
+                self.spinner = self.caps.live.then(|| self.spin(phase));
+                Ok(())
             }
             PhaseState::Progress { done, current } => {
-                if let Some(live) = &mut self.live {
-                    live.detail.clear();
-                    let _ = write!(live.detail, "{done} {} {current}", glyph::DOT);
+                let muted = self.theme.muted;
+                if let Some(spinner) = &self.spinner {
+                    let detail = format!("{muted}{done} {} {current}{muted:#}", glyph::DOT);
+                    spinner.set_message(format!("{}  {detail}", phase.subject));
                 }
-                self.draw_live()
+                Ok(())
             }
             PhaseState::Done(took) => {
-                self.end_live()?;
+                self.stop_spinner();
                 let took = (took.as_millis() >= 10).then_some(took);
                 self.phase_line(
                     glyph::OK,
@@ -125,15 +92,36 @@ impl<W: Write> Human<W> {
                 )
             }
             PhaseState::Failed => {
-                self.end_live()?;
-                self.phase_line(
-                    glyph::FAIL,
-                    self.theme.error,
-                    phase.verb.doing(),
-                    phase.subject,
-                    None,
-                )
+                self.stop_spinner();
+                let verb = phase.verb.doing();
+                self.phase_line(glyph::FAIL, self.theme.error, verb, phase.subject, None)
             }
+        }
+    }
+
+    /// A spinner on stderr for `phase`.
+    fn spin(&self, phase: &Phase<'_>) -> ProgressBar {
+        let accent = self.theme.accent;
+        let frames: Vec<String> = glyph::SPINNER
+            .iter()
+            .chain([&" "])
+            .map(|frame| format!("{accent}{frame}{accent:#}"))
+            .collect();
+        let frames: Vec<&str> = frames.iter().map(String::as_str).collect();
+        let style = ProgressStyle::with_template("  {spinner} {prefix:11} {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_strings(&frames);
+        let spinner = ProgressBar::new_spinner()
+            .with_style(style)
+            .with_prefix(phase.verb.doing())
+            .with_message(phase.subject.to_string());
+        spinner.enable_steady_tick(TICK);
+        spinner
+    }
+
+    fn stop_spinner(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.finish_and_clear();
         }
     }
 
@@ -159,61 +147,8 @@ impl<W: Write> Human<W> {
         writeln!(self.buf, "{muted:#}")
     }
 
-    /// Advances the spinner and redraws the live line.
-    fn tick(&mut self) -> io::Result<()> {
-        if let Some(live) = &mut self.live {
-            live.frame += 1;
-        }
-        self.draw_live()
-    }
-
-    /// Draws the live line in place, once its phase has run long enough.
-    fn draw_live(&mut self) -> io::Result<()> {
-        let Some(live) = &mut self.live else {
-            return Ok(());
-        };
-        if !self.caps.live || live.since.elapsed() < self.reveal_after {
-            return Ok(());
-        }
-        let frame = glyph::SPINNER[live.frame % glyph::SPINNER.len()];
-        let (accent, muted) = (self.theme.accent, self.theme.muted);
-        let room = usize::from(self.caps.width).saturating_sub(2 + 2 + VERB_WIDTH + 1 + 1);
-        let subject = truncate(&live.subject, room);
-        let room = room.saturating_sub(subject.chars().count() + 2);
-        let detail = truncate(&live.detail, room);
-        write!(
-            self.buf,
-            "{SYNC_BEGIN}\r{CLEAR_LINE}  {accent}{frame}{accent:#} {:<VERB_WIDTH$} {subject}",
-            live.verb
-        )?;
-        if !detail.is_empty() {
-            write!(self.buf, "  {muted}{detail}{muted:#}")?;
-        }
-        write!(self.buf, "{SYNC_END}")?;
-        live.shown = true;
-        Ok(())
-    }
-
-    /// Takes the live line off the screen; the next tick draws it again.
-    fn clear_live(&mut self) -> io::Result<()> {
-        if let Some(live) = &mut self.live
-            && std::mem::take(&mut live.shown)
-        {
-            write!(self.buf, "\r{CLEAR_LINE}")?;
-        }
-        Ok(())
-    }
-
-    fn end_live(&mut self) -> io::Result<()> {
-        self.clear_live()?;
-        self.live = None;
-        Ok(())
-    }
-
     fn running(&mut self, namespaces: &[&str]) -> io::Result<()> {
-        self.clear_live()?;
-        let accent = self.theme.accent;
-        let muted = self.theme.muted;
+        let (accent, muted) = (self.theme.accent, self.theme.muted);
         write!(
             self.buf,
             "  {accent}{}{accent:#} {:<VERB_WIDTH$}",
@@ -233,7 +168,6 @@ impl<W: Write> Human<W> {
 
     /// Renders `diagnostic` with miette, ending in where to read more.
     fn diagnostic(&mut self, diagnostic: &dyn miette::Diagnostic) -> io::Result<()> {
-        self.clear_live()?;
         let theme = match self.caps.depth {
             Depth::None => GraphicalTheme::unicode_nocolor(),
             _ => GraphicalTheme::unicode(),
@@ -252,7 +186,7 @@ impl<W: Write> Human<W> {
     }
 
     fn ended(&mut self, summary: &Summary) -> io::Result<()> {
-        self.end_live()?;
+        self.stop_spinner();
         let accent = self.theme.accent;
         let how = if summary.interrupted {
             "Stopped"
@@ -286,9 +220,21 @@ impl<W: Write> Human<W> {
     }
 
     fn log(&mut self, line: &LogLine<'_>) -> io::Result<()> {
-        self.clear_live()?;
         self.source_width = self.source_width.max(logline::source_len(&line.source));
         logline::write(&mut self.buf, line, &self.theme, self.source_width)
+    }
+
+    /// Writes the buffer to `out`, with the spinner, if any, off the screen.
+    fn flush(&mut self) {
+        let Self {
+            out, buf, spinner, ..
+        } = self;
+        let mut write = || out.write_all(buf).and_then(|()| out.flush());
+        let _ = match spinner {
+            Some(spinner) => spinner.suspend(write),
+            None => write(),
+        };
+        buf.clear();
     }
 }
 
@@ -303,33 +249,22 @@ impl<W: Write + Send> Reporter for Human<W> {
                 self.source_width = (*width).min(MAX_SOURCE_WIDTH);
                 Ok(())
             }
-            Event::Output(bytes) => self.clear_live().and_then(|()| self.buf.write_all(bytes)),
-            Event::Tick => self.tick(),
+            Event::Output(bytes) => self.buf.write_all(bytes),
             Event::Ended(summary) => self.ended(summary),
             Event::Changed(path) => {
                 let accent = self.theme.accent;
-                let again = glyph::AGAIN;
                 writeln!(
                     self.buf,
-                    "\n  {accent}{again}{accent:#} {:<VERB_WIDTH$} {path}\n",
+                    "\n  {accent}{}{accent:#} {:<VERB_WIDTH$} {path}\n",
+                    glyph::AGAIN,
                     "Changed"
                 )
             }
             Event::Data(_, value) => writeln!(self.buf, "{value:#}"),
         };
-        if written.is_ok() && !self.buf.is_empty() {
-            let _ = self
-                .out
-                .write_all(&self.buf)
-                .and_then(|()| self.out.flush());
+        match written {
+            Ok(()) if !self.buf.is_empty() => self.flush(),
+            _ => self.buf.clear(),
         }
-        self.buf.clear();
     }
-}
-
-/// The first `room` characters of `text`.
-fn truncate(text: &str, room: usize) -> &str {
-    text.char_indices()
-        .nth(room)
-        .map_or(text, |(end, _)| &text[..end])
 }

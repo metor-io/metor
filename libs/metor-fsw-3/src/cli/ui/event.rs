@@ -20,8 +20,6 @@ pub enum Event<'a> {
     /// Another program's output, shown as it was written, such as cargo's
     /// errors or a target file's traceback.
     Output(&'a [u8]),
-    /// Time passed; a live line may redraw.
-    Tick,
     /// The run is over.
     Ended(&'a Summary),
     /// A watched file changed, so the run starts again.

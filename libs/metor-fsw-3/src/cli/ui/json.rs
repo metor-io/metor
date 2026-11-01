@@ -28,7 +28,7 @@ impl<W: Write> Json<W> {
 /// event that only shapes text.
 fn object(event: &Event<'_>) -> Option<Value> {
     Some(match event {
-        Event::SourceWidth(_) | Event::Tick => return None,
+        Event::SourceWidth(_) => return None,
         Event::Ended(summary) => json!({
             "type": "ended",
             "secs": summary.took.as_secs_f64(),

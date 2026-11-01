@@ -49,6 +49,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 wasmi = { version = "1.1", default-features = false, features = ["std"], optional = true }
 zerocopy = { version = "0.8.2", features = ["alloc", "derive"] }
+indicatif = { version = "0.18", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stellarator = { path = "../stellarator", optional = true }
@@ -70,6 +71,7 @@ host = [
     "dep:clap",
     "dep:clap_complete",
     "dep:unicode-width",
+    "dep:indicatif",
     "dep:jiff",
     "dep:libc",
     "dep:libloading",

@@ -68,9 +68,6 @@ pub struct OutputArgs {
     pub verbose: bool,
 }
 
-/// How often a live line redraws.
-const TICK: core::time::Duration = core::time::Duration::from_millis(100);
-
 /// Drops every event.
 struct Silent;
 
@@ -92,10 +89,8 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// Picks the renderer for `args` on a `terminal`.
-    ///
-    /// A live terminal gets a thread that ticks its spinner. With
-    /// `--verbose`, cargo writes to the terminal too, so nothing redraws.
+    /// Picks the renderer for `args` on a `terminal`. With `--verbose`,
+    /// cargo writes to the terminal too, so nothing spins.
     pub fn new(args: &OutputArgs, terminal: Caps) -> Self {
         let mut caps = match args.format {
             Format::Human => terminal,
@@ -106,23 +101,13 @@ impl Ui {
             Format::Human => Box::new(Human::new(std::io::stderr(), caps)),
             Format::Json => Box::new(Json::new(std::io::stdout())),
         };
-        let ui = Self {
+        Self {
             color: args.color,
             format: args.format,
             verbose: args.verbose,
             child: crate::cli::children::is_child(),
             ..Self::with(reporter, caps)
-        };
-        if caps.live {
-            let ticker = ui.clone();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(TICK);
-                    ticker.emit(Event::Tick);
-                }
-            });
         }
-        ui
     }
 
     /// What stdout can show, under the same `--color`.
