@@ -1,20 +1,16 @@
-//! A borderless table: a muted header row, then aligned rows.
+//! A borderless table: a muted header row, then aligned rows with the first
+//! column bold.
 
-use anstyle::Style;
 use std::io::{self, Write};
 
-use super::glyph;
+use anstyle::Style;
+pub use comfy_table::CellAlignment as Align;
+use comfy_table::{ColumnConstraint, ContentArrangement, presets::NOTHING};
+
 use super::theme::Theme;
-use super::{pad, width};
+use super::{glyph, width};
 
-/// How a column aligns its cells.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Align {
-    Left,
-    Right,
-}
-
-/// Columns of text, measured and written in one pass.
+/// Columns of text, laid out when written.
 #[derive(Debug)]
 pub struct Table<'a> {
     headers: &'a [(&'a str, Align)],
@@ -22,9 +18,6 @@ pub struct Table<'a> {
     /// The widest a line may be. The last column is cut to fit.
     width: Option<usize>,
 }
-
-/// The gap between columns.
-const GAP: &str = "  ";
 
 impl<'a> Table<'a> {
     pub fn new(headers: &'a [(&'a str, Align)]) -> Self {
@@ -46,87 +39,46 @@ impl<'a> Table<'a> {
         self.rows.push(cells);
     }
 
-    /// Writes the table, indented by `indent`, with the first column bold.
+    /// Writes the table, indented by `indent`, without trailing blanks.
     pub fn write(&self, out: &mut impl Write, theme: &Theme, indent: &str) -> io::Result<()> {
-        let widths = self.widths();
-        let muted = theme.muted;
-        let headers: Vec<&str> = self.headers.iter().map(|(header, _)| *header).collect();
-        let header = self.line(&headers, &widths, 0);
-        writeln!(out, "{indent}{muted}{header}{muted:#}")?;
-        let bold = theme.bold(Style::new());
+        let (muted, bold) = (theme.muted, theme.bold(Style::new()));
+        let mut table = comfy_table::Table::new();
+        table
+            .load_preset(NOTHING)
+            .set_truncation_indicator(glyph::ELLIPSIS)
+            .set_header(
+                self.headers
+                    .iter()
+                    .map(|(h, _)| format!("{muted}{h}{muted:#}")),
+            );
         for row in &self.rows {
-            let cells: Vec<&str> = row.iter().map(String::as_str).collect();
-            let (first, rest) = cells.split_first().unwrap_or((&"", &[]));
-            let rest = self.line(rest, &widths, 1);
-            let room = self
-                .width
-                .map(|room| room.saturating_sub(width(indent) + widths[0] + GAP.len()));
-            let rest = cut(&rest, room, glyph::ELLIPSIS);
-            let padding = if rest.is_empty() {
-                String::new()
-            } else {
-                pad(first, widths[0])
-            };
-            write!(out, "{indent}{bold}{first}{bold:#}{padding}")?;
-            if !rest.is_empty() {
-                write!(out, "{GAP}{rest}")?;
+            let cells = row.iter().enumerate().map(|(column, cell)| match column {
+                0 => format!("{bold}{cell}{bold:#}"),
+                _ => cell.clone(),
+            });
+            table.add_row(cells);
+        }
+        if let Some(room) = self.width {
+            let room = room.saturating_sub(width(indent));
+            table
+                .set_content_arrangement(ContentArrangement::Dynamic)
+                .set_width(u16::try_from(room).unwrap_or(u16::MAX));
+        }
+        let last = self.headers.len().saturating_sub(1);
+        for (index, (column, (_, align))) in table.column_iter_mut().zip(self.headers).enumerate() {
+            column.set_padding((0, 2)).set_cell_alignment(*align);
+            if index < last {
+                column.set_constraint(ColumnConstraint::ContentWidth);
             }
-            writeln!(out)?;
+        }
+        for row in table.row_iter_mut() {
+            row.max_height(1);
+        }
+        for line in table.lines() {
+            writeln!(out, "{indent}{}", line.trim_end())?;
         }
         Ok(())
     }
-
-    /// `cells`, from column `from` on, padded to `widths` and without
-    /// trailing blanks.
-    fn line(&self, cells: &[&str], widths: &[usize], from: usize) -> String {
-        let mut line = String::new();
-        let columns = self.headers.iter().zip(widths).skip(from);
-        for (index, (cell, ((_, align), columns))) in cells.iter().zip(columns).enumerate() {
-            if index > 0 {
-                line.push_str(GAP);
-            }
-            let pad = pad(cell, *columns);
-            match align {
-                Align::Left => line.extend([*cell, &pad]),
-                Align::Right => line.extend([pad.as_str(), cell]),
-            }
-        }
-        line.trim_end().to_string()
-    }
-
-    /// The width of each column: its widest cell or header.
-    fn widths(&self) -> Vec<usize> {
-        self.headers
-            .iter()
-            .enumerate()
-            .map(|(column, (header, _))| {
-                let cells = self.rows.iter().filter_map(|row| row.get(column));
-                cells
-                    .map(|cell| width(cell))
-                    .chain([width(header)])
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect()
-    }
-}
-
-/// `text` cut to `room` columns, ending in `ellipsis` if it was cut.
-fn cut(text: &str, room: Option<usize>, ellipsis: &str) -> String {
-    let Some(room) = room.filter(|room| width(text) > *room) else {
-        return text.to_string();
-    };
-    let mut left = room.saturating_sub(width(ellipsis));
-    let kept: String = text
-        .chars()
-        .take_while(|c| {
-            let size = unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
-            let fits = size <= left;
-            left = left.saturating_sub(size);
-            fits
-        })
-        .collect();
-    format!("{}{ellipsis}", kept.trim_end())
 }
 
 /// `n` with its digits grouped in threes by spaces: `1 440`.
@@ -147,6 +99,14 @@ mod tests {
     use super::*;
     use crate::cli::ui::caps::Caps;
 
+    fn written(table: &Table<'_>, indent: &str) -> String {
+        let mut out = Vec::new();
+        table
+            .write(&mut out, &Theme::new(&Caps::plain()), indent)
+            .expect("writes to a Vec");
+        String::from_utf8(out).expect("utf-8")
+    }
+
     #[test]
     fn test_columns_align_and_trail_no_blanks() {
         let headers = [
@@ -157,12 +117,8 @@ mod tests {
         let mut table = Table::new(&headers);
         table.row(vec!["plant".into(), group(1440), String::new()]);
         table.row(vec!["fsw".into(), group(12), "slow".into()]);
-        let mut out = Vec::new();
-        table
-            .write(&mut out, &Theme::new(&Caps::plain()), "    ")
-            .expect("writes to a Vec");
         assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
+            written(&table, "    "),
             "    TARGET  CYCLES  NOTE\n    plant    1 440\n    fsw         12  slow\n"
         );
     }
@@ -173,14 +129,15 @@ mod tests {
         let mut table = Table::new(&headers).fit(Some(20));
         table.row(vec!["pub".into(), "plant.sensors, plant.gps".into()]);
         table.row(vec!["nav".into(), "gps".into()]);
-        let mut out = Vec::new();
-        table
-            .write(&mut out, &Theme::new(&Caps::plain()), "  ")
-            .expect("writes to a Vec");
-        assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
-            "  NAME  INPUTS\n  pub   plant.senso…\n  nav   gps\n"
+        let text = written(&table, "  ");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "  NAME  INPUTS", "{text}");
+        assert!(
+            lines[1].starts_with("  pub   plant") && lines[1].ends_with('…'),
+            "{text}"
         );
+        assert_eq!(lines[2], "  nav   gps", "{text}");
+        assert!(lines.iter().all(|l| width(l) <= 20), "{text}");
     }
 
     #[test]
@@ -189,15 +146,17 @@ mod tests {
         let mut table = Table::new(&headers).fit(Some(14));
         table.row(vec!["中文".into(), "x".into()]);
         table.row(vec!["ab".into(), "日本語の名前".into()]);
-        let mut out = Vec::new();
-        table
-            .write(&mut out, &Theme::new(&Caps::plain()), "")
-            .expect("writes to a Vec");
-        let text = String::from_utf8(out).expect("utf-8");
+        let text = written(&table, "");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1], "中文  x", "{text}");
-        assert!(lines.iter().all(|l| super::super::width(l) <= 14), "{text}");
+        assert!(lines.iter().all(|l| width(l) <= 14), "{text}");
         assert!(lines[2].ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn test_no_rows_is_a_header() {
+        let headers = [("NAME", Align::Left)];
+        assert_eq!(written(&Table::new(&headers), ""), "NAME\n");
     }
 
     #[test]
