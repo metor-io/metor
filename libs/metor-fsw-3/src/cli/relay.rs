@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use metor_proto_wkt::LogLevel;
 use serde_json::Value;
 
-use super::diagnostic::Report;
+use super::diagnostic;
 use super::ui::Ui;
 use super::ui::event::{Event, LogLine, Source, TargetSummary};
 use crate::coordinator::Location;
@@ -58,7 +58,7 @@ impl Relay {
         match value["type"].as_str()? {
             "log" => self.log(value),
             "diagnostic" => {
-                self.ui.emit(Event::Diagnostic(&report(value)?));
+                self.ui.emit(Event::Diagnostic(&*report(value)?));
                 Some(())
             }
             "ended" => {
@@ -129,7 +129,7 @@ fn fields(value: &Value) -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
         .collect()
 }
 
-fn report(value: &Value) -> Option<Report> {
+fn report(value: &Value) -> Option<miette::Report> {
     let text = |key: &str| value[key].as_str().map(str::to_string);
     let at = text("file")
         .zip(value["line"].as_u64())
@@ -139,7 +139,7 @@ fn report(value: &Value) -> Option<Report> {
                 line: u32::try_from(line).ok()?,
             })
         });
-    Some(Report::from_parts(
+    Some(diagnostic::from_parts(
         text("code")?,
         text("message")?,
         text("help"),

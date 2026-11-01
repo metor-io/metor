@@ -224,8 +224,8 @@ mod tests {
             code: Some("M0299".into()),
         };
         let error = explain(args, &ui).expect_err("M0299 is not a code");
-        let report = crate::cli::diagnostic::Report::new(&error);
-        let help = miette::Diagnostic::help(&report).map(|h| h.to_string());
+        let report = crate::cli::diagnostic::report(&error);
+        let help = report.help().map(|h| h.to_string());
         assert!(
             help.is_some_and(|h| h.contains("metor explain")),
             "{report:?}"

@@ -9,10 +9,9 @@
 //! and the deployment, `M03xx` the coordinator build, `M04xx` packs and
 //! cargo, `M05xx` the run.
 
-use std::borrow::Cow;
 use std::path::Path;
 
-use miette::{LabeledSpan, NamedSource, SourceCode, SourceSpan};
+use miette::{LabeledSpan, MietteDiagnostic, NamedSource, SourceSpan};
 
 use super::cargo::CargoError;
 use super::pack_dev::PackDevError;
@@ -28,111 +27,65 @@ fn help(code: &'static str, text: &str) -> Info {
     (code, Some(text.into()))
 }
 
-/// An error ready to render.
-#[derive(Debug)]
-pub struct Report {
-    code: Cow<'static, str>,
+/// The diagnostic for `error`. A located error reads its line from the
+/// file, which the target file names relative to the working directory. If
+/// the line cannot be read, the message keeps its location.
+pub fn report(error: &RunError) -> miette::Report {
+    report_in(error, Path::new("."))
+}
+
+/// The diagnostic for `error`, reading its line relative to `base`.
+fn report_in(error: &RunError, base: &Path) -> miette::Report {
+    let (code, help) = run_info(error);
+    let located =
+        located(error).and_then(|(location, inner)| Some((snippet(location, base)?, inner)));
+    match located {
+        Some((snippet, inner)) => build(code.into(), inner, help, Some(snippet)),
+        None => build(code.into(), error.to_string(), help, None),
+    }
+}
+
+/// Rebuilds a diagnostic from the parts `--format json` writes, reading the
+/// target file's line again if it names one.
+pub fn from_parts(
+    code: String,
+    message: String,
+    help: Option<String>,
+    at: Option<Location>,
+) -> miette::Report {
+    let snippet = at.as_ref().and_then(|at| snippet(at, Path::new(".")));
+    build(code, message, help, snippet)
+}
+
+/// A target file and the span of one of its lines.
+type Snippet = (NamedSource<String>, SourceSpan);
+
+fn build(
+    code: String,
     message: String,
     help: Option<String>,
     snippet: Option<Snippet>,
+) -> miette::Report {
+    let mut diagnostic = MietteDiagnostic::new(message).with_code(code);
+    if let Some(help) = help {
+        diagnostic = diagnostic.with_help(help);
+    }
+    let Some((source, span)) = snippet else {
+        return miette::Report::new(diagnostic);
+    };
+    let label = LabeledSpan::new_with_span(None, span);
+    miette::Report::new(diagnostic.with_label(label)).with_source_code(source)
 }
 
-/// The line of the target file an error points at.
-#[derive(Debug)]
-struct Snippet {
-    source: NamedSource<String>,
-    span: SourceSpan,
-}
-
-impl Report {
-    /// Builds the report for `error`. A located error reads its line from
-    /// the file, which the target file names relative to the working
-    /// directory. If the line cannot be read, the message keeps its location.
-    pub fn new(error: &RunError) -> Self {
-        Self::in_dir(error, Path::new("."))
-    }
-
-    /// Builds the report for `error`, reading its line relative to `base`.
-    fn in_dir(error: &RunError, base: &Path) -> Self {
-        let (code, help) = run_info(error);
-        let located = located(error)
-            .and_then(|(location, inner)| Some((Snippet::read(location, base)?, inner)));
-        let (snippet, message) = match located {
-            Some((snippet, inner)) => (Some(snippet), inner),
-            None => (None, error.to_string()),
-        };
-        Self {
-            code: code.into(),
-            message,
-            help,
-            snippet,
-        }
-    }
-
-    /// Rebuilds a report from the parts `--format json` writes, reading the
-    /// target file's line again if it names one.
-    pub fn from_parts(
-        code: String,
-        message: String,
-        help: Option<String>,
-        at: Option<Location>,
-    ) -> Self {
-        let snippet = at.as_ref().and_then(|at| Snippet::read(at, Path::new(".")));
-        Self {
-            code: code.into(),
-            message,
-            help,
-            snippet,
-        }
-    }
-}
-
-impl core::fmt::Display for Report {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Report {}
-
-impl miette::Diagnostic for Report {
-    fn code<'a>(&'a self) -> Option<Box<dyn core::fmt::Display + 'a>> {
-        Some(Box::new(&self.code))
-    }
-
-    fn help<'a>(&'a self) -> Option<Box<dyn core::fmt::Display + 'a>> {
-        self.help
-            .as_ref()
-            .map(|help| Box::new(help) as Box<dyn core::fmt::Display>)
-    }
-
-    fn source_code(&self) -> Option<&dyn SourceCode> {
-        self.snippet.as_ref().map(|s| &s.source as &dyn SourceCode)
-    }
-
-    fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
-        let span = self.snippet.as_ref()?.span;
-        Some(Box::new(core::iter::once(LabeledSpan::new_with_span(
-            None, span,
-        ))))
-    }
-}
-
-impl Snippet {
-    /// Reads the line `location` names, spanning it without its indent.
-    fn read(location: &Location, base: &Path) -> Option<Self> {
-        let path = base.join(&location.file);
-        let text = std::fs::read_to_string(&path).ok()?;
-        let index = usize::try_from(location.line).ok()?.checked_sub(1)?;
-        let start: usize = text.split_inclusive('\n').take(index).map(str::len).sum();
-        let line = text.get(start..)?.lines().next()?;
-        let indent = line.len() - line.trim_start().len();
-        let span = SourceSpan::new((start + indent).into(), line.trim().len());
-        Some(Self {
-            source: NamedSource::new(&location.file, text),
-            span,
-        })
-    }
+/// The line `location` names, spanned without its indent.
+fn snippet(location: &Location, base: &Path) -> Option<Snippet> {
+    let text = std::fs::read_to_string(base.join(&location.file)).ok()?;
+    let index = usize::try_from(location.line).ok()?.checked_sub(1)?;
+    let start: usize = text.split_inclusive('\n').take(index).map(str::len).sum();
+    let line = text.get(start..)?.lines().next()?;
+    let indent = line.len() - line.trim_start().len();
+    let span = SourceSpan::new((start + indent).into(), line.trim().len());
+    Some((NamedSource::new(&location.file, text), span))
 }
 
 /// The location and message of the innermost located error in `error`.
@@ -406,12 +359,18 @@ mod tests {
             },
             source: Box::new(BuildError::DuplicateId { id: "nav".into() }),
         });
-        let report = Report::in_dir(&error, dir.path());
+        let report = report_in(&error, dir.path());
         assert_eq!(report.to_string(), "system id `nav` is used twice");
-        assert_eq!(report.code, "M0304");
-        let snippet = report.snippet.expect("the line exists");
         assert_eq!(
-            snippet.span,
+            report.code().map(|c| c.to_string()).as_deref(),
+            Some("M0304")
+        );
+        let label = report
+            .labels()
+            .and_then(|mut l| l.next())
+            .expect("the line exists");
+        assert_eq!(
+            *label.inner(),
             SourceSpan::new(10.into(), "nav = add(\"nav\")".len())
         );
     }
@@ -428,7 +387,7 @@ mod tests {
                 },
                 source: Box::new(BuildError::DeterministicWall),
             });
-            Report::in_dir(&error, dir.path()).snippet.is_some()
+            report_in(&error, dir.path()).labels().is_some()
         };
         assert!(at("t.py", 1));
         let missing = RunError::Build(BuildError::Located {
@@ -438,7 +397,7 @@ mod tests {
             },
             source: Box::new(BuildError::DeterministicWall),
         });
-        let report = Report::in_dir(&missing, dir.path());
+        let report = report_in(&missing, dir.path());
         assert!(report.to_string().starts_with("gone.py:3: "), "{report}");
         assert!(!at("t.py", 5));
         assert!(!at("t.py", 0));
@@ -463,9 +422,9 @@ mod tests {
                 system: "gps".into(),
             }),
         });
-        let report = Report::in_dir(&error, dir.path());
+        let report = report_in(&error, dir.path());
         let mut out = Vec::new();
-        Human::new(&mut out, Caps::plain()).event(&Event::Diagnostic(&report));
+        Human::new(&mut out, Caps::plain()).event(&Event::Diagnostic(&*report));
         insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"));
     }
 }

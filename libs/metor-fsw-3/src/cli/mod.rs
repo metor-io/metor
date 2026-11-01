@@ -32,7 +32,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::pack::ABI_VERSION;
 use clap::ColorChoice;
-use diagnostic::{Report, exit_code};
+use diagnostic::exit_code;
 use run::RunError;
 use ui::caps::Caps;
 use ui::event::Event;
@@ -148,7 +148,7 @@ pub fn main() {
         return;
     };
     if !matches!(error, RunError::Interrupted) {
-        ui.emit(Event::Diagnostic(&Report::new(&error)));
+        ui.emit(Event::Diagnostic(&*diagnostic::report(&error)));
     }
     std::process::exit(exit_code(&error));
 }
