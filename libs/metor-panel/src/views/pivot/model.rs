@@ -123,6 +123,26 @@ impl Arrangement {
     pub fn is_empty(&self) -> bool {
         self.order.is_empty() && self.hidden.is_empty() && self.rows.is_empty()
     }
+
+    /// Drop field `from` of `grid` onto field `to`: it takes that slot.
+    pub fn move_field(&mut self, grid: &Grid, from: &SharedString, to: &SharedString) {
+        self.order = take_slot(&grid.fields, from, to);
+    }
+
+    /// Drop instance `from` of `grid` onto instance `to`: it takes that
+    /// slot.
+    pub fn move_instance(&mut self, grid: &Grid, from: &SharedString, to: &SharedString) {
+        let labels: Vec<SharedString> = grid.instances.iter().map(|i| i.label.clone()).collect();
+        self.rows = take_slot(&labels, from, to);
+    }
+
+    pub fn set_hidden(&mut self, field: &SharedString, hidden: bool) {
+        if hidden {
+            self.hidden.insert(field.clone());
+        } else {
+            self.hidden.remove(field);
+        }
+    }
 }
 
 /// A branch's instances: every child that is itself a branch, labelled by
@@ -224,11 +244,7 @@ fn lead_by<T>(
 /// `items` with `from` moved into the slot `to` occupies, the way a
 /// dragged column takes the place of the one it was dropped on. Unknown
 /// names leave the order unchanged.
-pub(crate) fn take_slot(
-    items: &[SharedString],
-    from: &SharedString,
-    to: &SharedString,
-) -> Vec<SharedString> {
+fn take_slot(items: &[SharedString], from: &SharedString, to: &SharedString) -> Vec<SharedString> {
     let mut out = items.to_vec();
     let (Some(from_ix), Some(to_ix)) = (
         items.iter().position(|i| i == from),

@@ -34,10 +34,13 @@ use super::filter_bar::{FilterBar, FilterBarEvent};
 use super::image_view::{collapsed_label, expands};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
-use super::pivot::{Arrangement, Grid, alike, common_suffix, signature, take_slot};
-use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate, drag_chip};
+use super::pivot::{
+    Arrangement, FieldDrag, Grid, InstanceDrag, alike, common_suffix, field_cell, field_label,
+    field_menu_rows, live_strip, signature,
+};
+use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
-use super::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
+use super::value_strip::{ComponentValueStrip, strip_row_width};
 use crate::icons::Icon;
 use crate::inspector::plot_preview::shift_hover_listener;
 use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
@@ -51,8 +54,6 @@ use model::{Disclosure, FrameType, Layout, OutlineRow, RowKind, flatten, root_no
 const INDENT: f32 = 14.0;
 /// Row height once sparklines are on — enough for a readable trace.
 const SPARKLINE_ROW_HEIGHT: f32 = 44.0;
-/// Horizontal padding inside one pivot cell.
-const PIVOT_CELL_PAD: f32 = 8.0;
 /// Live strips and sparklines kept alive; well above any visible row count
 /// so scrolling reuses entities while bounding stream tasks.
 const CACHE_CAP: usize = 256;
@@ -903,27 +904,24 @@ impl OutlineDelegate {
     /// Drop field `from` onto field `to`: it takes that slot.
     fn move_field(
         &mut self,
-        pivot: &Grid,
+        grid: &Grid,
         from: &SharedString,
         to: &SharedString,
         cx: &mut Context<Table<Self>>,
     ) {
-        let order = take_slot(&pivot.fields, from, to);
-        self.layout_mut(&pivot.key).order = order;
+        self.layout_mut(&grid.key).move_field(grid, from, to);
         self.reflatten(cx);
     }
 
     /// Drop instance `from` onto instance `to`: it takes that slot.
     fn move_row(
         &mut self,
-        pivot: &Grid,
+        grid: &Grid,
         from: &SharedString,
         to: &SharedString,
         cx: &mut Context<Table<Self>>,
     ) {
-        let labels: Vec<SharedString> = pivot.instances.iter().map(|i| i.label.clone()).collect();
-        let rows = take_slot(&labels, from, to);
-        self.layout_mut(&pivot.key).rows = rows;
+        self.layout_mut(&grid.key).move_instance(grid, from, to);
         self.reflatten(cx);
     }
 
@@ -934,12 +932,7 @@ impl OutlineDelegate {
         hidden: bool,
         cx: &mut Context<Table<Self>>,
     ) {
-        let layout = self.layout_mut(key);
-        if hidden {
-            layout.hidden.insert(field.clone());
-        } else {
-            layout.hidden.remove(field);
-        }
+        self.layout_mut(key).set_hidden(field, hidden);
         self.prune_layout(key);
         self.reflatten(cx);
     }
@@ -948,7 +941,7 @@ impl OutlineDelegate {
     /// back.
     fn open_field_menu(
         &mut self,
-        pivot: &Grid,
+        grid: &Grid,
         field: &SharedString,
         position: gpui::Point<Pixels>,
         window: &mut Window,
@@ -958,37 +951,18 @@ impl OutlineDelegate {
             return;
         };
         let table = cx.entity();
-        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-        {
-            let table = table.clone();
-            let key = pivot.key.clone();
-            let field = field.clone();
-            rows.push(Box::new(CommandRow::new(
-                format!("Hide {field}"),
-                Arc::new(move |_window, cx| {
-                    table.update(cx, |table, cx| {
-                        table
-                            .delegate_mut()
-                            .set_field_hidden(&key, &field, true, cx);
-                    });
-                }),
-            )));
-        }
-        for hidden in &pivot.hidden {
-            let table = table.clone();
-            let key = pivot.key.clone();
-            let field = hidden.clone();
-            rows.push(Box::new(CommandRow::new(
-                format!("Show {hidden}"),
-                Arc::new(move |_window, cx| {
-                    table.update(cx, |table, cx| {
-                        table
-                            .delegate_mut()
-                            .set_field_hidden(&key, &field, false, cx);
-                    });
-                }),
-            )));
-        }
+        let key = grid.key.clone();
+        let rows = field_menu_rows(
+            grid,
+            field,
+            Arc::new(move |field, hidden, cx| {
+                table.update(cx, |table, cx| {
+                    table
+                        .delegate_mut()
+                        .set_field_hidden(&key, &field, hidden, cx);
+                });
+            }),
+        );
         open(
             InspectorRequest {
                 rows,
@@ -1032,12 +1006,7 @@ impl OutlineDelegate {
         id: ComponentId,
         cx: &mut Context<Table<Self>>,
     ) -> Entity<ComponentValueStrip> {
-        let db = self.db.clone();
-        self.strips.get_or_create(id, || {
-            cx.new(|cx| {
-                ComponentValueStrip::new(db, id, StripStyle::boxes(), StripBehavior::default(), cx)
-            })
-        })
+        live_strip(&self.db, &mut self.strips, id, cx)
     }
 
     fn sparkline(&mut self, id: ComponentId, cx: &mut Context<Table<Self>>) -> Entity<LinePlot> {
@@ -1141,7 +1110,7 @@ impl OutlineDelegate {
         // another grid is ignored.
         if let RowKind::PivotInstance { pivot, ix } = &row.kind {
             let drop_target = theme.drop_target;
-            let drag = PivotRowDrag {
+            let drag = InstanceDrag {
                 key: pivot.key.clone(),
                 label: pivot.instances[*ix].label.clone(),
             };
@@ -1149,8 +1118,8 @@ impl OutlineDelegate {
             let pivot = pivot.clone();
             cell = cell
                 .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                .drag_over::<PivotRowDrag>(move |style, _, _, _| style.bg(drop_target))
-                .on_drop(cx.listener(move |table, drag: &PivotRowDrag, _, cx| {
+                .drag_over::<InstanceDrag>(move |style, _, _, _| style.bg(drop_target))
+                .on_drop(cx.listener(move |table, drag: &InstanceDrag, _, cx| {
                     if drag.key == pivot.key && drag.label != target {
                         table
                             .delegate_mut()
@@ -1234,50 +1203,28 @@ impl OutlineDelegate {
     fn render_pivot_header(
         &mut self,
         row_ix: usize,
-        pivot: &Arc<Grid>,
+        grid: &Arc<Grid>,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
-        let theme = theme(cx);
-        let scroll = self.pivot_scroll(&pivot.key);
-        let drop_target = theme.drop_target;
-        let cells = pivot.fields.iter().zip(&pivot.cells).map(|(field, &n)| {
-            let drag = PivotFieldDrag {
-                key: pivot.key.clone(),
-                field: field.clone(),
-            };
+        let scroll = self.pivot_scroll(&grid.key);
+        let cells = grid.fields.iter().zip(&grid.cells).map(|(field, &n)| {
             let target = field.clone();
-            let drop_pivot = pivot.clone();
-            let menu_pivot = pivot.clone();
+            let drop_grid = grid.clone();
+            let menu_grid = grid.clone();
             let menu_field = field.clone();
-            div()
-                .id((field.clone(), row_ix))
-                .w(ui_px(pivot_cell_width(n, field)))
-                .h_full()
-                .flex()
-                .items_center()
-                .flex_shrink_0()
-                .border_r_1()
-                .border_color(theme.border_primary)
-                .px(ui_px(PIVOT_CELL_PAD / 2.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_size(ui_px(11.0))
-                .text_color(theme.text_tertiary)
-                .child(field.clone())
-                .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                .drag_over::<PivotFieldDrag>(move |style, _, _, _| style.bg(drop_target))
-                .on_drop(cx.listener(move |table, drag: &PivotFieldDrag, _, cx| {
-                    if drag.key == drop_pivot.key && drag.field != target {
+            field_label(grid, field, n, (field.clone(), row_ix), cx)
+                .on_drop(cx.listener(move |table, drag: &FieldDrag, _, cx| {
+                    if drag.key == drop_grid.key && drag.field != target {
                         table
                             .delegate_mut()
-                            .move_field(&drop_pivot, &drag.field, &target, cx);
+                            .move_field(&drop_grid, &drag.field, &target, cx);
                     }
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |table, event: &MouseDownEvent, window, cx| {
                         table.delegate_mut().open_field_menu(
-                            &menu_pivot,
+                            &menu_grid,
                             &menu_field,
                             event.position,
                             window,
@@ -1296,57 +1243,21 @@ impl OutlineDelegate {
     fn render_pivot_cells(
         &mut self,
         row_ix: usize,
-        pivot: &Grid,
+        grid: &Grid,
         ix: usize,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
-        let theme = theme(cx);
-        let scroll = self.pivot_scroll(&pivot.key);
-        let instance = &pivot.instances[ix];
-        let db = self.db.clone();
-        let mut cells: Vec<AnyElement> = Vec::with_capacity(pivot.fields.len());
-        for (field_ix, (field, &n)) in pivot.fields.iter().zip(&pivot.cells).enumerate() {
-            let cell = div()
-                .w(ui_px(pivot_cell_width(n, field)))
-                .h_full()
-                .flex_shrink_0()
-                .border_r_1()
-                .border_color(theme.border_primary)
-                .px(ui_px(PIVOT_CELL_PAD / 2.0))
-                .flex()
-                .items_center();
-            let Some(id) = instance.ids[field_ix] else {
-                cells.push(
-                    cell.text_size(ui_px(12.0))
-                        .text_color(theme.text_tertiary)
-                        .child(SharedString::new_static("—"))
-                        .into_any_element(),
-                );
-                continue;
-            };
-            if let Some(label) = collapsed_label(&db, id) {
-                cells.push(
-                    cell.overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_tertiary)
-                        .child(SharedString::from(label))
-                        .into_any_element(),
-                );
-                continue;
-            }
-            let strip = self.strip(id, cx);
-            let name = SharedString::from(format!("{}.{}", instance.node.full_name, field));
-            let click = edit_click(db.clone(), id, name);
-            let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
-            behavior.on_element_right_click = Some(strip_menu(db.clone(), id));
-            strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
-            // Hold the strip to one line: the cell is sized for it, and
-            // an element that still doesn't fit should clip, not wrap.
-            let mut line = div().min_w(ui_px(strip_row_width(n))).child(strip);
-            line.style().flex_shrink = Some(0.0);
-            cells.push(cell.child(line).into_any_element());
-        }
+        let scroll = self.pivot_scroll(&grid.key);
+        let instance = &grid.instances[ix];
+        let cells: Vec<AnyElement> = grid
+            .fields
+            .iter()
+            .zip(&grid.cells)
+            .enumerate()
+            .map(|(field_ix, (field, &n))| {
+                field_cell(&self.db, &mut self.strips, instance, field_ix, field, n, cx)
+            })
+            .collect();
         pivot_scroller(row_ix, scroll)
             .children(cells)
             .into_any_element()
@@ -1482,44 +1393,6 @@ impl TableDelegate for OutlineDelegate {
             self.open_header_menu(col, position, window, cx);
         }
     }
-}
-
-/// A pivot field label in flight.
-#[derive(Clone)]
-struct PivotFieldDrag {
-    key: SharedString,
-    field: SharedString,
-}
-
-impl Render for PivotFieldDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        drag_chip(self.field.clone(), cx)
-    }
-}
-
-/// A pivot instance row in flight.
-#[derive(Clone)]
-struct PivotRowDrag {
-    key: SharedString,
-    label: SharedString,
-}
-
-impl Render for PivotRowDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        drag_chip(self.label.clone(), cx)
-    }
-}
-
-/// Approximate advance of one character of the 11px label face; the cell
-/// only needs to be roomy enough that a label isn't clipped.
-const LABEL_CHAR_WIDTH: f32 = 6.8;
-
-/// Width of a pivot cell: the wider of its `n`-element strip and its label,
-/// plus padding and the divider — a pixel short and the strip wraps.
-fn pivot_cell_width(n: usize, label: &str) -> f32 {
-    let strip = strip_row_width(n.max(1));
-    let text = label.chars().count() as f32 * LABEL_CHAR_WIDTH;
-    strip.max(text) + PIVOT_CELL_PAD + 1.0
 }
 
 /// The sideways-scrolling row container every pivot row shares the offset

@@ -4,6 +4,10 @@
 //! tabulates frames — the outline's inline pivots today — builds the same
 //! [`Grid`] and honours the same [`Arrangement`].
 
+pub(crate) mod cell;
 pub(crate) mod model;
 
-pub(crate) use model::{Arrangement, Grid, alike, children, common_suffix, signature, take_slot};
+pub(crate) use cell::{
+    FieldDrag, InstanceDrag, field_cell, field_label, field_menu_rows, live_strip,
+};
+pub(crate) use model::{Arrangement, Grid, alike, children, common_suffix, signature};
