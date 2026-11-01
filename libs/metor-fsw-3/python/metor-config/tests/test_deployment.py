@@ -245,6 +245,17 @@ class DeploymentTest(ConfigTest):
         db_entry = config["targets"][2]["coordinator"]["systems"][1]
         self.assertEqual(db_entry["params"]["commands"], sorted([LogEvent._name, Ping._name]))
 
+    def test_db_lays_out_frame_commands_for_their_port(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        gw, db = gateway("gw", peers=[], listen="0.0.0.0:2250")
+        a.add("cmds", Subscribe(transport=Peer(db), records=[Ping, Imu]))
+        config = Deployment(targets=[a, gw]).to_config()
+        db_entry = config["targets"][1]["coordinator"]["systems"][0]
+        self.assertEqual(
+            db_entry["params"]["commands"],
+            [Ping._name, {"frame": Imu._name, "port": f"a.cmds.{Imu._name}"}],
+        )
+
     def test_db_without_subscribers_has_no_commands(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         a.add("cmds", Subscribe(records=[Ping], transport=Listen("0.0.0.0:2260")))

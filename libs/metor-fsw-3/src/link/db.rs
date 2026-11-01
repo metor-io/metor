@@ -10,7 +10,8 @@ use futures_lite::future;
 use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
-use metor_proto_wkt::{CommandInfo, VTableMsg};
+use metor_proto::vtable::{Field, Op, VTable};
+use metor_proto_wkt::{CommandInfo, ComponentMetadata, VTableMsg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use stellarator::net::TcpListener;
@@ -36,10 +37,41 @@ pub struct DbParams {
     /// The target's telemetry namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    /// The names of the message records that subscribers receive through
-    /// this database.
+    /// The commands that subscribers receive through this database.
     #[serde(default)]
-    pub commands: Vec<String>,
+    pub commands: Vec<DbCommand>,
+}
+
+/// A command a `Db` takes from its clients and serves to the subscribers
+/// that dial it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum DbCommand {
+    /// A message record, by name. Every subscriber that takes it receives
+    /// it.
+    Msg(String),
+    /// The frame record `frame`, laid out for the subscriber port at `port`:
+    /// the `{namespace}.{system}.{port}` path that port's components are
+    /// named under. Its table id is that port's, so only that port
+    /// receives it.
+    Frame { frame: String, port: String },
+}
+
+impl DbCommand {
+    /// Resolves this command against the host's records to the record's
+    /// name and the schema it is sent with.
+    fn resolve<'a>(&'a self, records: &Records) -> Result<(&'a str, RecordSchema), RecordError> {
+        match self {
+            Self::Msg(name) => {
+                records.msg_command(name)?;
+                let def = records
+                    .get(name)
+                    .ok_or_else(|| RecordError::Unknown(name.clone()))?;
+                Ok((name, def.schema.clone()))
+            }
+            Self::Frame { frame, port } => Ok((frame, records.frame_at(frame, port)?)),
+        }
+    }
 }
 
 /// Ingest counters for a `Db`. It writes one on every cycle where a counter
@@ -118,11 +150,11 @@ pub async fn db(
     log: &mut Log,
     stop: Stop,
 ) {
-    let commands: Result<Vec<CommandInfo>, RecordError> = s
+    let commands: Result<Vec<_>, RecordError> = s
         .params
         .commands
         .iter()
-        .map(|name| records.msg_command(name))
+        .map(|command| command.resolve(records))
         .collect();
     let commands = match commands {
         Ok(commands) => commands,
@@ -135,9 +167,8 @@ pub async fn db(
         .iter_mut()
         .map(|(def, _)| Sink::register(&db, def, log))
         .collect();
-    let command_ids = commands.iter().map(|command| command.id).collect();
-    db.set_identity(s.params.namespace.clone(), command_ids);
-    db.add_commands(&commands);
+    db.set_identity(s.params.namespace.clone(), Vec::new());
+    db.add_commands(&describe(&db, &commands, log));
     let addr = listener.local_addr().ok();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
@@ -175,6 +206,23 @@ pub async fn db(
             reported = status;
         }
     }
+}
+
+/// Describes each resolved command for the database's clients.
+///
+/// A frame command's vtable and component metadata are registered, so a
+/// client can name its fields. Its records are kept as commands, not
+/// telemetry.
+fn describe(db: &DB, commands: &[(&str, RecordSchema)], log: &mut Log) -> Vec<CommandInfo> {
+    commands
+        .iter()
+        .map(|(record, schema)| {
+            if let RecordSchema::Frame { vtable, metadata } = schema {
+                register_frame(db, record, vtable, metadata, log);
+            }
+            schema.command(record)
+        })
+        .collect()
 }
 
 /// Accepts every client and serves each on its own task.
@@ -233,33 +281,8 @@ impl Sink {
     fn register(db: &DB, def: &PortDef, log: &mut Log) -> Sink {
         match &def.schema {
             RecordSchema::Frame { vtable, metadata } => {
-                let id = table_id(vtable);
-                let table = VTableMsg {
-                    id,
-                    vtable: vtable.clone(),
-                };
-                if let Err(error) = db.insert_vtable(table) {
-                    log.fault(
-                        "table_id_collision",
-                        format!(
-                            "port `{}` registers a table the store refuses: {error}",
-                            def.name
-                        ),
-                    );
-                    return Sink::Refused;
-                }
-                for component in metadata {
-                    let result = db.with_state_mut(|state| {
-                        state.set_component_metadata(component.clone(), &db.path)
-                    });
-                    if let Err(error) = result {
-                        log.fault(
-                            "component_metadata",
-                            format!("port `{}`: {error}", def.name),
-                        );
-                    }
-                }
-                Sink::Table(id)
+                register_frame(db, &def.name, vtable, metadata, log)
+                    .map_or(Sink::Refused, Sink::Table)
             }
             RecordSchema::Msg { id, name, codec } => {
                 let metadata = codec.msg_metadata(name);
@@ -272,6 +295,40 @@ impl Sink {
             }
         }
     }
+}
+
+/// Registers a frame's vtable and component metadata with the database,
+/// returning its table id.
+///
+/// If the database already holds a different vtable under the table id,
+/// the frame is refused, a fault is logged, and `None` is returned.
+fn register_frame(
+    db: &DB,
+    name: &str,
+    vtable: &VTable<Vec<Op>, Vec<u8>, Vec<Field>>,
+    metadata: &[ComponentMetadata],
+    log: &mut Log,
+) -> Option<PacketId> {
+    let id = table_id(vtable);
+    let table = VTableMsg {
+        id,
+        vtable: vtable.clone(),
+    };
+    if let Err(error) = db.insert_vtable(table) {
+        log.fault(
+            "table_id_collision",
+            format!("`{name}` registers a table the store refuses: {error}"),
+        );
+        return None;
+    }
+    for component in metadata {
+        let result =
+            db.with_state_mut(|state| state.set_component_metadata(component.clone(), &db.path));
+        if let Err(error) = result {
+            log.fault("component_metadata", format!("`{name}`: {error}"));
+        }
+    }
+    Some(id)
 }
 
 /// Writes every waiting record into the database and updates the counters.
@@ -548,28 +605,39 @@ mod tests {
             .collect()
     }
 
-    fn command_ids(records: &Records, names: &[&str]) -> Result<Vec<PacketId>, RecordError> {
+    fn msgs(names: &[&str]) -> Vec<DbCommand> {
         names
             .iter()
-            .map(|name| records.msg_command(name).map(|command| command.id))
+            .map(|name| DbCommand::Msg(name.to_string()))
             .collect()
     }
 
-    /// A command carries its record's metadata, as the record's own
-    /// announce does, so a client can build it.
-    #[test]
-    fn test_command_describes_its_record() {
-        let command = records().msg_command(Fixed::NAME).expect("a message");
-        let RecordSchema::Msg { name, codec, .. } = Fixed::schema() else {
-            panic!("`Fixed` is a message");
-        };
-        assert_eq!(command.kind, CommandKind::Msg(codec.msg_metadata(&name)));
+    fn command_ids(
+        records: &Records,
+        commands: &[DbCommand],
+    ) -> Result<Vec<PacketId>, RecordError> {
+        commands
+            .iter()
+            .map(|command| {
+                command
+                    .resolve(records)
+                    .map(|(_, schema)| schema.packet_id())
+            })
+            .collect()
+    }
+
+    /// `imu` laid out for the port `sat.cmds.imu`.
+    fn imu_command() -> DbCommand {
+        DbCommand::Frame {
+            frame: Imu::NAME.into(),
+            port: "sat.cmds.imu".into(),
+        }
     }
 
     #[test]
     fn test_commands_resolve_to_record_ids() {
         let names = [SequenceCommand::NAME, Fixed::NAME];
-        let ids = command_ids(&records(), &names).expect("known messages");
+        let ids = command_ids(&records(), &msgs(&names)).expect("known messages");
         assert_eq!(
             ids,
             [<SequenceCommand as Msg>::ID, Fixed::schema().packet_id()]
@@ -583,10 +651,72 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_or_frame_command_is_an_error() {
-        let unknown = command_ids(&records(), &["nope"]);
+    fn test_unknown_or_misplaced_command_is_an_error() {
+        let unknown = command_ids(&records(), &msgs(&["nope"]));
         assert_eq!(unknown, Err(RecordError::Unknown("nope".into())));
-        let frame = command_ids(&records(), &[Imu::NAME]);
-        assert_eq!(frame, Err(RecordError::Frame(Imu::NAME.into())));
+        let bare = command_ids(&records(), &msgs(&[Imu::NAME]));
+        assert_eq!(bare, Err(RecordError::Frame(Imu::NAME.into())));
+        let message = DbCommand::Frame {
+            frame: Fixed::NAME.into(),
+            port: "sat.cmds.fixed".into(),
+        };
+        let message = command_ids(&records(), &[message]);
+        assert_eq!(message, Err(RecordError::Msg(Fixed::NAME.into())));
+    }
+
+    /// A frame command's id is the table id of the port it is laid out for.
+    #[test]
+    fn test_frame_command_resolves_to_its_port_table() {
+        let ids = command_ids(&records(), &[imu_command()]).expect("a known frame");
+        assert_eq!(ids, [Imu::schema_with_root("sat.cmds.imu").packet_id()]);
+        assert_ne!(ids[0], Imu::schema().packet_id());
+    }
+
+    #[test]
+    fn test_parse_message_and_frame_commands() {
+        let params: DbParams = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "commands": ["ping", { "frame": "imu", "port": "sat.cmds.imu" }],
+        }))
+        .expect("valid params");
+        assert_eq!(
+            params.commands,
+            [DbCommand::Msg("ping".into()), imu_command()]
+        );
+    }
+
+    /// Describing a frame command registers its table and names its
+    /// components, and the description carries that table.
+    #[test]
+    fn test_describe_frame_command() {
+        let (_dir, db) = store();
+        let records = records();
+        let commands = [imu_command(), DbCommand::Msg(Fixed::NAME.into())];
+        let resolved: Vec<_> = commands
+            .iter()
+            .map(|command| command.resolve(&records).expect("known records"))
+            .collect();
+        let described = describe(&db, &resolved, &mut Log);
+        let RecordSchema::Frame { vtable, metadata } = Imu::schema_with_root("sat.cmds.imu") else {
+            panic!("a frame")
+        };
+        assert_eq!(
+            described[0],
+            CommandInfo {
+                id: table_id(&vtable),
+                kind: CommandKind::Frame {
+                    name: Imu::NAME.into(),
+                    vtable,
+                },
+            }
+        );
+        assert_eq!(described[1].id, Fixed::schema().packet_id());
+        assert!(matches!(described[1].kind, CommandKind::Msg(_)));
+        let named = db.with_state(|state| {
+            state
+                .get_component_metadata(metadata[0].component_id)
+                .map(|metadata| metadata.name.clone())
+        });
+        assert_eq!(named.as_deref(), Some("sat.cmds.imu.sample"));
     }
 }

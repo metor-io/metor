@@ -13,6 +13,7 @@ use metor_proto::types::PACKET_HEADER_LEN;
 use metor_proto_wkt::CommandInfo;
 
 use crate::coordinator::{OutputConfig, OutputSource};
+use crate::record::{RecordSchema, RerootError};
 use crate::system::PortDef;
 
 /// The part of one instance's config a system sees when computing its ports.
@@ -245,19 +246,40 @@ impl Records {
             .0
             .get(name)
             .ok_or_else(|| RecordError::Unknown(name.to_string()))?;
-        def.schema
-            .msg_command()
-            .ok_or_else(|| RecordError::Frame(name.to_string()))
+        match def.schema {
+            RecordSchema::Msg { .. } => Ok(def.schema.command(name)),
+            RecordSchema::Frame { .. } => Err(RecordError::Frame(name.to_string())),
+        }
+    }
+
+    /// Returns the schema of the frame record `name` with its components
+    /// under `path`, as an output port at that path carries it.
+    pub fn frame_at(&self, name: &str, path: &str) -> Result<RecordSchema, RecordError> {
+        let def = self
+            .0
+            .get(name)
+            .ok_or_else(|| RecordError::Unknown(name.to_string()))?;
+        match def.schema {
+            RecordSchema::Frame { .. } => def
+                .schema
+                .reroot(&def.name, path)
+                .map_err(|error| RecordError::Reroot(name.to_string(), error)),
+            RecordSchema::Msg { .. } => Err(RecordError::Msg(name.to_string())),
+        }
     }
 }
 
-/// Why a record name does not resolve to a message id.
+/// Why a record name does not resolve to the kind of record asked for.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
     #[error("`{0}` names no record the host knows")]
     Unknown(String),
     #[error("`{0}` is a frame, not a message")]
     Frame(String),
+    #[error("`{0}` is a message, not a frame")]
+    Msg(String),
+    #[error("frame `{0}` cannot move to its port's path: {1}")]
+    Reroot(String, RerootError),
 }
 
 #[cfg(test)]
@@ -392,6 +414,45 @@ mod tests {
         assert!(matches!(
             cx.dyn_output_defs(&[]),
             Err(DefError::Reroot { port, .. }) if port == "a"
+        ));
+    }
+
+    /// A frame placed at a path carries the schema an output port at that
+    /// path does, so both sides of a link agree on its table.
+    #[test]
+    fn test_frame_at_matches_the_port_at_that_path() {
+        let records = registry();
+        let listed = outputs(Imu::NAME, &["imu"]);
+        let cx = DefCx {
+            id: "cmds",
+            namespace: Some("sat"),
+            outputs: &listed,
+            records: &records,
+            ..DefCx::empty()
+        };
+        let port = cx.dyn_output_defs(&[]).expect("frames re-root");
+        let placed = records.frame_at(Imu::NAME, "sat.cmds.imu");
+        assert_eq!(placed, Ok(port[0].schema.clone()));
+        assert_eq!(
+            records.frame_at(Note::NAME, "sat.cmds.note"),
+            Err(RecordError::Msg(Note::NAME.into()))
+        );
+        assert_eq!(
+            records.frame_at("nope", "sat.cmds.nope"),
+            Err(RecordError::Unknown("nope".into()))
+        );
+    }
+
+    #[test]
+    fn test_frame_at_refuses_an_unnamed_frame() {
+        let mut imu = Output::<Imu>::def(&DefCx::empty(), "imu");
+        if let RecordSchema::Frame { metadata, .. } = &mut imu.schema {
+            metadata.clear();
+        }
+        let records = Records::from_port_defs([imu].iter());
+        assert!(matches!(
+            records.frame_at(Imu::NAME, "a"),
+            Err(RecordError::Reroot(name, RerootError::Unnamed(_))) if name == Imu::NAME
         ));
     }
 

@@ -203,8 +203,9 @@ class Db(_Sink, _generated.Db):
     fresh temporary directory is used. With `all`, it records every system
     added before this one.
 
-    Its commands are the message records of every `Subscribe` whose `peer` is
-    this db. They are collected when the config is emitted.
+    Its commands are the records of every `Subscribe` whose `peer` is this
+    db. A frame is a command for the one subscriber port that takes it. They
+    are collected when the config is emitted.
     """
 
     def __init__(
@@ -227,9 +228,12 @@ class Db(_Sink, _generated.Db):
             "commands": self._commands(),
         }
 
-    def _commands(self) -> list[str]:
-        """Returns the message record names that subscribers of this db take."""
+    def _commands(self) -> list[Any]:
+        """Returns the commands that subscribers of this db take: each message
+        record by name, then each frame record with the path of the
+        subscriber port it is laid out for."""
         names: set[str] = set()
+        frames: list[dict[str, str]] = []
         for target in _targets:
             for entry in target._systems:
                 system = entry.system
@@ -239,7 +243,17 @@ class Db(_Sink, _generated.Db):
                     continue
                 records = [copy.record for copy in system._peer_copies()] + system._records
                 names.update(record._name for record in records if record._kind == "msg")
-        return sorted(names)
+                for record in system._records:
+                    if record._kind == "frame":
+                        port = _port_path(target.namespace, entry.name, record._name)
+                        frames.append({"frame": record._name, "port": port})
+        return [*sorted(names), *sorted(frames, key=lambda frame: frame["port"])]
+
+
+def _port_path(namespace: str | None, system: str, port: str) -> str:
+    """The ``{namespace}.{system}.{port}`` path a port's components are named
+    under, leaving out an empty namespace."""
+    return ".".join(part for part in (namespace, system, port) if part)
 
 
 class Subscribe(Link, _generated.Subscribe):
