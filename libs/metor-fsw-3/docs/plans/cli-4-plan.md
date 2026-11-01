@@ -82,6 +82,12 @@ as `git log --graph` does:
   its span, so short edges hug the boxes. A tap that crosses an inner
   lane draws `┼`.
 - A link system shows `⇄ target.system` beside its box, found by port.
+- By default lanes merge by system: one lane per source system, tapping
+  one row per system it feeds (`sensors gps  ← plant`). A box's outputs
+  fold onto one `▸` row, and port lists past 32 columns end in `+N`. A lone
+  renamed port names its output (`← nav.attitude_estimate`). Systems with
+  no edge get no box and follow as `a, b  kind`. `--ports` draws a lane
+  per output port, as above.
 - Lanes are `Accent` and box borders `Muted`; each target's title is in
   its hue. ASCII mode uses
   `+-|>` and `<`/`>`.

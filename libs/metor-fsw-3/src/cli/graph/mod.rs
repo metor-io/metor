@@ -15,6 +15,7 @@ use super::ui::event::Event;
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 use crate::deploy::ResolvedDeployment;
+use picture::Detail;
 use wiring::{At, Link, links};
 
 /// The arguments to `metor graph`.
@@ -27,6 +28,9 @@ pub struct Graph {
     /// Write text for another tool instead of a picture.
     #[arg(long = "as", value_enum, value_name = "FORMAT")]
     pub text: Option<Text>,
+    /// Draw a lane per port instead of one per system.
+    #[arg(long)]
+    pub ports: bool,
 }
 
 /// A text format `--as` writes.
@@ -59,7 +63,18 @@ pub fn graph(args: Graph, ui: &Ui) -> Result<(), RunError> {
         }
         (None, Format::Human) => {
             let theme = Theme::new(&ui.stdout_caps());
-            return write_stdout(|out| draw(out, &config, &chosen, &targets, &links, &theme));
+            let detail = match args.ports {
+                true => Detail::Ports,
+                false => Detail::Systems,
+            };
+            let picture = Picture {
+                config: &config,
+                chosen: &chosen,
+                links: &links,
+                theme: &theme,
+                detail,
+            };
+            return write_stdout(|out| draw(out, &picture, &targets));
         }
     };
     write_stdout(|out| out.write_all(text.as_bytes()))
@@ -74,16 +89,29 @@ fn write_stdout(
     })
 }
 
-/// Each target in `chosen`, with its wiring in `targets`: its title line,
-/// then its picture.
+/// What a human picture draws, and how.
+pub struct Picture<'a> {
+    pub config: &'a ResolvedDeployment,
+    pub chosen: &'a [usize],
+    pub links: &'a [Link],
+    pub theme: &'a Theme,
+    pub detail: Detail,
+}
+
+/// Each target in `picture.chosen`, with its wiring in `targets`: its title
+/// line, then its picture.
 pub fn draw(
     out: &mut impl Write,
-    config: &ResolvedDeployment,
-    chosen: &[usize],
+    picture: &Picture<'_>,
     targets: &[export::Target<'_>],
-    links: &[Link],
-    theme: &Theme,
 ) -> io::Result<()> {
+    let Picture {
+        config,
+        chosen,
+        links,
+        theme,
+        detail,
+    } = *picture;
     for (index, (&t, (_, wiring))) in chosen.iter().zip(targets).enumerate() {
         if index > 0 {
             writeln!(out)?;
@@ -91,7 +119,7 @@ pub fn draw(
         show::write_title(out, &config.targets[t], t, theme)?;
         writeln!(out)?;
         let notes = notes(config, links, t, theme.glyphs.link);
-        picture::render(out, wiring, &notes, theme, "  ")?;
+        picture::render(out, wiring, &notes, theme, "  ", detail)?;
     }
     Ok(())
 }

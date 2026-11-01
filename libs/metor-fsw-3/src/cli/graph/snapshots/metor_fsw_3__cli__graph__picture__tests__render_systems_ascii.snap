@@ -1,0 +1,29 @@
+---
+source: libs/metor-fsw-3/src/cli/graph/picture.rs
+expression: "rendered(&busy(), &ascii(), Detail::Systems)"
+---
+         +------------------------------------------+
+         | plant  fsw.subscribe                     |  ⇄ ground.cmd
+  +------+ > sensors gps status                     |
+  |      +------------------------------------------+
+  |      +------------------------------------------+
+  |      | nav    adcs.Nav                          |
+  +----->+ sensors gps              <- plant        |
+  | +----+ > estimate status                        |
+  | |    +------------------------------------------+
+  | |    +------------------------------------------+
+  | |    | ctrl   adcs.Ctrl                         |
+  | +--->+ att                      <- nav.estimate |
+  +-+--->+ sensors                  <- plant        |
+  | | +->+ cmd                      <- cmds         |
+  | | |  +------------------------------------------+
+  | | |  +------------------------------------------+
+  | | |  | pub    fsw.publish                       |
+  +-+-+->+ plant.status             <- plant        |
+    +-+->+ nav.estimate nav.status  <- nav          |
+      |  +------------------------------------------+
+      |  +------------------------------------------+
+      |  | cmds   fsw.subscribe                     |
+      +--+ > cmd                                    |
+         +------------------------------------------+
+         io_a, io_b  fsw.io
