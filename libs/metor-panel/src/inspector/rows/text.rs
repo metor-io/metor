@@ -1,8 +1,9 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use gpui::{AnyElement, App, SharedString, Window, prelude::*};
+use gpui::{AnyElement, App, Hsla, SharedString, Window, prelude::*, px};
 
-use super::{InspectorRow, RowAction, value_row};
+use super::{InspectorRow, RowAction, row_base, row_label, row_value, value_row};
+use crate::theme::theme;
 
 /// Inspector row for a string field.
 ///
@@ -18,6 +19,7 @@ pub struct TextRow {
     source: Option<Arc<dyn Fn(&App) -> Option<SharedString>>>,
     pub on_change: Arc<dyn Fn(String, &mut Window, &mut App)>,
     pub read_only: bool,
+    tint: Option<Arc<dyn Fn(&App) -> Option<Hsla>>>,
 }
 
 impl TextRow {
@@ -32,6 +34,7 @@ impl TextRow {
             source: None,
             on_change,
             read_only: false,
+            tint: None,
         }
     }
 
@@ -60,7 +63,15 @@ impl TextRow {
             source: None,
             on_change: Arc::new(|_, _, _| {}),
             read_only: true,
+            tint: None,
         }
+    }
+
+    /// Color the value through `tint` on every render, for a status whose
+    /// value says whether something worked. `None` keeps the usual color.
+    pub fn tinted(mut self, tint: Arc<dyn Fn(&App) -> Option<Hsla>>) -> Self {
+        self.tint = Some(tint);
+        self
     }
 }
 
@@ -76,6 +87,14 @@ impl InspectorRow for TextRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        if let Some(color) = self.tint.as_ref().and_then(|tint| tint(cx)) {
+            let theme = theme(cx);
+            return row_base(row_ix, selected, cx)
+                .gap(px(2.))
+                .child(row_label(self.label.clone(), theme.text_secondary))
+                .child(row_value(self.current(cx), color))
+                .into_any_element();
+        }
         value_row(
             row_ix,
             selected,
