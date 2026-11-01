@@ -87,7 +87,7 @@ fn test_build_error_cites_the_target_file() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("`b.mirror` names link `a.out`, which does not listen on a fixed port")
-            && stderr.contains("--> deploy.py:6"),
+            && stderr.contains("[deploy.py:6:"),
         "{stderr}"
     );
 }
@@ -112,7 +112,7 @@ fn test_build_error_cites_the_target_file_from_a_parent_dir() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("--> sub/deploy.py:6"), "{stderr}");
+    assert!(stderr.contains("[sub/deploy.py:6:"), "{stderr}");
     assert!(stderr.contains("b.add(\"mirror\""), "{stderr}");
 }
 
@@ -127,7 +127,7 @@ fn test_target_without_a_deployment_says_so() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("error[M0207]"), "{stderr}");
+    assert!(stderr.contains("metor explain M0207"), "{stderr}");
 }
 
 /// With `--format json`, stdout is one versioned object per line, even when
@@ -400,7 +400,7 @@ fn test_check_fails_with_the_errors_code() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("error[M0212]"), "{stderr}");
+    assert!(stderr.contains("metor explain M0212"), "{stderr}");
 }
 
 #[test]
