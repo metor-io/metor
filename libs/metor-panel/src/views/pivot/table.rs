@@ -22,7 +22,7 @@ use gpui::{
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use super::cell::{cell_width, field_cell, field_menu_rows};
+use super::cell::{CellFit, cell_width, field_cell, field_menu_rows};
 use super::model::{Arrangement, Frame, Grid};
 use super::source::{FrameIndex, RowPattern, Sources};
 #[allow(unused_imports)]
@@ -40,8 +40,8 @@ use crate::views::value_strip::ComponentValueStrip;
 
 /// Live strips kept alive; well above any visible cell count.
 const CACHE_CAP: usize = 512;
-/// Window for coalescing a burst of vtable-generation bumps into one rebuild.
-const VTABLE_DEBOUNCE: Duration = Duration::from_millis(50);
+/// Window for coalescing a burst of registrations into one rebuild.
+const DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Persisted shape of a [`PivotTable`], shared by the pane and the
 /// dashboard widget. Every source is optional; a table lists the union of
@@ -243,11 +243,14 @@ impl PivotTable {
     }
 }
 
-/// Rebuild the tree and the frame tags whenever a component registers.
+/// Rebuild the tree and the frame tags whenever a component registers or
+/// its metadata changes — a producer re-announcing known components with
+/// new tags bumps only the metadata generation.
 fn spawn_watcher(db: Arc<DB>, cx: &mut Context<PivotTable>) -> gpui::Task<()> {
     cx.spawn(async move |this, cx| {
         loop {
-            let seen = db.vtable_gen.latest();
+            let vtables = db.vtable_gen.latest();
+            let metadata = db.metadata_gen.latest();
             let tree = Arc::new(build_full_tree(&db));
             let frames = FrameIndex::from_db(&db);
             let result = this.update(cx, |view, cx| {
@@ -258,8 +261,12 @@ fn spawn_watcher(db: Arc<DB>, cx: &mut Context<PivotTable>) -> gpui::Task<()> {
             if result.is_err() {
                 break;
             }
-            crate::vtable_changed(&db, seen).await;
-            cx.background_executor().timer(VTABLE_DEBOUNCE).await;
+            futures_lite::future::race(
+                db.vtable_gen.wait_for(|g| g != vtables),
+                db.metadata_gen.wait_for(|g| g != metadata),
+            )
+            .await;
+            cx.background_executor().timer(DEBOUNCE).await;
         }
     })
 }
@@ -310,7 +317,9 @@ pub struct PivotDelegate {
     grid: Arc<Grid>,
     /// Grid instance indices in display order.
     order: Vec<usize>,
-    sort: Option<(usize, ColumnSort)>,
+    /// The sorted column by name, as the table tracks it, so the sort
+    /// follows its column when captures come and go.
+    sort: Option<(SharedString, ColumnSort)>,
     strips: VisibleEntityCache<ComponentValueStrip>,
 }
 
@@ -355,19 +364,29 @@ impl PivotDelegate {
     fn apply_sort(&mut self) {
         let grid = &self.grid;
         let mut order: Vec<usize> = (0..grid.instances.len()).collect();
-        if let Some((col, sort)) = self.sort
-            && sort != ColumnSort::Default
+        if let Some((name, sort)) = &self.sort
+            && *sort != ColumnSort::Default
         {
-            let text = |ix: usize| -> &str {
-                let inst = &grid.instances[ix];
-                match col {
-                    0 => &inst.label,
-                    k => inst.captures.get(k - 1).map_or("", |s| s.as_ref()),
-                }
+            let key = if name.as_ref() == INSTANCE_COLUMN {
+                Some(None)
+            } else {
+                self.keys
+                    .iter()
+                    .position(|k| key_column(k) == *name)
+                    .map(Some)
             };
-            order.sort_by(|&a, &b| natural_cmp(text(a), text(b)));
-            if sort == ColumnSort::Descending {
-                order.reverse();
+            if let Some(key) = key {
+                let text = |ix: usize| -> &str {
+                    let inst = &grid.instances[ix];
+                    match key {
+                        None => &inst.label,
+                        Some(k) => inst.captures.get(k).map_or("", |s| s.as_ref()),
+                    }
+                };
+                order.sort_by(|&a, &b| natural_cmp(text(a), text(b)));
+                if *sort == ColumnSort::Descending {
+                    order.reverse();
+                }
             }
         }
         self.order = order;
@@ -406,11 +425,15 @@ impl PivotDelegate {
 
 impl TableDelegate for PivotDelegate {
     fn columns(&self) -> Vec<Column> {
-        let mut cols = vec![Column::new("Instance", 220.0).min_width(80.0).sortable()];
+        let mut cols = vec![
+            Column::new(INSTANCE_COLUMN, 220.0)
+                .min_width(80.0)
+                .sortable(),
+        ];
         cols.extend(
             self.keys
                 .iter()
-                .map(|k| Column::new(format!("{{{k}}}"), 80.0).sortable()),
+                .map(|k| Column::new(key_column(k), 80.0).sortable()),
         );
         cols.extend(
             self.grid
@@ -462,11 +485,23 @@ impl TableDelegate for PivotDelegate {
         let (Some(field), Some(&n)) = (grid.fields.get(field_ix), grid.cells.get(field_ix)) else {
             return div().into_any_element();
         };
-        field_cell(&self.db, &mut self.strips, instance, field_ix, field, n, cx)
+        field_cell(
+            &self.db,
+            &mut self.strips,
+            instance,
+            field_ix,
+            field,
+            n,
+            CellFit::Fill,
+            cx,
+        )
     }
 
     fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &mut Context<Table<Self>>) {
-        self.sort = Some((col_ix, sort));
+        let Some(column) = self.columns().into_iter().nth(col_ix) else {
+            return;
+        };
+        self.sort = Some((column.name, sort));
         self.apply_sort();
         cx.notify();
     }
@@ -519,6 +554,14 @@ impl TableDelegate for PivotDelegate {
             cx,
         );
     }
+}
+
+/// The leading column, naming each instance by path.
+const INSTANCE_COLUMN: &str = "Instance";
+
+/// A capture's column name, braced so it can't collide with a field.
+fn key_column(capture: &str) -> SharedString {
+    format!("{{{capture}}}").into()
 }
 
 /// `"1 field"` / `"3 fields"`.
@@ -680,5 +723,44 @@ mod tests {
             assert_eq!(config.fields, ["voltage", "current"]);
             assert_eq!(config.hidden, ["current"]);
         });
+    }
+
+    #[gpui::test]
+    fn a_key_sort_goes_with_its_column(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        let cx = cx.add_empty_window();
+        let view = open(
+            &db,
+            PivotTableConfig {
+                pattern: "{dut}.{part}".into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        let set_pattern = |pattern: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.pattern = pattern.into();
+                    view.resolve(cx);
+                })
+            })
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, cx| {
+                    // Instance, {dut}, {part}: sort descending by {dut}.
+                    table
+                        .delegate_mut()
+                        .sort_column(1, ColumnSort::Descending, cx);
+                });
+            })
+        });
+        assert_eq!(labels(&view, cx), ["dut3.psu", "dut2.psu", "dut1.psu"]);
+        // Column 1 is now `{x}`; the sort was on `{dut}`, which is gone.
+        set_pattern("{x}.{part}", cx);
+        assert_eq!(labels(&view, cx), ["dut1.psu", "dut2.psu", "dut3.psu"]);
+        // `{dut}` returns as the second key, and the sort reads it again.
+        set_pattern("/(?<x>dut)(?<dut>\\d)\\.psu/", cx);
+        assert_eq!(labels(&view, cx), ["dut3.psu", "dut2.psu", "dut1.psu"]);
     }
 }

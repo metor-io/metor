@@ -98,7 +98,6 @@ impl WidgetKind {
     pub fn pivot_table() -> Self {
         Self(SharedString::new_static("pivot_table"))
     }
-
     pub fn traffic_light() -> Self {
         Self(SharedString::new_static("traffic_light"))
     }

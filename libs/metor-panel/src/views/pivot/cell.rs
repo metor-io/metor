@@ -52,8 +52,18 @@ pub(crate) fn live_strip<T: 'static>(
     })
 }
 
+/// How a field cell takes its width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CellFit {
+    /// Its own width and divider, for a host that lays cells in a row.
+    Sized,
+    /// The host's cell, which already has a width and a divider.
+    Fill,
+}
+
 /// One field of one instance: its strip, a muted stand-in for a value that
 /// doesn't strip, or a dash where the instance lacks the field.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn field_cell<T: 'static>(
     db: &Arc<DB>,
     strips: &mut VisibleEntityCache<ComponentValueStrip>,
@@ -61,18 +71,24 @@ pub(crate) fn field_cell<T: 'static>(
     field_ix: usize,
     field: &SharedString,
     n: usize,
+    fit: CellFit,
     cx: &mut Context<T>,
 ) -> AnyElement {
     let theme = theme(cx);
     let cell = div()
-        .w(ui_px(cell_width(n, field)))
         .h_full()
-        .flex_shrink_0()
-        .border_r_1()
-        .border_color(theme.border_primary)
         .px(ui_px(CELL_PAD / 2.0))
         .flex()
-        .items_center();
+        .items_center()
+        .overflow_hidden();
+    let cell = match fit {
+        CellFit::Sized => cell
+            .w(ui_px(cell_width(n, field)))
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.border_primary),
+        CellFit::Fill => cell.w_full(),
+    };
     let Some(id) = instance.ids[field_ix] else {
         return cell
             .text_size(ui_px(12.0))

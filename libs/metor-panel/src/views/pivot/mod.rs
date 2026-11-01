@@ -11,7 +11,7 @@ pub(crate) mod source;
 pub(crate) mod table;
 
 pub(crate) use cell::{
-    FieldDrag, InstanceDrag, field_cell, field_label, field_menu_rows, live_strip,
+    CellFit, FieldDrag, InstanceDrag, field_cell, field_label, field_menu_rows, live_strip,
 };
 pub(crate) use model::{Arrangement, Frame, Grid, alike, children, common_suffix, signature};
 pub use table::{PivotTable, PivotTableConfig};

@@ -35,8 +35,8 @@ use super::image_view::{collapsed_label, expands};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::pivot::{
-    Arrangement, FieldDrag, Grid, InstanceDrag, alike, common_suffix, field_cell, field_label,
-    field_menu_rows, live_strip, signature,
+    Arrangement, CellFit, FieldDrag, Grid, InstanceDrag, alike, children, common_suffix,
+    field_cell, field_label, field_menu_rows, live_strip, signature,
 };
 use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
@@ -692,11 +692,17 @@ impl OutlineDelegate {
                 },
             ));
         }
-        if node.children.values().any(|c| !c.children.is_empty()) {
+        // The children the outline shows, so a compressed chain stays one
+        // instance just as it does when the branch pivots inline.
+        let instances: Vec<String> = children(node, false)
+            .into_iter()
+            .map(|f| f.node.full_name.to_string())
+            .collect();
+        if !instances.is_empty() {
             out.push((
                 SharedString::new_static("Open children as table"),
                 PivotTableConfig {
-                    pattern: format!("{}.{{instance}}", node.full_name),
+                    instances,
                     ..Default::default()
                 },
             ));
@@ -1301,7 +1307,16 @@ impl OutlineDelegate {
             .zip(&grid.cells)
             .enumerate()
             .map(|(field_ix, (field, &n))| {
-                field_cell(&self.db, &mut self.strips, instance, field_ix, field, n, cx)
+                field_cell(
+                    &self.db,
+                    &mut self.strips,
+                    instance,
+                    field_ix,
+                    field,
+                    n,
+                    CellFit::Sized,
+                    cx,
+                )
             })
             .collect();
         pivot_scroller(row_ix, scroll)
@@ -1456,19 +1471,25 @@ fn pivot_scroller(row_ix: usize, scroll: ScrollHandle) -> gpui::Stateful<gpui::D
     scroller
 }
 
-/// The frame type `node` is the root of, when its producer tagged it.
+/// The frame type `node` is the root of, when its producer tagged it:
+/// any component beneath whose tagged root is `node` itself, since a nested
+/// port's fields may sort first.
 fn frame_type(db: &DB, node: &ComponentNode) -> Option<String> {
-    let id = first_component(node)?;
+    let mut ids = Vec::new();
+    collect_ids(node, &mut ids);
     db.with_state(|state| {
-        let meta = state.get_component_metadata(id)?;
-        let (frame, root) = meta.frame()?;
-        (root == node.full_name.as_ref()).then(|| frame.to_string())
+        ids.into_iter().find_map(|id| {
+            let (frame, root) = state.get_component_metadata(id)?.frame()?;
+            (root == node.full_name.as_ref()).then(|| frame.to_string())
+        })
     })
 }
 
-fn first_component(node: &ComponentNode) -> Option<ComponentId> {
-    node.component_id
-        .or_else(|| node.children.values().find_map(|c| first_component(c)))
+fn collect_ids(node: &ComponentNode, out: &mut Vec<ComponentId>) {
+    out.extend(node.component_id);
+    for child in node.children.values() {
+        collect_ids(child, out);
+    }
 }
 
 /// `"1 field"` / `"3 fields"`.

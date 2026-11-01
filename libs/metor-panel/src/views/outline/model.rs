@@ -20,7 +20,7 @@
 //! how four reaction wheels read as a grid instead of four folded subtrees.
 //! Alike siblings are detected structurally, so nothing in the FSW has to
 //! opt in; siblings missing a field simply get an empty cell. A
-//! [`PivotLayout`] records how the user arranged a grid — field order,
+//! [`Arrangement`] records how the user arranged a grid — field order,
 //! hidden fields, instance order — apart from the grid itself, so it
 //! survives fields and instances coming and going.
 //!
