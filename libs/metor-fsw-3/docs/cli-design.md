@@ -50,8 +50,8 @@ Colours are semantic tokens in one `Theme`, never literals at call sites.
 - `Theme` has a dark and a light variant in truecolor. The variant comes
   from the terminal's background, queried with OSC 11, then `COLORFGBG`,
   then dark.
-- Colours step down to 256 and then 16 when the terminal lacks truecolor.
-  Each step is a designed palette, not a nearest-colour match.
+- Each token is one RGB colour per variant. `anstyle-lossy` converts it
+  to 256 or 16 colours when the terminal lacks truecolor.
 - Target hues are chosen to stay apart in both variants and under the
   common forms of colour blindness. Each also carries a letter or glyph,
   so colour is never the only signal.
@@ -66,8 +66,7 @@ Colours are semantic tokens in one `Theme`, never literals at call sites.
 | `▏▎▍▌▋▊▉█`       | progress, to 1/8 cell           |
 | `→ ← ⇄`          | wiring and links                |
 
-Each has an ASCII fallback, used when the locale is not UTF-8 or with
-`--ascii`.
+There is no ASCII fallback.
 
 ### Tables
 
@@ -263,29 +262,40 @@ On exit, a table says how the run ended:
 ### Errors
 
 Errors are `miette` diagnostics: a code, a headline, the source location,
-and a help line, rendered by miette's graphical handler with its
-characters and colours set from `Theme`. A config error points at the `target.py` line that added the system;
+and a help line, rendered by miette's graphical handler, with a footer
+naming `metor explain` and the code. A config error points at the `target.py` line that added the system;
 the Python recorder keeps each call site for this. A Python exception
 shows only the frames in the user's files.
 
 ```
-  ✗ error[M0201]  `nav` has no input port `sensor`
-    --> target.py:42:28
+M0201
 
-    42 │ nav = fsw.add("nav", Nav(sensor=plant.sensors))
-       │                          ^^^^^^ did you mean `sensors`?
+  × `nav` has no input port `sensor`
+    ╭─[target.py:42:28]
+ 41 │ plant = fsw.add("plant", Plant())
+ 42 │ nav = fsw.add("nav", Nav(sensor=plant.sensors))
+    ·                          ───┬──
+    ·                             ╰── did you mean `sensors`?
+    ╰────
+  help: `Nav` takes `sensors`, `params`
 
-    help: `Nav` takes `sensors`, `params`
+  more: metor explain M0201
 ```
 
 Names typed on the command line get suggestions too:
 
 ```
-  ✗ error[M0101]  no target `fws`
-    help: did you mean `fsw`?  targets: plant, fsw, gateway
+M0101
+
+  × no target `fws`
+  help: did you mean `fsw`?  targets: plant, fsw, gateway
+
+  more: metor explain M0101
 ```
 
-`metor explain M0201` prints the long form, rendered as styled Markdown.
+`metor explain M0201` prints the long form from `codes.md`, which is
+wrapped at 76 columns, with code blocks muted and inline code in the
+accent colour.
 
 ## Ergonomics
 
@@ -341,33 +351,29 @@ Most of these are in the workspace already or come with clap.
 |---|---|
 | `miette` | Diagnostics: the derive, source spans, and the renderer |
 | `strsim` | "did you mean" suggestions |
-| `tracing-subscriber` | A custom `Layer` that formats log lines and feeds the `Reporter`; `EnvFilter` for `RUST_LOG`. `--log nav=debug` maps system names onto it |
-| `tracing-indicatif` | Keeps log lines and spinners from overwriting each other |
-| `indicatif` | Spinners and the build gauge, with braille frames and 1/8 blocks |
-| `anstyle`, `anstream` | Styles, and colour handling for `NO_COLOR`, `CLICOLOR_FORCE`, and pipes |
-| `colorchoice-clap` | The `--color` flag |
+| `indicatif` | The spinner on a running phase |
+| `anstyle`, `anstyle-lossy` | Styles, and RGB down to 256 or 16 colours |
+| `supports-color` | Colour depth, with `NO_COLOR`, `FORCE_COLOR`, and `CLICOLOR_FORCE` |
 | `terminal-colorsaurus` | The background colour, via OSC 11, to pick the theme variant |
-| `supports-color`, `supports-unicode`, `supports-hyperlinks` | Colour depth, the ASCII fallback, OSC 8 links |
 | `unicode-width`, `terminal_size` | Column widths and the terminal width for alignment |
-| `comfy-table` | Borderless tables (`presets::NOTHING`) that fit the width; replaced by our own `Table` if it gets in the way |
+| `comfy-table` | Borderless tables (`presets::NOTHING`) that fit the width |
 | `clap`, `clap_complete` | `Styles` for themed help; dynamic completion of target and system names (`unstable-dynamic`) |
 | `jiff` | `--sim-dt 10ms` and `--for 30s` via `SignedDuration`, `--epoch` via `Timestamp` |
-| `notify`, `notify-debouncer-full` | File watching for `watch` |
-| `termimad` | Markdown for `explain` |
-| `snapbox`, `trycmd`, `insta` | CLI cases, SVG snapshots of styled output (`term-svg`), widget snapshots |
+| `notify`, `notify-debouncer-mini` | File watching for `watch` |
+| `insta` | Snapshots of rendered output |
 
 - Durations parse as `SignedDuration` rather than `Span`, since a step
   has no calendar units, then convert to `std::time::Duration`, which
   refuses negatives. `--wall 100hz` keeps its own parser.
-- The run-time log path must still allocate nothing in steady state. Our
-  layer and `indicatif` are checked for this; the other crates run only
+- The run-time log path must still allocate nothing in steady state. The
+  spinner runs only during setup phases, and the other crates run only
   at setup or after the run.
 
 ## Testing
 
 - Widgets and renderers: snapshot tests that feed fixed events and compare
   the text, at 60, 100, and 160 columns, in both theme variants,
-  in truecolor, 16-colour, and ASCII.
+  with and without colour.
 - Commands: `trycmd` cases over the fixtures in `tests/`, covering a good
   run, a config error, a Python exception, a missing toolchain, and an
   interrupted run.
