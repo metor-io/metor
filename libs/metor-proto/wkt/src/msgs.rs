@@ -1032,7 +1032,9 @@ impl Request for GetDbInfo {
     type Reply<B: IoBuf + Clone> = DbInfoResp;
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// Decoded by [`VersionedFields`], so a reply from an older server still
+/// decodes with the fields it predates defaulted.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct DbInfoResp {
     pub protocol_version: u32,
     /// Capability bits; clients gate post-version-1 requests on these.
@@ -1041,17 +1043,87 @@ pub struct DbInfoResp {
     pub features: u64,
     /// The msg ids a client should forward up this connection: requests
     /// going to the server, never records coming back. Added in version 3.
-    #[serde(default)]
     pub command_ids: Vec<PacketId>,
     /// The serving target's telemetry namespace, when it has one: the bare
     /// dotted prefix its components carry. Added in version 3.
-    #[serde(default)]
     pub namespace: Option<String>,
     /// What a client needs to build and send each command: one entry per
     /// command this server takes, messages and frames alike. Added in
     /// version 4.
-    #[serde(default)]
     pub commands: Vec<CommandInfo>,
+}
+
+impl<'de> Deserialize<'de> for DbInfoResp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DbInfoResp;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a DbInfoResp")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<DbInfoResp, A::Error> {
+                let mut fields = VersionedFields::new(seq)?;
+                Ok(DbInfoResp {
+                    protocol_version: fields.version,
+                    features: fields.since(1)?,
+                    command_ids: fields.since(3)?,
+                    namespace: fields.since(3)?,
+                    commands: fields.since(4)?,
+                })
+            }
+        }
+        const FIELDS: &[&str] = &[
+            "protocol_version",
+            "features",
+            "command_ids",
+            "namespace",
+            "commands",
+        ];
+        deserializer.deserialize_struct("DbInfoResp", FIELDS, Visitor)
+    }
+}
+
+/// The fields of an identity struct ([`DbInfoResp`], [`LinkInfo`]) in wire
+/// order, each read only when the sender's protocol version carries it.
+///
+/// Postcard cannot default a missing trailing field — an older peer's reply
+/// simply ends early, which is an unexpected-end error — so the leading
+/// `protocol_version` says how far to read. Whatever a newer peer appends
+/// past the known fields stays unread, as postcard always allowed.
+struct VersionedFields<A> {
+    seq: A,
+    version: u32,
+    index: usize,
+}
+
+impl<'de, A: serde::de::SeqAccess<'de>> VersionedFields<A> {
+    fn new(mut seq: A) -> Result<Self, A::Error> {
+        let version = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::invalid_length(0, &"a protocol version"))?;
+        Ok(VersionedFields {
+            seq,
+            version,
+            index: 1,
+        })
+    }
+
+    /// The next field, introduced in protocol version `since`.
+    fn since<T: Deserialize<'de> + Default>(&mut self, since: u32) -> Result<T, A::Error> {
+        if self.version < since {
+            return Ok(T::default());
+        }
+        let index = self.index;
+        self.index += 1;
+        self.seq.next_element()?.ok_or_else(|| {
+            serde::de::Error::invalid_length(index, &"every field the sender's version carries")
+        })
+    }
 }
 
 /// A command a server takes from its clients, described well enough for a
@@ -1258,7 +1330,10 @@ pub const LINK_PROTOCOL_VERSION: u32 = 3;
 /// [`GetDbInfo`] — the pair is how one address form serves both peers: a
 /// client probes with `GetDbInfo` and lets the first packet's id decide
 /// the mode.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+///
+/// Decoded by [`VersionedFields`], so an older link's identity still
+/// decodes with the fields it predates defaulted.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct LinkInfo {
     pub protocol_version: u32,
     /// Capability bits, reserved (0 for now).
@@ -1269,16 +1344,47 @@ pub struct LinkInfo {
     pub command_ids: Vec<PacketId>,
     /// The serving target's telemetry namespace, when it has one: the bare
     /// dotted prefix its components carry. Added in protocol version 2.
-    #[serde(default)]
     pub namespace: Option<String>,
     /// The serving `TcpServer` state's declaration name, so a subscriber can
     /// tell one of a target's links from another. Added in version 2.
-    #[serde(default)]
     pub link: String,
     /// What a ground tool needs to build and send each of `command_ids`. See
     /// [`DbInfoResp::commands`]. Added in version 3.
-    #[serde(default)]
     pub commands: Vec<CommandInfo>,
+}
+
+impl<'de> Deserialize<'de> for LinkInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = LinkInfo;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a LinkInfo")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<LinkInfo, A::Error> {
+                let mut fields = VersionedFields::new(seq)?;
+                Ok(LinkInfo {
+                    protocol_version: fields.version,
+                    features: fields.since(1)?,
+                    command_ids: fields.since(1)?,
+                    namespace: fields.since(2)?,
+                    link: fields.since(2)?,
+                    commands: fields.since(3)?,
+                })
+            }
+        }
+        const FIELDS: &[&str] = &[
+            "protocol_version",
+            "features",
+            "command_ids",
+            "namespace",
+            "link",
+            "commands",
+        ];
+        deserializer.deserialize_struct("LinkInfo", FIELDS, Visitor)
+    }
 }
 
 impl Msg for LinkInfo {
@@ -1808,16 +1914,111 @@ mod link_info_tests {
             }
         );
     }
+
+    /// A described command crosses intact, frames included.
+    #[test]
+    fn link_info_round_trips_commands() {
+        use metor_proto::vtable::builder::{component, raw_field, schema as field_schema, vtable};
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: vec![AlarmAck::ID, [9, 9]],
+            namespace: None,
+            link: "ground".into(),
+            commands: vec![
+                CommandInfo {
+                    id: AlarmAck::ID,
+                    kind: CommandKind::Msg(MsgMetadata {
+                        name: "alarm_ack".into(),
+                        schema: OwnedNamedType {
+                            name: "AlarmAck".into(),
+                            ty: postcard_schema::schema::owned::OwnedDataModelType::U8,
+                        },
+                        metadata: HashMap::from([("codec".into(), "json".into())]),
+                    }),
+                },
+                CommandInfo {
+                    id: [9, 9],
+                    kind: CommandKind::Frame {
+                        name: "burn".into(),
+                        vtable: vtable([raw_field(
+                            0,
+                            8,
+                            field_schema(
+                                metor_proto::types::PrimType::F64,
+                                &[1],
+                                component("burn.dv"),
+                            ),
+                        )]),
+                    },
+                },
+            ],
+        };
+        let bytes = postcard::to_allocvec(&info).expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<LinkInfo>(&bytes).expect("decode"),
+            info
+        );
+    }
+
+    /// A version-2 link's identity — no `commands` — still decodes, so a new
+    /// ground tool connects to an older fsw.
+    #[test]
+    fn link_info_v2_bytes_decode_as_current() {
+        #[derive(Serialize)]
+        struct LinkInfoV2 {
+            protocol_version: u32,
+            features: u64,
+            command_ids: Vec<PacketId>,
+            namespace: Option<String>,
+            link: String,
+        }
+        let bytes = postcard::to_allocvec(&LinkInfoV2 {
+            protocol_version: 2,
+            features: 0,
+            command_ids: vec![SequenceCommand::ID],
+            namespace: Some("sat".into()),
+            link: "ground".into(),
+        })
+        .expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<LinkInfo>(&bytes).expect("decode v2"),
+            LinkInfo {
+                protocol_version: 2,
+                features: 0,
+                command_ids: vec![SequenceCommand::ID],
+                namespace: Some("sat".into()),
+                link: "ground".into(),
+                commands: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn link_info_v1_bytes_decode_as_current() {
+        let bytes =
+            postcard::to_allocvec(&(1u32, 0u64, vec![SequenceCommand::ID])).expect("encode");
+        let info = postcard::from_bytes::<LinkInfo>(&bytes).expect("decode v1");
+        assert_eq!(info.command_ids, vec![SequenceCommand::ID]);
+        assert_eq!((info.namespace, info.link), (None, String::new()));
+    }
+
+    /// A version-3 link that misses a field its version promises is
+    /// malformed, not an older link.
+    #[test]
+    fn link_info_truncated_is_an_error() {
+        let bytes =
+            postcard::to_allocvec(&(3u32, 0u64, vec![SequenceCommand::ID])).expect("encode");
+        assert!(postcard::from_bytes::<LinkInfo>(&bytes).is_err());
+    }
 }
 
 #[cfg(test)]
 mod db_info_tests {
     use super::*;
 
-    /// A v2 reader decodes a v3 reply: postcard stops at the fields it knows
-    /// and ignores the trailing bytes. The reverse does not hold — a
-    /// truncated v2 encoding is an unexpected end, the `LinkInfo` precedent —
-    /// so a v3 client must gate on `protocol_version`, not on the decode.
+    /// A v2 reader decodes a current reply: postcard stops at the fields it
+    /// knows and ignores the trailing bytes.
     #[test]
     fn db_info_v3_decodes_under_v2() {
         #[derive(Deserialize, Debug, PartialEq, Eq)]
@@ -1845,5 +2046,43 @@ mod db_info_tests {
             postcard::from_bytes::<DbInfoResp>(&bytes).expect("round trip"),
             v3
         );
+    }
+
+    /// A version-3 server's reply — no `commands` — still decodes, so a new
+    /// client connects to an older db.
+    #[test]
+    fn db_info_v3_bytes_decode_as_current() {
+        #[derive(Serialize)]
+        struct DbInfoRespV3 {
+            protocol_version: u32,
+            features: u64,
+            command_ids: Vec<PacketId>,
+            namespace: Option<String>,
+        }
+        let bytes = postcard::to_allocvec(&DbInfoRespV3 {
+            protocol_version: 3,
+            features: FEATURE_MSG_SYNC,
+            command_ids: vec![AlarmAck::ID],
+            namespace: Some("sat".into()),
+        })
+        .expect("encode");
+        assert_eq!(
+            postcard::from_bytes::<DbInfoResp>(&bytes).expect("decode v3"),
+            DbInfoResp {
+                protocol_version: 3,
+                features: FEATURE_MSG_SYNC,
+                command_ids: vec![AlarmAck::ID],
+                namespace: Some("sat".into()),
+                commands: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn db_info_v2_bytes_decode_as_current() {
+        let bytes = postcard::to_allocvec(&(2u32, FEATURE_MSG_SYNC)).expect("encode");
+        let info = postcard::from_bytes::<DbInfoResp>(&bytes).expect("decode v2");
+        assert_eq!(info.features, FEATURE_MSG_SYNC);
+        assert!(info.command_ids.is_empty() && info.namespace.is_none());
     }
 }
