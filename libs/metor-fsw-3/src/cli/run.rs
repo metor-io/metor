@@ -370,12 +370,12 @@ pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, Run
         DeploymentConfig::from_slice(&std::fs::read(target).map_err(io(target))?)?
     } else {
         let name = target.file_name().unwrap_or_default().to_string_lossy();
-        phased(ui, Verb::Evaluate, &name, || {
+        phased(ui, Verb::EVALUATE, &name, || {
             eval_target(target, &packs, ui)
         })?
     };
     let subject = plural(config.targets.len(), "target");
-    let config = phased(ui, Verb::Resolve, &subject, || resolve(config, target))?;
+    let config = phased(ui, Verb::RESOLVE, &subject, || resolve(config, target))?;
     if target.extension().is_some_and(|ext| ext == "py") && !super::children::is_child() {
         super::completions::write_cache(target, &config);
     }

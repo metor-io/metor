@@ -6,7 +6,6 @@ pub mod event;
 pub mod glyph;
 pub mod human;
 pub mod json;
-pub mod logline;
 pub mod table;
 pub mod theme;
 

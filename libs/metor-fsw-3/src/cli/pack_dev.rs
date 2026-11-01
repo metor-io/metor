@@ -85,7 +85,7 @@ pub fn pack_dev(root: &Path, ui: &Ui) -> Result<(), PackDevError> {
     let config = PackConfig::read(root)?;
     let phase = |state: PhaseState<'_>| {
         ui.emit(Event::Phase(Phase {
-            verb: Verb::Build,
+            verb: Verb::BUILD,
             subject: &config.module,
             state,
         }))

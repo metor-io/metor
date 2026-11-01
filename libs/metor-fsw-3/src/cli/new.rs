@@ -230,7 +230,7 @@ pub fn new(args: New, ui: &Ui) -> Result<(), RunError> {
         return Err(RunError::Exists(args.path));
     }
     let files = files(args.kind, &dir, &Source::detect())?;
-    phased(ui, Verb::Create, &args.path.display().to_string(), || {
+    phased(ui, Verb::CREATE, &args.path.display().to_string(), || {
         write(&dir, &files).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&dir);
         })

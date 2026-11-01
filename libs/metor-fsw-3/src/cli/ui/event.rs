@@ -37,36 +37,23 @@ pub struct Phase<'a> {
     pub state: PhaseState<'a>,
 }
 
+/// A phase's verb: the present participle, shown while it runs, and the
+/// past tense, shown once it is done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verb {
-    Build,
-    Evaluate,
-    Resolve,
-    Check,
-    Create,
+pub struct Verb {
+    pub doing: &'static str,
+    pub done: &'static str,
 }
 
 impl Verb {
-    /// The present participle, shown while the phase runs.
-    pub fn doing(self) -> &'static str {
-        match self {
-            Self::Build => "Building",
-            Self::Evaluate => "Evaluating",
-            Self::Resolve => "Resolving",
-            Self::Check => "Checking",
-            Self::Create => "Creating",
-        }
-    }
+    pub const BUILD: Self = Self::new("Building", "Built");
+    pub const EVALUATE: Self = Self::new("Evaluating", "Evaluated");
+    pub const RESOLVE: Self = Self::new("Resolving", "Resolved");
+    pub const CHECK: Self = Self::new("Checking", "Checked");
+    pub const CREATE: Self = Self::new("Creating", "Created");
 
-    /// The past tense, shown once the phase is done.
-    pub fn done(self) -> &'static str {
-        match self {
-            Self::Build => "Built",
-            Self::Evaluate => "Evaluated",
-            Self::Resolve => "Resolved",
-            Self::Check => "Checked",
-            Self::Create => "Created",
-        }
+    const fn new(doing: &'static str, done: &'static str) -> Self {
+        Self { doing, done }
     }
 }
 

@@ -23,7 +23,7 @@ pub struct Check {
 pub fn check(args: Check, ui: &Ui) -> Result<(), RunError> {
     let config = prepare(args.target.as_deref(), ui)?;
     for target in &config.targets {
-        phased(ui, Verb::Check, target_name(target), || {
+        phased(ui, Verb::CHECK, target_name(target), || {
             load(target, &Run::default(), None).map(drop)
         })?;
     }

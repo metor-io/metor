@@ -48,7 +48,7 @@ fn object(event: &Event<'_>) -> Option<Value> {
         Event::Phase(phase) => {
             let mut value = json!({
                 "type": "phase",
-                "phase": phase.verb.doing().to_lowercase(),
+                "phase": phase.verb.doing.to_lowercase(),
                 "subject": phase.subject,
             });
             value["state"] = match phase.state {

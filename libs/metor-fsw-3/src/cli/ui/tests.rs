@@ -14,7 +14,7 @@ struct NoTarget;
 fn script(reporter: &mut dyn Reporter) {
     let build = |state| {
         Event::Phase(Phase {
-            verb: Verb::Build,
+            verb: Verb::BUILD,
             subject: "adcs_pack",
             state,
         })
@@ -30,7 +30,7 @@ fn script(reporter: &mut dyn Reporter) {
         reporter.event(&build(state));
     }
     reporter.event(&Event::Phase(Phase {
-        verb: Verb::Evaluate,
+        verb: Verb::EVALUATE,
         subject: "target.py",
         state: PhaseState::Done(Duration::from_millis(5)),
     }));
@@ -89,7 +89,7 @@ fn test_ui_shares_one_renderer() {
 
 fn evaluate(state: PhaseState<'static>) -> Event<'static> {
     Event::Phase(Phase {
-        verb: Verb::Evaluate,
+        verb: Verb::EVALUATE,
         subject: "target.py",
         state,
     })
