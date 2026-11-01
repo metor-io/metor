@@ -55,7 +55,7 @@ pub struct Run {
     pub target: Option<PathBuf>,
     /// The namespace of the target to run. Without it, a deployment with
     /// several targets runs all of them.
-    #[arg(long = "target", value_name = "NS", add = super::completions::targets())]
+    #[arg(long = "target", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
     pub member: Option<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]

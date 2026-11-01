@@ -93,11 +93,6 @@ pub enum Command {
         after_help = "Examples:\n  metor explain M0201          what a code means and how to fix it\n  metor explain                every code"
     )]
     Explain(explain::Explain),
-    /// Prints the script that registers completions with a shell.
-    #[command(
-        after_help = "Examples:\n  source <(metor completions bash)\n  metor completions zsh > ~/.zfunc/_metor\n  metor completions fish > ~/.config/fish/completions/metor.fish"
-    )]
-    Completions(completions::Completions),
     /// Commands for pack authors.
     #[command(subcommand)]
     Pack(PackCommand),
@@ -107,10 +102,11 @@ pub enum Command {
 }
 
 const EXAMPLES: &str = "Examples:
-  metor run                    run the nearest target.py
-  metor check                  find errors without running
-  metor show fsw               list a target's systems
-  metor doctor                 check python, cargo, and wasm32";
+  metor run                      run the nearest target.py
+  metor check                    find errors without running
+  metor show fsw                 list a target's systems
+  metor doctor                   check python, cargo, and wasm32
+  source <(COMPLETE=bash metor)  shell completion; also zsh, fish";
 
 const RUN_EXAMPLES: &str = "Examples:
   metor run                            the nearest target.py
@@ -137,9 +133,7 @@ pub enum PackCommand {
 /// Runs the command line. On failure, reports the error and exits with its
 /// status. An interrupted run's summary already says so.
 pub fn main() {
-    clap_complete::CompleteEnv::with_factory(Cli::command)
-        .var(completions::VAR)
-        .complete();
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
     let early = Early::scan(std::env::args_os().skip(1));
     let caps = Caps::detect(early.color, early.query);
     let cli = parse(&caps, early.color);
@@ -226,7 +220,6 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Watch(args) => watch::watch(args, ui)?,
         Command::Show(args) => show::show(args, ui)?,
         Command::Graph(args) => graph::graph(args, ui)?,
-        Command::Completions(args) => completions::completions(args, ui)?,
         Command::New(args) => new::new(args, ui)?,
     }
     Ok(())

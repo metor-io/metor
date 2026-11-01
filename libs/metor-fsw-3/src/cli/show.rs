@@ -22,7 +22,7 @@ use crate::deploy::{ResolvedDeployment, TargetConfig};
 pub struct Show {
     /// A target file, then a name: `fsw` for a target, `fsw.nav` for one of
     /// its systems. Without a file, the nearest `target.py` is shown.
-    #[arg(num_args = 0..=2, value_name = "FILE|NAME", add = completions::files_or_names())]
+    #[arg(num_args = 0..=2, value_name = "FILE|NAME", add = completions::names(&[completions::TARGET, completions::SYSTEM], true))]
     pub args: Vec<String>,
 }
 

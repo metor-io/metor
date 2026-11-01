@@ -23,7 +23,7 @@ use wiring::{At, Link, links};
 pub struct Graph {
     /// A target file, then a target's name. Without a file, the nearest
     /// `target.py` is drawn.
-    #[arg(num_args = 0..=2, value_name = "FILE|TARGET", add = completions::files_or_targets())]
+    #[arg(num_args = 0..=2, value_name = "FILE|TARGET", add = completions::names(&[completions::TARGET], true))]
     pub args: Vec<String>,
     /// Write text for another tool instead of a picture.
     #[arg(long = "as", value_enum, value_name = "FORMAT")]

@@ -116,7 +116,6 @@ metor pack   build|show|list   pack author commands
 metor doctor                   check the toolchain
 metor explain CODE             the long form of an error
 metor version [-v]             version, ABI, toolchain
-metor completions SHELL
 ```
 
 `abi-version` folds into `version -v`. `pack dev` becomes `pack build`;
@@ -310,8 +309,9 @@ accent colour.
 - **`watch`.** Reruns on changes to `target.py`, pack sources, and
   `pyproject.toml`. Each rebuild is a new process, since a loaded library
   cannot be replaced.
-- **Completions.** Static for commands and flags; dynamic for target
-  namespaces and system names, read from the last `check`.
+- **Completions.** `clap_complete`'s dynamic engine: `COMPLETE=fish metor`
+  prints the registration script. Commands and flags come from clap;
+  target namespaces and system names from a cache the last `check` wrote.
 - **Environment.** Every `METOR_*` variable is listed in `metor help env`.
 - **Help.** `--help` is styled with the same theme: grouped flags, an
   example for each command, and the defaults in `muted`.

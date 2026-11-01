@@ -1,55 +1,25 @@
-//! Shell completion: the registration script, and target and system names
-//! from a cache the last `prepare` wrote.
+//! Shell completion of target and system names, from a cache the last
+//! `prepare` wrote. `clap_complete` does the rest: `COMPLETE=fish metor`
+//! prints the script that registers it.
 //!
 //! Completion never evaluates Python, so it stays fast. The cache is
 //! `.metor/names` beside the target file: one `target NAME` or `system NAME`
 //! line per name.
 
 use std::ffi::OsStr;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap_complete::engine::{
     ArgValueCompleter, CompletionCandidate, PathCompleter, ValueCompleter,
 };
-use clap_complete::env::Shells;
 
-use super::run::{RunError, find_target, print};
+use super::run::find_target;
 use super::show;
-use super::ui::Ui;
 use crate::deploy::ResolvedDeployment;
 
-/// The environment variable the registration script sets to ask for
-/// candidates.
-pub const VAR: &str = "COMPLETE";
-
-/// The arguments to `metor completions`.
-#[derive(clap::Args, Debug)]
-pub struct Completions {
-    /// The shell to write the script for.
-    #[arg(value_parser = SHELLS)]
-    pub shell: String,
-}
-
-/// The shells `clap_complete` registers with.
-const SHELLS: [&str; 5] = ["bash", "zsh", "fish", "elvish", "powershell"];
-
-/// Writes the script that registers `metor`'s completions with `args.shell`.
-pub fn completions(args: Completions, ui: &Ui) -> Result<(), RunError> {
-    print(ui, |out, _, _| registration(out, &args.shell))
-}
-
-pub fn registration(out: &mut impl Write, shell: &str) -> io::Result<()> {
-    let shells = Shells::builtins();
-    let completer = shells
-        .completer(shell)
-        .ok_or_else(|| io::Error::other(format!("no completer for {shell}")))?;
-    completer.write_registration(VAR, "metor", "metor", "metor", out)
-}
-
 /// A cached name's kind.
-const TARGET: &str = "target";
-const SYSTEM: &str = "system";
+pub const TARGET: &str = "target";
+pub const SYSTEM: &str = "system";
 
 /// The cache of `config`'s names: its targets, then every name `show`
 /// takes.
@@ -102,17 +72,21 @@ fn nearest_cache() -> String {
         .unwrap_or_default()
 }
 
-fn complete(current: &OsStr, kinds: &[&str], files: bool) -> Vec<CompletionCandidate> {
-    let prefix = current.to_string_lossy();
-    let cache = nearest_cache();
-    let names = candidates(&cache, kinds, &prefix)
-        .into_iter()
-        .map(CompletionCandidate::new);
-    let files = match files {
-        true => target_files().complete(current),
-        false => Vec::new(),
-    };
-    names.chain(files).collect()
+/// Completes the cached names of `kinds`, and target files when `files`.
+pub fn names(kinds: &'static [&'static str], files: bool) -> ArgValueCompleter {
+    ArgValueCompleter::new(move |current: &OsStr| {
+        let cache = nearest_cache();
+        let names = candidates(&cache, kinds, &current.to_string_lossy())
+            .into_iter()
+            .map(CompletionCandidate::new);
+        let files = files.then(|| target_files().complete(current));
+        names.chain(files.into_iter().flatten()).collect::<Vec<_>>()
+    })
+}
+
+/// Completes a target file.
+pub fn files() -> ArgValueCompleter {
+    ArgValueCompleter::new(target_files())
 }
 
 /// Directories, and files `metor` reads: `.py` and `.json`.
@@ -123,26 +97,6 @@ fn target_files() -> PathCompleter {
                 .extension()
                 .is_some_and(|ext| ext == "py" || ext == "json")
     })
-}
-
-/// Completes a target's namespace.
-pub fn targets() -> ArgValueCompleter {
-    ArgValueCompleter::new(|current: &OsStr| complete(current, &[TARGET], false))
-}
-
-/// Completes a target file, or a target or system name.
-pub fn files_or_names() -> ArgValueCompleter {
-    ArgValueCompleter::new(|current: &OsStr| complete(current, &[TARGET, SYSTEM], true))
-}
-
-/// Completes a target file, or a target name.
-pub fn files_or_targets() -> ArgValueCompleter {
-    ArgValueCompleter::new(|current: &OsStr| complete(current, &[TARGET], true))
-}
-
-/// Completes a target file.
-pub fn files() -> ArgValueCompleter {
-    ArgValueCompleter::new(target_files())
 }
 
 #[cfg(test)]
@@ -162,19 +116,6 @@ mod tests {
         assert_eq!(candidates(CACHE, &[SYSTEM], "fsw."), ["fsw.nav"]);
         assert!(candidates("", &[TARGET], "").is_empty());
         assert!(candidates(CACHE, &[TARGET], "zz").is_empty());
-    }
-
-    #[test]
-    fn test_registration_names_metor_for_every_shell() {
-        for shell in SHELLS {
-            let mut out = Vec::new();
-            registration(&mut out, shell).expect("writes to a Vec");
-            let script = String::from_utf8(out).expect("utf-8");
-            assert!(
-                script.contains("metor") && script.contains(VAR),
-                "{shell:?}: {script}"
-            );
-        }
     }
 
     #[test]
