@@ -28,8 +28,9 @@ use crate::{ConnState, DB, Error, PacketTx};
 /// returning the error that ended it (the caller loops). Two raced loops
 /// over the one socket: ingest every pushed packet through the local
 /// packet handler — the same shapes a directly-attached producer sends —
-/// and forward `command_ids`' msg logs up the link from their live edge
-/// (nothing queued before this call is replayed).
+/// and forward `command_ids`' logs up the link from their live edge
+/// (nothing queued before this call is replayed), each in the shape
+/// `commands` describes for it.
 ///
 /// `db` advertises the forwarded set as its own commands, described by
 /// whichever of the link's `commands` it covers, so a client of `db` can
@@ -60,7 +61,7 @@ pub async fn fsw_stream(
     let tx = Arc::new(Mutex::new(tx));
     futures_lite::future::race(
         ingest(rx, buf, tx.clone(), db, on_packet),
-        super::forward(command_ids, tx, db),
+        super::forward(command_ids, described, tx, db),
     )
     .await
 }

@@ -183,7 +183,7 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> 
     let tx = Arc::new(Mutex::new(tx));
     Err(futures_lite::future::race(
         ingest(rx, tx.clone(), db),
-        super::forward(info.command_ids, tx, db),
+        super::forward(info.command_ids, info.commands, tx, db),
     )
     .await)
 }

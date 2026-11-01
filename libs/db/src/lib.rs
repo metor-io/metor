@@ -5,7 +5,7 @@ use metor_proto::types::{PacketHeader, PacketTy};
 use metor_proto::vtable::builder::{
     OpBuilder, component, raw_field, raw_table, schema, timestamp, vtable,
 };
-use metor_proto::vtable::{ElementKey, RealizedField, builder};
+use metor_proto::vtable::{ElementKey, Field, Op, RealizedField, builder};
 use metor_proto::{
     registry,
     schema::Schema,
@@ -827,6 +827,21 @@ impl State {
                 entry.insert(msg_log)
             }
         })
+    }
+
+    /// The vtable of frame command `id`, when `id` is one.
+    ///
+    /// A frame command is kept in a msg log like a message command, and
+    /// crosses the wire as its table: the vtable announced once per
+    /// connection, then a `Table` packet per record.
+    fn frame_command(&self, id: PacketId) -> Option<&VTable<Vec<Op>, Vec<u8>, Vec<Field>>> {
+        self.commands
+            .iter()
+            .find(|command| command.id == id)
+            .and_then(|command| match &command.kind {
+                CommandKind::Frame { vtable, .. } => Some(vtable),
+                CommandKind::Msg(_) => None,
+            })
     }
 
     pub fn set_msg_metadata(
@@ -1779,7 +1794,11 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         }
         Packet::Table(table) => {
             trace!(table.len = table.buf.len(), "sinking table");
-            db.ingest_table(table.id, stellarator::buf::deref(&table.buf))?;
+            let buf = stellarator::buf::deref(&table.buf);
+            match db.with_state(|s| s.frame_command(table.id).is_some()) {
+                true => db.push_msg(Timestamp::now(), table.id, buf)?,
+                false => db.ingest_table(table.id, buf)?,
+            }
         }
 
         Packet::Msg(m) if m.id == GetDbSettings::ID => {
@@ -1823,6 +1842,14 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         }
         Packet::Msg(m) if m.id == MsgStream::ID => {
             let MsgStream { msg_id } = m.parse::<MsgStream>()?;
+            if let Some(vtable) = db.with_state(|s| s.frame_command(msg_id).cloned()) {
+                let tail = remote::CommandTail::open(db, msg_id, remote::Shape::Table(None))?;
+                // Announced here, not by the tail, so it precedes every
+                // record any stream on this connection sends.
+                tx.send_msg(&VTableMsg { id: msg_id, vtable }).await?;
+                stellarator::spawn(remote::tail(vec![tail], tx.tx.clone()));
+                return Ok(());
+            }
             let msg_log =
                 db.with_state_mut(|s| s.get_or_insert_msg_log(msg_id, &db.path).cloned())?;
             let req_id = m.req_id;
@@ -4090,5 +4117,151 @@ mod series_tests {
         lens.sort();
         lens.dedup();
         assert_eq!(lens, [16, 8 + IMAGE_SIZE]);
+    }
+}
+
+#[cfg(test)]
+mod frame_command_tests {
+    use super::*;
+    use metor_proto::types::table_id;
+    use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
+    use metor_proto_stellar::Client;
+    use std::sync::Mutex as StdMutex;
+
+    type Seen = Arc<StdMutex<Vec<(PacketTy, PacketId, Vec<u8>)>>>;
+
+    const MSG: PacketId = [0x51, 0];
+
+    fn command() -> CommandInfo {
+        let vtable = vtable([raw_field(
+            0,
+            8,
+            schema(PrimType::F64, &[1], component("sat.cmds.set_mode.mode")),
+        )]);
+        CommandInfo {
+            id: table_id(&vtable),
+            kind: CommandKind::Frame {
+                name: "set_mode".into(),
+                vtable,
+            },
+        }
+    }
+
+    fn serve(db: Arc<DB>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+        addr
+    }
+
+    /// Dials `addr` the way a subscriber does, asking for `id`'s stream, and
+    /// records every packet it is sent.
+    async fn subscribe(addr: SocketAddr, id: PacketId) -> Seen {
+        let mut client = Client::connect(addr).await.unwrap();
+        client
+            .send((&MsgStream { msg_id: id }).with_request_id(3))
+            .await
+            .0
+            .unwrap();
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        let Client { mut rx, .. } = client;
+        stellarator::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok(pkt) = rx.next_grow(buf).await else {
+                    return;
+                };
+                let entry = match &pkt {
+                    Packet::Msg(m) => Some((PacketTy::Msg, m.id, m.buf[..].to_vec())),
+                    Packet::Table(t) => Some((PacketTy::Table, t.id, t.buf[..].to_vec())),
+                    Packet::TimeSeries(_) => None,
+                };
+                sink.lock().unwrap().extend(entry);
+                buf = pkt.into_buf().into_inner();
+            }
+        });
+        seen
+    }
+
+    /// Calls `push` until `seen` holds a packet with `id`, failing after
+    /// five seconds.
+    async fn push_until_seen(seen: &Seen, id: PacketId, push: impl Fn(), what: &str) {
+        for _ in 0..200 {
+            if seen.lock().unwrap().iter().any(|(_, seen, _)| *seen == id) {
+                return;
+            }
+            push();
+            stellarator::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("never saw {what}");
+    }
+
+    /// The gateway hop: a ground db mirroring the server forwards a frame
+    /// command it logged as its vtable and a table, the server logs it as a
+    /// command rather than telemetry, and a subscriber that asked for it
+    /// gets the announce at once and the record with the bytes the ground
+    /// logged.
+    #[stellarator::test]
+    async fn frame_command_relays_from_ground_to_subscriber() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(DB::create(dir.path().join("server")).unwrap());
+        let command = command();
+        let id = command.id;
+        server.add_commands(std::slice::from_ref(&command));
+        let addr = serve(server.clone());
+
+        let seen = subscribe(addr, id).await;
+        let ground = Arc::new(DB::create(dir.path().join("ground")).unwrap());
+        remote::RemoteDb::new(addr).spawn(ground.clone());
+        let record = 2.5f64.to_le_bytes();
+        // The mirror forwards only what is logged after it connects, so the
+        // ground repeats the command until one crosses.
+        let push = || ground.push_msg(Timestamp::now(), id, &record).unwrap();
+        push_until_seen(&seen, id, push, "the command").await;
+
+        let seen = seen.lock().unwrap().clone();
+        let (ty, msg_id, bytes) = seen[0].clone();
+        assert_eq!(
+            (ty, msg_id),
+            (PacketTy::Msg, VTableMsg::ID),
+            "announce first"
+        );
+        let announce: VTableMsg = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(announce.id, id);
+        let tables = &seen[1..];
+        assert!(!tables.is_empty());
+        assert!(
+            tables
+                .iter()
+                .all(|t| *t == (PacketTy::Table, id, record.to_vec())),
+            "{tables:?}"
+        );
+
+        let sampled = server.with_state(|s| {
+            s.get_component(ComponentId::new("sat.cmds.set_mode.mode"))
+                .is_some_and(|c| c.time_series.latest().is_some())
+        });
+        assert!(!sampled, "a frame command is not telemetry");
+        assert!(
+            server.with_state(|s| s.msg_logs.contains_key(&id)),
+            "the server logs the command"
+        );
+    }
+
+    /// A message id outside the frame commands streams as messages, with no
+    /// announce.
+    #[stellarator::test]
+    async fn msg_stream_for_a_message_sends_no_announce() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(DB::create(dir.path().join("server")).unwrap());
+        server.add_commands(&[command()]);
+        let addr = serve(server.clone());
+        let seen = subscribe(addr, MSG).await;
+        let push = || server.push_msg(Timestamp::now(), MSG, b"go").unwrap();
+        push_until_seen(&seen, MSG, push, "the message").await;
+        let first = seen.lock().unwrap().first().cloned();
+        assert_eq!(first, Some((PacketTy::Msg, MSG, b"go".to_vec())));
     }
 }
