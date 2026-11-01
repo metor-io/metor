@@ -1016,7 +1016,7 @@ pub struct LogEvent {
 /// telemetry, so probing with anything else pollutes the remote DB.
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
-pub const NODE_PROTOCOL_VERSION: u32 = 3;
+pub const NODE_PROTOCOL_VERSION: u32 = 4;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
@@ -1047,6 +1047,40 @@ pub struct DbInfoResp {
     /// dotted prefix its components carry. Added in version 3.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// What a client needs to build and send each command: one entry per
+    /// command this server takes, messages and frames alike. Added in
+    /// version 4.
+    #[serde(default)]
+    pub commands: Vec<CommandInfo>,
+}
+
+/// A command a server takes from its clients, described well enough for a
+/// ground tool to list it, build a form for it, and encode what the operator
+/// filled in.
+///
+/// `command_ids` only says which logs to forward; this says what goes in
+/// them. A client forwards a message command as `Msg` packets on `id`, and a
+/// frame command as its table: the vtable announced once, then a `Table`
+/// packet per record.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CommandInfo {
+    /// The msg id for a message, or `table_id(vtable)` for a frame.
+    pub id: PacketId,
+    pub kind: CommandKind,
+}
+
+/// The two record kinds a command can be, as metor-fsw-3 defines them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum CommandKind {
+    /// A serde value, encoded as its metadata's codec says (postcard when
+    /// `metadata["codec"]` is absent).
+    Msg(MsgMetadata),
+    /// A fixed `#[repr(C)]` record whose bytes are the table the vtable
+    /// describes.
+    Frame {
+        name: String,
+        vtable: VTable<Vec<Op>, Vec<u8>, Vec<Field>>,
+    },
 }
 
 impl Msg for DbInfoResp {
@@ -1216,7 +1250,7 @@ impl Msg for NodeAck {
 
 /// Version of the fsw link identity protocol ([`LinkInfo`]), independent
 /// of [`NODE_PROTOCOL_VERSION`].
-pub const LINK_PROTOCOL_VERSION: u32 = 2;
+pub const LINK_PROTOCOL_VERSION: u32 = 3;
 
 /// Identity push from an fsw link server: the FIRST packet on every
 /// accepted connection, ahead of the schema announce replay. A metor-db
@@ -1241,6 +1275,10 @@ pub struct LinkInfo {
     /// tell one of a target's links from another. Added in version 2.
     #[serde(default)]
     pub link: String,
+    /// What a ground tool needs to build and send each of `command_ids`. See
+    /// [`DbInfoResp::commands`]. Added in version 3.
+    #[serde(default)]
+    pub commands: Vec<CommandInfo>,
 }
 
 impl Msg for LinkInfo {
@@ -1734,6 +1772,7 @@ mod link_info_tests {
             command_ids: vec![SequenceCommand::ID, AlarmAck::ID],
             namespace: Some("sat".into()),
             link: "ground".into(),
+            commands: Vec::new(),
         };
         let bytes = postcard::to_allocvec(&info).expect("encode");
         let back: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
@@ -1756,13 +1795,14 @@ mod link_info_tests {
             command_ids: vec![SequenceCommand::ID],
             namespace: Some("sat".into()),
             link: "ground".into(),
+            commands: Vec::new(),
         };
         let bytes = postcard::to_allocvec(&info).expect("encode");
         let v1: LinkInfoV1 = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(
             v1,
             LinkInfoV1 {
-                protocol_version: 2,
+                protocol_version: LINK_PROTOCOL_VERSION,
                 features: 0,
                 command_ids: vec![SequenceCommand::ID],
             }
@@ -1790,13 +1830,14 @@ mod db_info_tests {
             features: FEATURE_MSG_SYNC,
             command_ids: vec![AlarmAck::ID],
             namespace: Some("sat".into()),
+            commands: Vec::new(),
         };
         let bytes = postcard::to_allocvec(&v3).expect("encode");
         let v2: DbInfoRespV2 = postcard::from_bytes(&bytes).expect("decode v3 as v2");
         assert_eq!(
             v2,
             DbInfoRespV2 {
-                protocol_version: 3,
+                protocol_version: NODE_PROTOCOL_VERSION,
                 features: FEATURE_MSG_SYNC,
             }
         );

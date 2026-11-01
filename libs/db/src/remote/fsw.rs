@@ -105,6 +105,7 @@ mod tests {
             command_ids,
             namespace: None,
             link: String::new(),
+            commands: Vec::new(),
         })
             .into_len_packet()
             .inner

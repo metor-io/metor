@@ -22,6 +22,7 @@ pub(crate) fn link_info(
         command_ids,
         namespace: namespace.map(str::to_string),
         link: link.to_string(),
+        commands: Vec::new(),
     };
     (&info).into_len_packet().inner
 }

@@ -1901,6 +1901,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 features: FEATURE_MSG_SYNC,
                 command_ids,
                 namespace,
+                commands: Vec::new(),
             })
             .await?;
         }
