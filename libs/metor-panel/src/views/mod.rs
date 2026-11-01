@@ -24,6 +24,7 @@ pub mod map;
 pub mod meter;
 pub mod monitor;
 pub mod outline;
+pub(crate) mod pivot;
 pub mod plot_common;
 pub(crate) mod popover;
 pub mod samples_table;

@@ -16,7 +16,8 @@ use crate::inspector::OpenInspectorCallback;
 use crate::inspector::rows::InspectorRow;
 use crate::views::add_menu::{AddMenu, Host};
 use crate::views::dashboard::WidgetRegistry;
-use crate::views::outline::model::{PivotLayout, type_key};
+use crate::views::outline::model::type_key;
+use crate::views::pivot::Arrangement;
 use crate::views::time_series::Override;
 use crate::views::{
     AlarmListMode, AlarmView, ComponentBrowser, ComponentOutline, LevelFilter, LogView,
@@ -191,7 +192,7 @@ pub struct FrameTypeConfig {
     pub rows: Vec<String>,
 }
 
-impl PivotLayout {
+impl Arrangement {
     fn from_config(order: Vec<String>, hidden: Vec<String>, rows: Vec<String>) -> Self {
         Self {
             order: order.into_iter().map(SharedString::from).collect(),
@@ -230,7 +231,7 @@ pub(crate) fn outline_view(
     let mut layouts = HashMap::new();
     let mut pivoted = Vec::with_capacity(cfg.pivots.len());
     for p in cfg.pivots {
-        let layout = PivotLayout::from_config(p.fields, p.hidden, p.rows);
+        let layout = Arrangement::from_config(p.fields, p.hidden, p.rows);
         if !layout.is_empty() {
             layouts.insert(SharedString::from(p.path.clone()), layout);
         }
@@ -239,7 +240,7 @@ pub(crate) fn outline_view(
     outline.set_pivoted_paths(pivoted, cx);
     let mut types = Vec::with_capacity(cfg.types.len());
     for t in cfg.types {
-        let layout = PivotLayout::from_config(t.order, t.hidden, t.rows);
+        let layout = Arrangement::from_config(t.order, t.hidden, t.rows);
         if !layout.is_empty() {
             layouts.insert(type_key(&t.label), layout);
         }
@@ -257,7 +258,7 @@ pub(crate) fn outline_config(inner: &ComponentOutline, cx: &App) -> OutlinePanel
     let arrangement = |key: &SharedString| {
         layouts
             .get(key)
-            .map(PivotLayout::to_config)
+            .map(Arrangement::to_config)
             .unwrap_or_default()
     };
     OutlinePanelConfig {

@@ -26,6 +26,7 @@ use smallvec::SmallVec;
 pub(crate) mod model;
 
 use super::column_browser::ToggleFilterBar;
+use super::component_browser::component_tree::component_count;
 use super::component_browser::component_tree::{ComponentNode, build_tree, chain_to};
 use super::component_browser::{component_rows, strip_cell_count, strip_menu};
 use super::copy::copy_name_row;
@@ -33,6 +34,7 @@ use super::filter_bar::{FilterBar, FilterBarEvent};
 use super::image_view::{collapsed_label, expands};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
+use super::pivot::{Arrangement, Grid, alike, common_suffix, signature, take_slot};
 use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate, drag_chip};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
@@ -43,10 +45,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{theme, ui_px};
 use crate::tiles::OpenOutlineAction;
-use model::{
-    Disclosure, FrameType, Layout, OutlineRow, Pivot, PivotLayout, RowKind, alike, common_suffix,
-    component_count, flatten, root_node, signature, take_slot, type_key,
-};
+use model::{Disclosure, FrameType, Layout, OutlineRow, RowKind, flatten, root_node, type_key};
 
 /// Indent per tree depth, in pixels.
 const INDENT: f32 = 14.0;
@@ -206,13 +205,13 @@ impl ComponentOutline {
     }
 
     /// Every pivot arrangement, keyed by pivot key, for persistence.
-    pub(crate) fn pivot_layouts(&self, cx: &App) -> HashMap<SharedString, PivotLayout> {
+    pub(crate) fn pivot_layouts(&self, cx: &App) -> HashMap<SharedString, Arrangement> {
         self.table.read(cx).delegate().layouts.clone()
     }
 
     pub(crate) fn set_pivot_layouts(
         &mut self,
-        layouts: HashMap<SharedString, PivotLayout>,
+        layouts: HashMap<SharedString, Arrangement>,
         cx: &mut Context<Self>,
     ) {
         self.table.update(cx, |table, cx| {
@@ -502,7 +501,7 @@ pub struct OutlineDelegate {
     /// so the grid scrolls sideways as a unit.
     pivot_scrolls: HashMap<SharedString, ScrollHandle>,
     /// How the user arranged each pivot grid, by pivot key.
-    layouts: HashMap<SharedString, PivotLayout>,
+    layouts: HashMap<SharedString, Arrangement>,
     /// Frame types the user has collected, shown above the tree.
     types: Vec<FrameType>,
     /// A type label shown alone.
@@ -889,14 +888,14 @@ impl OutlineDelegate {
         );
     }
 
-    fn layout_mut(&mut self, key: &SharedString) -> &mut PivotLayout {
+    fn layout_mut(&mut self, key: &SharedString) -> &mut Arrangement {
         self.layouts.entry(key.clone()).or_default()
     }
 
     /// An arrangement back at its default drops out, so a layout only
     /// persists grids the user touched.
     fn prune_layout(&mut self, key: &SharedString) {
-        if self.layouts.get(key).is_some_and(PivotLayout::is_empty) {
+        if self.layouts.get(key).is_some_and(Arrangement::is_empty) {
             self.layouts.remove(key);
         }
     }
@@ -904,7 +903,7 @@ impl OutlineDelegate {
     /// Drop field `from` onto field `to`: it takes that slot.
     fn move_field(
         &mut self,
-        pivot: &Pivot,
+        pivot: &Grid,
         from: &SharedString,
         to: &SharedString,
         cx: &mut Context<Table<Self>>,
@@ -917,7 +916,7 @@ impl OutlineDelegate {
     /// Drop instance `from` onto instance `to`: it takes that slot.
     fn move_row(
         &mut self,
-        pivot: &Pivot,
+        pivot: &Grid,
         from: &SharedString,
         to: &SharedString,
         cx: &mut Context<Table<Self>>,
@@ -949,7 +948,7 @@ impl OutlineDelegate {
     /// back.
     fn open_field_menu(
         &mut self,
-        pivot: &Pivot,
+        pivot: &Grid,
         field: &SharedString,
         position: gpui::Point<Pixels>,
         window: &mut Window,
@@ -1235,7 +1234,7 @@ impl OutlineDelegate {
     fn render_pivot_header(
         &mut self,
         row_ix: usize,
-        pivot: &Arc<Pivot>,
+        pivot: &Arc<Grid>,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
@@ -1297,7 +1296,7 @@ impl OutlineDelegate {
     fn render_pivot_cells(
         &mut self,
         row_ix: usize,
-        pivot: &Pivot,
+        pivot: &Grid,
         ix: usize,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {

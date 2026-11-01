@@ -205,6 +205,16 @@ pub fn chain_to(root: &Arc<ComponentNode>, name: &str) -> SmallVec<[Arc<Componen
     out
 }
 
+/// Components at or below `node`, the node itself included.
+pub(crate) fn component_count(node: &ComponentNode) -> usize {
+    usize::from(node.component_id.is_some())
+        + node
+            .children
+            .values()
+            .map(|c| component_count(c))
+            .sum::<usize>()
+}
+
 /// Whether `name` is `prefix` itself or a path beneath it; everything is
 /// under the empty prefix.
 pub fn under(prefix: &str, name: &str) -> bool {
