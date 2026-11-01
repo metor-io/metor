@@ -36,11 +36,12 @@ enum Part {
 }
 
 /// The lines of a picture with the node each belongs to, the lanes between
-/// them, and the `idle` nodes left out.
+/// them and the node each leaves, and the `idle` nodes left out.
 #[derive(Debug, Default)]
 struct Layout {
     parts: Vec<(usize, Part)>,
     spans: Vec<Span>,
+    owners: Vec<usize>,
     idle: Vec<usize>,
 }
 
@@ -96,8 +97,8 @@ fn by_port(wiring: &Wiring<'_>, out: char) -> Layout {
 }
 
 /// A row per system feeding a box, one row for a box's outputs, and a lane
-/// per source system.
-fn by_system(wiring: &Wiring<'_>, notes: &[Option<String>], out: char) -> Layout {
+/// per source system. A box's feeders run in ascending `rank`, by node.
+fn by_system(wiring: &Wiring<'_>, notes: &[Option<String>], out: char, rank: &[usize]) -> Layout {
     let mut layout = Layout::default();
     let mut sources = vec![None; wiring.nodes.len()];
     let mut sinks: Vec<(usize, usize)> = Vec::new();
@@ -108,7 +109,9 @@ fn by_system(wiring: &Wiring<'_>, notes: &[Option<String>], out: char) -> Layout
         }
         layout.push(index, Part::Top);
         layout.push(index, Part::Title);
-        for source in feeders(wiring, index) {
+        let mut feeders = feeders(wiring, index);
+        feeders.sort_by_key(|&f| rank.get(f).copied().unwrap_or(0));
+        for source in feeders {
             let part = group(wiring, source, index);
             sinks.push((source, layout.push(index, part)));
         }
@@ -118,21 +121,48 @@ fn by_system(wiring: &Wiring<'_>, notes: &[Option<String>], out: char) -> Layout
         }
         layout.push(index, Part::Bottom);
     }
-    layout.spans = system_spans(&sources, &sinks);
+    (layout.owners, layout.spans) = system_spans(&sources, &sinks).into_iter().unzip();
     layout
 }
 
 /// A span from each source row in `sources`, indexed by node, to the rows
-/// in `sinks` that node feeds.
-fn system_spans(sources: &[Option<usize>], sinks: &[(usize, usize)]) -> Vec<Span> {
+/// in `sinks` that node feeds, with that node.
+fn system_spans(sources: &[Option<usize>], sinks: &[(usize, usize)]) -> Vec<(usize, Span)> {
     let span = |(node, row): (usize, &Option<usize>)| {
         let rows = sinks.iter().filter(|(s, _)| *s == node).map(|(_, r)| *r);
-        Some(Span {
+        let span = Span {
             source: (*row)?,
             sinks: rows.collect(),
-        })
+        };
+        Some((node, span))
     };
     sources.iter().enumerate().filter_map(span).collect()
+}
+
+/// The layout for `detail`, and its lanes' columns. By system, each box's
+/// feeders are ordered innermost lane first, so a lane ending in the box
+/// ends before an outer one taps across it.
+fn lay_out(
+    wiring: &Wiring<'_>,
+    notes: &[Option<String>],
+    out: char,
+    detail: Detail,
+) -> (Layout, Vec<usize>) {
+    let layout = match detail {
+        Detail::Systems => by_system(wiring, notes, out, &[]),
+        Detail::Ports => by_port(wiring, out),
+    };
+    let columns = lanes::pack(&layout.spans);
+    if detail == Detail::Ports {
+        return (layout, columns);
+    }
+    let mut rank = vec![0; wiring.nodes.len()];
+    for (&node, &column) in layout.owners.iter().zip(&columns) {
+        rank[node] = column;
+    }
+    let layout = by_system(wiring, notes, out, &rank);
+    let columns = lanes::pack(&layout.spans);
+    (layout, columns)
 }
 
 /// The systems feeding `node`, in the order of their first edge.
@@ -209,11 +239,7 @@ pub fn render(
     detail: Detail,
 ) -> io::Result<()> {
     let lines = &theme.glyphs.lines;
-    let layout = match detail {
-        Detail::Systems => by_system(wiring, notes, lines.out),
-        Detail::Ports => by_port(wiring, lines.out),
-    };
-    let columns = lanes::pack(&layout.spans);
+    let (layout, columns) = lay_out(wiring, notes, lines.out, detail);
     let grid = lanes::draw(layout.parts.len(), &layout.spans, &columns, lines);
     let size = Size::of(wiring, &layout, theme.glyphs.from);
     let lane = theme.style(Token::Accent);
@@ -503,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_by_system_has_a_lane_per_source_system() {
-        let layout = by_system(&busy(), &[], '>');
+        let layout = by_system(&busy(), &[], '>', &[]);
         assert_eq!(layout.spans.len(), 3, "plant, nav, and cmds");
         assert_eq!(layout.spans[0].sinks.len(), 3, "plant feeds nav, ctrl, pub");
         let cmds = &layout.spans[2];
@@ -603,7 +629,7 @@ mod tests {
             ],
             edges: vec![edge(0, 0, 0, 0), edge(0, 0, 2, 0), edge(1, 0, 2, 0)],
         };
-        let layout = by_system(&wiring, &[], '>');
+        let layout = by_system(&wiring, &[], '>', &[]);
         let span = |source| layout.spans.iter().find(|s| s.source == source);
         assert_eq!(
             span(3).map(|s| s.sinks.clone()),

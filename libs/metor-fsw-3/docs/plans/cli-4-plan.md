@@ -78,9 +78,12 @@ as `git log --graph` does:
 
 - One lane per output port, from its row to its last consumer's input
   row, tapped with `├▶` at each consumer between. A loop's lane runs up.
-- Lanes are packed greedily: a lane takes the innermost column free over
-  its span, so short edges hug the boxes. A tap that crosses an inner
-  lane draws `┼`.
+- Lanes are ordered to draw the fewest crossings (`┼`, a tap across an
+  inner lane): exactly over every order up to 12 lanes, greedily past it,
+  then refined by swapping neighbours. Lanes that don't overlap share a
+  column. The old shortest-inside packing is kept when it draws fewer.
+  By system, a box's input rows run innermost lane first, so a lane that
+  ends in the box ends before an outer one taps across it.
 - A link system shows `⇄ target.system` beside its box, found by port.
 - By default lanes merge by system: one lane per source system, tapping
   one row per system it feeds (`sensors gps  ← plant`). A box's outputs
