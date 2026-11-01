@@ -5,6 +5,9 @@ expression: human(caps)
 [?2026h[2K  [38;2;180;142;255m⠋[0m Building    adcs_pack[?2026l[?2026h[2K  [38;2;180;142;255m⠋[0m Building    adcs_pack  [38;2;138;143;152m41 · nalgebra[0m[?2026l[2K  [38;2;127;216;143m✓[0m Built       adcs_pack                 [38;2;138;143;152m  2.1s[0m
   [38;2;127;216;143m✓[0m Evaluated   target.py
   [38;2;180;142;255m●[0m Running     [1m[38;2;86;180;233mplant[0m  [1m[38;2;230;159;0mfsw[0m    [38;2;138;143;152mctrl-c to stop[0m
-  [1m[38;2;255;107;107m✗ error[M0101][0m  no target `fws`
-    [38;2;138;143;152mhelp:[0m did you mean `fsw`?
-    [38;2;78;83;92mmore: metor explain M0101[0m
+[31mM0101[0m
+
+  [31m×[0m no target `fws`
+[36m  help: [0mdid you mean `fsw`?
+
+  more: metor explain M0101

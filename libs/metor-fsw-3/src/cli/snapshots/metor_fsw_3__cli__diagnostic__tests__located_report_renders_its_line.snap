@@ -2,11 +2,14 @@
 source: libs/metor-fsw-3/src/cli/diagnostic.rs
 expression: "String::from_utf8(out).expect(\"utf-8\")"
 ---
-  ✗ error[M0327]  `gps` holds a `Cap`, so an fsw.io must follow it
-    --> t.py:2
-      │
-    2 │ fsw.io = 2
-      │ ^^^^^^^^^^
+M0327
 
-    help: add fsw.io after `gps`
-    more: metor explain M0327
+  × `gps` holds a `Cap`, so an fsw.io must follow it
+   ╭─[t.py:2:1]
+ 1 │ a = 1
+ 2 │ fsw.io = 2
+   · ──────────
+   ╰────
+  help: add fsw.io after `gps`
+
+  more: metor explain M0327

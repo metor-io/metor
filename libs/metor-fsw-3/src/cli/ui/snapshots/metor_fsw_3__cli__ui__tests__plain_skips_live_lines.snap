@@ -5,6 +5,9 @@ expression: "human(Caps::plain())"
   ✓ Built       adcs_pack                   2.1s
   ✓ Evaluated   target.py
   ● Running     plant  fsw
-  ✗ error[M0101]  no target `fws`
-    help: did you mean `fsw`?
-    more: metor explain M0101
+M0101
+
+  × no target `fws`
+  help: did you mean `fsw`?
+
+  more: metor explain M0101
