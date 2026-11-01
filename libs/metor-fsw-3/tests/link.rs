@@ -24,7 +24,9 @@ use metor_fsw_3::{
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::PacketStream;
 use metor_proto_wkt::LogEvent;
-use metor_proto_wkt::{LinkInfo, SequenceCommand, SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{
+    CommandInfo, CommandKind, LinkInfo, SequenceCommand, SetComponentMetadata, VTableMsg,
+};
 use serde_json::json;
 use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
@@ -597,6 +599,7 @@ async fn test_subscribe_announces_and_routes() {
 
     let Fsw { info, tx, .. } = dial_fsw(addr).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
+    assert_described(&info.command_ids, &info.commands);
     assert_eq!(info.link, "cmds-routes");
 
     tx.send((&Ping { n: 7 }).into_len_packet())
@@ -1178,5 +1181,18 @@ async fn test_db_advertises_command_record_ids() {
     assert_eq!(
         info.command_ids,
         vec![<SequenceCommand as Msg>::ID, <Ping as Msg>::ID]
+    );
+    assert_described(&info.command_ids, &info.commands);
+}
+
+/// Every advertised command is described as the message it is.
+fn assert_described(ids: &[metor_proto::types::PacketId], commands: &[CommandInfo]) {
+    let described: Vec<_> = commands.iter().map(|command| command.id).collect();
+    assert_eq!(described, ids, "every command is described");
+    assert!(
+        commands
+            .iter()
+            .all(|command| matches!(command.kind, CommandKind::Msg(_))),
+        "{commands:?}"
     );
 }

@@ -55,22 +55,26 @@ pub async fn subscribe(
     link_status: &mut Output<LinkStatus>,
     log: &mut Log,
 ) -> Result<(), SeqError> {
-    let mut routes = Routes::of(outputs);
-    let msgs = routes.ids(PacketTy::Msg);
     let LinkParams {
         namespace,
         link,
         dialing,
         ..
     } = &s.params;
+    let commands = outputs
+        .iter_mut()
+        .filter_map(|(def, _)| def.schema.msg_command())
+        .collect();
+    let mut routes = Routes::of(outputs);
     let seed: Vec<u8> = match dialing {
         // A db peer answers these by forwarding the message logs. A
         // `Publish` peer ignores them.
-        true => msgs
-            .iter()
-            .flat_map(|&msg_id| (&MsgStream { msg_id }).into_len_packet().inner)
+        true => routes
+            .ids(PacketTy::Msg)
+            .into_iter()
+            .flat_map(|msg_id| (&MsgStream { msg_id }).into_len_packet().inner)
             .collect(),
-        false => wire::link_info(msgs, namespace.as_deref(), link),
+        false => wire::link_info(commands, namespace.as_deref(), link),
     };
     let tables = routes.ids(PacketTy::Table);
     let mem = s.mem.take().ok_or_else(made_once)?;

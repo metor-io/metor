@@ -9,10 +9,10 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use metor_proto::types::{PACKET_HEADER_LEN, PacketId};
+use metor_proto::types::PACKET_HEADER_LEN;
+use metor_proto_wkt::CommandInfo;
 
 use crate::coordinator::{OutputConfig, OutputSource};
-use crate::record::RecordSchema;
 use crate::system::PortDef;
 
 /// The part of one instance's config a system sees when computing its ports.
@@ -239,16 +239,15 @@ impl Records {
         self.0.get(name)
     }
 
-    /// Returns the packet id of the message record `name`.
-    pub fn msg_id(&self, name: &str) -> Result<PacketId, RecordError> {
+    /// Describes the message record `name` as a command a client sends.
+    pub fn msg_command(&self, name: &str) -> Result<CommandInfo, RecordError> {
         let def = self
             .0
             .get(name)
             .ok_or_else(|| RecordError::Unknown(name.to_string()))?;
-        match def.schema {
-            RecordSchema::Msg { id, .. } => Ok(id),
-            RecordSchema::Frame { .. } => Err(RecordError::Frame(name.to_string())),
-        }
+        def.schema
+            .msg_command()
+            .ok_or_else(|| RecordError::Frame(name.to_string()))
     }
 }
 
@@ -264,6 +263,7 @@ pub enum RecordError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::RecordSchema;
     use crate::tests::utils::{Imu, ImuPair, Nav, Note};
     use crate::{Output, Record};
 

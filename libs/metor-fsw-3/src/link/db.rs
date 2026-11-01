@@ -10,7 +10,7 @@ use futures_lite::future;
 use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
-use metor_proto_wkt::VTableMsg;
+use metor_proto_wkt::{CommandInfo, VTableMsg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use stellarator::net::TcpListener;
@@ -118,14 +118,14 @@ pub async fn db(
     log: &mut Log,
     stop: Stop,
 ) {
-    let commands: Result<Vec<PacketId>, RecordError> = s
+    let commands: Result<Vec<CommandInfo>, RecordError> = s
         .params
         .commands
         .iter()
-        .map(|name| records.msg_id(name))
+        .map(|name| records.msg_command(name))
         .collect();
     let commands = match commands {
-        Ok(ids) => ids,
+        Ok(commands) => commands,
         Err(error) => return log.fault("unknown_command", error.to_string()),
     };
     // PANIC Safety: `new` always sets the listener, and a system runs once.
@@ -135,7 +135,9 @@ pub async fn db(
         .iter_mut()
         .map(|(def, _)| Sink::register(&db, def, log))
         .collect();
-    db.set_identity(s.params.namespace.clone(), commands);
+    let command_ids = commands.iter().map(|command| command.id).collect();
+    db.set_identity(s.params.namespace.clone(), command_ids);
+    db.add_commands(&commands);
     let addr = listener.local_addr().ok();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
@@ -300,7 +302,7 @@ mod tests {
 
     use metor_fsw_3_ring::RingBuffer;
     use metor_proto::types::{IntoLenPacket, Msg, msg_id};
-    use metor_proto_wkt::{GetDbInfo, SequenceCommand};
+    use metor_proto_wkt::{CommandKind, GetDbInfo, SequenceCommand};
     use stellarator::io::AsyncWrite;
     use stellarator::net::TcpStream;
 
@@ -547,7 +549,21 @@ mod tests {
     }
 
     fn command_ids(records: &Records, names: &[&str]) -> Result<Vec<PacketId>, RecordError> {
-        names.iter().map(|name| records.msg_id(name)).collect()
+        names
+            .iter()
+            .map(|name| records.msg_command(name).map(|command| command.id))
+            .collect()
+    }
+
+    /// A command carries its record's metadata, as the record's own
+    /// announce does, so a client can build it.
+    #[test]
+    fn test_command_describes_its_record() {
+        let command = records().msg_command(Fixed::NAME).expect("a message");
+        let RecordSchema::Msg { name, codec, .. } = Fixed::schema() else {
+            panic!("`Fixed` is a message");
+        };
+        assert_eq!(command.kind, CommandKind::Msg(codec.msg_metadata(&name)));
     }
 
     #[test]

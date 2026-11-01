@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
 use metor_proto_wkt::{
-    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata, SetMsgMetadata, VTableMsg,
+    CommandInfo, CommandKind, LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata,
+    SetMsgMetadata, VTableMsg,
 };
 
 use crate::record::{MsgCodec, RecordSchema};
@@ -10,19 +11,20 @@ use crate::system::PortDef;
 
 /// Encodes a `LinkInfo` packet.
 ///
-/// A link sends this first on every connection to identify itself.
+/// A link sends this first on every connection to identify itself, with the
+/// commands it takes described so a ground tool can build them.
 pub(crate) fn link_info(
-    command_ids: Vec<PacketId>,
+    commands: Vec<CommandInfo>,
     namespace: Option<&str>,
     link: &str,
 ) -> Vec<u8> {
     let info = LinkInfo {
         protocol_version: LINK_PROTOCOL_VERSION,
         features: 0,
-        command_ids,
+        command_ids: commands.iter().map(|command| command.id).collect(),
         namespace: namespace.map(str::to_string),
         link: link.to_string(),
-        commands: Vec::new(),
+        commands,
     };
     (&info).into_len_packet().inner
 }
@@ -73,6 +75,20 @@ pub(crate) fn announce(
         blob.extend_from_slice(&announce.into_len_packet().inner);
     }
     (blob, ids)
+}
+
+impl RecordSchema {
+    /// Describes a message record as a command a client sends, or `None`
+    /// for a frame.
+    pub(crate) fn msg_command(&self) -> Option<CommandInfo> {
+        let RecordSchema::Msg { id, name, codec } = self else {
+            return None;
+        };
+        Some(CommandInfo {
+            id: *id,
+            kind: CommandKind::Msg(codec.msg_metadata(name)),
+        })
+    }
 }
 
 impl MsgCodec {
