@@ -11,7 +11,6 @@ pub mod completions;
 pub mod console;
 pub mod diagnostic;
 pub mod doctor;
-pub mod explain;
 pub mod graph;
 pub mod module;
 pub mod new;
@@ -88,11 +87,6 @@ pub enum Command {
     Build(build::Build),
     /// Checks the tools a project needs.
     Doctor,
-    /// Prints the long form of an error code, or lists every code.
-    #[command(
-        after_help = "Examples:\n  metor explain M0201          what a code means and how to fix it\n  metor explain                every code"
-    )]
-    Explain(explain::Explain),
     /// Commands for pack authors.
     #[command(subcommand)]
     Pack(PackCommand),
@@ -213,7 +207,6 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root, ui)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
         Command::Doctor => doctor::doctor(ui)?,
-        Command::Explain(args) => explain::explain(args, ui)?,
         Command::Run(args) => run::run(args, ui)?,
         Command::Build(args) => build::build(args, ui)?,
         Command::Check(args) => check::check(args, ui)?,

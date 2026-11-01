@@ -75,17 +75,6 @@ Each failed check prints its fix under it. The usual ones:
 - `cargo`: install Rust from rustup.rs.
 - `wasm32`: `rustup target add wasm32-unknown-unknown`.
 
-## M0106
-
-**No such code**
-
-`metor explain` was given a code it does not know. Codes are an `M` and four
-digits, such as `M0201`, and appear in brackets after `error` in a
-diagnostic.
-
-Check the code against the diagnostic it came from. A code from a different
-version of metor may not exist in this one.
-
 ## M0107
 
 **That name cannot name a project**

@@ -169,20 +169,16 @@ impl<W: Write> Human<W> {
         writeln!(self.buf)
     }
 
-    /// Renders `diagnostic` with miette, ending in where to read more. On a
-    /// terminal its code links to the code's text; elsewhere the link is
-    /// written out.
+    /// Renders `diagnostic` with miette. On a terminal its code links to the
+    /// code's text; elsewhere the link is written out.
     fn diagnostic(&mut self, diagnostic: &dyn miette::Diagnostic) -> io::Result<()> {
         let theme = match self.caps.depth {
             Depth::None => GraphicalTheme::unicode_nocolor(),
             _ => GraphicalTheme::unicode(),
         };
-        let mut handler = GraphicalReportHandler::new_themed(theme)
+        let handler = GraphicalReportHandler::new_themed(theme)
             .with_width(usize::from(self.caps.width))
             .with_links(self.caps.live);
-        if let Some(code) = diagnostic.code() {
-            handler = handler.with_footer(format!("more: metor explain {code}"));
-        }
         let mut text = String::new();
         handler
             .render_report(&mut text, diagnostic)

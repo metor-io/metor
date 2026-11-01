@@ -103,9 +103,6 @@ pub enum RunError {
     #[error("nothing in the deployment is named `{name}`")]
     #[diagnostic(code(M0104), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_NAMES)))]
     NoSuchName { name: String, known: Vec<String> },
-    #[error("no code is named `{code}`")]
-    #[diagnostic(code(M0106), help("{}", crate::cli::diagnostic::suggest(.code, .known, crate::cli::diagnostic::CODES)))]
-    NoSuchCode { code: String, known: Vec<String> },
     #[error("`{name}` cannot name a project: {why}")]
     #[diagnostic(
         code(M0107),

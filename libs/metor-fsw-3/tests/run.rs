@@ -127,7 +127,7 @@ fn test_target_without_a_deployment_says_so() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("metor explain M0207"), "{stderr}");
+    assert!(stderr.contains("M0207"), "{stderr}");
 }
 
 /// With `--format json`, stdout is one versioned object per line, even when
@@ -400,7 +400,7 @@ fn test_check_fails_with_the_errors_code() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("metor explain M0212"), "{stderr}");
+    assert!(stderr.contains("M0212"), "{stderr}");
 }
 
 #[test]

@@ -117,7 +117,6 @@ pub(crate) type Noun = (&'static str, &'static str);
 
 pub(crate) const SHOW_NAMES: Noun = ("names", "metor show");
 pub(crate) const SHOW_TARGETS: Noun = ("targets", "metor show");
-pub(crate) const CODES: Noun = ("codes", "metor explain");
 
 /// A help line naming the closest of `known` to `name`, then all of them
 /// if there are few.
@@ -140,6 +139,63 @@ pub(crate) fn suggest(name: &str, known: &[String], (noun, lister): Noun) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text behind each code's link: a `## M0201` heading, a bold title,
+    /// then the body.
+    const CODES: &str = include_str!("codes.md");
+
+    /// The files whose error types name codes.
+    const SOURCES: [&str; 7] = [
+        include_str!("run.rs"),
+        include_str!("pack_dev.rs"),
+        include_str!("cargo.rs"),
+        include_str!("../deploy/config.rs"),
+        include_str!("../deploy/error.rs"),
+        include_str!("../coordinator/error.rs"),
+        include_str!("../dl/mod.rs"),
+    ];
+
+    /// Every `code(M0123)` in `SOURCES`, sorted.
+    fn codes_used() -> Vec<&'static str> {
+        let mut codes: Vec<&str> = SOURCES
+            .iter()
+            .flat_map(|source| {
+                source
+                    .match_indices("code(M")
+                    .filter_map(|(at, _)| source.get(at + 5..at + 10))
+            })
+            .filter(|code| code[1..].bytes().all(|b| b.is_ascii_digit()))
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
+
+    #[test]
+    fn test_every_code_has_a_section_and_every_section_a_code() {
+        let used = codes_used();
+        let documented: Vec<&str> = CODES
+            .lines()
+            .filter_map(|l| l.strip_prefix("## "))
+            .collect();
+        assert!(used.len() > 50, "{used:?}");
+        assert_eq!(
+            documented, used,
+            "codes.md holds each used code once, in order"
+        );
+    }
+
+    #[test]
+    fn test_each_section_has_a_title_and_fits() {
+        let lines: Vec<&str> = CODES.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            if line.starts_with("## ") {
+                let title = lines.get(at + 2).copied().unwrap_or("");
+                assert!(title.starts_with("**") && title.ends_with("**"), "{line}");
+            }
+        }
+        assert_eq!(lines.iter().find(|l| l.chars().count() > 76), None);
+    }
 
     #[test]
     fn test_suggest_names_the_closest_target() {

@@ -96,7 +96,7 @@ table is aligned columns and whitespace, with no borders.
 ### Terminal features
 
 - File paths and error codes are OSC 8 hyperlinks: `target.py:42` opens
-  the file, `M0201` opens `metor explain`.
+  the file, `M0201` opens its section of `codes.md`.
 - `NO_COLOR`, `CLICOLOR_FORCE`, and `--color auto|always|never` are
   respected. A dumb terminal or a pipe gets the `Plain` renderer.
 - On GitHub Actions, diagnostics are also emitted as annotations and
@@ -114,7 +114,6 @@ metor graph  [FILE] [WHAT]     the deployment's wiring as a picture
 metor watch  [FILE]            rerun on source change
 metor pack   build|show|list   pack author commands
 metor doctor                   check the toolchain
-metor explain CODE             the long form of an error
 metor version [-v]             version, ABI, toolchain
 ```
 
@@ -261,11 +260,11 @@ On exit, a table says how the run ended:
 ### Errors
 
 Errors are `miette` diagnostics: a code, a headline, the source location,
-and a help line, rendered by miette's graphical handler, with a footer
-naming `metor explain` and the code. Each error variant names its code
+and a help line, rendered by miette's graphical handler. Each error variant names its code
 and help with `#[diagnostic(code(..), help(..))]`, next to its message.
-The code links to its section of `codes.md` on GitHub, a terminal
-hyperlink where the terminal supports one. A config error points at the `target.py` line that added the system;
+The code links to its long form, a section of `codes.md` on GitHub: a
+terminal hyperlink where the terminal supports one, the URL elsewhere.
+A config error points at the `target.py` line that added the system;
 the Python recorder keeps each call site for this. A Python exception
 shows only the frames in the user's files.
 
@@ -280,8 +279,6 @@ M0201
     ·                             ╰── did you mean `sensors`?
     ╰────
   help: `Nav` takes `sensors`, `params`
-
-  more: metor explain M0201
 ```
 
 Names typed on the command line get suggestions too:
@@ -291,13 +288,7 @@ M0101
 
   × no target `fws`
   help: did you mean `fsw`?  targets: plant, fsw, gateway
-
-  more: metor explain M0101
 ```
-
-`metor explain M0201` prints the long form from `codes.md`, which is
-wrapped at 76 columns, with code blocks muted and inline code in the
-accent colour.
 
 ## Ergonomics
 
@@ -344,7 +335,7 @@ The CLI is a producer of events and a set of renderers.
   that already exist. A UI thread drains them and prints. Its buffers are
   sized at start; steady state allocates nothing and never blocks a cycle.
 - Every error type derives `miette::Diagnostic` next to `thiserror`, with
-  a code, labelled spans, help, and a `url` to `metor explain`.
+  a code, labelled spans, help, and a `url` to its section of `codes.md`.
 
 ## Crates
 
@@ -391,7 +382,8 @@ Most of these are in the workspace already or come with clap.
    output, log format.
 2. `check`, `show`, `doctor`, units on flags, exit codes, styled help.
 3. Summary, children over NDJSON, `watch`.
-4. `graph`, `new`, dynamic completions, `explain`.
+4. `graph`, `new`, dynamic completions, `explain` (since replaced by links
+   to `codes.md`).
 
 ## Later
 
