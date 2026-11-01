@@ -7,7 +7,7 @@ use core::borrow::Borrow;
 
 use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id, table_id};
 use metor_proto::vtable::{Op, OpRef, VTable};
-use metor_proto_wkt::ComponentMetadata;
+use metor_proto_wkt::{ComponentMetadata, FRAME_ROOT_KEY};
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -119,11 +119,14 @@ pub enum MsgCodec {
 impl RecordSchema {
     /// Creates the schema for frame `T`.
     ///
-    /// Each field is announced at `{root}.{field}`.
+    /// Each field is announced at `{root}.{field}`, tagged with the frame's
+    /// name and root so the ground can gather every instance of `T`.
     pub fn frame<T: Frame>(root: &str) -> Self {
         Self::Frame {
             vtable: metor_proto::vtable::builder::vtable(T::vtable_fields(root.to_string())),
-            metadata: T::metadata(root.to_string()).collect(),
+            metadata: T::metadata(root.to_string())
+                .map(|m| m.with_frame(T::NAME, root))
+                .collect(),
         }
     }
 
@@ -198,20 +201,29 @@ pub enum RerootError {
     Malformed,
 }
 
-/// `meta` with its name moved from under `from` to under `to`.
+/// `meta` with its name moved from under `from` to under `to`, and its
+/// frame root moved with it.
 fn renamed(meta: &ComponentMetadata, from: &str, to: &str) -> ComponentMetadata {
-    let Some(rest) = meta.name.strip_prefix(from) else {
+    let Some(name) = moved(&meta.name, from, to) else {
         return meta.clone();
     };
-    if !(rest.is_empty() || rest.starts_with('.')) {
-        return meta.clone();
+    let mut metadata = meta.metadata.clone();
+    if let Some(root) = metadata.get_mut(FRAME_ROOT_KEY)
+        && let Some(root_moved) = moved(root, from, to)
+    {
+        *root = root_moved;
     }
-    let name = format!("{to}{rest}");
     ComponentMetadata {
         component_id: ComponentId::new(&name),
         name,
-        metadata: meta.metadata.clone(),
+        metadata,
     }
+}
+
+/// `path` moved from under `from` to under `to`, when it is under `from`.
+fn moved(path: &str, from: &str, to: &str) -> Option<String> {
+    let rest = path.strip_prefix(from)?;
+    (rest.is_empty() || rest.starts_with('.')).then(|| format!("{to}{rest}"))
 }
 
 /// The data range of each component id in `vtable`, with its new id.

@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 /// `"true"` or `"false"`: whether the db builds LoD levels for a component.
 pub const LOD_KEY: &str = "lod";
+/// The frame type a component is a field of.
+pub const FRAME_KEY: &str = "frame";
+/// The path a frame's fields sit under; one frame instance per root.
+pub const FRAME_ROOT_KEY: &str = "frame.root";
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Schema)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
@@ -69,6 +73,26 @@ impl ComponentMetadata {
         self.metadata
             .insert("is_string".to_string(), "true".to_string());
         self
+    }
+
+    /// Marks this component as a field of a frame: `name` is the frame's
+    /// type and `root` the path its fields sit under, so a ground tool can
+    /// gather every instance of one frame type without guessing from names.
+    pub fn with_frame(mut self, name: &str, root: &str) -> Self {
+        self.metadata
+            .insert(FRAME_KEY.to_string(), name.to_string());
+        self.metadata
+            .insert(FRAME_ROOT_KEY.to_string(), root.to_string());
+        self
+    }
+
+    /// The frame type and root this component is a field of, when its
+    /// producer said.
+    pub fn frame(&self) -> Option<(&str, &str)> {
+        Some((
+            self.metadata.get(FRAME_KEY)?.as_str(),
+            self.metadata.get(FRAME_ROOT_KEY)?.as_str(),
+        ))
     }
 
     pub fn group_name(&self) -> Option<&str> {
