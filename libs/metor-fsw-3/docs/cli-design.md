@@ -185,7 +185,7 @@ shape means no general graph layout is needed.
                                    ╰─────────────╯
 ```
 
-`--format mermaid|dot` writes text for docs and other tools instead.
+`--as mermaid` writes text for docs and other tools instead.
 
 ### `doctor`
 

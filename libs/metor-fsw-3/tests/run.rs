@@ -457,8 +457,8 @@ fn test_graph_joins_a_link_across_targets() {
     );
     let ports = graph(&["deploy.py", "--ports"]);
     assert!(
-        ports.contains("b.mirror") && !ports.contains("io_submit, io_complete"),
-        "every system is a box: {ports}"
+        ports.contains("b.mirror") && ports.contains("io_submit, io_complete  fsw.io"),
+        "idle systems are listed by kind: {ports}"
     );
 }
 

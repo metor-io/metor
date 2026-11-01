@@ -4,7 +4,7 @@
 use std::io::{self, Write};
 
 use super::lanes::{self, Span};
-use super::wiring::{Edge, Wiring};
+use super::wiring::{Node, Wiring};
 use crate::cli::ui::theme::{Theme, Token};
 use crate::cli::ui::{pad, width};
 
@@ -35,13 +35,16 @@ enum Part {
     Bottom,
 }
 
-/// The lines of a picture with the node each belongs to, the lanes between
-/// them and the node each leaves, and the `idle` nodes left out.
+/// A lane's source: a node and an output index, 0 for a whole system.
+type Key = (usize, usize);
+
+/// The lines of a picture with the node each belongs to, the rows lanes
+/// leave and enter by [`Key`], and the `idle` nodes left out.
 #[derive(Debug, Default)]
 struct Layout {
     parts: Vec<(usize, Part)>,
-    spans: Vec<Span>,
-    owners: Vec<usize>,
+    sources: Vec<(Key, usize)>,
+    sinks: Vec<(Key, usize)>,
     idle: Vec<usize>,
 }
 
@@ -50,6 +53,65 @@ impl Layout {
     fn push(&mut self, node: usize, part: Part) -> usize {
         self.parts.push((node, part));
         self.parts.len() - 1
+    }
+
+    /// A span from each source row to the rows its key enters.
+    fn spans(&self) -> Vec<Span> {
+        let span = |&(key, source): &(Key, usize)| Span {
+            source,
+            sinks: self
+                .sinks
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, r)| *r)
+                .collect(),
+        };
+        self.sources.iter().map(span).collect()
+    }
+
+    /// The rows of `node` for `detail`. By system, its feeders run in
+    /// ascending `rank`.
+    fn add(&mut self, wiring: &Wiring<'_>, node: usize, detail: Detail, rank: &[usize], out: char) {
+        self.push(node, Part::Top);
+        self.push(node, Part::Title);
+        match detail {
+            Detail::Systems => self.add_systems(wiring, node, rank, out),
+            Detail::Ports => self.add_ports(wiring, node, out),
+        }
+        self.push(node, Part::Bottom);
+    }
+
+    fn add_systems(&mut self, wiring: &Wiring<'_>, node: usize, rank: &[usize], out: char) {
+        let mut feeders = feeders(wiring, node);
+        feeders.sort_by_key(|&f| rank.get(f).copied().unwrap_or(0));
+        for source in feeders {
+            let row = self.push(node, group(wiring, source, node));
+            self.sinks.push(((source, 0), row));
+        }
+        let outputs = &wiring.nodes[node].outputs;
+        if !outputs.is_empty() {
+            let row = self.push(node, Part::Output(format!("{out} {}", fold(outputs, LIST))));
+            self.sources.push(((node, 0), row));
+        }
+    }
+
+    fn add_ports(&mut self, wiring: &Wiring<'_>, node: usize, out: char) {
+        for (input, port) in wiring.nodes[node].inputs.iter().enumerate() {
+            let part = Part::Input {
+                ports: port.to_string(),
+                from: None,
+            };
+            let row = self.push(node, part);
+            let edges = wiring
+                .edges
+                .iter()
+                .filter(|e| e.to == node && e.input == input);
+            self.sinks.extend(edges.map(|e| ((e.from, e.output), row)));
+        }
+        for (output, port) in wiring.nodes[node].outputs.iter().enumerate() {
+            let row = self.push(node, Part::Output(format!("{port} {out}")));
+            self.sources.push(((node, output), row));
+        }
     }
 }
 
@@ -60,86 +122,26 @@ fn is_idle(wiring: &Wiring<'_>, notes: &[Option<String>], node: usize) -> bool {
     ports.inputs.is_empty() && ports.outputs.is_empty() && !noted
 }
 
-/// A box per system, a row per port, and a lane per output.
-fn by_port(wiring: &Wiring<'_>, out: char) -> Layout {
+/// A box per system that isn't idle, its rows for `detail`.
+fn layout(
+    wiring: &Wiring<'_>,
+    notes: &[Option<String>],
+    out: char,
+    detail: Detail,
+    rank: &[usize],
+) -> Layout {
     let mut layout = Layout::default();
-    let mut inputs = vec![Vec::new(); wiring.nodes.len()];
-    let mut outputs = vec![Vec::new(); wiring.nodes.len()];
-    for (index, node) in wiring.nodes.iter().enumerate() {
-        layout.push(index, Part::Top);
-        layout.push(index, Part::Title);
-        for port in &node.inputs {
-            let ports = port.to_string();
-            inputs[index].push(layout.push(index, Part::Input { ports, from: None }));
-        }
-        for port in &node.outputs {
-            outputs[index].push(layout.push(index, Part::Output(format!("{port} {out}"))));
-        }
-        layout.push(index, Part::Bottom);
-    }
-    let mut keyed: Vec<((usize, usize), Span)> = Vec::new();
-    for edge in &wiring.edges {
-        let sink = inputs[edge.to][edge.input];
-        let key = (edge.from, edge.output);
-        match keyed.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, span)) => span.sinks.push(sink),
-            None => keyed.push((
-                key,
-                Span {
-                    source: outputs[edge.from][edge.output],
-                    sinks: vec![sink],
-                },
-            )),
+    for node in 0..wiring.nodes.len() {
+        if is_idle(wiring, notes, node) {
+            layout.idle.push(node);
+        } else {
+            layout.add(wiring, node, detail, rank, out);
         }
     }
-    layout.spans = keyed.into_iter().map(|(_, span)| span).collect();
     layout
 }
 
-/// A row per system feeding a box, one row for a box's outputs, and a lane
-/// per source system. A box's feeders run in ascending `rank`, by node.
-fn by_system(wiring: &Wiring<'_>, notes: &[Option<String>], out: char, rank: &[usize]) -> Layout {
-    let mut layout = Layout::default();
-    let mut sources = vec![None; wiring.nodes.len()];
-    let mut sinks: Vec<(usize, usize)> = Vec::new();
-    for (index, node) in wiring.nodes.iter().enumerate() {
-        if is_idle(wiring, notes, index) {
-            layout.idle.push(index);
-            continue;
-        }
-        layout.push(index, Part::Top);
-        layout.push(index, Part::Title);
-        let mut feeders = feeders(wiring, index);
-        feeders.sort_by_key(|&f| rank.get(f).copied().unwrap_or(0));
-        for source in feeders {
-            let part = group(wiring, source, index);
-            sinks.push((source, layout.push(index, part)));
-        }
-        if !node.outputs.is_empty() {
-            let part = Part::Output(format!("{out} {}", fold(&node.outputs, LIST)));
-            sources[index] = Some(layout.push(index, part));
-        }
-        layout.push(index, Part::Bottom);
-    }
-    (layout.owners, layout.spans) = system_spans(&sources, &sinks).into_iter().unzip();
-    layout
-}
-
-/// A span from each source row in `sources`, indexed by node, to the rows
-/// in `sinks` that node feeds, with that node.
-fn system_spans(sources: &[Option<usize>], sinks: &[(usize, usize)]) -> Vec<(usize, Span)> {
-    let span = |(node, row): (usize, &Option<usize>)| {
-        let rows = sinks.iter().filter(|(s, _)| *s == node).map(|(_, r)| *r);
-        let span = Span {
-            source: (*row)?,
-            sinks: rows.collect(),
-        };
-        Some((node, span))
-    };
-    sources.iter().enumerate().filter_map(span).collect()
-}
-
-/// The layout for `detail`, and its lanes' columns. By system, each box's
+/// The layout for `detail`, its spans, and their columns. Each box's
 /// feeders are ordered innermost lane first, so a lane ending in the box
 /// ends before an outer one taps across it.
 fn lay_out(
@@ -147,22 +149,16 @@ fn lay_out(
     notes: &[Option<String>],
     out: char,
     detail: Detail,
-) -> (Layout, Vec<usize>) {
-    let layout = match detail {
-        Detail::Systems => by_system(wiring, notes, out, &[]),
-        Detail::Ports => by_port(wiring, out),
-    };
-    let columns = lanes::pack(&layout.spans);
-    if detail == Detail::Ports {
-        return (layout, columns);
-    }
+) -> (Layout, Vec<Span>, Vec<usize>) {
+    let first = layout(wiring, notes, out, detail, &[]);
     let mut rank = vec![0; wiring.nodes.len()];
-    for (&node, &column) in layout.owners.iter().zip(&columns) {
-        rank[node] = column;
+    for (((node, _), _), column) in first.sources.iter().zip(lanes::pack(&first.spans())) {
+        rank[*node] = column;
     }
-    let layout = by_system(wiring, notes, out, &rank);
-    let columns = lanes::pack(&layout.spans);
-    (layout, columns)
+    let layout = layout(wiring, notes, out, detail, &rank);
+    let spans = layout.spans();
+    let columns = lanes::pack(&spans);
+    (layout, spans, columns)
 }
 
 /// The systems feeding `node`, in the order of their first edge.
@@ -179,14 +175,14 @@ fn feeders(wiring: &Wiring<'_>, node: usize) -> Vec<usize> {
 /// The row for the inputs of `node` that `source` feeds. A lone port named
 /// neither `output` nor `source.output` names the output it comes from.
 fn group(wiring: &Wiring<'_>, source: usize, node: usize) -> Part {
-    let edges: Vec<&Edge> = wiring
+    let edges: Vec<_> = wiring
         .edges
         .iter()
         .filter(|e| e.from == source && e.to == node)
         .collect();
     let mut names: Vec<&str> = Vec::new();
     for edge in &edges {
-        let name = wiring.nodes[node].inputs[edge.input];
+        let (_, name) = wiring.ports(edge);
         if !names.contains(&name) {
             names.push(name);
         }
@@ -194,9 +190,9 @@ fn group(wiring: &Wiring<'_>, source: usize, node: usize) -> Part {
     let id = wiring.nodes[source].id;
     let from = match edges.as_slice() {
         [edge] => {
-            let output = wiring.nodes[source].outputs[edge.output];
+            let (output, input) = wiring.ports(edge);
             let full = format!("{id}.{output}");
-            if names[0] == output || names[0] == full {
+            if input == output || input == full {
                 id.to_string()
             } else {
                 full
@@ -239,26 +235,19 @@ pub fn render(
     detail: Detail,
 ) -> io::Result<()> {
     let lines = &theme.glyphs.lines;
-    let (layout, columns) = lay_out(wiring, notes, lines.out, detail);
-    let grid = lanes::draw(layout.parts.len(), &layout.spans, &columns, lines);
+    let (layout, spans, columns) = lay_out(wiring, notes, lines.out, detail);
+    let grid = lanes::draw(layout.parts.len(), &spans, &columns, lines);
     let size = Size::of(wiring, &layout, theme.glyphs.from);
     let lane = theme.style(Token::Accent);
     for ((node, part), lanes) in layout.parts.iter().zip(&grid) {
         let lanes: String = lanes.iter().collect();
         write!(out, "{indent}{lane}{lanes}{lane:#}")?;
         let note = notes.get(*node).and_then(Option::as_deref);
-        let node = &wiring.nodes[*node];
-        write_part(out, part, node.id, node.kind, note, size, theme)?;
+        write_part(out, part, &wiring.nodes[*node], note, size, theme)?;
         writeln!(out)?;
     }
-    let margin = " ".repeat(lanes::width(&columns));
-    write_idle(
-        out,
-        wiring,
-        &layout.idle,
-        theme,
-        &format!("{indent}{margin}"),
-    )
+    let indent = format!("{indent}{}", " ".repeat(lanes::width(&columns)));
+    write_idle(out, wiring, &layout.idle, theme, &indent)
 }
 
 /// `a, b  kind` for each kind among `idle`, in step order.
@@ -299,71 +288,70 @@ struct Size {
 
 impl Size {
     fn of(wiring: &Wiring<'_>, layout: &Layout, glyph: &str) -> Self {
-        let boxed = || layout.parts.iter().map(|(node, _)| &wiring.nodes[*node]);
-        let id = boxed().map(|n| width(n.id)).max().unwrap_or(0);
-        let title = boxed().map(|n| id + 2 + width(n.kind)).max().unwrap_or(0);
-        let inputs = layout.parts.iter().filter_map(|(_, part)| match part {
-            Part::Input { ports, from } => Some((ports, from)),
-            _ => None,
+        let widest = |f: &dyn Fn(&Node<'_>, &Part) -> usize| {
+            let parts = layout.parts.iter();
+            parts
+                .map(|(node, part)| f(&wiring.nodes[*node], part))
+                .max()
+                .unwrap_or(0)
+        };
+        let id = widest(&|node, _| width(node.id));
+        let title = id + 2 + widest(&|node, _| width(node.kind));
+        let ports = widest(&|_, part| match part {
+            Part::Input { ports, .. } => width(ports),
+            _ => 0,
         });
-        let ports = inputs.clone().map(|(p, _)| width(p)).max().unwrap_or(0);
-        let from = inputs
-            .filter_map(|(_, from)| Some(source_width(glyph, from.as_deref()?)))
-            .max()
-            .unwrap_or(0);
-        let outputs = layout.parts.iter().filter_map(|(_, part)| match part {
-            Part::Output(text) => Some(width(text)),
-            _ => None,
+        let rest = widest(&|_, part| match part {
+            Part::Input { from, .. } => width(&source(glyph, from.as_deref())),
+            Part::Output(text) => width(text).saturating_sub(ports),
+            _ => 0,
         });
         Self {
             id,
             ports,
-            inner: title.max(ports + from).max(outputs.max().unwrap_or(0)),
+            inner: title.max(ports + rest),
         }
     }
 }
 
-/// The columns `  ← from` takes after an input row's ports.
-fn source_width(glyph: &str, from: &str) -> usize {
-    2 + width(glyph) + 1 + width(from)
+/// `  ← from`, written after an input row's ports.
+fn source(glyph: &str, from: Option<&str>) -> String {
+    from.map(|from| format!("  {glyph} {from}"))
+        .unwrap_or_default()
 }
 
 fn write_part(
     out: &mut impl Write,
     part: &Part,
-    id: &str,
-    kind: &str,
+    node: &Node<'_>,
     note: Option<&str>,
     size: Size,
     theme: &Theme,
 ) -> io::Result<()> {
     let lines = &theme.glyphs.lines;
-    let border = theme.style(Token::Muted);
     let muted = theme.style(Token::Muted);
-    let rule = || lines.horizontal.to_string().repeat(size.inner + 2);
+    let bar = format!("{muted}{}{muted:#}", lines.vertical);
+    let tee = format!("{muted}{}{muted:#}", lines.tee_left);
+    let rule = lines.horizontal.to_string().repeat(size.inner + 2);
     let inner = size.inner;
     match part {
         Part::Top => write!(
             out,
-            "{border}{}{}{}{border:#}",
-            lines.down_right,
-            rule(),
-            lines.down_left
+            "{muted}{}{rule}{}{muted:#}",
+            lines.down_right, lines.down_left
         ),
         Part::Bottom => write!(
             out,
-            "{border}{}{}{}{border:#}",
-            lines.up_right,
-            rule(),
-            lines.up_left
+            "{muted}{}{rule}{}{muted:#}",
+            lines.up_right, lines.up_left
         ),
         Part::Title => {
             let bold = theme.bold(theme.style(Token::Text));
+            let (id, kind) = (node.id, node.kind);
             let (id_pad, kind_pad) = (pad(id, size.id), pad(kind, inner - size.id - 2));
             write!(
                 out,
-                "{border}{}{border:#} {bold}{id}{bold:#}{id_pad}  {muted}{kind}{muted:#}{kind_pad} {border}{}{border:#}",
-                lines.vertical, lines.vertical,
+                "{bar} {bold}{id}{bold:#}{id_pad}  {muted}{kind}{muted:#}{kind_pad} {bar}"
             )?;
             match note {
                 Some(note) => write!(out, "  {muted}{note}{muted:#}"),
@@ -371,25 +359,15 @@ fn write_part(
             }
         }
         Part::Input { ports, from } => {
-            write!(out, "{border}{}{border:#} {ports}", lines.tee_left)?;
-            let used = match from {
-                Some(from) => {
-                    let glyph = theme.glyphs.from;
-                    let gap = pad(ports, size.ports);
-                    write!(out, "{gap}  {muted}{glyph} {from}{muted:#}")?;
-                    size.ports + source_width(glyph, from)
-                }
-                None => width(ports),
-            };
-            let rest = " ".repeat(inner - used);
-            write!(out, "{rest} {border}{}{border:#}", lines.vertical)
+            let from = source(theme.glyphs.from, from.as_deref());
+            let gap = pad(ports, size.ports);
+            let rest = pad(&from, inner - size.ports);
+            write!(out, "{tee} {ports}{gap}{muted}{from}{muted:#}{rest} {bar}")
         }
         Part::Output(text) => write!(
             out,
-            "{border}{}{border:#} {muted}{text}{muted:#}{} {border}{}{border:#}",
-            lines.tee_left,
-            pad(text, inner),
-            lines.vertical
+            "{tee} {muted}{text}{muted:#}{} {bar}",
+            pad(text, inner)
         ),
     }
 }
@@ -397,7 +375,7 @@ fn write_part(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::graph::wiring::Node;
+    use crate::cli::graph::wiring::Edge;
     use crate::cli::ui::caps::Caps;
 
     fn node<'a>(id: &'a str, kind: &'a str, inputs: &[&'a str], outputs: &[&'a str]) -> Node<'a> {
@@ -472,11 +450,26 @@ mod tests {
         }
     }
 
-    fn rendered(wiring: &Wiring<'_>, caps: &Caps, detail: Detail) -> String {
+    fn drawn(
+        wiring: &Wiring<'_>,
+        notes: &[Option<String>],
+        caps: &Caps,
+        indent: &str,
+        detail: Detail,
+    ) -> String {
         let mut out = Vec::new();
-        let notes = [Some("⇄ ground.cmd".into()), None, None, None];
-        render(&mut out, wiring, &notes, &Theme::new(caps), "  ", detail).expect("writes to a Vec");
+        render(&mut out, wiring, notes, &Theme::new(caps), indent, detail)
+            .expect("writes to a Vec");
         String::from_utf8(out).expect("utf-8")
+    }
+
+    fn rendered(wiring: &Wiring<'_>, caps: &Caps, detail: Detail) -> String {
+        let notes = [Some("⇄ ground.cmd".into()), None, None, None];
+        drawn(wiring, &notes, caps, "  ", detail)
+    }
+
+    fn plain(wiring: &Wiring<'_>, notes: &[Option<String>], detail: Detail) -> String {
+        drawn(wiring, notes, &unicode(), "", detail)
     }
 
     fn unicode() -> Caps {
@@ -514,11 +507,11 @@ mod tests {
     }
 
     #[test]
-    fn test_by_port_spans_group_an_output_s_edges() {
-        let layout = by_port(&fixture(), '>');
-        assert_eq!(layout.spans.len(), 3);
+    fn test_ports_spans_group_an_output_s_edges() {
+        let spans = layout(&fixture(), &[], '>', Detail::Ports, &[]).spans();
+        assert_eq!(spans.len(), 3);
         assert_eq!(
-            layout.spans[0],
+            spans[1],
             Span {
                 source: 7,
                 sinks: vec![6, 17]
@@ -528,11 +521,12 @@ mod tests {
     }
 
     #[test]
-    fn test_by_system_has_a_lane_per_source_system() {
-        let layout = by_system(&busy(), &[], '>', &[]);
-        assert_eq!(layout.spans.len(), 3, "plant, nav, and cmds");
-        assert_eq!(layout.spans[0].sinks.len(), 3, "plant feeds nav, ctrl, pub");
-        let cmds = &layout.spans[2];
+    fn test_systems_have_a_lane_per_source_system() {
+        let layout = layout(&busy(), &[], '>', Detail::Systems, &[]);
+        let spans = layout.spans();
+        assert_eq!(spans.len(), 3, "plant, nav, and cmds");
+        assert_eq!(spans[0].sinks.len(), 3, "plant feeds nav, ctrl, pub");
+        let cmds = &spans[2];
         assert!(cmds.sinks[0] < cmds.source, "cmds loops up");
         assert_eq!(layout.idle, [5, 6]);
     }
@@ -584,43 +578,13 @@ mod tests {
             nodes: vec![node("a", "k", &[], &[]), node("b", "k", &[], &[])],
             edges: Vec::new(),
         };
-        let mut out = Vec::new();
-        render(
-            &mut out,
-            &wiring,
-            &[],
-            &Theme::new(&unicode()),
-            "",
-            Detail::Systems,
-        )
-        .expect("writes to a Vec");
-        assert_eq!(String::from_utf8(out).expect("utf-8"), "a, b  k\n");
+        for detail in [Detail::Systems, Detail::Ports] {
+            assert_eq!(plain(&wiring, &[], detail), "a, b  k\n");
+        }
     }
 
     #[test]
-    fn test_render_ports_boxes_systems_without_edges() {
-        let wiring = Wiring {
-            nodes: vec![node("a", "k", &[], &[])],
-            edges: Vec::new(),
-        };
-        let mut out = Vec::new();
-        render(
-            &mut out,
-            &wiring,
-            &[],
-            &Theme::new(&unicode()),
-            "",
-            Detail::Ports,
-        )
-        .expect("writes to a Vec");
-        assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
-            "╭──────╮\n│ a  k │\n╰──────╯\n"
-        );
-    }
-
-    #[test]
-    fn test_by_system_fan_in_and_self_loop() {
+    fn test_systems_fan_in_and_self_loop() {
         let wiring = Wiring {
             nodes: vec![
                 node("a", "k", &["x"], &["p"]),
@@ -629,8 +593,9 @@ mod tests {
             ],
             edges: vec![edge(0, 0, 0, 0), edge(0, 0, 2, 0), edge(1, 0, 2, 0)],
         };
-        let layout = by_system(&wiring, &[], '>', &[]);
-        let span = |source| layout.spans.iter().find(|s| s.source == source);
+        let layout = layout(&wiring, &[], '>', Detail::Systems, &[]);
+        let spans = layout.spans();
+        let span = |source| spans.iter().find(|s| s.source == source);
         assert_eq!(
             span(3).map(|s| s.sinks.clone()),
             Some(vec![2, 11]),
@@ -667,18 +632,8 @@ mod tests {
             edges: Vec::new(),
         };
         let notes = [Some("⇄ b.mirror".into())];
-        let mut out = Vec::new();
-        render(
-            &mut out,
-            &wiring,
-            &notes,
-            &Theme::new(&unicode()),
-            "",
-            Detail::Systems,
-        )
-        .expect("writes to a Vec");
         assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
+            plain(&wiring, &notes, Detail::Systems),
             "╭─────────╮\n│ link  k │  ⇄ b.mirror\n╰─────────╯\nio  k\n"
         );
     }

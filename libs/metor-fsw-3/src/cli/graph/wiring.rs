@@ -13,6 +13,14 @@ pub struct Wiring<'a> {
     pub edges: Vec<Edge>,
 }
 
+impl<'a> Wiring<'a> {
+    /// The output and input port names `edge` joins.
+    pub fn ports(&self, edge: &Edge) -> (&'a str, &'a str) {
+        let output = self.nodes[edge.from].outputs[edge.output];
+        (output, self.nodes[edge.to].inputs[edge.input])
+    }
+}
+
 /// A system, with the ports that carry an edge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node<'a> {

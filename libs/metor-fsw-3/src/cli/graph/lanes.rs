@@ -23,20 +23,27 @@ impl Span {
         self.rows().max().unwrap_or(self.source)
     }
 
+    fn length(&self) -> usize {
+        self.bottom() - self.top()
+    }
+
     fn overlaps(&self, other: &Span) -> bool {
         self.top() <= other.bottom() && other.top() <= self.bottom()
     }
 }
 
-/// The most spans [`order`] orders exactly; past it, greedily.
+/// The most spans [`exact`] orders.
 const EXACT: usize = 12;
 
-/// The column of each span, 0 beside the boxes: the layout that draws the
-/// fewest crossings, then the narrowest, of [`nest`] and [`stack`] over an
-/// [`order`] refined by swapping neighbours.
+/// The column of each span, 0 beside the boxes: of [`nest`] and, for up to
+/// [`EXACT`] spans, [`exact`], the layout with the fewest crossings, then
+/// the narrowest.
 pub fn pack(spans: &[Span]) -> Vec<usize> {
-    let stacked = stack(spans, &refine(spans, order(spans)));
     let nested = nest(spans);
+    if spans.len() > EXACT {
+        return nested;
+    }
+    let stacked = stack(spans, &exact(spans));
     if drawn(spans, &nested) < drawn(spans, &stacked) {
         nested
     } else {
@@ -47,7 +54,7 @@ pub fn pack(spans: &[Span]) -> Vec<usize> {
 /// Shorter spans first, each in the innermost column free over its rows.
 fn nest(spans: &[Span]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..spans.len()).collect();
-    order.sort_by_key(|&i| (spans[i].bottom() - spans[i].top(), spans[i].top()));
+    order.sort_by_key(|&i| (spans[i].length(), spans[i].top()));
     let mut columns: Vec<Vec<usize>> = Vec::new();
     let mut placed = vec![0; spans.len()];
     for i in order {
@@ -91,58 +98,28 @@ fn drawn(spans: &[Span], columns: &[usize]) -> (usize, usize) {
     (total, width(columns))
 }
 
-/// `order` with neighbours swapped while a swap draws fewer crossings.
-fn refine(spans: &[Span], mut order: Vec<usize>) -> Vec<usize> {
-    let mut best = drawn(spans, &stack(spans, &order));
-    for _ in 0..order.len() {
-        let mut better = false;
-        for k in 1..order.len() {
-            order.swap(k - 1, k);
-            let score = drawn(spans, &stack(spans, &order));
-            if score < best {
-                (best, better) = (score, true);
-            } else {
-                order.swap(k - 1, k);
-            }
-        }
-        if !better {
-            break;
-        }
-    }
-    order
-}
-
 /// The rows of `outer` that cross `inner`'s line when `outer` lies outside.
 fn crossings(outer: &Span, inner: &Span) -> usize {
     let within = |row: &usize| inner.top() < *row && *row < inner.bottom();
     outer.rows().filter(within).count()
 }
 
-/// What placing `next` outside every span in `inside` costs: its crossings,
-/// then how many shorter spans it holds inside it, so short spans nest.
-fn cost(spans: &[Span], next: usize, inside: impl Iterator<Item = usize>) -> (usize, usize) {
-    let length = |s: &Span| s.bottom() - s.top();
-    inside.fold((0, 0), |(cross, nest), j| {
-        let longer = length(&spans[j]) > length(&spans[next]);
-        (
-            cross + crossings(&spans[next], &spans[j]),
-            nest + usize::from(longer),
-        )
-    })
-}
-
-/// The spans from innermost out, ordered to cross the fewest lines.
-fn order(spans: &[Span]) -> Vec<usize> {
-    match spans.len() {
-        0..=EXACT => exact(spans),
-        _ => greedy(spans),
-    }
-}
-
-/// The cheapest order, by a search over which spans lie inside.
+/// The spans from innermost out in the order that crosses the fewest lines,
+/// then holds the fewest shorter spans inside longer ones, by a search over
+/// which spans lie inside.
 fn exact(spans: &[Span]) -> Vec<usize> {
     let n = spans.len();
     let members = |set: usize| (0..n).filter(move |j| set & (1 << j) != 0);
+    let cost = |next: usize, set: usize| {
+        let outer = &spans[next];
+        members(set).fold((0, 0), |(cross, nest), j| {
+            let longer = spans[j].length() > outer.length();
+            (
+                cross + crossings(outer, &spans[j]),
+                nest + usize::from(longer),
+            )
+        })
+    };
     let mut best: Vec<Option<((usize, usize), usize)>> = vec![None; 1 << n];
     best[0] = Some(((0, 0), 0));
     for set in 0..(1usize << n) {
@@ -150,7 +127,7 @@ fn exact(spans: &[Span]) -> Vec<usize> {
             continue;
         };
         for next in (0..n).filter(|j| set & (1 << j) == 0) {
-            let (c, s) = cost(spans, next, members(set));
+            let (c, s) = cost(next, set);
             let total = ((cross + c, nest + s), next);
             let slot = &mut best[set | (1 << next)];
             if slot.is_none_or(|(old, _)| total.0 < old) {
@@ -165,18 +142,6 @@ fn exact(spans: &[Span]) -> Vec<usize> {
         set &= !(1 << last);
     }
     order.reverse();
-    order
-}
-
-/// Each step, the span cheapest to place outside those placed.
-fn greedy(spans: &[Span]) -> Vec<usize> {
-    let mut order: Vec<usize> = Vec::with_capacity(spans.len());
-    while order.len() < spans.len() {
-        let next = (0..spans.len())
-            .filter(|i| !order.contains(i))
-            .min_by_key(|&i| (cost(spans, i, order.iter().copied()), spans[i].top()));
-        order.extend(next);
-    }
     order
 }
 
@@ -203,15 +168,18 @@ pub fn draw(height: usize, spans: &[Span], columns: &[usize], lines: &Lines) -> 
         }
     }
     for (span, &column) in spans.iter().zip(columns) {
-        let sinks = core::iter::once(false).chain(core::iter::repeat(true));
-        for (row, sink) in span.rows().zip(sinks) {
+        for (index, row) in span.rows().enumerate() {
             let Some(line) = grid.get_mut(row) else {
                 continue;
             };
             for cell in &mut line[x(column) + 1..width - 1] {
                 *cell = join(*cell, lines);
             }
-            line[width - 1] = if sink { lines.arrow } else { lines.horizontal };
+            line[width - 1] = if index > 0 {
+                lines.arrow
+            } else {
+                lines.horizontal
+            };
         }
     }
     grid

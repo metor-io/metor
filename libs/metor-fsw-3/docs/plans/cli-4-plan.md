@@ -79,9 +79,9 @@ as `git log --graph` does:
 - One lane per output port, from its row to its last consumer's input
   row, tapped with `├▶` at each consumer between. A loop's lane runs up.
 - Lanes are ordered to draw the fewest crossings (`┼`, a tap across an
-  inner lane): exactly over every order up to 12 lanes, greedily past it,
-  then refined by swapping neighbours. Lanes that don't overlap share a
-  column. The old shortest-inside packing is kept when it draws fewer.
+  inner lane): up to 12 lanes, the better of an exact search over every
+  order and shortest-inside packing; past 12, shortest-inside. Lanes that
+  don't overlap share a column.
   By system, a box's input rows run innermost lane first, so a lane that
   ends in the box ends before an outer one taps across it.
 - A link system shows `⇄ target.system` beside its box, found by port.
@@ -90,20 +90,20 @@ as `git log --graph` does:
   fold onto one `▸` row, and port lists past 32 columns end in `+N`. A lone
   renamed port names its output (`← nav.attitude_estimate`). Systems with
   no edge get no box and follow as `a, b  kind`. `--ports` draws a lane
-  per output port, as above.
+  per output port and a row per port.
 - Lanes are `Accent` and box borders `Muted`; each target's title is in
   its hue. ASCII mode uses
   `+-|>` and `<`/`>`.
 
 The layout is a pure function from a target to a grid of styled cells;
-drawing is separate. `--as mermaid` and `--as dot` write text instead:
-one subgraph or cluster per target, an edge per input labelled with its
-port, and a dashed edge per link. `--format json` writes one `graph`
+drawing is separate. `--as mermaid` writes text instead: one subgraph
+per target, an edge per input labelled with its port, and a dotted edge
+per link. `--format json` writes one `graph`
 event of nodes and edges.
 
 Tests: lane packing over nested, disjoint, and loop spans; snapshots of
 the fixture target and a two-target deployment, Unicode and ASCII;
-Mermaid and DOT snapshots; an unknown target name.
+a Mermaid snapshot; an unknown target name.
 
 ### T3. Completions
 

@@ -37,7 +37,6 @@ pub struct Graph {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Text {
     Mermaid,
-    Dot,
 }
 
 /// Draws the deployment, or the target `args` names, to stdout.
@@ -54,73 +53,46 @@ pub fn graph(args: Graph, ui: &Ui) -> Result<(), RunError> {
         .map(|&t| (target_name(&config, t), wiring::wiring(&config.targets[t])))
         .collect();
     let within = within(&links, &chosen);
-    let text = match (args.text, ui.format) {
-        (Some(Text::Mermaid), _) => export::mermaid(&targets, &within),
-        (Some(Text::Dot), _) => export::dot(&targets, &within),
+    let mut out = io::stdout().lock();
+    match (args.text, ui.format) {
+        (Some(Text::Mermaid), _) => out.write_all(export::mermaid(&targets, &within).as_bytes()),
         (None, Format::Json) => {
             ui.emit(Event::Data("graph", &export::json(&targets, &within)));
-            return Ok(());
+            Ok(())
         }
         (None, Format::Human) => {
             let theme = Theme::new(&ui.stdout_caps());
-            let detail = if args.ports {
-                Detail::Ports
-            } else {
-                Detail::Systems
+            let detail = match args.ports {
+                true => Detail::Ports,
+                false => Detail::Systems,
             };
-            let picture = Picture {
-                config: &config,
-                chosen: &chosen,
-                links: &links,
-                theme: &theme,
-                detail,
-            };
-            return write_stdout(|out| draw(out, &picture, &targets));
+            draw(&mut out, &config, &links, &chosen, &theme, detail)
         }
-    };
-    write_stdout(|out| out.write_all(text.as_bytes()))
-}
-
-fn write_stdout(
-    write: impl FnOnce(&mut io::StdoutLock<'static>) -> io::Result<()>,
-) -> Result<(), RunError> {
-    write(&mut io::stdout().lock()).map_err(|source| RunError::Io {
+    }
+    .map_err(|source| RunError::Io {
         path: PathBuf::from("stdout"),
         source,
     })
 }
 
-/// What a human picture draws, and how.
-pub struct Picture<'a> {
-    pub config: &'a ResolvedDeployment,
-    pub chosen: &'a [usize],
-    pub links: &'a [Link],
-    pub theme: &'a Theme,
-    pub detail: Detail,
-}
-
-/// Each target in `picture.chosen`, with its wiring in `targets`: its title
-/// line, then its picture.
-pub fn draw(
+/// Each target in `chosen`: its title line, then its picture.
+fn draw(
     out: &mut impl Write,
-    picture: &Picture<'_>,
-    targets: &[export::Target<'_>],
+    config: &ResolvedDeployment,
+    links: &[Link],
+    chosen: &[usize],
+    theme: &Theme,
+    detail: Detail,
 ) -> io::Result<()> {
-    let Picture {
-        config,
-        chosen,
-        links,
-        theme,
-        detail,
-    } = *picture;
-    for (index, (&t, (_, wiring))) in chosen.iter().zip(targets).enumerate() {
+    for (index, &t) in chosen.iter().enumerate() {
         if index > 0 {
             writeln!(out)?;
         }
         show::write_title(out, &config.targets[t], t, theme)?;
         writeln!(out)?;
         let notes = notes(config, links, t, theme.glyphs.link);
-        picture::render(out, wiring, &notes, theme, "  ", detail)?;
+        let wiring = wiring::wiring(&config.targets[t]);
+        picture::render(out, &wiring, &notes, theme, "  ", detail)?;
     }
     Ok(())
 }
@@ -150,13 +122,12 @@ fn notes(
         .map(|s| {
             let peers: Vec<String> = links
                 .iter()
-                .filter_map(
-                    |link| match ((target, s) == link.dial, (target, s) == link.listen) {
-                        (true, _) => Some(system_name(config, link.listen)),
-                        (_, true) => Some(system_name(config, link.dial)),
-                        _ => None,
-                    },
-                )
+                .filter_map(|link| match (target, s) {
+                    at if at == link.dial => Some(link.listen),
+                    at if at == link.listen => Some(link.dial),
+                    _ => None,
+                })
+                .map(|at| system_name(config, at))
                 .collect();
             (!peers.is_empty()).then(|| format!("{glyph} {}", peers.join(", ")))
         })
