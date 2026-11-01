@@ -16,6 +16,42 @@ use super::conns::{ConnsMem, ops_for};
 use super::subscribe::Routes;
 use super::*;
 
+/// The output names of sequence `S` under the empty context, and its def.
+fn seq_def<S: crate::SequenceFn>(_: S) -> crate::SystemDef {
+    crate::sequence::def::<S>(&DefCx::empty()).expect("a static definition")
+}
+
+#[test]
+fn test_publish_alarm_ports_follow_io_sq_and_log() {
+    let def = seq_def(publish::publish());
+    let names: Vec<_> = def.outputs.iter().map(|p| p.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        [
+            "link_status",
+            "io_sq",
+            "log",
+            "alarm_raised",
+            "alarm_cleared"
+        ]
+    );
+    assert_eq!(def.io.map(|io| io.sq), Some(1));
+    assert_eq!(def.log, Some(2));
+}
+
+#[test]
+fn test_subscribe_alarm_ports_come_last() {
+    let def = seq_def(subscribe::subscribe());
+    let names: Vec<_> = def
+        .outputs
+        .iter()
+        .rev()
+        .take(2)
+        .map(|p| p.name.as_ref())
+        .collect();
+    assert_eq!(names, ["alarm_cleared", "alarm_raised"]);
+}
+
 #[test]
 fn test_status_changes_on_counters_only() {
     let status = LinkStatus {

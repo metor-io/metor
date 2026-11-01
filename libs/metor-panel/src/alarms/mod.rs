@@ -42,6 +42,10 @@ mod tests;
 /// history can be queried from the persisted message log on demand.
 const MAX_HISTORY: usize = 1000;
 
+/// How many clears that arrived before their raise the store keeps. A link may
+/// deliver a raise and a clear from the same cycle in either order.
+const MAX_EARLY_CLEARS: usize = 64;
+
 /// Longest a shelf may run. ISA-18.2 has no "shelve forever": a point that needs
 /// permanent suppression needs a configuration change, not an operator gesture.
 pub const MAX_SHELF_DURATION: Duration = Duration::from_secs(8 * 60 * 60);
@@ -133,6 +137,8 @@ pub struct AlarmState {
     latched: HashMap<AlarmId, LatchedAlarm>,
     shelves: HashMap<AlarmId, Shelf>,
     history: VecDeque<AlarmEvent>,
+    /// Clears for occurrences not yet raised, oldest first.
+    early_clears: VecDeque<(Timestamp, AlarmCleared)>,
     /// Total events ever pushed; a monotonic staleness stamp for observers
     /// (the plot's event overlay) that stays valid as the ring evicts.
     history_pushed: u64,
@@ -189,13 +195,24 @@ impl AlarmState {
             severity: Some(raised.severity),
             detail: raised.message,
         });
+        let early = self
+            .early_clears
+            .iter()
+            .position(|(_, c)| c.occurrence == raised.occurrence);
+        if let Some((ts, cleared)) = early.and_then(|i| self.early_clears.remove(i)) {
+            self.apply_cleared(ts, cleared);
+        }
     }
 
     /// Fold a clear. An occurrence the operator already dismissed is dropped; one that
     /// cleared unacknowledged latches instead, so it survives to be dismissed.
     pub fn apply_cleared(&mut self, timestamp: Timestamp, cleared: AlarmCleared) {
-        // Ignore clears for occurrences we never saw raised — they carry no state.
+        // A clear ahead of its raise waits for it.
         let Some(alarm) = self.active.remove(&cleared.occurrence) else {
+            if self.early_clears.len() == MAX_EARLY_CLEARS {
+                self.early_clears.pop_front();
+            }
+            self.early_clears.push_back((timestamp, cleared));
             return;
         };
         if !self.acked.remove(&cleared.occurrence) {

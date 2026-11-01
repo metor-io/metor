@@ -156,6 +156,7 @@ struct Exports {
     def: TypedFunc<(u32, u32, u32, u32, u32), u32>,
     create: TypedFunc<CreateArgs, u32>,
     execute: TypedFunc<(u32, i64), u32>,
+    destroy: TypedFunc<u32, ()>,
     alloc: TypedFunc<(u32, u32), u32>,
     free: TypedFunc<(u32, u32, u32), ()>,
 }
@@ -245,6 +246,11 @@ impl Guest {
         call(&mut self.store, self.exports.execute, (instance, now), fuel)
     }
 
+    /// Calls `metor_fsw_destroy`, which drops the instance and its ports.
+    pub fn destroy(&mut self, instance: u32, fuel: u64) -> Result<(), Trap> {
+        call(&mut self.store, self.exports.destroy, instance, fuel)
+    }
+
     /// Calls `metor_fsw_alloc` and returns the offset, or zero if allocation
     /// failed.
     pub fn alloc(&mut self, len: u32, align: u32, fuel: u64) -> Result<u32, Trap> {
@@ -325,6 +331,7 @@ impl Exports {
             def: typed(instance, store, "metor_fsw_def")?,
             create: typed(instance, store, "metor_fsw_create")?,
             execute: typed(instance, store, "metor_fsw_execute")?,
+            destroy: typed(instance, store, "metor_fsw_destroy")?,
             alloc: typed(instance, store, "metor_fsw_alloc")?,
             free: typed(instance, store, "metor_fsw_free")?,
         })

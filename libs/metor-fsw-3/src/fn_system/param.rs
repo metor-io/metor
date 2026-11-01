@@ -10,6 +10,7 @@ use metor_proto::types::Timestamp;
 
 use crate::{
     Rng,
+    alarm::{ALARM_CLEARED_PORT, ALARM_RAISED_PORT, AlarmPorts, Alarms, ClearedMsg, RaisedMsg},
     channel::{ABORT_PORT, Abort, AbortRequest},
     coordinator::MakeError,
     def::{DefCx, DefError, Records},
@@ -152,6 +153,8 @@ pub struct Defs {
     pub(crate) io: Option<IoPorts>,
     /// Whether any parameter is an `Rng`.
     pub(crate) rng: bool,
+    /// Whether any parameter is `Alarms`.
+    pub(crate) alarms: bool,
     /// Whether a parameter takes the inputs a config lists.
     pub(crate) takes_inputs: bool,
     /// Whether a parameter takes the outputs a config lists.
@@ -242,7 +245,7 @@ impl<'a> Cycle<'a> {
 
     /// Returns the sequence's handle as a `Seq<'a>`.
     ///
-    /// Redlines linked through it may only borrow what outlives `'a`.
+    /// Watches linked through it may only borrow what outlives `'a`.
     pub fn seq(&self) -> &'a Seq<'a> {
         // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
         // sequence, whose step builds its cycle `with_seq`, reaches this.
@@ -252,7 +255,7 @@ impl<'a> Cycle<'a> {
         // SAFETY: the lifetime parameter is phantom, so the layout does not
         // change. Through the result, a condition can only be linked if it
         // outlives `'a`, which ends no later than the body (see `with_seq`).
-        // The redlines are checked only while that body is alive, because
+        // The watches are stepped only while that body is alive, because
         // `advance` runs inside the future that owns it. `Seq`'s `Drop` clears the back-pointers of nodes that are still linked,
         // without calling any condition.
         unsafe { &*core::ptr::from_ref(seq).cast::<Seq<'a>>() }
@@ -459,6 +462,48 @@ impl Param for Rng {
         output: &'a mut Rng,
         _cx: &mut Cycle<'a>,
     ) -> &'a mut Rng {
+        output
+    }
+}
+
+/// `Alarms` takes the `alarm_raised` and `alarm_cleared` outputs, whatever
+/// the parameter is called.
+impl Param for Alarms {
+    type In<W: InputWake> = ();
+    type Out = Alarms;
+    type Item<'a, W: InputWake> = &'a mut Alarms;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        defs.outputs
+            .push(Output::<RaisedMsg>::def(cx, ALARM_RAISED_PORT));
+        defs.outputs
+            .push(Output::<ClearedMsg>::def(cx, ALARM_CLEARED_PORT));
+        defs.alarms = true;
+        Ok(())
+    }
+
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
+
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Alarms, MakeError> {
+        param_name(names);
+        // PANIC Safety: the coordinator binds one writer per declared output;
+        // a mismatch is a coordinator bug.
+        let mut next = || writers.bindings.next().expect("two bindings per Alarms");
+        let (raised, cleared) = (next(), next());
+        AlarmPorts::bind(&writers.instance, raised, cleared, &writers.dropped).map(Alarms::new)
+    }
+
+    fn get<'a, W: InputWake>(
+        _input: &'a mut (),
+        output: &'a mut Alarms,
+        cx: &mut Cycle<'a>,
+    ) -> &'a mut Alarms {
+        output.set_now(cx.now);
         output
     }
 }

@@ -161,7 +161,10 @@ fn test_pack_reports_system_metadata() {
             "until_fix",
             "count_up",
             "count_down",
-            "count_by"
+            "count_by",
+            "level",
+            "hot",
+            "burn"
         ]
     );
 

@@ -1,6 +1,7 @@
 //! The [`Seq`] handle, the wait futures it returns, and abort handlers.
 
 use core::cell::{Cell, UnsafeCell};
+use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
@@ -13,22 +14,25 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use cordyceps::List;
 use metor_proto::types::Timestamp;
 
-use super::redline::{Node, Redline};
+use super::watch::{Node, OnTrip, Watch};
+use crate::alarm::{AlarmPorts, Edge, Msg};
 use crate::log::Log;
 
 /// A sequence's handle to its current cycle.
 ///
 /// The body uses it to read the cycle time, check whether the sequence was
-/// aborted, wait, and add redlines.
+/// aborted, wait, and add alarms and redlines.
 ///
-/// The lifetime `'a` is invariant, and every redline condition linked into a
+/// The lifetime `'a` is invariant, and every watch condition linked into a
 /// `Seq<'a>` must outlive `'a`. Only this crate creates a `Seq`, and it never
-/// moves one after a redline is linked.
+/// moves one after a watch is linked.
 pub struct Seq<'a> {
     clock: Clock,
     polling: Cell<bool>,
-    redlines: UnsafeCell<List<Node>>,
+    watches: UnsafeCell<List<Node>>,
     walking: Cell<bool>,
+    /// Written only while `walking` is raised.
+    alarms: UnsafeCell<Option<AlarmPorts>>,
     _share_lifetime: PhantomData<fn(&'a ()) -> &'a ()>,
 }
 
@@ -57,10 +61,18 @@ impl<'a> Seq<'a> {
                 aborted: Cell::new(false),
             },
             polling: Cell::new(false),
-            redlines: UnsafeCell::new(List::new()),
+            watches: UnsafeCell::new(List::new()),
             walking: Cell::new(false),
+            alarms: UnsafeCell::new(None),
             _share_lifetime: PhantomData,
         }
+    }
+
+    /// A `Seq` that publishes its watches' edges on `alarms`.
+    pub(crate) fn with_alarms(ports: AlarmPorts) -> Self {
+        let mut seq = Self::new();
+        *seq.alarms.get_mut() = Some(ports);
+        seq
     }
 
     /// Returns the current cycle's time.
@@ -152,7 +164,8 @@ impl<'a> Seq<'a> {
         self.clock.now.set(now);
     }
 
-    /// Polls `body` once, unless the sequence is aborted or a redline trips.
+    /// Steps the watches, then polls `body` once, unless the sequence is
+    /// aborted or a redline trips.
     ///
     /// Returns [`SeqError::Aborted`] without polling `body` once the sequence
     /// is aborted. A tripped redline logs a `redline` fault with its name and
@@ -165,7 +178,7 @@ impl<'a> Seq<'a> {
     ) -> Poll<Result<(), SeqError>> {
         if !self.aborted()
             && let Some(name) =
-                catch_unwind(AssertUnwindSafe(|| self.tripped())).unwrap_or_else(|payload| {
+                catch_unwind(AssertUnwindSafe(|| self.walk())).unwrap_or_else(|payload| {
                     let _ = self.abort();
                     resume_unwind(payload)
                 })
@@ -180,72 +193,118 @@ impl<'a> Seq<'a> {
         body.poll(cx)
     }
 
-    /// Links a pinned redline into this `Seq`.
+    /// Links a pinned watch into this `Seq`.
     ///
-    /// Most code should use [`redline!`](crate::redline) instead, which
-    /// pins the redline for the rest of the block. The redline unlinks itself
-    /// when it is dropped. This call does nothing if the redline is already
-    /// linked, or if it is made while the redlines are being checked (for
-    /// example, from inside a condition).
+    /// Most code should use [`alarm!`](macro@crate::alarm) or
+    /// [`redline!`](crate::redline) instead, which pin the watch for the rest
+    /// of the block. The watch unlinks itself when it is dropped. This call
+    /// does nothing if the watch is already linked, or if it is made while
+    /// the watches are being stepped (for example, from inside a condition).
     ///
     /// A condition must outlive the sequence's parameters, so it cannot
     /// borrow a local of the body.
-    pub fn redline<C: Fn() -> bool + 'a>(&self, redline: Pin<&Redline<C>>) {
-        if self.walking.get() || !redline.node.claim(self) {
+    pub fn watch<C: 'a, F: 'a>(&self, watch: Pin<&Watch<C, F>>) {
+        if self.walking.get() || !watch.node.claim(self) {
             return;
         }
-        let node = NonNull::from(redline.get_ref()).cast::<Node>();
+        let node = NonNull::from(watch.get_ref()).cast::<Node>();
         // SAFETY: `Seq` is `!Sync`, so only this thread can reach the list,
         // and outside a walk no reference to it is live. The node is pinned,
         // so its memory lasts until its `Drop`, which unlinks it. The pointer
-        // is derived from the whole redline, which `check` casts back to.
-        unsafe { (*self.redlines.get()).push_back(node) };
+        // is derived from the whole watch, which `breached` casts back to.
+        unsafe { (*self.watches.get()).push_back(node) };
     }
 
-    /// Unlinks a node that is being dropped.
+    /// Unlinks a node that is being dropped, clearing its alarm.
     pub(crate) fn unlink(&self, node: NonNull<Node>) {
         if self.walking.get() {
-            // A condition dropped a linked redline, possibly its own, while
-            // the walk still borrows that redline's memory. There is no sound
+            // A condition dropped a linked watch, possibly its own, while
+            // the walk still borrows that watch's memory. There is no sound
             // way to continue.
             std::process::abort();
         }
-        // SAFETY: as in `redline`, only this thread can reach the list, and
-        // no reference to it is live outside a walk. `node` is linked into it.
-        unsafe { (*self.redlines.get()).remove(node) };
+        let _walking = Raised::new(&self.walking);
+        // SAFETY: the guard is up, so these are the only references to the
+        // list and the ports. `node` is live, being dropped, and linked.
+        unsafe {
+            clear(node.as_ref(), &mut *self.alarms.get());
+            (*self.watches.get()).remove(node);
+        }
     }
 
-    /// Returns the name of the first redline that trips.
+    /// Steps every linked watch, publishing its edges, and returns the name
+    /// of the first tripped redline.
     ///
-    /// Redlines are checked in the order they were linked.
+    /// Watches are stepped in the order they were linked.
     ///
     /// The caller must keep everything the conditions borrow alive for `'a`.
-    pub(crate) fn tripped(&self) -> Option<&'static str> {
+    pub(crate) fn walk(&self) -> Option<&'static str> {
         let _walking = Raised::new(&self.walking);
-        // SAFETY: while walking, `redline` refuses to link and `unlink`
-        // aborts the process, so this is the only reference to the list. Only
-        // this thread can reach it, since `Seq` is `!Sync`.
-        let list = unsafe { &mut *self.redlines.get() };
-        list.iter_raw()
+        let now = self.now();
+        // SAFETY: while walking, `watch` refuses to link and `unlink` aborts
+        // the process, so these are the only references to the list and the
+        // ports. Only this thread can reach them, since `Seq` is `!Sync`.
+        let (list, alarms) = unsafe { (&mut *self.watches.get(), &mut *self.alarms.get()) };
+        let mut tripped = None;
+        for node in list.iter_raw() {
             // SAFETY: a linked node's memory is live, and its pointer was
-            // derived from the whole redline. The caller keeps the
-            // condition's borrows alive. The body is suspended, and a
-            // condition only takes shared borrows. The body's own `&mut` to
-            // its `!Unpin` frame does not claim exclusive access, just as for
-            // any `async fn` that borrows a local across an `.await`.
-            .find(|&node| unsafe { Node::holds(node) })
+            // derived from the whole watch. The caller keeps the condition's
+            // borrows alive. The body is suspended, and a condition only
+            // takes shared borrows. The body's own `&mut` to its `!Unpin`
+            // frame does not claim exclusive access, just as for any
+            // `async fn` that borrows a local across an `.await`.
+            if let Some(edge) = unsafe { Node::step(node, now) }
+                && let Some(ports) = alarms
+            {
+                // SAFETY: as above.
+                let n = unsafe { node.as_ref() };
+                // SAFETY: as above.
+                let fmt = |m: &mut Msg| unsafe { Node::format(node, m) };
+                publish(ports, n, edge, fmt);
+            }
             // SAFETY: as above, a linked node is live.
-            .map(|node| unsafe { node.as_ref() }.name)
+            let node = unsafe { node.as_ref() };
+            if tripped.is_none() && node.tripped() {
+                tripped = Some(node.spec.id);
+            }
+        }
+        tripped
     }
 }
 
+/// Disarms `node` and publishes its clear, if it was active.
+fn clear(node: &Node, ports: &mut Option<AlarmPorts>) {
+    if let Some(edge) = node.disarm()
+        && let Some(ports) = ports
+    {
+        publish(ports, node, edge, |_| Ok(()));
+    }
+}
+
+/// Publishes `edge` for `node` under its alarm or redline id.
+fn publish(
+    ports: &mut AlarmPorts,
+    node: &Node,
+    edge: Edge,
+    fmt: impl FnOnce(&mut Msg) -> fmt::Result,
+) {
+    match node.on_trip {
+        OnTrip::Raise => ports.publish_alarm(&node.spec, edge, fmt),
+        OnTrip::RaiseAbort => ports.publish_redline(&node.spec, edge, fmt),
+    }
+}
+
+/// Clears and releases every node still linked, as from a leaked frame.
 impl Drop for Seq<'_> {
     fn drop(&mut self) {
-        let list = self.redlines.get_mut();
+        let list = self.watches.get_mut();
+        let ports = self.alarms.get_mut();
         while let Some(node) = list.pop_front() {
             // SAFETY: a linked node's memory is live until its `Drop` unlinks
             // it. Only the node itself is read; its condition is never called.
-            unsafe { node.as_ref() }.release();
+            let n = unsafe { node.as_ref() };
+            clear(n, ports);
+            n.release();
         }
     }
 }
@@ -394,12 +453,42 @@ mod tests {
     use core::task::Waker;
 
     use super::*;
+    use crate::alarm::{ClearedMsg, RaisedMsg};
+    use crate::sequence::SpecName;
     use crate::sequence::tests::{Trace, ms};
+    use crate::tests::utils::pair;
 
     const MS: Duration = Duration::from_millis(1);
 
     fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    const HOT: crate::AlarmSpec = crate::AlarmSpec::warning("hot");
+
+    /// A `Seq` with alarm ports, and the inputs that read them.
+    fn alarmed() -> (
+        Seq<'static>,
+        crate::port::Input<RaisedMsg>,
+        crate::port::Input<ClearedMsg>,
+        [metor_fsw_3_ring::RingBuffer; 2],
+    ) {
+        let (r1, raised_out, raised) = pair::<RaisedMsg>(64);
+        let (r2, cleared_out, cleared) = pair::<ClearedMsg>(64);
+        let ports = AlarmPorts::new(raised_out, cleared_out, "t").expect("fits");
+        (Seq::with_alarms(ports), raised, cleared, [r1, r2])
+    }
+
+    #[test]
+    fn test_dropping_an_active_watch_clears_it() {
+        let (seq, mut raised, mut cleared, _rings) = alarmed();
+        {
+            let watch = pin!(Watch::alarm(&HOT, || true, SpecName));
+            seq.watch(watch.as_ref());
+            seq.walk();
+        }
+        assert_eq!(raised.drain().count(), 1);
+        assert_eq!(cleared.drain().count(), 1);
     }
 
     #[test]

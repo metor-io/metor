@@ -262,7 +262,16 @@ class DeploymentTest(ConfigTest):
         self.assertEqual([s["id"] for s in systems], ["a", "db", "io_submit", "io_complete"])
         self.assertEqual(
             [i["port"] for i in systems[1]["inputs"]],
-            ["a.plant.imu", "a.plant.log", "a.plant.status", "a.link_status", "a.log", "a.status"],
+            [
+                "a.plant.imu",
+                "a.plant.log",
+                "a.plant.status",
+                "a.link_status",
+                "a.alarm_raised",
+                "a.alarm_cleared",
+                "a.log",
+                "a.status",
+            ],
         )
         self.assertEqual(db.db_status.record.__name__, "DbStatus")
 
@@ -275,7 +284,14 @@ class DeploymentTest(ConfigTest):
         pub = config["targets"][1]["coordinator"]["systems"][1]
         self.assertEqual(
             [i["port"] for i in pub["inputs"]],
-            ["mirror.plant.imu", "mirror.link_status", "mirror.log", "mirror.status"],
+            [
+                "mirror.plant.imu",
+                "mirror.link_status",
+                "mirror.alarm_raised",
+                "mirror.alarm_cleared",
+                "mirror.log",
+                "mirror.status",
+            ],
         )
 
     def test_message_arrives_on_one_port(self) -> None:

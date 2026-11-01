@@ -14,7 +14,7 @@ use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
 use crate::io::{Io, IoState, Sqe};
 use crate::port::{Input, Output};
-use crate::sequence::{self, SeqInputs, SequenceFn, SequenceStep};
+use crate::sequence::{self, SeqInputs, SeqOutputs, SequenceFn, SequenceStep};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
@@ -498,12 +498,12 @@ impl TableEntry {
             adapters: SystemKind::Sequence.adapters(),
             def: sequence::def::<S>(&DefCx::empty())?,
             takes_inputs: SeqInputs::<S>::takes_config_ports(),
-            takes_outputs: OutSet::<S>::takes_config_ports(),
+            takes_outputs: SeqOutputs::<S>::takes_config_ports(),
             def_fn: Box::new(sequence::def::<S>),
             doc: Cow::Borrowed(S::DOC),
             schema: C::schema(),
             make: Arc::new(move |mut cx| {
-                let (inputs, outs, io) = cx.bind_ports::<SeqInputs<S>, OutSet<S>>()?;
+                let (inputs, outs, io) = cx.bind_ports::<SeqInputs<S>, SeqOutputs<S>>()?;
                 let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
                 let SeqInputs { abort, ins } = inputs;
                 Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))

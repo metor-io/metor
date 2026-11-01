@@ -56,6 +56,18 @@ class Ping(Record):
     _pack = PACK
 
 
+class AlarmRaised(Record):
+    _kind = "msg"
+    _name = "alarm_raised"
+    _pack = PACK
+
+
+class AlarmCleared(Record):
+    _kind = "msg"
+    _name = "alarm_cleared"
+    _pack = PACK
+
+
 class Plant(System):
     """The vehicle."""
 
@@ -167,5 +179,28 @@ class Fan(System):
     def __init__(self, *, records: Sequence[type[Record]] = ()) -> None:
         super().__init__({}, {}, records=records)
 
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Burn(System):
+    """A sequence: its alarm ports follow its own outputs."""
+
+    _pack = PACK
+    _ty = "burn"
+    _ports = {
+        "cmd": MotorCmd,
+        "alarm_raised": AlarmRaised,
+        "alarm_cleared": AlarmCleared,
+        "log": LogEvent,
+        "status": SystemStatus,
+    }
+
+    def __init__(self, *, est: Sources[Est] = ()) -> None:
+        super().__init__({"est": est}, {})
+
+    cmd: OutPort[MotorCmd]
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]

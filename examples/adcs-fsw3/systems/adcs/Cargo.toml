@@ -33,5 +33,6 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 workspace = true
 
 [dev-dependencies]
+metor-fsw-3 = { path = "../../../../libs/metor-fsw-3" }
 metor-star = { path = "../../../../libs/metor-star", features = ["gpu", "testkit"] }
 serde_json = "1"

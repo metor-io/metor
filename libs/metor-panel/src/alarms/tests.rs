@@ -522,3 +522,37 @@ fn live_ingestion_orders_ack_before_a_buffered_escalation(cx: &mut gpui::TestApp
         );
     });
 }
+
+/// A clear that arrives before its raise applies once the raise does.
+#[test]
+fn a_clear_ahead_of_its_raise_waits_for_it() {
+    let mut state = AlarmState::default();
+    let cleared = AlarmCleared {
+        def_id: "A".into(),
+        occurrence: 1,
+    };
+    state.apply_cleared(ts(1), cleared);
+    state.apply_raised(ts(1), raised(1, Severity::Critical));
+    assert!(state.active_sorted().is_empty());
+    let pending = state.pending_sorted();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, TileState::ClearedUnacked);
+
+    state.apply_raised(ts(2), raised(2, Severity::Critical));
+    assert_eq!(state.active_sorted().len(), 1, "the clear was used up");
+}
+
+/// Early clears are bounded: the oldest is dropped first.
+#[test]
+fn early_clears_are_bounded() {
+    let mut state = AlarmState::default();
+    for occurrence in 0..=super::MAX_EARLY_CLEARS as u64 {
+        let cleared = AlarmCleared {
+            def_id: "A".into(),
+            occurrence,
+        };
+        state.apply_cleared(ts(1), cleared);
+    }
+    state.apply_raised(ts(2), raised(0, Severity::Warning));
+    assert_eq!(state.active_sorted().len(), 1, "the oldest was dropped");
+}

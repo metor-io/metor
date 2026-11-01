@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use common::{Ping, fixture_lib, fixture_wasm, open_wasm, panicked};
+use metor_fsw_3::alarm::{ClearedMsg, RaisedMsg};
 use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, MakeError};
 use metor_fsw_3::metor_proto_wkt::{LogEvent, SequenceCommand, SequenceCommandKind};
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -167,6 +168,20 @@ fn commander(#[state] c: &mut Commander, commands: &mut Output<SequenceCommand>)
 }
 
 struct Watch(Shared);
+
+/// Records the occurrence of every alarm raise and clear, in order.
+struct AlarmSink(Rc<RefCell<Vec<(bool, u64)>>>);
+
+#[system]
+fn alarm_sink(
+    #[state] s: &mut AlarmSink,
+    raised: &mut Input<RaisedMsg>,
+    cleared: &mut Input<ClearedMsg>,
+) {
+    let mut seen = s.0.borrow_mut();
+    seen.extend(raised.drain().flatten().map(|r| (true, r.occurrence)));
+    seen.extend(cleared.drain().flatten().map(|c| (false, c.occurrence)));
+}
 
 #[system]
 fn watch(#[state] w: &mut Watch, msg: &mut Input<ChannelMessage>) {
@@ -475,4 +490,63 @@ fn sequence_completes_aborts_and_resets(pack: &Arc<Pack>) {
     assert_eq!(messages, completed);
     assert_eq!(pings(&seen), [1, 2, 3]);
     assert_eq!(panicked(&coordinator).len(), 0);
+}
+
+/// Builds `older -> mode (echo.hot behind a channel) -> alarms`.
+fn hot_channel() -> CoordinatorConfig {
+    let mut config = channel();
+    config.systems.truncate(1);
+    config.systems.extend([
+        SystemConfig::new("older", "older"),
+        SystemConfig {
+            adapter: Some(Adapter::Channel(ChannelConfig {
+                name: metor_fsw_3::ChannelName::try_from("mode".to_string()).expect("a short name"),
+                start: RunState::Running,
+            })),
+            inputs: vec![
+                InputConfig::new("sample", "older", "sample"),
+                InputConfig::new("commands", "cmds", "commands"),
+            ],
+            ..SystemConfig::new("mode", "echo.hot")
+        },
+        SystemConfig {
+            inputs: vec![
+                InputConfig::new("raised", "mode", "alarm_raised"),
+                InputConfig::new("cleared", "mode", "alarm_cleared"),
+            ],
+            ..SystemConfig::new("alarms", "alarm_sink")
+        },
+    ]);
+    config
+}
+
+#[test]
+fn test_reset_while_active_clears() {
+    for pack in [wasm_pack(), dylib_pack()] {
+        reset_while_active_clears(&pack);
+    }
+}
+
+fn reset_while_active_clears(pack: &Arc<Pack>) {
+    let seen = Shared::default();
+    let edges = Rc::new(RefCell::new(Vec::new()));
+    let mut table = table(pack, &seen);
+    let e = edges.clone();
+    table
+        .register("alarm_sink", alarm_sink(), move || AlarmSink(e.clone()))
+        .expect("valid records");
+    let mut coordinator = hot_channel().build(&table).expect("the config builds");
+    run(&mut coordinator, 2);
+    let raised = edges.borrow().clone();
+    let [(true, occurrence)] = raised[..] else {
+        panic!("one raise: {raised:?}");
+    };
+    edges.borrow_mut().clear();
+    seen.borrow_mut().queue.push_back(SequenceCommandKind::Stop);
+    run(&mut coordinator, 1);
+    seen.borrow_mut()
+        .queue
+        .push_back(SequenceCommandKind::Reset);
+    run(&mut coordinator, 2);
+    assert_eq!(*edges.borrow(), [(false, occurrence)]);
 }

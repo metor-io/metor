@@ -9353,6 +9353,7 @@ dependencies = [
  "const-fnv1a-hash",
  "cordyceps",
  "futures-lite",
+ "heapless 0.8.0",
  "indexmap 2.14.0",
  "io-uring",
  "libc",

@@ -20,6 +20,8 @@ use crate::port::{Input, Output, Sample, ring_capacity};
 use crate::tests::utils::{Control, Imu, Nav, NoParams, input, output, pair, ring};
 use crate::{Frame, Payload, Record};
 
+mod alarms;
+
 /// Doubles the newest sample, stamping it with the cycle time.
 struct Doubler;
 

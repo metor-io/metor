@@ -16,6 +16,18 @@ PACK = Pack(
 )
 
 
+class AlarmCleared(Record):
+    _name = "alarm_cleared"
+    _kind = "msg"
+    _pack = PACK
+
+
+class AlarmRaised(Record):
+    _name = "alarm_raised"
+    _kind = "msg"
+    _pack = PACK
+
+
 class GpsFix(Record):
     _name = "gps_fix"
     _kind = "msg"
@@ -312,7 +324,7 @@ class UntilFix(System):
 
     _pack = PACK
     _ty = "until_fix"
-    _ports = {"log": LogEvent, "status": SystemStatus}
+    _ports = {"alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, fix: Sources[GpsFix] = (), timeout_s: float) -> None:
         """
@@ -321,6 +333,8 @@ class UntilFix(System):
         """
         super().__init__({"fix": fix}, {"timeout_s": timeout_s})
 
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 
@@ -330,12 +344,14 @@ class CountUp(System):
 
     _pack = PACK
     _ty = "count_up"
-    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+    _ports = {"output": Ping, "alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
 
     output: OutPort[Ping]
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 
@@ -345,12 +361,14 @@ class CountDown(System):
 
     _pack = PACK
     _ty = "count_down"
-    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+    _ports = {"output": Ping, "alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
 
     output: OutPort[Ping]
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 
@@ -360,7 +378,7 @@ class CountBy(System):
 
     _pack = PACK
     _ty = "count_by"
-    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+    _ports = {"output": Ping, "alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = (), by: int) -> None:
         """
@@ -370,5 +388,54 @@ class CountBy(System):
         super().__init__({"input": input}, {"by": by})
 
     output: OutPort[Ping]
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Level(System):
+    "Holds the newest ping's count as a sample, written every cycle."
+
+    _pack = PACK
+    _ty = "level"
+    _ports = {"sample": Sample, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    sample: OutPort[Sample]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Hot(System):
+    "Raises `hot` while the sample is 1 or more."
+
+    _pack = PACK
+    _ty = "hot"
+    _ports = {"alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, sample: Sources[Sample] = ()) -> None:
+        super().__init__({"sample": sample}, {})
+
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Burn(System):
+    "Raises `warm` at a sample of 1 or more, and aborts at 2 or more."
+
+    _pack = PACK
+    _ty = "burn"
+    _ports = {"alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, sample: Sources[Sample] = ()) -> None:
+        super().__init__({"sample": sample}, {})
+
+    alarm_raised: OutPort[AlarmRaised]
+    alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]

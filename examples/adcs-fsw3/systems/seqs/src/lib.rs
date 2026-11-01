@@ -6,8 +6,23 @@
 use core::time::Duration;
 
 use adcs_contracts::{AttitudeEstimate, ModeCmd, V3};
-use metor_fsw_3::{JsonSchema, Output, Sample, Seq, SeqError, SystemTable, sequence};
+use metor_fsw_3::{
+    AlarmSpec, JsonSchema, Output, Sample, Seq, SeqError, SystemTable, alarm, redline, sequence,
+};
 use serde::Deserialize;
+
+/// Raised while the body rate is above the settled rate.
+const DETUMBLING: AlarmSpec = AlarmSpec::warning("detumbling");
+
+/// Raised while the wheels, after taking over from the magnetorquers, let the
+/// rate climb past [`REBOUND`] times the settled rate.
+const RATE_REBOUND: AlarmSpec = AlarmSpec::warning("rate_rebound").debounce(12);
+
+/// How far past the settled rate the wheels may let the rate climb.
+const REBOUND: f64 = 2.0;
+
+/// A body rate (rad/s) no detumble should reach.
+const RUNAWAY_RATE: f64 = 0.5;
 
 /// Configuration for [`commission`].
 #[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
@@ -16,6 +31,9 @@ pub struct CommissionParams {
     pub rate: f64,
     /// Longest detumble (s) before going on to nadir regardless.
     pub detumble_timeout_s: f64,
+    /// How long (s) the sequence watches the wheels hold the rate after
+    /// detumbling.
+    pub handover_s: f64,
 }
 
 /// [`commission`]'s params, parsed from [`CommissionParams`].
@@ -26,6 +44,7 @@ pub struct CommissionParams {
 pub struct Commission {
     rate: f64,
     detumble_timeout: Duration,
+    handover: Duration,
 }
 
 impl TryFrom<CommissionParams> for Commission {
@@ -37,9 +56,12 @@ impl TryFrom<CommissionParams> for Commission {
         }
         let detumble_timeout = Duration::try_from_secs_f64(p.detumble_timeout_s)
             .map_err(|err| format!("`detumble_timeout_s`: {err}"))?;
+        let handover = Duration::try_from_secs_f64(p.handover_s)
+            .map_err(|err| format!("`handover_s`: {err}"))?;
         Ok(Self {
             rate: p.rate,
             detumble_timeout,
+            handover,
         })
     }
 }
@@ -55,7 +77,8 @@ impl JsonSchema for Commission {
 }
 
 /// Detumbles on the magnetorquers until the estimated rate settles, then
-/// holds nadir. Commands safe if aborted.
+/// commands nadir and watches the wheels hold the rate for the handover.
+/// Commands safe if aborted, and aborts on a runaway rate.
 #[sequence]
 pub async fn commission(
     #[state] params: &mut Commission,
@@ -67,24 +90,48 @@ pub async fn commission(
         let _ = mode_cmd.write(&ModeCmd::safe().stamped(seq.now()));
     });
     let _ = mode_cmd.write(&ModeCmd::detumble().stamped(seq.now()));
-    let settled = || {
-        estimate
-            .get()
-            .is_some_and(|e| below(&e.omega_b, params.rate))
-    };
-    // A slow detumble goes on to nadir, as a boot sequence would.
-    let _ = seq.wait_for(params.detumble_timeout, settled).await;
+    let rate = params.rate;
+    redline!(seq, "rate runaway", || estimate
+        .get()
+        .is_some_and(|e| !below(&e.omega_b, RUNAWAY_RATE)));
+    // `DETUMBLING` disarms when the detumble ends, settled or timed out.
+    {
+        alarm!(
+            seq,
+            &DETUMBLING,
+            move || estimate.get().map(|e| !below(&e.omega_b, rate)),
+            move |m| write!(m, "rate above {rate} rad/s")
+        );
+        let settled = || estimate.get().is_some_and(|e| below(&e.omega_b, rate));
+        // A slow detumble goes on to nadir, as a boot sequence would.
+        let _ = seq.wait_for(params.detumble_timeout, settled).await;
+    }
     let _ = mode_cmd.write(&ModeCmd::idle().stamped(seq.now()));
-    Ok(())
+    let rebound = REBOUND * rate;
+    alarm!(
+        seq,
+        &RATE_REBOUND,
+        move || estimate.get().map(|e| !below(&e.omega_b, rebound)),
+        move |m| {
+            let now = estimate.get().map_or(f64::NAN, |e| norm(&e.omega_b));
+            write!(m, "rate {now:.3} rad/s, above {rebound} on the wheels")
+        }
+    );
+    seq.sleep(params.handover).await
 }
 
-/// Whether `|v| < bound`, summed in scalar order.
+/// Whether `|v| < bound`.
+fn below(v: &V3, bound: f64) -> bool {
+    norm(v) < bound
+}
+
+/// `|v|`, summed in scalar order.
 ///
 /// `V3::norm` goes through `faer`, whose wasm build carries SIMD the module
 /// runtime refuses, and whose native build may round differently.
-fn below(v: &V3, bound: f64) -> bool {
+fn norm(v: &V3) -> f64 {
     let [x, y, z] = v.into_buf();
-    (x * x + y * y + z * z).sqrt() < bound
+    (x * x + y * y + z * z).sqrt()
 }
 
 /// Returns a table of the pack's sequences, registered as `commission`.

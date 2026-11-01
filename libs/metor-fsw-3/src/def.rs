@@ -166,6 +166,9 @@ pub enum DefError {
         max_len: usize,
         conn_cap: usize,
     },
+
+    #[error("async system `{system}` takes `Alarms`, which only a stepped system takes")]
+    AlarmsOnAsync { system: String },
 }
 
 /// The smallest whole-MiB `conn_cap` whose packets carry a `max_len`-byte

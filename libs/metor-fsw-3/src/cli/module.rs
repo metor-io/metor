@@ -727,6 +727,11 @@ mod tests {
         ));
         assert!(!text.contains("class Interface"), "{text}");
         assert!(text.contains("IO_RECORDS = (\"io_sqe\", \"io_cqe\")\n"));
+        assert!(text.contains("class AlarmRaised(Record):\n    _name = \"alarm_raised\"\n"));
+        assert!(
+            text.contains("_ports = {\"link_status\": LinkStatus, \"alarm_raised\": AlarmRaised, \"alarm_cleared\": AlarmCleared, \"log\": LogEvent, \"status\": SystemStatus}"),
+            "a sequence gains the alarm ports: {text}"
+        );
     }
 
     #[test]
