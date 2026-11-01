@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use metor_proto::types::{LenPacket, PacketId, PacketTy};
 use metor_proto_stellar::{PacketSink, PacketStream};
+use metor_proto_wkt::CommandInfo;
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
 use stellarator::sync::Mutex;
@@ -30,17 +31,29 @@ use crate::{ConnState, DB, Error, PacketTx};
 /// and forward `command_ids`' msg logs up the link from their live edge
 /// (nothing queued before this call is replayed).
 ///
+/// `db` advertises the forwarded set as its own commands, described by
+/// whichever of the link's `commands` it covers, so a client of `db` can
+/// build them and its commands ride on up the link.
+///
 /// `on_packet` is called once per ingested packet with whether the db took
 /// it, so a caller keeping a gauge counts what crossed without parsing the
 /// stream twice; a caller with no gauge passes `|_| {}`.
 pub async fn fsw_stream(
     command_ids: Vec<PacketId>,
+    commands: &[CommandInfo],
     rx: PacketStream<OwnedReader<TcpStream>>,
     tx: PacketSink<OwnedWriter<TcpStream>>,
     buf: Vec<u8>,
     db: &Arc<DB>,
     on_packet: impl FnMut(bool),
 ) -> Error {
+    db.add_command_ids(&command_ids);
+    let described: Vec<CommandInfo> = commands
+        .iter()
+        .filter(|c| command_ids.contains(&c.id))
+        .cloned()
+        .collect();
+    db.add_commands(&described);
     // The sink is shared the way the mirror already shares it (`PacketTx`
     // holds it behind this same lock); the ingest arms never reply to an
     // fsw stream, so the forwarder's sends are uncontended in practice.
@@ -98,14 +111,32 @@ mod tests {
     const CMD_B: PacketId = [0x52, 0];
     const DATA: PacketId = [0x33, 7];
 
+    /// Every command described as a message named for its id.
+    fn described(command_ids: &[PacketId]) -> Vec<CommandInfo> {
+        command_ids
+            .iter()
+            .map(|id| CommandInfo {
+                id: *id,
+                kind: metor_proto_wkt::CommandKind::Msg(metor_proto_wkt::MsgMetadata {
+                    name: format!("cmd_{}", id[0]),
+                    schema: postcard_schema::schema::owned::OwnedNamedType {
+                        name: "Cmd".into(),
+                        ty: postcard_schema::schema::owned::OwnedDataModelType::U8,
+                    },
+                    metadata: Default::default(),
+                }),
+            })
+            .collect()
+    }
+
     fn identity(command_ids: Vec<PacketId>) -> Vec<u8> {
         (&LinkInfo {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
+            commands: described(&command_ids),
             command_ids,
             namespace: None,
             link: String::new(),
-            commands: Vec::new(),
         })
             .into_len_packet()
             .inner
@@ -197,7 +228,16 @@ mod tests {
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            let err = fsw_stream(info.command_ids, rx, tx, buf, &stream_db, |_| {}).await;
+            let err = fsw_stream(
+                info.command_ids,
+                &info.commands,
+                rx,
+                tx,
+                buf,
+                &stream_db,
+                |_| {},
+            )
+            .await;
             tracing::info!(?err, "link ended");
         })
         .drop_guard();
@@ -217,6 +257,11 @@ mod tests {
             "the pushed msg ingested",
         )
         .await;
+        assert_eq!(
+            db.commands(),
+            described(&[CMD_A, CMD_B]),
+            "the link's commands are re-advertised"
+        );
 
         // Fresh commands on both advertised ids cross the link.
         db.push_msg(Timestamp(2), CMD_A, b"go").unwrap();
@@ -248,12 +293,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let inbound = fake_fsw(listener, vec![CMD_A, CMD_B]);
 
-        let Peer::Fsw { rx, tx, buf, .. } = identify(addr).await.expect("identify") else {
+        let Peer::Fsw { info, rx, tx, buf } = identify(addr).await.expect("identify") else {
             panic!("expected an fsw peer");
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            fsw_stream(vec![CMD_A], rx, tx, buf, &stream_db, |_| {}).await;
+            fsw_stream(vec![CMD_A], &info.commands, rx, tx, buf, &stream_db, |_| {}).await;
         })
         .drop_guard();
 
@@ -269,6 +314,7 @@ mod tests {
             "the link's push",
         )
         .await;
+        assert_eq!(db.commands(), described(&[CMD_A]), "only the forwarded set");
 
         db.push_msg(Timestamp(2), CMD_B, b"dropped").unwrap();
         db.push_msg(Timestamp(3), CMD_A, b"go").unwrap();

@@ -95,6 +95,10 @@ pub struct State {
     /// Msg ids this db serves as commands: a client forwards them up, and
     /// they never ride a [`SyncMsgs`] stream back down.
     command_ids: Vec<PacketId>,
+    /// What a client needs to build each command in `command_ids`, one per
+    /// id at most. An id may have none: a peer that predates descriptions
+    /// only names its commands.
+    commands: Vec<CommandInfo>,
     /// This db's telemetry namespace, when it serves one target's prefix.
     namespace: Option<String>,
 
@@ -439,12 +443,53 @@ impl DB {
     }
 
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
-    /// components carry and the command set clients forward up.
+    /// components carry and the command set clients forward up. A
+    /// description whose id leaves the set goes with it; describe the new
+    /// set with [`add_commands`](Self::add_commands).
     pub fn set_identity(&self, namespace: Option<String>, command_ids: Vec<PacketId>) {
         self.with_state_mut(|s| {
             s.namespace = namespace;
+            s.commands.retain(|c| command_ids.contains(&c.id));
             s.command_ids = command_ids;
         });
+    }
+
+    /// Union described commands into the advertised set, a re-sent id
+    /// replacing its description. A message command's description is also
+    /// its log's metadata, so it reads like any announced message; the
+    /// metadata generation moves either way, waking anything that lists
+    /// commands.
+    ///
+    /// A client mirroring a peer calls this with the peer's descriptions,
+    /// and so re-advertises them: its own clients' commands land in its
+    /// logs, which its forwarder carries on up to the peer.
+    pub fn add_commands(&self, commands: &[CommandInfo]) {
+        if commands.is_empty() {
+            return;
+        }
+        self.with_state_mut(|s| {
+            for command in commands {
+                if let CommandKind::Msg(metadata) = &command.kind
+                    && let Err(err) = s.set_msg_metadata(command.id, metadata.clone(), &self.path)
+                {
+                    warn!(?err, name = %metadata.name, "failed to record command metadata");
+                }
+                if !s.command_ids.contains(&command.id) {
+                    s.command_ids.push(command.id);
+                }
+                match s.commands.iter_mut().find(|c| c.id == command.id) {
+                    Some(existing) => *existing = command.clone(),
+                    None => s.commands.push(command.clone()),
+                }
+            }
+            s.metadata_generation = s.metadata_generation.wrapping_add(1);
+        });
+    }
+
+    /// The commands this db advertises with a description, in the order
+    /// they were first described.
+    pub fn commands(&self) -> Vec<CommandInfo> {
+        self.with_state(|s| s.commands.clone())
     }
 
     /// Union more ids into the advertised command set.
@@ -1894,14 +1939,19 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             })?;
         }
         Packet::Msg(m) if m.id == GetDbInfo::ID => {
-            let (command_ids, namespace) =
-                db.with_state(|s| (s.command_ids.clone(), s.namespace.clone()));
+            let (command_ids, namespace, commands) = db.with_state(|s| {
+                (
+                    s.command_ids.clone(),
+                    s.namespace.clone(),
+                    s.commands.clone(),
+                )
+            });
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
                 features: FEATURE_MSG_SYNC,
                 command_ids,
                 namespace,
-                commands: Vec::new(),
+                commands,
             })
             .await?;
         }
@@ -3226,6 +3276,50 @@ mod msg_sync_tests {
         assert_ne!(info.features & FEATURE_MSG_SYNC, 0);
         assert_eq!(info.command_ids, vec![CMD]);
         assert_eq!(info.namespace.as_deref(), Some("sat"));
+        assert!(info.commands.is_empty(), "nothing described the command");
+    }
+
+    fn msg_command(id: PacketId, name: &str) -> CommandInfo {
+        CommandInfo {
+            id,
+            kind: CommandKind::Msg(MsgMetadata {
+                name: name.into(),
+                schema: Payload::SCHEMA.into(),
+                metadata: Default::default(),
+            }),
+        }
+    }
+
+    /// Descriptions union by id into the advertised set, a message's also
+    /// naming its log, and a narrower identity drops the ones it leaves out.
+    #[stellarator::test]
+    async fn db_info_describes_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
+        db.set_identity(None, vec![CMD]);
+        let generation = db.metadata_gen.latest();
+        db.add_commands(&[msg_command(CMD, "old"), msg_command(LOG_A, "log_a")]);
+        db.add_commands(&[msg_command(CMD, "fire")]);
+        assert_ne!(db.metadata_gen.latest(), generation, "watchers woke");
+        assert_eq!(
+            db.with_state(|s| s
+                .msg_log_iter()
+                .find(|(id, _)| *id == CMD)
+                .and_then(|(_, meta)| meta.map(|m| m.name.clone()))),
+            Some("fire".to_string()),
+        );
+
+        let addr = serve(db.clone());
+        let mut client = Client::connect(addr).await.unwrap();
+        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
+        assert_eq!(info.command_ids, vec![CMD, LOG_A]);
+        assert_eq!(
+            info.commands,
+            vec![msg_command(CMD, "fire"), msg_command(LOG_A, "log_a")]
+        );
+
+        db.set_identity(None, vec![LOG_A]);
+        assert_eq!(db.commands(), vec![msg_command(LOG_A, "log_a")]);
     }
 
     /// The seeded latest arrives with its source timestamp, live records

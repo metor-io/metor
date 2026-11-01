@@ -151,6 +151,10 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> 
         peer_version = info.protocol_version,
         "mirroring remote db"
     );
+    // Advertised again by this db, so its own clients' commands reach the
+    // peer through the forwarder below.
+    db.add_command_ids(&info.command_ids);
+    db.add_commands(&info.commands);
     emit(MirrorEvent::Connected);
 
     let metadata: DumpMetadataResp = handshake_request(client.request(&DumpMetadata)).await?;
