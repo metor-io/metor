@@ -29,7 +29,7 @@ pub struct Graph {
     #[arg(long = "as", value_enum, value_name = "FORMAT")]
     pub text: Option<Text>,
     /// Draw a lane per port instead of one per system.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "text")]
     pub ports: bool,
 }
 
@@ -63,9 +63,10 @@ pub fn graph(args: Graph, ui: &Ui) -> Result<(), RunError> {
         }
         (None, Format::Human) => {
             let theme = Theme::new(&ui.stdout_caps());
-            let detail = match args.ports {
-                true => Detail::Ports,
-                false => Detail::Systems,
+            let detail = if args.ports {
+                Detail::Ports
+            } else {
+                Detail::Systems
             };
             let picture = Picture {
                 config: &config,

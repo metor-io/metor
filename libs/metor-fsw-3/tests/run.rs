@@ -451,8 +451,15 @@ fn test_graph_joins_a_link_across_targets() {
     assert!(mermaid.contains("t1_0 <-.-> t0_0"), "{mermaid}");
     let one = graph(&["deploy.py", "b"]);
     assert!(!one.contains("  a  "), "one target: {one}");
+    assert!(
+        picture.contains("io_submit, io_complete  fsw.io"),
+        "{picture}"
+    );
     let ports = graph(&["deploy.py", "--ports"]);
-    assert!(ports.contains("b.mirror"), "{ports}");
+    assert!(
+        ports.contains("b.mirror") && !ports.contains("io_submit, io_complete"),
+        "every system is a box: {ports}"
+    );
 }
 
 /// `metor new target` makes a project that checks as written. The

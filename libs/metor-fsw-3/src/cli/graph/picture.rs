@@ -35,7 +35,7 @@ enum Part {
     Bottom,
 }
 
-/// The lines of a picture, the node each belongs to, and the lanes between
+/// The lines of a picture with the node each belongs to, the lanes between
 /// them, and the `idle` nodes left out.
 #[derive(Debug, Default)]
 struct Layout {
@@ -59,16 +59,12 @@ fn is_idle(wiring: &Wiring<'_>, notes: &[Option<String>], node: usize) -> bool {
     ports.inputs.is_empty() && ports.outputs.is_empty() && !noted
 }
 
-/// A row per port, and a lane per output.
-fn by_port(wiring: &Wiring<'_>, notes: &[Option<String>], out: char) -> Layout {
+/// A box per system, a row per port, and a lane per output.
+fn by_port(wiring: &Wiring<'_>, out: char) -> Layout {
     let mut layout = Layout::default();
     let mut inputs = vec![Vec::new(); wiring.nodes.len()];
     let mut outputs = vec![Vec::new(); wiring.nodes.len()];
     for (index, node) in wiring.nodes.iter().enumerate() {
-        if is_idle(wiring, notes, index) {
-            layout.idle.push(index);
-            continue;
-        }
         layout.push(index, Part::Top);
         layout.push(index, Part::Title);
         for port in &node.inputs {
@@ -122,18 +118,21 @@ fn by_system(wiring: &Wiring<'_>, notes: &[Option<String>], out: char) -> Layout
         }
         layout.push(index, Part::Bottom);
     }
-    layout.spans = sources
-        .iter()
-        .enumerate()
-        .filter_map(|(node, row)| {
-            let sinks = sinks.iter().filter(|(s, _)| *s == node).map(|(_, r)| *r);
-            Some(Span {
-                source: (*row)?,
-                sinks: sinks.collect(),
-            })
-        })
-        .collect();
+    layout.spans = system_spans(&sources, &sinks);
     layout
+}
+
+/// A span from each source row in `sources`, indexed by node, to the rows
+/// in `sinks` that node feeds.
+fn system_spans(sources: &[Option<usize>], sinks: &[(usize, usize)]) -> Vec<Span> {
+    let span = |(node, row): (usize, &Option<usize>)| {
+        let rows = sinks.iter().filter(|(s, _)| *s == node).map(|(_, r)| *r);
+        Some(Span {
+            source: (*row)?,
+            sinks: rows.collect(),
+        })
+    };
+    sources.iter().enumerate().filter_map(span).collect()
 }
 
 /// The systems feeding `node`, in the order of their first edge.
@@ -167,9 +166,10 @@ fn group(wiring: &Wiring<'_>, source: usize, node: usize) -> Part {
         [edge] => {
             let output = wiring.nodes[source].outputs[edge.output];
             let full = format!("{id}.{output}");
-            match names[0] == output || names[0] == full {
-                true => id.to_string(),
-                false => full,
+            if names[0] == output || names[0] == full {
+                id.to_string()
+            } else {
+                full
             }
         }
         _ => id.to_string(),
@@ -211,7 +211,7 @@ pub fn render(
     let lines = &theme.glyphs.lines;
     let layout = match detail {
         Detail::Systems => by_system(wiring, notes, lines.out),
-        Detail::Ports => by_port(wiring, notes, lines.out),
+        Detail::Ports => by_port(wiring, lines.out),
     };
     let columns = lanes::pack(&layout.spans);
     let grid = lanes::draw(layout.parts.len(), &layout.spans, &columns, lines);
@@ -282,7 +282,7 @@ impl Size {
         });
         let ports = inputs.clone().map(|(p, _)| width(p)).max().unwrap_or(0);
         let from = inputs
-            .filter_map(|(_, from)| Some(2 + width(glyph) + 1 + width(from.as_deref()?)))
+            .filter_map(|(_, from)| Some(source_width(glyph, from.as_deref()?)))
             .max()
             .unwrap_or(0);
         let outputs = layout.parts.iter().filter_map(|(_, part)| match part {
@@ -295,6 +295,11 @@ impl Size {
             inner: title.max(ports + from).max(outputs.max().unwrap_or(0)),
         }
     }
+}
+
+/// The columns `  ← from` takes after an input row's ports.
+fn source_width(glyph: &str, from: &str) -> usize {
+    2 + width(glyph) + 1 + width(from)
 }
 
 fn write_part(
@@ -346,7 +351,7 @@ fn write_part(
                     let glyph = theme.glyphs.from;
                     let gap = pad(ports, size.ports);
                     write!(out, "{gap}  {muted}{glyph} {from}{muted:#}")?;
-                    size.ports + 2 + width(glyph) + 1 + width(from)
+                    size.ports + source_width(glyph, from)
                 }
                 None => width(ports),
             };
@@ -484,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_by_port_spans_group_an_output_s_edges() {
-        let layout = by_port(&fixture(), &[], '>');
+        let layout = by_port(&fixture(), '>');
         assert_eq!(layout.spans.len(), 3);
         assert_eq!(
             layout.spans[0],
@@ -564,6 +569,69 @@ mod tests {
         )
         .expect("writes to a Vec");
         assert_eq!(String::from_utf8(out).expect("utf-8"), "a, b  k\n");
+    }
+
+    #[test]
+    fn test_render_ports_boxes_systems_without_edges() {
+        let wiring = Wiring {
+            nodes: vec![node("a", "k", &[], &[])],
+            edges: Vec::new(),
+        };
+        let mut out = Vec::new();
+        render(
+            &mut out,
+            &wiring,
+            &[],
+            &Theme::new(&unicode()),
+            "",
+            Detail::Ports,
+        )
+        .expect("writes to a Vec");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "╭──────╮\n│ a  k │\n╰──────╯\n"
+        );
+    }
+
+    #[test]
+    fn test_by_system_fan_in_and_self_loop() {
+        let wiring = Wiring {
+            nodes: vec![
+                node("a", "k", &["x"], &["p"]),
+                node("b", "k", &[], &["p"]),
+                node("c", "k", &["x"], &[]),
+            ],
+            edges: vec![edge(0, 0, 0, 0), edge(0, 0, 2, 0), edge(1, 0, 2, 0)],
+        };
+        let layout = by_system(&wiring, &[], '>');
+        let span = |source| layout.spans.iter().find(|s| s.source == source);
+        assert_eq!(
+            span(3).map(|s| s.sinks.clone()),
+            Some(vec![2, 11]),
+            "a loops and feeds c"
+        );
+        assert_eq!(
+            span(7).map(|s| s.sinks.clone()),
+            Some(vec![12]),
+            "b feeds c"
+        );
+        assert_eq!(
+            layout.parts[11..13]
+                .iter()
+                .map(|(_, part)| part.clone())
+                .collect::<Vec<_>>(),
+            [
+                Part::Input {
+                    ports: "x".into(),
+                    from: Some("a.p".into())
+                },
+                Part::Input {
+                    ports: "x".into(),
+                    from: Some("b.p".into())
+                },
+            ],
+            "one row per feeding system"
+        );
     }
 
     #[test]
