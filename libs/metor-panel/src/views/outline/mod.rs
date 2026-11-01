@@ -47,7 +47,8 @@ use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{theme, ui_px};
-use crate::tiles::OpenOutlineAction;
+use crate::tiles::{OpenOutlineAction, OpenPivotTableAction};
+use crate::views::PivotTableConfig;
 use model::{Disclosure, FrameType, Layout, OutlineRow, RowKind, flatten, root_node, type_key};
 
 /// Indent per tree depth, in pixels.
@@ -676,6 +677,42 @@ impl OutlineDelegate {
         self.pivot_scrolls.entry(path.clone()).or_default().clone()
     }
 
+    /// The pivot tables a branch can open as: every frame of its tagged
+    /// type, its branch children by a pattern, and every subtree with at
+    /// least its fields.
+    fn table_configs(&self, row: &OutlineRow) -> Vec<(SharedString, PivotTableConfig)> {
+        let node = &row.node;
+        let mut out = Vec::new();
+        if let Some(frame) = frame_type(&self.db, node) {
+            out.push((
+                SharedString::from(format!("Open all {frame} frames as table")),
+                PivotTableConfig {
+                    frame,
+                    ..Default::default()
+                },
+            ));
+        }
+        if node.children.values().any(|c| !c.children.is_empty()) {
+            out.push((
+                SharedString::new_static("Open children as table"),
+                PivotTableConfig {
+                    pattern: format!("{}.{{instance}}", node.full_name),
+                    ..Default::default()
+                },
+            ));
+        }
+        if row.component_count > usize::from(node.component_id.is_some()) {
+            out.push((
+                SharedString::new_static("Open alike frames as table"),
+                PivotTableConfig {
+                    shape: signature(node).iter().map(|f| f.to_string()).collect(),
+                    ..Default::default()
+                },
+            ));
+        }
+        out
+    }
+
     /// Right-click on a row: a branch pivots or folds its subtree, a
     /// component plots or copies, a pivot instance copies its path.
     fn open_row_menu(
@@ -773,6 +810,15 @@ impl OutlineDelegate {
             )));
         }
         if is_branch {
+            for (label, config) in self.table_configs(row) {
+                rows.push(Box::new(CommandRow::new(
+                    label,
+                    Arc::new(move |window, cx| {
+                        let config = config.clone();
+                        window.dispatch_action(Box::new(OpenPivotTableAction { config }), cx);
+                    }),
+                )));
+            }
             for (label, expanded) in [("Expand all", true), ("Collapse all", false)] {
                 let target = row.clone();
                 let table = table.clone();
@@ -954,7 +1000,7 @@ impl OutlineDelegate {
         let key = grid.key.clone();
         let rows = field_menu_rows(
             grid,
-            field,
+            Some(field),
             Arc::new(move |field, hidden, cx| {
                 table.update(cx, |table, cx| {
                     table
@@ -1408,6 +1454,21 @@ fn pivot_scroller(row_ix: usize, scroll: ScrollHandle) -> gpui::Stateful<gpui::D
         .track_scroll(&scroll);
     scroller.style().restrict_scroll_to_axis = Some(true);
     scroller
+}
+
+/// The frame type `node` is the root of, when its producer tagged it.
+fn frame_type(db: &DB, node: &ComponentNode) -> Option<String> {
+    let id = first_component(node)?;
+    db.with_state(|state| {
+        let meta = state.get_component_metadata(id)?;
+        let (frame, root) = meta.frame()?;
+        (root == node.full_name.as_ref()).then(|| frame.to_string())
+    })
+}
+
+fn first_component(node: &ComponentNode) -> Option<ComponentId> {
+    node.component_id
+        .or_else(|| node.children.values().find_map(|c| first_component(c)))
 }
 
 /// `"1 field"` / `"3 fields"`.

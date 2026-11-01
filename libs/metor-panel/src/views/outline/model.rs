@@ -41,7 +41,7 @@ use crate::views::component_browser::component_tree::{
     ComponentNode, chain_to, component_count, under,
 };
 use crate::views::component_browser::prune_to_matches;
-use crate::views::pivot::{Arrangement, Grid, alike, children};
+use crate::views::pivot::{Arrangement, Frame, Grid, alike, children};
 
 /// Depth below which branches start open: the top-level namespaces are
 /// disclosed and everything beneath them is folded.
@@ -336,13 +336,13 @@ fn push_type_rows(
     rows: &mut Vec<OutlineRow>,
 ) {
     let filtering = !layout.query.is_empty();
-    let mut instances: Vec<(Arc<ComponentNode>, SharedString)> = alike(tree, &t.fields)
+    let mut instances: Vec<Frame> = alike(tree, &t.fields)
         .into_iter()
         .filter(|n| !filtering || layout.query.matches_name(&n.full_name))
         .filter(|n| under(layout.root, &n.full_name))
         .map(|n| {
             let label = n.full_name.clone();
-            (n, label)
+            Frame::labelled(n, label)
         })
         .collect();
     if layout.descending {
@@ -356,7 +356,7 @@ fn push_type_rows(
         segment: t.label.clone(),
         full_name: key.clone(),
         component_id: None,
-        children: instances.iter().map(|(n, _)| n.clone()).collect(),
+        children: instances.iter().map(|f| f.node.clone()).collect(),
     });
     let expanded = focused || filtering || layout.disclosure.is_expanded(&key, 0);
     let arrangement = layout.layouts.get(&key);

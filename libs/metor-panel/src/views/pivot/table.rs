@@ -1,0 +1,684 @@
+//! The pivot table: every instance of a kind of frame as one row, its
+//! fields as columns.
+//!
+//! Where the outline pivots one branch inline, this view gathers instances
+//! from anywhere through its [`Sources`] — a producer's frame tag, a path
+//! pattern whose captures become key columns, a shape, hand-picked paths —
+//! and lays them out on real table columns, so fields resize, reorder and
+//! hide like any table's. The same view serves as a pane and a dashboard
+//! widget.
+//!
+//! The source fields are plain inspector-editable text; the view compares
+//! them against what it last resolved at render time, so an inspector edit
+//! re-resolves without a setter, as the annunciator's pattern does.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui::{
+    AnyElement, App, Context, Entity, IntoElement, Pixels, Render, SharedString, Window, div,
+    prelude::*, px,
+};
+use metor_db::DB;
+use serde::{Deserialize, Serialize};
+
+use super::cell::{cell_width, field_cell, field_menu_rows};
+use super::model::{Arrangement, Frame, Grid};
+use super::source::{FrameIndex, RowPattern, Sources};
+#[allow(unused_imports)]
+use crate::inspect;
+use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
+use crate::query::Query;
+use crate::theme::{theme, ui_px};
+use crate::views::component_browser::component_tree::{
+    ComponentNode, build_full_tree, natural_cmp,
+};
+use crate::views::component_browser::strip_cell_count;
+use crate::views::lazy_pool::VisibleEntityCache;
+use crate::views::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
+use crate::views::value_strip::ComponentValueStrip;
+
+/// Live strips kept alive; well above any visible cell count.
+const CACHE_CAP: usize = 512;
+/// Window for coalescing a burst of vtable-generation bumps into one rebuild.
+const VTABLE_DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// Persisted shape of a [`PivotTable`], shared by the pane and the
+/// dashboard widget. Every source is optional; a table lists the union of
+/// the ones set.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct PivotTableConfig {
+    pub title: String,
+    /// A frame type, gathered by the tag its producer stamps on each field.
+    pub frame: String,
+    /// A row pattern: a glob with `{captures}`, or a `/regex/`.
+    pub pattern: String,
+    /// Fields an instance must have; it may have more.
+    pub shape: Vec<String>,
+    /// Hand-picked instance paths.
+    pub instances: Vec<String>,
+    /// Keeps only instances whose path matches, in the filter bar's syntax.
+    pub filter: String,
+    /// Drops instances whose path matches any of these terms.
+    pub exclude: String,
+    /// Fields first, in this order.
+    pub fields: Vec<String>,
+    pub hidden: Vec<String>,
+}
+
+/// The text of every source, as last resolved.
+#[derive(Default, Clone, PartialEq)]
+struct Spec {
+    frame: SharedString,
+    pattern: SharedString,
+    filter: SharedString,
+    exclude: SharedString,
+    shape: Vec<SharedString>,
+    instances: Vec<SharedString>,
+}
+
+/// The pivot table pane and widget.
+#[derive(facet::Facet)]
+pub struct PivotTable {
+    /// Names the tab; empty falls back to the frame type or pattern.
+    pub title: SharedString,
+    #[facet(inspect::label = "Frame type")]
+    pub frame: SharedString,
+    #[facet(inspect::label = "Row pattern")]
+    pub pattern: SharedString,
+    pub filter: SharedString,
+    pub exclude: SharedString,
+    #[facet(opaque)]
+    shape: Vec<SharedString>,
+    #[facet(opaque)]
+    instances: Vec<SharedString>,
+    #[facet(opaque)]
+    resolved: Spec,
+    /// Why the pattern didn't compile, shown over the table.
+    #[facet(skip)]
+    error: Option<SharedString>,
+    #[facet(opaque)]
+    tree: Arc<ComponentNode>,
+    #[facet(opaque)]
+    frames: FrameIndex,
+    #[facet(opaque)]
+    table: Entity<Table<PivotDelegate>>,
+    #[facet(opaque)]
+    _watcher: gpui::Task<()>,
+}
+
+impl PivotTable {
+    pub fn from_config(cfg: PivotTableConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let arrangement = Arrangement {
+            order: cfg.fields.into_iter().map(SharedString::from).collect(),
+            hidden: cfg.hidden.into_iter().map(SharedString::from).collect(),
+            rows: Vec::new(),
+        };
+        let table = cx.new(|_| Table::new(PivotDelegate::new(db.clone(), arrangement)));
+        cx.observe(&table, |_, _, cx| cx.notify()).detach();
+        let strings = |v: Vec<String>| v.into_iter().map(SharedString::from).collect();
+        Self {
+            title: cfg.title.into(),
+            frame: cfg.frame.into(),
+            pattern: cfg.pattern.into(),
+            filter: cfg.filter.into(),
+            exclude: cfg.exclude.into(),
+            shape: strings(cfg.shape),
+            instances: strings(cfg.instances),
+            // Never equal to a real spec, so the first render resolves.
+            resolved: Spec {
+                frame: "\0".into(),
+                ..Default::default()
+            },
+            error: None,
+            tree: Arc::new(ComponentNode {
+                segment: SharedString::default(),
+                full_name: SharedString::default(),
+                component_id: None,
+                children: Default::default(),
+            }),
+            frames: FrameIndex::default(),
+            table,
+            _watcher: spawn_watcher(db, cx),
+        }
+    }
+
+    pub fn to_config(&self, cx: &App) -> PivotTableConfig {
+        let strings = |v: &[SharedString]| v.iter().map(|s| s.to_string()).collect();
+        let arrangement = &self.table.read(cx).delegate().arrangement;
+        let mut hidden: Vec<String> = arrangement.hidden.iter().map(|s| s.to_string()).collect();
+        hidden.sort();
+        PivotTableConfig {
+            title: self.title.to_string(),
+            frame: self.frame.to_string(),
+            pattern: self.pattern.to_string(),
+            shape: strings(&self.shape),
+            instances: strings(&self.instances),
+            filter: self.filter.to_string(),
+            exclude: self.exclude.to_string(),
+            fields: strings(&arrangement.order),
+            hidden,
+        }
+    }
+
+    /// The tab's name: the title, else what the table gathers.
+    pub fn tab_title(&self) -> SharedString {
+        [&self.title, &self.frame, &self.pattern]
+            .into_iter()
+            .find(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| SharedString::new_static("Pivot"))
+    }
+
+    fn spec(&self) -> Spec {
+        Spec {
+            frame: self.frame.clone(),
+            pattern: self.pattern.clone(),
+            filter: self.filter.clone(),
+            exclude: self.exclude.clone(),
+            shape: self.shape.clone(),
+            instances: self.instances.clone(),
+        }
+    }
+
+    /// Resolve the sources against the latest tree and hand the rows to
+    /// the table.
+    fn resolve(&mut self, cx: &mut Context<Self>) {
+        let spec = self.spec();
+        let pattern = match RowPattern::parse(&spec.pattern) {
+            Ok(p) => {
+                self.error = None;
+                p
+            }
+            Err(e) => {
+                self.error = Some(format!("Row pattern: {e}").into());
+                None
+            }
+        };
+        let keys = pattern
+            .as_ref()
+            .map(|p| p.capture_names().to_vec())
+            .unwrap_or_default();
+        let sources = Sources {
+            frame: spec.frame.clone(),
+            pattern,
+            shape: spec.shape.clone(),
+            instances: spec.instances.clone(),
+            filter: Query::parse(&spec.filter),
+            exclude: Sources::parse_exclude(&spec.exclude),
+        };
+        let frames = sources.resolve(&self.tree, &self.frames);
+        self.resolved = spec;
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().set_frames(frames, keys, cx);
+        });
+    }
+
+    fn status(&self, cx: &App) -> SharedString {
+        if let Some(error) = &self.error {
+            return error.clone();
+        }
+        let grid = &self.table.read(cx).delegate().grid;
+        if grid.instances.is_empty() {
+            let r = &self.resolved;
+            let unset = r.frame.trim().is_empty()
+                && r.pattern.trim().is_empty()
+                && r.shape.is_empty()
+                && r.instances.is_empty();
+            return if unset {
+                SharedString::new_static(
+                    "Set a frame type or row pattern in the inspector to gather instances",
+                )
+            } else {
+                SharedString::new_static("No instances match")
+            };
+        }
+        format!(
+            "{} × {}",
+            count_label(grid.instances.len(), "instance"),
+            count_label(grid.fields.len(), "field")
+        )
+        .into()
+    }
+}
+
+/// Rebuild the tree and the frame tags whenever a component registers.
+fn spawn_watcher(db: Arc<DB>, cx: &mut Context<PivotTable>) -> gpui::Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            let seen = db.vtable_gen.latest();
+            let tree = Arc::new(build_full_tree(&db));
+            let frames = FrameIndex::from_db(&db);
+            let result = this.update(cx, |view, cx| {
+                view.tree = tree;
+                view.frames = frames;
+                view.resolve(cx);
+            });
+            if result.is_err() {
+                break;
+            }
+            crate::vtable_changed(&db, seen).await;
+            cx.background_executor().timer(VTABLE_DEBOUNCE).await;
+        }
+    })
+}
+
+impl Render for PivotTable {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.resolved != self.spec() {
+            self.resolve(cx);
+        }
+        let theme = theme(cx);
+        let status = self.status(cx);
+        let status_color = if self.error.is_some() {
+            theme.error_accent
+        } else {
+            theme.text_tertiary
+        };
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.bg_primary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(ui_px(24.0))
+                    .px(ui_px(8.0))
+                    .border_b_1()
+                    .border_color(theme.border_primary)
+                    .text_size(ui_px(11.0))
+                    .text_color(status_color)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(status),
+            )
+            .child(div().flex_1().min_h_0().w_full().child(self.table.clone()))
+    }
+}
+
+/// Row source for the pivot table: the resolved instances, laid out on a
+/// [`Grid`] by the table's arrangement and shown in sort order.
+pub struct PivotDelegate {
+    db: Arc<DB>,
+    frames: Vec<Frame>,
+    /// Capture names, one key column each.
+    keys: Vec<SharedString>,
+    arrangement: Arrangement,
+    grid: Arc<Grid>,
+    /// Grid instance indices in display order.
+    order: Vec<usize>,
+    sort: Option<(usize, ColumnSort)>,
+    strips: VisibleEntityCache<ComponentValueStrip>,
+}
+
+impl PivotDelegate {
+    fn new(db: Arc<DB>, arrangement: Arrangement) -> Self {
+        Self {
+            db,
+            frames: Vec::new(),
+            keys: Vec::new(),
+            arrangement,
+            grid: Arc::new(Grid::new(SharedString::default(), Vec::new(), None, &|_| 1)),
+            order: Vec::new(),
+            sort: None,
+            strips: VisibleEntityCache::new(CACHE_CAP),
+        }
+    }
+
+    fn set_frames(
+        &mut self,
+        frames: Vec<Frame>,
+        keys: Vec<SharedString>,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        self.frames = frames;
+        self.keys = keys;
+        self.relayout(cx);
+    }
+
+    fn relayout(&mut self, cx: &mut Context<Table<Self>>) {
+        let db = self.db.clone();
+        self.grid = Arc::new(Grid::new(
+            SharedString::new_static("pivot"),
+            self.frames.clone(),
+            Some(&self.arrangement),
+            &|id| strip_cell_count(&db, id),
+        ));
+        self.apply_sort();
+        cx.notify();
+    }
+
+    /// Instance and key columns sort naturally; unsorted is path order.
+    fn apply_sort(&mut self) {
+        let grid = &self.grid;
+        let mut order: Vec<usize> = (0..grid.instances.len()).collect();
+        if let Some((col, sort)) = self.sort
+            && sort != ColumnSort::Default
+        {
+            let text = |ix: usize| -> &str {
+                let inst = &grid.instances[ix];
+                match col {
+                    0 => &inst.label,
+                    k => inst.captures.get(k - 1).map_or("", |s| s.as_ref()),
+                }
+            };
+            order.sort_by(|&a, &b| natural_cmp(text(a), text(b)));
+            if sort == ColumnSort::Descending {
+                order.reverse();
+            }
+        }
+        self.order = order;
+    }
+
+    /// First column index that shows a field.
+    fn field_start(&self) -> usize {
+        1 + self.keys.len()
+    }
+
+    fn set_hidden(&mut self, field: &SharedString, hidden: bool, cx: &mut Context<Table<Self>>) {
+        self.arrangement.set_hidden(field, hidden);
+        self.relayout(cx);
+    }
+
+    fn render_text(&self, text: SharedString, primary: bool, cx: &App) -> AnyElement {
+        let theme = theme(cx);
+        div()
+            .flex()
+            .items_center()
+            .h_full()
+            .px(ui_px(8.0))
+            .text_size(ui_px(12.0))
+            .text_color(if primary {
+                theme.text_primary
+            } else {
+                theme.text_secondary
+            })
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(text)
+            .into_any_element()
+    }
+}
+
+impl TableDelegate for PivotDelegate {
+    fn columns(&self) -> Vec<Column> {
+        let mut cols = vec![Column::new("Instance", 220.0).min_width(80.0).sortable()];
+        cols.extend(
+            self.keys
+                .iter()
+                .map(|k| Column::new(format!("{{{k}}}"), 80.0).sortable()),
+        );
+        cols.extend(
+            self.grid
+                .fields
+                .iter()
+                .zip(&self.grid.cells)
+                .map(|(field, &n)| Column::new(field.clone(), cell_width(n, field)).movable()),
+        );
+        cols
+    }
+
+    fn rows_count(&self) -> usize {
+        self.order.len()
+    }
+
+    fn row_height(&self) -> Pixels {
+        px(ROW_HEIGHT)
+    }
+
+    fn frame_rendered(&mut self) {
+        self.strips.prune();
+    }
+
+    fn render_cell(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) -> AnyElement {
+        let Some(&ix) = self.order.get(row_ix) else {
+            return div().into_any_element();
+        };
+        let grid = self.grid.clone();
+        let instance = &grid.instances[ix];
+        if col_ix == 0 {
+            return self.render_text(instance.label.clone(), true, cx);
+        }
+        let start = self.field_start();
+        if col_ix < start {
+            let value = instance
+                .captures
+                .get(col_ix - 1)
+                .cloned()
+                .unwrap_or_default();
+            return self.render_text(value, false, cx);
+        }
+        let field_ix = col_ix - start;
+        let (Some(field), Some(&n)) = (grid.fields.get(field_ix), grid.cells.get(field_ix)) else {
+            return div().into_any_element();
+        };
+        field_cell(&self.db, &mut self.strips, instance, field_ix, field, n, cx)
+    }
+
+    fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &mut Context<Table<Self>>) {
+        self.sort = Some((col_ix, sort));
+        self.apply_sort();
+        cx.notify();
+    }
+
+    fn move_column(&mut self, from: usize, to: usize, cx: &mut Context<Table<Self>>) {
+        let start = self.field_start();
+        if from < start {
+            return;
+        }
+        let mut fields = self.grid.fields.clone();
+        let field = fields.remove(from - start);
+        fields.insert(to.saturating_sub(start).min(fields.len()), field);
+        self.arrangement.order = fields;
+        self.relayout(cx);
+    }
+
+    /// Right-click on a header: hide a field, or bring a hidden one back.
+    fn header_menu(
+        &mut self,
+        col_ix: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let Some(open) = open_inspector(cx) else {
+            return;
+        };
+        let field = col_ix
+            .checked_sub(self.field_start())
+            .and_then(|ix| self.grid.fields.get(ix));
+        if field.is_none() && self.grid.hidden.is_empty() {
+            return;
+        }
+        let table = cx.entity();
+        let rows = field_menu_rows(
+            &self.grid,
+            field,
+            Arc::new(move |field, hidden, cx| {
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().set_hidden(&field, hidden, cx);
+                });
+            }),
+        );
+        open(
+            InspectorRequest {
+                rows,
+                mode: InspectorMode::Anchored(position),
+            },
+            window,
+            cx,
+        );
+    }
+}
+
+/// `"1 field"` / `"3 fields"`.
+fn count_label(n: usize, singular: &str) -> String {
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {singular}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+    use metor_proto_wkt::ComponentMetadata;
+
+    use super::*;
+
+    /// Three PSU ports, tagged as `psu` frames except the last, plus an
+    /// untagged sibling.
+    fn psu_db() -> (Arc<DB>, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        let fields = [
+            ("dut1.psu.current", Some("dut1.psu")),
+            ("dut1.psu.voltage", Some("dut1.psu")),
+            ("dut2.psu.current", Some("dut2.psu")),
+            ("dut2.psu.voltage", Some("dut2.psu")),
+            ("dut3.psu.current", None),
+            ("dut3.serial", None),
+        ];
+        for (name, root) in fields {
+            let mut meta = ComponentMetadata::from(name);
+            if let Some(root) = root {
+                meta = meta.with_frame("psu", root);
+            }
+            let id = meta.component_id;
+            db.with_state_mut(|s| {
+                s.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)?;
+                s.set_component_metadata(meta, &db.path)
+            })
+            .unwrap();
+        }
+        (Arc::new(db), temp)
+    }
+
+    fn open(
+        db: &Arc<DB>,
+        cfg: PivotTableConfig,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<PivotTable> {
+        let view = cx.update(|_, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            crate::inspector::edits::init(cx);
+            cx.new(|cx| PivotTable::from_config(cfg, db.clone(), cx))
+        });
+        cx.run_until_parked();
+        view
+    }
+
+    fn labels(view: &Entity<PivotTable>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
+        cx.update(|_, cx| {
+            let delegate = view.read(cx).table.read(cx).delegate();
+            delegate
+                .order
+                .iter()
+                .map(|&ix| delegate.grid.instances[ix].label.to_string())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_frame_type_gathers_every_tagged_instance(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        let cx = cx.add_empty_window();
+        let view = open(
+            &db,
+            PivotTableConfig {
+                frame: "psu".into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(labels(&view, cx), ["dut1.psu", "dut2.psu"]);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, cx| {
+                    let cols = table.delegate().columns().len();
+                    assert_eq!(cols, 3);
+                    for row in 0..table.delegate().rows_count() {
+                        for col in 0..cols {
+                            table.delegate_mut().render_cell(row, col, window, cx);
+                        }
+                    }
+                    assert!(
+                        table
+                            .delegate()
+                            .strips
+                            .contains(metor_proto::types::ComponentId::new("dut2.psu.voltage"))
+                    );
+                });
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn an_inspector_edit_re_resolves_and_captures_become_keys(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        let cx = cx.add_empty_window();
+        let view = open(&db, PivotTableConfig::default(), cx);
+        assert!(labels(&view, cx).is_empty());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                // What a reflective field write leaves behind; render notices.
+                view.pattern = "dut{dut}.psu".into();
+                assert!(view.resolved != view.spec());
+                view.resolve(cx);
+            })
+        });
+        assert_eq!(labels(&view, cx), ["dut1.psu", "dut2.psu", "dut3.psu"]);
+        cx.update(|_, cx| {
+            let table = view.read(cx).table.read(cx);
+            let names: Vec<String> = table
+                .delegate()
+                .columns()
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect();
+            assert_eq!(names, ["Instance", "{dut}", "current", "voltage"]);
+            let config = view.read(cx).to_config(cx);
+            assert_eq!(config.pattern, "dut{dut}.psu");
+        });
+    }
+
+    #[gpui::test]
+    fn hiding_and_moving_fields_persist(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        let cx = cx.add_empty_window();
+        let view = open(
+            &db,
+            PivotTableConfig {
+                frame: "psu".into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, cx| {
+                    // Instance, current, voltage: drop voltage before current.
+                    table.delegate_mut().move_column(2, 1, cx);
+                    assert_eq!(table.delegate().grid.fields, ["voltage", "current"]);
+                    table.delegate_mut().set_hidden(&"current".into(), true, cx);
+                    assert_eq!(table.delegate().grid.fields, ["voltage"]);
+                });
+            });
+            let config = view.read(cx).to_config(cx);
+            assert_eq!(config.fields, ["voltage", "current"]);
+            assert_eq!(config.hidden, ["current"]);
+        });
+    }
+}

@@ -136,15 +136,18 @@ pub(crate) fn field_label(
         .drag_over::<FieldDrag>(move |style, _, _, _| style.bg(drop_target))
 }
 
-/// Hide `field`, or bring back one the grid hides. `set_hidden` applies
-/// the choice to whatever holds the grid's arrangement.
+/// Hide `field` when there is one, or bring back one the grid hides.
+/// `set_hidden` applies the choice to whatever holds the grid's
+/// arrangement.
 pub(crate) fn field_menu_rows(
     grid: &Grid,
-    field: &SharedString,
+    field: Option<&SharedString>,
     set_hidden: Arc<dyn Fn(SharedString, bool, &mut App)>,
 ) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::with_capacity(grid.hidden.len() + 1);
-    let entries = std::iter::once((field.clone(), true))
+    let entries = field
+        .map(|f| (f.clone(), true))
+        .into_iter()
         .chain(grid.hidden.iter().map(|f| (f.clone(), false)));
     for (field, hide) in entries {
         let verb = if hide { "Hide" } else { "Show" };

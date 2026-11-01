@@ -108,6 +108,22 @@ fn trim_zeros(digits: &[u8]) -> &[u8] {
 /// non-branching prefix (`cube_sat.sim.reaction_wheels.…`) renders as
 /// one row instead of a column-per-segment drill-down.
 pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
+    let raw = build_full_tree(db);
+    Arc::new(ComponentNode {
+        segment: raw.segment,
+        full_name: raw.full_name,
+        component_id: raw.component_id,
+        children: raw
+            .children
+            .values()
+            .map(|c| compress_subtree(c.clone()))
+            .collect(),
+    })
+}
+
+/// Every visible component in `db` as a tree with one node per segment —
+/// no chain compressed — so every path prefix of a name is a node.
+pub(crate) fn build_full_tree(db: &DB) -> ComponentNode {
     let mut root = Builder::new(SharedString::new_static(""), String::new());
     db.with_state(|state| {
         for (id, meta) in state.component_metadata_iter() {
@@ -119,17 +135,16 @@ pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
             insert(&mut root, &meta.name, *id);
         }
     });
-    let raw = root.freeze();
-    Arc::new(ComponentNode {
-        segment: raw.segment,
-        full_name: raw.full_name,
-        component_id: raw.component_id,
-        children: raw
-            .children
-            .values()
-            .map(|c| compress_subtree(c.clone()))
-            .collect(),
-    })
+    root.freeze()
+}
+
+/// The node named `path` in an uncompressed tree.
+pub(crate) fn node_at(root: &Arc<ComponentNode>, path: &str) -> Option<Arc<ComponentNode>> {
+    let mut current = root.clone();
+    for seg in path.split('.') {
+        current = current.children.get(seg)?.clone();
+    }
+    Some(current)
 }
 
 /// Post-order fuse a non-component branch with its only surviving child.

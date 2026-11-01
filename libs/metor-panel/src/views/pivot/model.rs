@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use gpui::SharedString;
 use metor_proto::types::ComponentId;
+use smallvec::SmallVec;
 
 use crate::views::component_browser::component_tree::{
     ComponentNode, component_count, natural_cmp,
@@ -36,10 +37,34 @@ pub(crate) struct Grid {
     pub hidden: Vec<SharedString>,
 }
 
+/// Values a row pattern's named captures took for one instance, in the
+/// pattern's capture order.
+pub(crate) type Captures = SmallVec<[SharedString; 2]>;
+
+/// One subtree chosen to be a row, before it's laid out on the grid.
+#[derive(Clone)]
+pub(crate) struct Frame {
+    pub node: Arc<ComponentNode>,
+    pub label: SharedString,
+    pub captures: Captures,
+}
+
+impl Frame {
+    /// A row labelled `label` with nothing captured.
+    pub fn labelled(node: Arc<ComponentNode>, label: SharedString) -> Self {
+        Self {
+            node,
+            label,
+            captures: Captures::new(),
+        }
+    }
+}
+
 pub(crate) struct Instance {
     pub node: Arc<ComponentNode>,
     /// Row label: the segment under a branch, the full path in a type.
     pub label: SharedString,
+    pub captures: Captures,
     /// One slot per field; `None` where this instance lacks it.
     pub ids: Vec<Option<ComponentId>>,
 }
@@ -50,19 +75,19 @@ impl Grid {
     /// the widest strip any instance renders in it.
     pub fn new(
         key: SharedString,
-        instances: Vec<(Arc<ComponentNode>, SharedString)>,
+        instances: Vec<Frame>,
         arrangement: Option<&Arrangement>,
         cell_count: &dyn Fn(ComponentId) -> usize,
     ) -> Self {
         let instances = match arrangement {
-            Some(a) => lead_by(instances, &a.rows, |(_, label)| label),
+            Some(a) => lead_by(instances, &a.rows, |f| &f.label),
             None => instances,
         };
         let per_instance: Vec<BTreeMap<SharedString, ComponentId>> = instances
             .iter()
-            .map(|(inst, _)| {
+            .map(|f| {
                 let mut leaves = BTreeMap::new();
-                collect_leaves(inst, inst.full_name.len() + 1, &mut leaves);
+                collect_leaves(&f.node, f.node.full_name.len() + 1, &mut leaves);
                 leaves
             })
             .collect();
@@ -81,9 +106,10 @@ impl Grid {
         let instances: Vec<Instance> = instances
             .into_iter()
             .zip(&per_instance)
-            .map(|((node, label), leaves)| Instance {
-                node,
-                label,
+            .map(|(f, leaves)| Instance {
+                node: f.node,
+                label: f.label,
+                captures: f.captures,
                 ids: fields.iter().map(|f| leaves.get(f).copied()).collect(),
             })
             .collect();
@@ -147,15 +173,12 @@ impl Arrangement {
 
 /// A branch's instances: every child that is itself a branch, labelled by
 /// its segment, in display order.
-pub(crate) fn children(
-    branch: &ComponentNode,
-    descending: bool,
-) -> Vec<(Arc<ComponentNode>, SharedString)> {
+pub(crate) fn children(branch: &ComponentNode, descending: bool) -> Vec<Frame> {
     let mut out: Vec<_> = branch
         .children
         .values()
         .filter(|c| !c.children.is_empty())
-        .map(|c| (c.clone(), c.segment.clone()))
+        .map(|c| Frame::labelled(c.clone(), c.segment.clone()))
         .collect();
     if descending {
         out.reverse();
@@ -335,12 +358,12 @@ pub(crate) mod tests {
         signature(exemplar)
     }
 
-    fn label_all(nodes: Vec<Arc<ComponentNode>>) -> Vec<(Arc<ComponentNode>, SharedString)> {
+    fn label_all(nodes: Vec<Arc<ComponentNode>>) -> Vec<Frame> {
         nodes
             .into_iter()
             .map(|n| {
                 let label = n.full_name.clone();
-                (n, label)
+                Frame::labelled(n, label)
             })
             .collect()
     }
@@ -406,7 +429,7 @@ pub(crate) mod tests {
         let labels = |descending| -> Vec<String> {
             children(&tree, descending)
                 .into_iter()
-                .map(|(_, l)| l.to_string())
+                .map(|f| f.label.to_string())
                 .collect()
         };
         assert_eq!(labels(false), ["dut1", "dut2", "dut3"]);

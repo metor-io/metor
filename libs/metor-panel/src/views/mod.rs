@@ -63,6 +63,7 @@ pub use map::{Map, MapConfig};
 pub use meter::{Meter, MeterConfig, MeterShape, Orientation};
 pub use monitor::{Monitor, MonitorConfig};
 pub use outline::{Col, ComponentOutline, OutlineColumns, default_columns};
+pub use pivot::{PivotTable, PivotTableConfig};
 pub use samples_table::{SampleSource, SampleTimeFormat, SamplesTable, SamplesTableConfig};
 pub use scrollbar::Scrollbar;
 pub use sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
