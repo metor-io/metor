@@ -1,5 +1,5 @@
 //! A borderless table: a muted header row, then aligned rows with the first
-//! column bold.
+//! column bold, laid out by comfy-table.
 
 use std::io::{self, Write};
 
@@ -7,78 +7,51 @@ use anstyle::Style;
 pub use comfy_table::CellAlignment as Align;
 use comfy_table::{ColumnConstraint, ContentArrangement, presets::NOTHING};
 
+use super::glyph;
 use super::theme::Theme;
-use super::{glyph, width};
 
-/// Columns of text, laid out when written.
-#[derive(Debug)]
-pub struct Table<'a> {
-    headers: &'a [(&'a str, Align)],
-    rows: Vec<Vec<String>>,
-    /// The widest a line may be. The last column is cut to fit.
+/// Writes `rows` under `headers`, indented by `indent`, without trailing
+/// blanks. The last column is cut so each line fits `width`.
+pub fn write(
+    out: &mut impl Write,
+    headers: &[(&str, Align)],
+    rows: impl IntoIterator<Item = Vec<String>>,
+    theme: &Theme,
     width: Option<usize>,
-}
-
-impl<'a> Table<'a> {
-    pub fn new(headers: &'a [(&'a str, Align)]) -> Self {
-        Self {
-            headers,
-            rows: Vec::new(),
-            width: None,
+    indent: &str,
+) -> io::Result<()> {
+    let (muted, bold) = (theme.muted, theme.bold(Style::new()));
+    let mut table = comfy_table::Table::new();
+    table
+        .load_preset(NOTHING)
+        .set_truncation_indicator(glyph::ELLIPSIS)
+        .set_header(headers.iter().map(|(h, _)| format!("{muted}{h}{muted:#}")));
+    for mut row in rows {
+        if let Some(first) = row.first_mut() {
+            *first = format!("{bold}{first}{bold:#}");
         }
+        table.add_row(row);
     }
-
-    /// Cuts the last column so each line, with its indent, fits `width`.
-    pub fn fit(mut self, width: Option<usize>) -> Self {
-        self.width = width;
-        self
-    }
-
-    /// Adds a row. Missing cells are blank.
-    pub fn row(&mut self, cells: Vec<String>) {
-        self.rows.push(cells);
-    }
-
-    /// Writes the table, indented by `indent`, without trailing blanks.
-    pub fn write(&self, out: &mut impl Write, theme: &Theme, indent: &str) -> io::Result<()> {
-        let (muted, bold) = (theme.muted, theme.bold(Style::new()));
-        let mut table = comfy_table::Table::new();
+    if let Some(room) = width {
+        let room = room.saturating_sub(super::width(indent));
         table
-            .load_preset(NOTHING)
-            .set_truncation_indicator(glyph::ELLIPSIS)
-            .set_header(
-                self.headers
-                    .iter()
-                    .map(|(h, _)| format!("{muted}{h}{muted:#}")),
-            );
-        for row in &self.rows {
-            let cells = row.iter().enumerate().map(|(column, cell)| match column {
-                0 => format!("{bold}{cell}{bold:#}"),
-                _ => cell.clone(),
-            });
-            table.add_row(cells);
-        }
-        if let Some(room) = self.width {
-            let room = room.saturating_sub(width(indent));
-            table
-                .set_content_arrangement(ContentArrangement::Dynamic)
-                .set_width(u16::try_from(room).unwrap_or(u16::MAX));
-        }
-        let last = self.headers.len().saturating_sub(1);
-        for (index, (column, (_, align))) in table.column_iter_mut().zip(self.headers).enumerate() {
-            column.set_padding((0, 2)).set_cell_alignment(*align);
-            if index < last {
-                column.set_constraint(ColumnConstraint::ContentWidth);
-            }
-        }
-        for row in table.row_iter_mut() {
-            row.max_height(1);
-        }
-        for line in table.lines() {
-            writeln!(out, "{indent}{}", line.trim_end())?;
-        }
-        Ok(())
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_width(u16::try_from(room).unwrap_or(u16::MAX));
     }
+    let last = headers.len().saturating_sub(1);
+    for (index, (column, (_, align))) in table.column_iter_mut().zip(headers).enumerate() {
+        column.set_padding((0, 2)).set_cell_alignment(*align);
+        if index < last {
+            column.set_constraint(ColumnConstraint::ContentWidth);
+        }
+    }
+    for row in table.row_iter_mut() {
+        row.max_height(1);
+    }
+    for line in table.lines() {
+        writeln!(out, "{indent}{}", line.trim_end())?;
+    }
+    Ok(())
 }
 
 /// `n` with its digits grouped in threes by spaces: `1 440`.
@@ -99,11 +72,25 @@ mod tests {
     use super::*;
     use crate::cli::ui::caps::Caps;
 
-    fn written(table: &Table<'_>, indent: &str) -> String {
+    fn written(
+        headers: &[(&str, Align)],
+        rows: &[&[&str]],
+        width: Option<usize>,
+        indent: &str,
+    ) -> String {
+        let rows = rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_string()).collect());
         let mut out = Vec::new();
-        table
-            .write(&mut out, &Theme::new(&Caps::plain()), indent)
-            .expect("writes to a Vec");
+        write(
+            &mut out,
+            headers,
+            rows,
+            &Theme::new(&Caps::plain()),
+            width,
+            indent,
+        )
+        .expect("writes to a Vec");
         String::from_utf8(out).expect("utf-8")
     }
 
@@ -114,11 +101,9 @@ mod tests {
             ("CYCLES", Align::Right),
             ("NOTE", Align::Left),
         ];
-        let mut table = Table::new(&headers);
-        table.row(vec!["plant".into(), group(1440), String::new()]);
-        table.row(vec!["fsw".into(), group(12), "slow".into()]);
+        let rows: [&[&str]; 2] = [&["plant", "1 440", ""], &["fsw", "12", "slow"]];
         assert_eq!(
-            written(&table, "    "),
+            written(&headers, &rows, None, "    "),
             "    TARGET  CYCLES  NOTE\n    plant    1 440\n    fsw         12  slow\n"
         );
     }
@@ -126,10 +111,8 @@ mod tests {
     #[test]
     fn test_fit_cuts_the_last_column() {
         let headers = [("NAME", Align::Left), ("INPUTS", Align::Left)];
-        let mut table = Table::new(&headers).fit(Some(20));
-        table.row(vec!["pub".into(), "plant.sensors, plant.gps".into()]);
-        table.row(vec!["nav".into(), "gps".into()]);
-        let text = written(&table, "  ");
+        let rows: [&[&str]; 2] = [&["pub", "plant.sensors, plant.gps"], &["nav", "gps"]];
+        let text = written(&headers, &rows, Some(20), "  ");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "  NAME  INPUTS", "{text}");
         assert!(
@@ -137,26 +120,24 @@ mod tests {
             "{text}"
         );
         assert_eq!(lines[2], "  nav   gps", "{text}");
-        assert!(lines.iter().all(|l| width(l) <= 20), "{text}");
+        assert!(lines.iter().all(|l| super::super::width(l) <= 20), "{text}");
     }
 
     #[test]
     fn test_wide_cells_pad_and_cut_by_columns() {
         let headers = [("NAME", Align::Left), ("KIND", Align::Left)];
-        let mut table = Table::new(&headers).fit(Some(14));
-        table.row(vec!["中文".into(), "x".into()]);
-        table.row(vec!["ab".into(), "日本語の名前".into()]);
-        let text = written(&table, "");
+        let rows: [&[&str]; 2] = [&["中文", "x"], &["ab", "日本語の名前"]];
+        let text = written(&headers, &rows, Some(14), "");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1], "中文  x", "{text}");
-        assert!(lines.iter().all(|l| width(l) <= 14), "{text}");
+        assert!(lines.iter().all(|l| super::super::width(l) <= 14), "{text}");
         assert!(lines[2].ends_with('…'), "{text}");
     }
 
     #[test]
     fn test_no_rows_is_a_header() {
         let headers = [("NAME", Align::Left)];
-        assert_eq!(written(&Table::new(&headers), ""), "NAME\n");
+        assert_eq!(written(&headers, &[], None, ""), "NAME\n");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use super::completions;
 use super::run::{RunError, prepare, print};
 use super::ui::event::Event;
-use super::ui::table::{Align, Table};
+use super::ui::table::{self, Align};
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 use crate::cli::ui::glyph;
@@ -198,11 +198,9 @@ fn write_target(
 ) -> io::Result<()> {
     let target = &config.targets[index];
     write_title(out, target, index, theme)?;
-    let mut table = Table::new(&SYSTEM_COLUMNS).fit(width);
-    for system in &target.coordinator.systems {
-        table.row(vec![system.id.clone(), system.ty.clone(), inputs(system)]);
-    }
-    table.write(out, theme, "    ")
+    let systems = target.coordinator.systems.iter();
+    let rows = systems.map(|system| vec![system.id.clone(), system.ty.clone(), inputs(system)]);
+    table::write(out, &SYSTEM_COLUMNS, rows, theme, width, "    ")
 }
 
 /// `fsw  100 Hz wall`, the name in the target's hue.
@@ -270,10 +268,8 @@ fn write_section(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut table = Table::new(columns);
-    rows.into_iter().for_each(|row| table.row(row));
     writeln!(out)?;
-    table.write(out, theme, "    ")
+    table::write(out, columns, rows, theme, None, "    ")
 }
 
 const SYSTEM_COLUMNS: [(&str, Align); 3] = [

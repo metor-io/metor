@@ -16,7 +16,7 @@ use super::Reporter;
 use super::caps::{Caps, Depth};
 use super::event::{Event, LogLine, Phase, PhaseState, Source, Summary};
 use super::glyph;
-use super::table::{Align, Table, group};
+use super::table::{self, Align, group};
 use super::theme::Theme;
 use super::width;
 
@@ -205,21 +205,23 @@ impl<W: Write> Human<W> {
         if summary.targets.is_empty() {
             return Ok(());
         }
-        let mut table = Table::new(&SUMMARY_COLUMNS);
-        for target in &summary.targets {
+        let rows = summary.targets.iter().map(|target| {
             let overruns = match target.overruns {
                 0 => String::new(),
                 n => group(n),
             };
-            table.row(vec![
-                target.name.clone(),
-                group(target.cycles),
-                format!("{:.2} ms", target.max_cycle.as_secs_f64() * 1e3),
-                overruns,
-            ]);
-        }
+            let max = format!("{:.2} ms", target.max_cycle.as_secs_f64() * 1e3);
+            vec![target.name.clone(), group(target.cycles), max, overruns]
+        });
         writeln!(self.buf)?;
-        table.write(&mut self.buf, &self.theme, "    ")
+        table::write(
+            &mut self.buf,
+            &SUMMARY_COLUMNS,
+            rows,
+            &self.theme,
+            None,
+            "    ",
+        )
     }
 
     fn log(&mut self, line: &LogLine<'_>) -> io::Result<()> {

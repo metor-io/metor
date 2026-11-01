@@ -7,7 +7,7 @@ use serde_json::json;
 
 use super::run::{RunError, print};
 use super::ui::event::Event;
-use super::ui::table::{Align, Table};
+use super::ui::table::{self, Align};
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 
@@ -139,11 +139,8 @@ pub fn render_list<'a>(
     theme: &Theme,
     width: Option<usize>,
 ) -> io::Result<()> {
-    let mut table = Table::new(&LIST_COLUMNS).fit(width);
-    for section in sections {
-        table.row(vec![section.code.into(), section.title.into()]);
-    }
-    table.write(out, theme, "  ")
+    let rows = sections.map(|s| vec![s.code.into(), s.title.into()]);
+    table::write(out, &LIST_COLUMNS, rows, theme, width, "  ")
 }
 
 #[cfg(test)]
