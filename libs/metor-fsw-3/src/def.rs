@@ -10,7 +10,6 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 
 use metor_proto::types::PACKET_HEADER_LEN;
-use metor_proto_wkt::CommandInfo;
 
 use crate::coordinator::{OutputConfig, OutputSource};
 use crate::record::{RecordSchema, RerootError};
@@ -241,7 +240,8 @@ impl Records {
     }
 
     /// Describes the message record `name` as a command a client sends.
-    pub fn msg_command(&self, name: &str) -> Result<CommandInfo, RecordError> {
+    #[cfg(feature = "host")]
+    pub fn msg_command(&self, name: &str) -> Result<metor_proto_wkt::CommandInfo, RecordError> {
         let def = self
             .0
             .get(name)
