@@ -1331,6 +1331,22 @@ pub async fn handle_conn(stream: TcpStream, db: Arc<DB>) {
 #[derive(Default)]
 struct ConnState {
     incoming_node: Option<IncomingNode>,
+    /// Whether this connection carries an upstream peer's stream down into
+    /// this db, as a mirror or fsw link does. Its tables are telemetry even
+    /// under a frame command's id: a vehicle that records the port a
+    /// command lands on sends the same table back down, and logging that
+    /// echo as a command would forward it up again, round and round.
+    downlink: bool,
+}
+
+impl ConnState {
+    /// The state for a connection that ingests an upstream peer's stream.
+    pub(crate) fn downlink() -> Self {
+        Self {
+            downlink: true,
+            ..Self::default()
+        }
+    }
 }
 
 struct IncomingNode {
@@ -1795,7 +1811,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         Packet::Table(table) => {
             trace!(table.len = table.buf.len(), "sinking table");
             let buf = stellarator::buf::deref(&table.buf);
-            match db.with_state(|s| s.frame_command(table.id).is_some()) {
+            let command = !conn.downlink && db.with_state(|s| s.frame_command(table.id).is_some());
+            match command {
                 true => db.push_msg(Timestamp::now(), table.id, buf)?,
                 false => db.ingest_table(table.id, buf)?,
             }
@@ -2517,8 +2534,12 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
                 visited_ids.insert(component.component_id);
                 let sink = sink.clone();
                 let component = component.clone();
-                let metadata = state.get_component_metadata(component.component_id).cloned();
-                stellarator::spawn(handle_real_time_component(sink, component, metadata, req_id));
+                let metadata = state
+                    .get_component_metadata(component.component_id)
+                    .cloned();
+                stellarator::spawn(handle_real_time_component(
+                    sink, component, metadata, req_id,
+                ));
                 Ok(())
             })
         })?;

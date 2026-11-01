@@ -195,7 +195,7 @@ async fn ingest(
     tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
     db: &Arc<DB>,
 ) -> Error {
-    let mut conn = ConnState::default();
+    let mut conn = ConnState::downlink();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
     loop {

@@ -75,7 +75,7 @@ async fn ingest(
     db: &Arc<DB>,
     mut on_packet: impl FnMut(bool),
 ) -> Error {
-    let mut conn = ConnState::default();
+    let mut conn = ConnState::downlink();
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
     loop {
         let pkt = match rx.next_grow(buf).await {
@@ -190,6 +190,119 @@ mod tests {
             }
         });
         inbound
+    }
+
+    /// A vehicle that records the port a frame command lands on publishes
+    /// that table, under the command's own id, back down the link. The
+    /// ground keeps the echo as telemetry: logging it as a command would
+    /// forward it straight back up, round and round.
+    #[stellarator::test]
+    async fn echoed_frame_command_is_telemetry() {
+        use metor_proto::types::{ComponentId, PrimType, table_id};
+        use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
+        use metor_proto_wkt::{CommandKind, VTableMsg};
+
+        let vtable = vtable([raw_field(
+            0,
+            8,
+            schema(PrimType::F64, &[1], component("sat.cmds.set_mode.mode")),
+        )]);
+        let id = table_id(&vtable);
+        let command = CommandInfo {
+            id,
+            kind: CommandKind::Frame {
+                name: "set_mode".into(),
+                vtable: vtable.clone(),
+            },
+        };
+
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tables_up = Arc::new(StdMutex::new(0usize));
+        let counted = tables_up.clone();
+        stellarator::struc_con::stellar(move || async move {
+            use stellarator::io::{AsyncWrite, SplitExt};
+            let stream = listener.accept().await.expect("accept");
+            let (rx, tx) = stream.split();
+            let info = LinkInfo {
+                protocol_version: LINK_PROTOCOL_VERSION,
+                features: 0,
+                command_ids: vec![id],
+                namespace: None,
+                link: String::new(),
+                commands: vec![command],
+            };
+            tx.write_all((&info).into_len_packet().inner)
+                .await
+                .0
+                .expect("identity");
+            let announce = VTableMsg { id, vtable };
+            tx.write_all((&announce).into_len_packet().inner)
+                .await
+                .0
+                .expect("vtable");
+            stellarator::spawn(async move {
+                let mut packets = PacketStream::new(rx);
+                let mut buf = vec![0u8; 1024];
+                loop {
+                    let Ok(pkt) = packets.next_grow(buf).await else {
+                        return;
+                    };
+                    if matches!(pkt, OwnedPacket::Table(_)) {
+                        *counted.lock().unwrap() += 1;
+                    }
+                    buf = pkt.into_buf().into_inner();
+                }
+            });
+            for _ in 0..40 {
+                let mut table = LenPacket::table(id, 8);
+                table.extend_from_slice(&2.5f64.to_le_bytes());
+                if tx.write_all(table.inner).await.0.is_err() {
+                    return;
+                }
+                stellarator::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::DB::create(dir.path().join("db")).unwrap());
+        let Peer::Fsw { info, rx, tx, buf } = identify(addr).await.expect("identify") else {
+            panic!("expected an fsw peer");
+        };
+        let stream_db = db.clone();
+        let _link = stellarator::spawn(async move {
+            fsw_stream(
+                info.command_ids,
+                &info.commands,
+                rx,
+                tx,
+                buf,
+                &stream_db,
+                |_| {},
+            )
+            .await;
+        })
+        .drop_guard();
+
+        let mode = ComponentId::new("sat.cmds.set_mode.mode");
+        wait_for(
+            || {
+                db.with_state(|s| {
+                    s.get_component(mode)
+                        .is_some_and(|c| c.time_series.latest().is_some())
+                })
+            },
+            "the echo as telemetry",
+        )
+        .await;
+        stellarator::sleep(Duration::from_millis(200)).await;
+        let logged = db.with_state(|s| s.msg_logs.get(&id).is_some_and(|log| !log.is_empty()));
+        assert!(!logged, "the echo is not logged as a command");
+        assert_eq!(
+            *tables_up.lock().unwrap(),
+            0,
+            "nothing is forwarded back up"
+        );
     }
 
     #[stellarator::test]
