@@ -14,7 +14,7 @@ use std::time::Instant;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 
-use super::run::{Run, RunError, dev_packs, find_target, interrupted, watch_sigint};
+use super::run::{Run, RunError, dev_packs, dir_of, interrupted, target_file, watch_sigint};
 use super::ui::Ui;
 use super::ui::event::{Event, LogLine, Source};
 use metor_proto_wkt::LogLevel;
@@ -72,26 +72,11 @@ fn warn(ui: &Ui, message: &str) {
     }));
 }
 
-/// The target file named, or the nearest one.
-fn target_file(named: Option<&Path>) -> Result<PathBuf, RunError> {
-    if let Some(named) = named {
-        return Ok(named.to_path_buf());
-    }
-    let cwd = std::env::current_dir().map_err(|source| RunError::Io {
-        path: PathBuf::from("."),
-        source,
-    })?;
-    find_target(&cwd).ok_or(RunError::NoProject(cwd))
-}
-
 /// The directories to watch for `target`, each recursively: its own, and
 /// each local crate its dev packs build from. A root under another is
 /// left out. Roots are canonical, as the OS reports changed paths.
 pub fn watch_roots(target: &Path) -> Vec<PathBuf> {
-    let dir = target
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = dir_of(target);
     let packs = dev_packs(dir);
     let crates = packs.iter().flat_map(|pack| local_crates(pack));
     let mut roots: Vec<PathBuf> = core::iter::once(dir.to_path_buf())
@@ -106,12 +91,11 @@ pub fn watch_roots(target: &Path) -> Vec<PathBuf> {
             .iter()
             .any(|other| other != root && root.starts_with(other))
     };
-    let kept: Vec<PathBuf> = roots
+    roots
         .iter()
         .filter(|root| !covered(root))
         .cloned()
-        .collect();
-    kept
+        .collect()
 }
 
 /// The directories of the local crates `pack` builds from, per
@@ -171,16 +155,11 @@ pub fn relevant(path: &Path, roots: &[PathBuf]) -> bool {
 
 /// This process's arguments with its `watch` command turned into `run`.
 pub fn run_argv(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    let mut replaced = false;
-    args.into_iter()
-        .map(|arg| match arg == "watch" && !replaced {
-            true => {
-                replaced = true;
-                "run".into()
-            }
-            false => arg,
-        })
-        .collect()
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    if let Some(command) = args.iter_mut().find(|arg| *arg == "watch") {
+        *command = "run".into();
+    }
+    args
 }
 
 fn start(argv: &[OsString]) -> Result<Child, RunError> {

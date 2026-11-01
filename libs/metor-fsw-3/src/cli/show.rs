@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::completions;
-use super::run::{RunError, prepare};
+use super::run::{RunError, prepare, print};
 use super::ui::event::Event;
 use super::ui::table::{Align, Table};
 use super::ui::theme::{Theme, Token};
@@ -42,13 +42,24 @@ pub fn show(args: Show, ui: &Ui) -> Result<(), RunError> {
         ui.emit(Event::Data("config", &value));
         return Ok(());
     }
-    let caps = ui.stdout_caps();
-    let width = ui.stdout_width();
-    let mut out = std::io::stdout().lock();
-    render(&mut out, &config, selection, &Theme::new(&caps), width).map_err(|source| RunError::Io {
-        path: PathBuf::from("stdout"),
-        source,
+    print(ui, |out, theme, width| {
+        render(out, &config, selection, theme, width)
     })
+}
+
+/// `fsw`, or `target` for a deployment's one unnamed target.
+pub(crate) fn target_name<S, R>(target: &TargetConfig<S, R>) -> &str {
+    Some(target.namespace())
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or("target")
+}
+
+/// `1 target` or `3 targets`.
+pub(crate) fn plural(n: usize, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
 }
 
 /// Splits `args` into a target file and a name. A lone argument is the
@@ -167,13 +178,6 @@ fn write_overview(
         .collect();
     packs.sort_unstable();
     packs.dedup();
-    let plural = |n: usize, noun: &str| {
-        if n == 1 {
-            format!("1 {noun}")
-        } else {
-            format!("{n} {noun}s")
-        }
-    };
     writeln!(
         out,
         "  {muted}{} {dot} {}{muted:#}",
@@ -212,9 +216,7 @@ pub(crate) fn write_title(
 ) -> io::Result<()> {
     let hue = theme.bold(theme.hue(index));
     let muted = theme.style(Token::Muted);
-    let name = Some(target.namespace())
-        .filter(|ns| !ns.is_empty())
-        .unwrap_or("target");
+    let name = target_name(target);
     let clock = clock(&target.coordinator.clock);
     writeln!(out, "  {hue}{name}{hue:#}  {muted}{clock}{muted:#}")
 }

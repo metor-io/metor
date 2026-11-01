@@ -25,15 +25,11 @@ pub fn write(
         Some(elapsed) => write!(out, "  {muted}{}{muted:#}", Elapsed(elapsed))?,
         None => write!(out, "  {:TIME_WIDTH$}", "")?,
     }
-    let (glyph, glyph_style, message_style) = level(line.level, theme);
-    write!(out, "  {glyph_style}{glyph:<1}{glyph_style:#}  ")?;
+    let (glyph, style) = level(line.level, theme);
+    write!(out, "  {style}{glyph:<1}{style:#}  ")?;
     write_source(out, &line.source, theme)?;
     let pad = source_width.saturating_sub(source_len(&line.source));
-    write!(
-        out,
-        "{:pad$}  {message_style}{}{message_style:#}",
-        "", line.message
-    )?;
+    write!(out, "{:pad$}  {style}{}{style:#}", "", line.message)?;
     for (key, value) in line.fields {
         write!(out, "  {muted}{key}={muted:#}")?;
         if value.is_empty() || value.contains(char::is_whitespace) {
@@ -61,28 +57,17 @@ fn write_source(out: &mut impl Write, source: &Source<'_>, theme: &Theme) -> io:
     write!(out, "{}", source.system)
 }
 
-/// The glyph, its style, and the message style for `level`.
-fn level(level: LogLevel, theme: &Theme) -> (&'static str, Style, Style) {
+/// The glyph for `level`, and the style of it and the message.
+fn level(level: LogLevel, theme: &Theme) -> (&'static str, Style) {
     let glyphs = theme.glyphs;
-    match level {
-        LogLevel::Error => {
-            let error = theme.style(Token::Error);
-            (glyphs.fail, error, error)
-        }
-        LogLevel::Warn => {
-            let warn = theme.style(Token::Warn);
-            (glyphs.warn, warn, warn)
-        }
-        LogLevel::Info => (" ", Style::new(), Style::new()),
-        LogLevel::Debug => {
-            let muted = theme.style(Token::Muted);
-            (glyphs.dot, muted, muted)
-        }
-        LogLevel::Trace => {
-            let faint = theme.style(Token::Faint);
-            (glyphs.dot, faint, faint)
-        }
-    }
+    let (glyph, token) = match level {
+        LogLevel::Error => (glyphs.fail, Token::Error),
+        LogLevel::Warn => (glyphs.warn, Token::Warn),
+        LogLevel::Info => (" ", Token::Text),
+        LogLevel::Debug => (glyphs.dot, Token::Muted),
+        LogLevel::Trace => (glyphs.dot, Token::Faint),
+    };
+    (glyph, theme.style(token))
 }
 
 /// Formats as `+MM:SS.mmm`, [`TIME_WIDTH`] wide, or `+H:MM:SS.mmm` from an

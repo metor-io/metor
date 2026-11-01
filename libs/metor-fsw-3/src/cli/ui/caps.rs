@@ -45,7 +45,6 @@ pub struct Probe {
     /// `COLORTERM` names truecolor.
     pub truecolor_env: bool,
     pub unicode: bool,
-    pub links: bool,
     pub width: Option<u16>,
     pub background: Option<Background>,
 }
@@ -75,7 +74,6 @@ impl Probe {
             truecolor_env: env("COLORTERM")
                 .is_some_and(|value| value == "truecolor" || value == "24bit"),
             unicode: supports_unicode::on(supports_unicode::Stream::Stderr),
-            links: tty && supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr),
             width: terminal_size::terminal_size_of(std::io::stderr()).map(|(w, _)| w.0),
             background: (query && tty && foreground())
                 .then(query_background)
@@ -120,7 +118,6 @@ pub struct Caps {
     pub live: bool,
     pub depth: Depth,
     pub unicode: bool,
-    pub links: bool,
     pub width: u16,
     pub background: Background,
 }
@@ -149,7 +146,6 @@ impl Caps {
             live: probe.tty,
             depth,
             unicode: probe.unicode && !ascii,
-            links: probe.links,
             width: probe.width.unwrap_or(Self::DEFAULT_WIDTH),
             background: probe.background.unwrap_or_default(),
         }
@@ -161,7 +157,6 @@ impl Caps {
             live: false,
             depth: Depth::None,
             unicode: false,
-            links: false,
             width: Self::DEFAULT_WIDTH,
             background: Background::Dark,
         }

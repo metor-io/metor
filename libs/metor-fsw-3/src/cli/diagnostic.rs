@@ -45,9 +45,14 @@ impl Report {
     /// the file, which the target file names relative to the working
     /// directory. If the line cannot be read, the message keeps its location.
     pub fn new(error: &RunError) -> Self {
+        Self::in_dir(error, Path::new("."))
+    }
+
+    /// Builds the report for `error`, reading its line relative to `base`.
+    fn in_dir(error: &RunError, base: &Path) -> Self {
         let (code, help) = run_info(error);
         let located = located(error)
-            .and_then(|(location, inner)| Some((Snippet::read(location, Path::new("."))?, inner)));
+            .and_then(|(location, inner)| Some((Snippet::read(location, base)?, inner)));
         let (snippet, message) = match located {
             Some((snippet, inner)) => (Some(snippet), inner),
             None => (None, error.to_string()),
@@ -75,19 +80,6 @@ impl Report {
             help,
             snippet,
         }
-    }
-
-    /// Reads `location`'s line relative to `base`.
-    #[cfg(test)]
-    fn in_dir(error: &RunError, base: &Path) -> Self {
-        let mut report = Self::new(error);
-        if let Some((location, inner)) = located(error)
-            && let Some(snippet) = Snippet::read(location, base)
-        {
-            report.snippet = Some(snippet);
-            report.message = inner;
-        }
-        report
     }
 }
 

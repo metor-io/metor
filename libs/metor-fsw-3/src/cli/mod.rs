@@ -76,7 +76,7 @@ pub enum Command {
     Show(show::Show),
     /// Draws the deployment's wiring.
     #[command(
-        after_help = "Examples:\n  metor graph                  every target\n  metor graph fsw              one target\n  metor graph --as mermaid     text for docs; also --as dot"
+        after_help = "Examples:\n  metor graph                  every target\n  metor graph fsw              one target\n  metor graph --as mermaid     text for docs"
     )]
     Graph(graph::Graph),
     /// Evaluates a target file and writes out the resolved deployment.
@@ -233,7 +233,7 @@ fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
         Command::Watch(args) => watch::watch(args, ui)?,
         Command::Show(args) => show::show(args, ui)?,
         Command::Graph(args) => graph::graph(args, ui)?,
-        Command::Completions(args) => completions::completions(args)?,
+        Command::Completions(args) => completions::completions(args, ui)?,
         Command::New(args) => new::new(args, ui)?,
     }
     Ok(())

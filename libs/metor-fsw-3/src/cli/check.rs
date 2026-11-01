@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::run::{Run, RunError, load, phased, prepare};
+use super::show::target_name;
 use super::ui::Ui;
 use super::ui::event::Verb;
 
@@ -21,13 +22,8 @@ pub struct Check {
 /// Checks every target of the deployment, each as a phase.
 pub fn check(args: Check, ui: &Ui) -> Result<(), RunError> {
     let config = prepare(args.target.as_deref(), ui)?;
-    for (target, namespace) in config.targets.iter().zip(config.namespaces()) {
-        let name = if namespace.is_empty() {
-            "target"
-        } else {
-            namespace
-        };
-        phased(ui, Verb::Check, name, || {
+    for target in &config.targets {
+        phased(ui, Verb::Check, target_name(target), || {
             load(target, &Run::default(), None).map(drop)
         })?;
     }

@@ -7,29 +7,28 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 use core::time::Duration;
-use std::collections::BTreeMap;
 use std::env::JoinPathsError;
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
+use std::io::{self as stdio, StdoutLock, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use metor_proto_wkt::LogLevel;
-use serde::Deserialize;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
-
-use std::sync::mpsc::SyncSender;
 
 use super::cargo::read_toml;
 use super::console::{self, ConsoleLayer, Origin, Route, Settings, Tap};
 use super::pack_dev::{PackDevError, pack_dev};
 use super::relay::Relay;
+use super::show::{plural, target_name};
 use super::ui::Ui;
 use super::ui::event::{Event, Phase, PhaseState, Summary, TargetSummary, Verb};
+use super::ui::theme::Theme;
 use super::units;
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
@@ -138,11 +137,23 @@ pub enum RunError {
 }
 
 /// Returns a closure that turns an IO error into an `Io` error for `path`.
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
+pub(super) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
     |source| RunError::Io {
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// Writes to stdout with the theme and width it can show.
+pub(super) fn print(
+    ui: &Ui,
+    write: impl FnOnce(&mut StdoutLock<'static>, &Theme, Option<usize>) -> stdio::Result<()>,
+) -> Result<(), RunError> {
+    let theme = Theme::new(&ui.stdout_caps());
+    let mut out = stdio::stdout().lock();
+    write(&mut out, &theme, ui.stdout_width())
+        .and_then(|()| out.flush())
+        .map_err(io(Path::new("stdout")))
 }
 
 /// Runs `metor run`.
@@ -195,10 +206,7 @@ fn run_member(
     };
     let stats = tap.stats.clone();
     let (coordinator, systems) = load(&config.targets[member], args, Some(tap))?;
-    let name = Some(namespaces[member])
-        .filter(|ns| !ns.is_empty())
-        .unwrap_or("target")
-        .to_string();
+    let name = target_name(&config.targets[member]).to_string();
     ui.emit(Event::SourceWidth(source_width(config)));
     ui.emit(Event::Running(&[&name]));
     let origin = Origin {
@@ -350,19 +358,11 @@ fn console_level(filter: LevelFilter) -> LogLevel {
 /// and a `.json` file is read as is. If the config still has peer references,
 /// every target's packs are opened to resolve them.
 pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, RunError> {
-    let found;
-    let target = match target {
-        Some(target) => target,
-        None => {
-            let cwd = std::env::current_dir().map_err(io(Path::new(".")))?;
-            found = find_target(&cwd).ok_or(RunError::NoProject(cwd))?;
-            &found
-        }
-    };
+    let target = &target_file(target)?;
     if !target.is_file() {
-        return Err(RunError::NoTargetFile(target.to_path_buf()));
+        return Err(RunError::NoTargetFile(target.clone()));
     }
-    let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
+    let packs = dev_packs(dir_of(target));
     for pack in &packs {
         pack_dev(pack, ui)?;
     }
@@ -374,15 +374,27 @@ pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, Run
             eval_target(target, &packs, ui)
         })?
     };
-    let subject = match config.targets.len() {
-        1 => "1 target".to_string(),
-        n => format!("{n} targets"),
-    };
+    let subject = plural(config.targets.len(), "target");
     let config = phased(ui, Verb::Resolve, &subject, || resolve(config, target))?;
     if target.extension().is_some_and(|ext| ext == "py") && !super::children::is_child() {
         super::completions::write_cache(target, &config);
     }
     Ok(config)
+}
+
+/// `named`, or the nearest target file to the working directory.
+pub(super) fn target_file(named: Option<&Path>) -> Result<PathBuf, RunError> {
+    if let Some(named) = named {
+        return Ok(named.to_path_buf());
+    }
+    let cwd = std::env::current_dir().map_err(io(Path::new(".")))?;
+    find_target(&cwd).ok_or(RunError::NoProject(cwd))
+}
+
+/// The directory of the target file `target`.
+pub(super) fn dir_of(target: &Path) -> &Path {
+    let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
+    dir.unwrap_or(Path::new("."))
 }
 
 /// The nearest `target.py` in `start` or a directory above it, stopping at
@@ -439,8 +451,7 @@ fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeploy
             .iter()
             .map(table_for)
             .collect::<Result<_, _>>()?;
-        let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
-        let dir = dir.unwrap_or(Path::new("."));
+        let dir = dir_of(target);
         let dir = std::path::absolute(dir).map_err(io(dir))?;
         pending.resolve(&mut config, &tables, &store::dir(&dir))?;
     }
@@ -452,15 +463,16 @@ fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeploy
 /// A dev pack is a `[tool.uv.sources]` path that is both a cargo crate and a
 /// metor pack.
 pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
-    let Ok(project) = read_toml::<UvProject>(&target_dir.join("pyproject.toml")) else {
+    let Ok(project) = read_toml::<toml::Table>(&target_dir.join("pyproject.toml")) else {
         return Vec::new();
     };
-    let mut packs: Vec<_> = project
-        .tool
-        .uv
-        .sources
-        .into_values()
-        .filter_map(|source| source.path)
+    let sources = project
+        .get("tool")
+        .and_then(|tool| tool.get("uv")?.get("sources")?.as_table());
+    let mut packs: Vec<_> = sources
+        .into_iter()
+        .flat_map(toml::Table::values)
+        .filter_map(|source| source.get("path")?.as_str())
         .map(|path| target_dir.join(path))
         .filter(|root| is_dev_pack(root))
         .filter_map(|root| root.canonicalize().ok())
@@ -470,53 +482,15 @@ pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
     packs
 }
 
+/// Whether `root` is a cargo crate with a `[tool.metor.pack]` table.
 fn is_dev_pack(root: &Path) -> bool {
-    root.join("Cargo.toml").is_file()
-        && read_toml::<PackProject>(&root.join("pyproject.toml"))
-            .is_ok_and(|project| project.tool.metor.pack.is_some())
-}
-
-/// The `[tool.uv.sources]` of a target's `pyproject.toml`.
-#[derive(Deserialize)]
-struct UvProject {
-    #[serde(default)]
-    tool: UvTool,
-}
-
-#[derive(Default, Deserialize)]
-struct UvTool {
-    #[serde(default)]
-    uv: Uv,
-}
-
-#[derive(Default, Deserialize)]
-struct Uv {
-    #[serde(default)]
-    sources: BTreeMap<String, UvSource>,
-}
-
-/// One uv source. Only a `path` source can be a dev pack.
-#[derive(Deserialize)]
-struct UvSource {
-    path: Option<PathBuf>,
-}
-
-/// The `[tool.metor.pack]` table of a `pyproject.toml`, if it has one.
-#[derive(Deserialize)]
-struct PackProject {
-    #[serde(default)]
-    tool: PackTool,
-}
-
-#[derive(Default, Deserialize)]
-struct PackTool {
-    #[serde(default)]
-    metor: PackMetor,
-}
-
-#[derive(Default, Deserialize)]
-struct PackMetor {
-    pack: Option<toml::Table>,
+    let pack = |project: toml::Table| {
+        let pack = project
+            .get("tool")
+            .and_then(|tool| tool.get("metor")?.get("pack"));
+        pack.is_some_and(toml::Value::is_table)
+    };
+    root.join("Cargo.toml").is_file() && read_toml(&root.join("pyproject.toml")).is_ok_and(pack)
 }
 
 /// Runs the target file as a script and reads the deployment it emitted.

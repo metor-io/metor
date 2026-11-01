@@ -135,7 +135,6 @@ impl Ui {
         Caps {
             live: false,
             depth: caps::Depth::None,
-            links: false,
             ..self.caps
         }
     }

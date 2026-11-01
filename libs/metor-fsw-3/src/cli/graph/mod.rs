@@ -6,11 +6,10 @@ pub mod picture;
 pub mod wiring;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 use super::completions;
-use super::run::{RunError, prepare};
-use super::show::{self, Selection, select, split_args};
+use super::run::{RunError, prepare, print};
+use super::show::{self, Selection, select, split_args, target_name};
 use super::ui::event::Event;
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
@@ -50,29 +49,30 @@ pub fn graph(args: Graph, ui: &Ui) -> Result<(), RunError> {
     let links = links(&config);
     let targets: Vec<export::Target<'_>> = chosen
         .iter()
-        .map(|&t| (target_name(&config, t), wiring::wiring(&config.targets[t])))
+        .map(|&t| {
+            (
+                target_name(&config.targets[t]),
+                wiring::wiring(&config.targets[t]),
+            )
+        })
         .collect();
     let within = within(&links, &chosen);
-    let mut out = io::stdout().lock();
+    let detail = match args.ports {
+        true => Detail::Ports,
+        false => Detail::Systems,
+    };
     match (args.text, ui.format) {
-        (Some(Text::Mermaid), _) => out.write_all(export::mermaid(&targets, &within).as_bytes()),
+        (Some(Text::Mermaid), _) => print(ui, |out, _, _| {
+            out.write_all(export::mermaid(&targets, &within).as_bytes())
+        }),
         (None, Format::Json) => {
             ui.emit(Event::Data("graph", &export::json(&targets, &within)));
             Ok(())
         }
-        (None, Format::Human) => {
-            let theme = Theme::new(&ui.stdout_caps());
-            let detail = match args.ports {
-                true => Detail::Ports,
-                false => Detail::Systems,
-            };
-            draw(&mut out, &config, &links, &chosen, &theme, detail)
-        }
+        (None, Format::Human) => print(ui, |out, theme, _| {
+            draw(out, &config, &links, &chosen, theme, detail)
+        }),
     }
-    .map_err(|source| RunError::Io {
-        path: PathBuf::from("stdout"),
-        source,
-    })
 }
 
 /// Each target in `chosen`: its title line, then its picture.
@@ -97,17 +97,10 @@ fn draw(
     Ok(())
 }
 
-/// `fsw`, or `target` for a deployment's one unnamed target.
-fn target_name(config: &ResolvedDeployment, target: usize) -> &str {
-    Some(config.targets[target].namespace())
-        .filter(|ns| !ns.is_empty())
-        .unwrap_or("target")
-}
-
 /// `fsw.plant`.
 fn system_name(config: &ResolvedDeployment, (t, s): At) -> String {
     let id = &config.targets[t].coordinator.systems[s].id;
-    format!("{}.{id}", target_name(config, t))
+    format!("{}.{id}", target_name(&config.targets[t]))
 }
 
 /// Beside each system of `target` with a link, the systems at its other end.

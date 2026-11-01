@@ -8,8 +8,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::json;
 
-use super::run::RunError;
-use super::ui::event::{Event, Phase, PhaseState, Verb};
+use super::run::{RunError, io, phased};
+use super::ui::event::{Event, Verb};
 use super::ui::{Format, Ui};
 
 /// The metor-fsw-3 crate this binary was built from.
@@ -147,22 +147,14 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
         })
 }
 
-/// The names of a pack.
-#[derive(Clone, Copy, Debug)]
-struct PackNames<'a> {
-    /// The distribution and crate name.
-    dist: &'a str,
-    /// The pack id, and so the start of its system types.
-    id: &'a str,
-}
-
-/// A pack's files, for a pack at the absolute `dir`.
-fn pack_files(names: PackNames<'_>, dir: &Path, source: &Source) -> Vec<File> {
-    let module = names.dist.replace('-', "_");
+/// The files of a pack named `dist` with id `id`, for a pack at the
+/// absolute `dir`.
+fn pack_files(dist: &str, id: &str, dir: &Path, source: &Source) -> Vec<File> {
+    let module = dist.replace('-', "_");
     let values = [
-        ("crate", names.dist),
-        ("dist", names.dist),
-        ("id", names.id),
+        ("crate", dist),
+        ("dist", dist),
+        ("id", id),
         ("module", &module),
         ("metor_fsw", &source.cargo(dir)),
         ("metor_build", &source.python(dir, "metor-build")),
@@ -196,11 +188,7 @@ fn target_files(name: &str, ident: &str, dir: &Path, source: &Source) -> Vec<Fil
         text: fill(template, &values),
     };
     let pack_dir = Path::new("systems").join(name);
-    let names = PackNames {
-        dist: &pack_dist,
-        id: ident,
-    };
-    let pack = pack_files(names, &dir.join(&pack_dir), source)
+    let pack = pack_files(&pack_dist, ident, &dir.join(&pack_dir), source)
         .into_iter()
         .filter(|file| file.path != Path::new(".gitignore"))
         .map(|file| File {
@@ -229,14 +217,7 @@ pub fn files(kind: Kind, dir: &Path, source: &Source) -> Result<Vec<File>, RunEr
         why,
     })?;
     Ok(match kind {
-        Kind::Pack => pack_files(
-            PackNames {
-                dist: &name,
-                id: &ident,
-            },
-            dir,
-            source,
-        ),
+        Kind::Pack => pack_files(&name, &ident, dir, source),
         Kind::Target => target_files(&name, &ident, dir, source),
     })
 }
@@ -249,21 +230,11 @@ pub fn new(args: New, ui: &Ui) -> Result<(), RunError> {
         return Err(RunError::Exists(args.path));
     }
     let files = files(args.kind, &dir, &Source::detect())?;
-    let subject = args.path.display().to_string();
-    let phase = |state| {
-        ui.emit(Event::Phase(Phase {
-            verb: Verb::Create,
-            subject: &subject,
-            state,
-        }))
-    };
-    phase(PhaseState::Started);
-    if let Err(error) = write(&dir, &files) {
-        let _ = std::fs::remove_dir_all(&dir);
-        phase(PhaseState::Failed);
-        return Err(error);
-    }
-    phase(PhaseState::Done(core::time::Duration::ZERO));
+    phased(ui, Verb::Create, &args.path.display().to_string(), || {
+        write(&dir, &files).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+    })?;
     report(ui, &args, &cwd, &files);
     Ok(())
 }
@@ -306,13 +277,6 @@ fn write(dir: &Path, files: &[File]) -> Result<(), RunError> {
         std::fs::write(&path, &file.text).map_err(io(&path))?;
     }
     Ok(())
-}
-
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
-    |source| RunError::Io {
-        path: path.to_path_buf(),
-        source,
-    }
 }
 
 /// What to do next, or the files written as JSON.

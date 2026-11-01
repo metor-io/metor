@@ -14,8 +14,9 @@ use clap_complete::engine::{
 };
 use clap_complete::env::Shells;
 
-use super::run::{RunError, find_target};
+use super::run::{RunError, find_target, print};
 use super::show;
+use super::ui::Ui;
 use crate::deploy::ResolvedDeployment;
 
 /// The environment variable the registration script sets to ask for
@@ -26,52 +27,29 @@ pub const VAR: &str = "COMPLETE";
 #[derive(clap::Args, Debug)]
 pub struct Completions {
     /// The shell to write the script for.
-    #[arg(value_enum)]
-    pub shell: Shell,
+    #[arg(value_parser = SHELLS)]
+    pub shell: String,
 }
 
-/// A shell `clap_complete` registers with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum Shell {
-    Bash,
-    Zsh,
-    Fish,
-    Elvish,
-    Powershell,
-}
+/// The shells `clap_complete` registers with.
+const SHELLS: [&str; 5] = ["bash", "zsh", "fish", "elvish", "powershell"];
 
 /// Writes the script that registers `metor`'s completions with `args.shell`.
-pub fn completions(args: Completions) -> Result<(), RunError> {
-    let mut out = io::stdout().lock();
-    registration(&mut out, args.shell).map_err(|source| RunError::Io {
-        path: PathBuf::from("stdout"),
-        source,
-    })
+pub fn completions(args: Completions, ui: &Ui) -> Result<(), RunError> {
+    print(ui, |out, _, _| registration(out, &args.shell))
 }
 
-pub fn registration(out: &mut impl Write, shell: Shell) -> io::Result<()> {
-    let name = match shell {
-        Shell::Bash => "bash",
-        Shell::Zsh => "zsh",
-        Shell::Fish => "fish",
-        Shell::Elvish => "elvish",
-        Shell::Powershell => "powershell",
-    };
+pub fn registration(out: &mut impl Write, shell: &str) -> io::Result<()> {
     let shells = Shells::builtins();
     let completer = shells
-        .completer(name)
-        .ok_or_else(|| io::Error::other(format!("no completer for {name}")))?;
-    let mut buf = Vec::new();
-    completer.write_registration(VAR, "metor", "metor", "metor", &mut buf)?;
-    out.write_all(&buf)
+        .completer(shell)
+        .ok_or_else(|| io::Error::other(format!("no completer for {shell}")))?;
+    completer.write_registration(VAR, "metor", "metor", "metor", out)
 }
 
-/// What a cached name names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Target,
-    System,
-}
+/// A cached name's kind.
+const TARGET: &str = "target";
+const SYSTEM: &str = "system";
 
 /// The cache of `config`'s names: its targets, then every name `show`
 /// takes.
@@ -80,11 +58,11 @@ pub fn cache(config: &ResolvedDeployment) -> String {
         .namespaces()
         .into_iter()
         .filter(|ns| !ns.is_empty())
-        .map(|ns| format!("target {ns}\n"));
+        .map(|ns| format!("{TARGET} {ns}\n"));
     let names = show::names(config).into_iter();
     let systems = names
         .filter(|name| !config.namespaces().contains(&name.as_str()))
-        .map(|name| format!("system {name}\n"));
+        .map(|name| format!("{SYSTEM} {name}\n"));
     targets.chain(systems).collect()
 }
 
@@ -105,18 +83,12 @@ pub fn write_cache(target: &Path, config: &ResolvedDeployment) {
 }
 
 /// The names of `kinds` in `cache` that start with `prefix`.
-pub fn candidates<'a>(cache: &'a str, kinds: &[Kind], prefix: &str) -> Vec<&'a str> {
+pub fn candidates<'a>(cache: &'a str, kinds: &[&str], prefix: &str) -> Vec<&'a str> {
     cache
         .lines()
-        .filter_map(|line| {
-            let (kind, name) = line.split_once(' ')?;
-            let kind = match kind {
-                "target" => Kind::Target,
-                "system" => Kind::System,
-                _ => return None,
-            };
-            (kinds.contains(&kind) && name.starts_with(prefix)).then_some(name)
-        })
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(kind, name)| kinds.contains(kind) && name.starts_with(prefix))
+        .map(|(_, name)| name)
         .collect()
 }
 
@@ -130,7 +102,7 @@ fn nearest_cache() -> String {
         .unwrap_or_default()
 }
 
-fn complete(current: &OsStr, kinds: &[Kind], files: bool) -> Vec<CompletionCandidate> {
+fn complete(current: &OsStr, kinds: &[&str], files: bool) -> Vec<CompletionCandidate> {
     let prefix = current.to_string_lossy();
     let cache = nearest_cache();
     let names = candidates(&cache, kinds, &prefix)
@@ -155,17 +127,17 @@ fn target_files() -> PathCompleter {
 
 /// Completes a target's namespace.
 pub fn targets() -> ArgValueCompleter {
-    ArgValueCompleter::new(|current: &OsStr| complete(current, &[Kind::Target], false))
+    ArgValueCompleter::new(|current: &OsStr| complete(current, &[TARGET], false))
 }
 
 /// Completes a target file, or a target or system name.
 pub fn files_or_names() -> ArgValueCompleter {
-    ArgValueCompleter::new(|current: &OsStr| complete(current, &[Kind::Target, Kind::System], true))
+    ArgValueCompleter::new(|current: &OsStr| complete(current, &[TARGET, SYSTEM], true))
 }
 
 /// Completes a target file, or a target name.
 pub fn files_or_targets() -> ArgValueCompleter {
-    ArgValueCompleter::new(|current: &OsStr| complete(current, &[Kind::Target], true))
+    ArgValueCompleter::new(|current: &OsStr| complete(current, &[TARGET], true))
 }
 
 /// Completes a target file.
@@ -182,25 +154,19 @@ mod tests {
 
     #[test]
     fn test_candidates_filter_by_kind_and_prefix() {
-        assert_eq!(candidates(CACHE, &[Kind::Target], ""), ["plant", "fsw"]);
+        assert_eq!(candidates(CACHE, &[TARGET], ""), ["plant", "fsw"]);
         assert_eq!(
-            candidates(CACHE, &[Kind::Target, Kind::System], "p"),
+            candidates(CACHE, &[TARGET, SYSTEM], "p"),
             ["plant", "plant.pub"]
         );
-        assert_eq!(candidates(CACHE, &[Kind::System], "fsw."), ["fsw.nav"]);
-        assert!(candidates("", &[Kind::Target], "").is_empty());
-        assert!(candidates(CACHE, &[Kind::Target], "zz").is_empty());
+        assert_eq!(candidates(CACHE, &[SYSTEM], "fsw."), ["fsw.nav"]);
+        assert!(candidates("", &[TARGET], "").is_empty());
+        assert!(candidates(CACHE, &[TARGET], "zz").is_empty());
     }
 
     #[test]
     fn test_registration_names_metor_for_every_shell() {
-        for shell in [
-            Shell::Bash,
-            Shell::Zsh,
-            Shell::Fish,
-            Shell::Elvish,
-            Shell::Powershell,
-        ] {
+        for shell in SHELLS {
             let mut out = Vec::new();
             registration(&mut out, shell).expect("writes to a Vec");
             let script = String::from_utf8(out).expect("utf-8");

@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use super::run::{RunError, find_target, interpreter, python_path};
+use super::run::{RunError, find_target, interpreter, io, print, python_path};
 use super::ui::event::Event;
 use super::ui::theme::{Theme, Token};
 use super::ui::{Format, Ui};
@@ -69,13 +69,7 @@ pub fn doctor(ui: &Ui) -> Result<(), RunError> {
         let value = json!(checks.iter().map(to_json).collect::<Vec<_>>());
         ui.emit(Event::Data("doctor", &value));
     } else {
-        let mut out = io::stdout().lock();
-        render(&mut out, &checks, &Theme::new(&ui.stdout_caps())).map_err(|source| {
-            RunError::Io {
-                path: PathBuf::from("stdout"),
-                source,
-            }
-        })?;
+        print(ui, |out, theme, _| render(out, &checks, theme))?;
     }
     let failed: Vec<&str> = checks
         .iter()
@@ -90,10 +84,7 @@ pub fn doctor(ui: &Ui) -> Result<(), RunError> {
 
 /// The directory of the nearest `target.py`, or the working directory.
 fn project_dir() -> Result<PathBuf, RunError> {
-    let cwd = std::env::current_dir().map_err(|source| RunError::Io {
-        path: PathBuf::from("."),
-        source,
-    })?;
+    let cwd = std::env::current_dir().map_err(io(Path::new(".")))?;
     let found = find_target(&cwd).and_then(|target| target.parent().map(Path::to_path_buf));
     Ok(found.unwrap_or(cwd))
 }

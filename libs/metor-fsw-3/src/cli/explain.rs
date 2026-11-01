@@ -1,11 +1,10 @@
 //! `metor explain` prints the long form of a diagnostic code.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 use serde_json::json;
 
-use super::run::RunError;
+use super::run::{RunError, print};
 use super::ui::event::Event;
 use super::ui::markdown;
 use super::ui::table::{Align, Table};
@@ -74,9 +73,10 @@ pub fn explain(args: Explain, ui: &Ui) -> Result<(), RunError> {
         ui.emit(Event::Data("explain", &value));
         return Ok(());
     }
-    let theme = Theme::new(&ui.stdout_caps());
-    let width = ui.stdout_width().unwrap_or(MAX_WIDTH).min(MAX_WIDTH);
-    write_stdout(|out| render(out, &section, &theme, width))
+    print(ui, |out, theme, width| {
+        let width = width.unwrap_or(MAX_WIDTH).min(MAX_WIDTH);
+        render(out, &section, theme, width)
+    })
 }
 
 fn list(ui: &Ui) -> Result<(), RunError> {
@@ -87,17 +87,8 @@ fn list(ui: &Ui) -> Result<(), RunError> {
         ui.emit(Event::Data("codes", &json!(codes)));
         return Ok(());
     }
-    let theme = Theme::new(&ui.stdout_caps());
-    let width = ui.stdout_width();
-    write_stdout(|out| render_list(out, sections(CODES), &theme, width))
-}
-
-fn write_stdout(
-    write: impl FnOnce(&mut io::StdoutLock<'static>) -> io::Result<()>,
-) -> Result<(), RunError> {
-    write(&mut io::stdout().lock()).map_err(|source| RunError::Io {
-        path: PathBuf::from("stdout"),
-        source,
+    print(ui, |out, theme, width| {
+        render_list(out, sections(CODES), theme, width)
     })
 }
 
