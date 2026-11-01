@@ -24,6 +24,10 @@ use crate::dl::PackError;
 /// A code and an optional help line.
 type Info = (&'static str, Option<String>);
 
+fn help(code: &'static str, text: &str) -> Info {
+    (code, Some(text.into()))
+}
+
 /// An error ready to render.
 #[derive(Debug)]
 pub struct Report {
@@ -163,44 +167,36 @@ fn run_info(error: &RunError) -> Info {
         RunError::Build(error) => build_info(error),
         RunError::PackDev(error) => pack_dev_info(error),
         RunError::Pack(error) => pack_info(error),
-        RunError::EpochWall => (
-            "M0101",
-            Some("pass --sim-dt, or run a simulated target".into()),
-        ),
-        RunError::NoTargetFile(_) => (
+        RunError::EpochWall => help("M0101", "pass --sim-dt, or run a simulated target"),
+        RunError::NoTargetFile(_) => help(
             "M0206",
-            Some("check the path; without one, metor finds the nearest target.py".into()),
+            "check the path; without one, metor finds the nearest target.py",
         ),
-        RunError::NoSuchName { name, known } => ("M0104", Some(suggest(name, known, SHOW_NAMES))),
-        RunError::NoSuchCode { code, known } => ("M0106", Some(suggest(code, known, CODES))),
-        RunError::BadName { .. } => (
+        RunError::NoSuchName { name, known } => help("M0104", &suggest(name, known, SHOW_NAMES)),
+        RunError::NoSuchCode { code, known } => help("M0106", &suggest(code, known, CODES)),
+        RunError::BadName { .. } => help(
             "M0107",
-            Some("use lowercase letters, digits, and `-`, as in `my-sat`".into()),
+            "use lowercase letters, digits, and `-`, as in `my-sat`",
         ),
-        RunError::Exists(_) => ("M0108", Some("pick a new directory".into())),
-        RunError::Doctor(_) => ("M0105", Some("each fix is listed under its check".into())),
-        RunError::NoProject(_) => (
+        RunError::Exists(_) => help("M0108", "pick a new directory"),
+        RunError::Doctor(_) => help("M0105", "each fix is listed under its check"),
+        RunError::NoProject(_) => help(
             "M0209",
-            Some("pass the target file, or run from a project directory".into()),
+            "pass the target file, or run from a project directory",
         ),
-        RunError::NoDeployment => (
+        RunError::NoDeployment => help(
             "M0207",
-            Some("create a `Target` or a `Deployment` in the target file".into()),
+            "create a `Target` or a `Deployment` in the target file",
         ),
         RunError::Io { .. } => ("M0208", None),
-        RunError::Python { .. } => ("M0201", Some("the traceback above shows where".into())),
+        RunError::Python { .. } => help("M0201", "the traceback above shows where"),
         RunError::PythonPath(_) => ("M0202", None),
-        RunError::Spawn(_) => (
-            "M0203",
-            Some("set $METOR_PYTHON or activate a virtualenv".into()),
-        ),
-        RunError::Latched(_) => (
+        RunError::Spawn(_) => help("M0203", "set $METOR_PYTHON or activate a virtualenv"),
+        RunError::Latched(_) => help(
             "M0501",
-            Some(
-                "a latched system stops for the rest of the run; its last log lines say why".into(),
-            ),
+            "a latched system stops for the rest of the run; its last log lines say why",
         ),
-        RunError::Children(_) => ("M0502", Some("each target's own error is above".into())),
+        RunError::Children(_) => help("M0502", "each target's own error is above"),
         RunError::Interrupted => ("M0503", None),
     }
 }
@@ -208,12 +204,12 @@ fn run_info(error: &RunError) -> Info {
 fn config_info(error: &ConfigError) -> Info {
     match error {
         ConfigError::NoSuchTarget { name, known } => {
-            ("M0102", Some(suggest(name, known, SHOW_TARGETS)))
+            help("M0102", &suggest(name, known, SHOW_TARGETS))
         }
         ConfigError::SelectTarget(_) => ("M0103", None),
-        ConfigError::Version { .. } => (
+        ConfigError::Version { .. } => help(
             "M0204",
-            Some("install the metor-config that ships with this metor".into()),
+            "install the metor-config that ships with this metor",
         ),
         ConfigError::Decode(_) => ("M0205", None),
     }
@@ -225,12 +221,12 @@ fn deploy_info(error: &DeployError) -> Info {
         DeployError::Build { source, .. } => build_info(source),
         DeployError::NoSuchTarget { .. } => ("M0210", None),
         DeployError::NoSuchLink { .. } => ("M0211", None),
-        DeployError::NotAListener { .. } => (
+        DeployError::NotAListener { .. } => help(
             "M0212",
-            Some("give the link a `Listen` transport with a fixed port".into()),
+            "give the link a `Listen` transport with a fixed port",
         ),
         DeployError::NoSuchPort { .. } => ("M0213", None),
-        DeployError::PortTaken { .. } => ("M0214", Some("give each listener its own port".into())),
+        DeployError::PortTaken { .. } => help("M0214", "give each listener its own port"),
         DeployError::Cycle { .. } => ("M0215", None),
         DeployError::Unresolved { .. } => ("M0216", None),
         DeployError::UnresolvedDial { .. } => ("M0217", None),
@@ -241,18 +237,18 @@ fn deploy_info(error: &DeployError) -> Info {
 }
 
 fn build_info(error: &BuildError) -> Info {
-    let deterministic = || Some("pass --sim-dt and --epoch with --deterministic".into());
+    let deterministic = |code| help(code, "pass --sim-dt and --epoch with --deterministic");
     match error {
         BuildError::Located { source, .. } => build_info(source),
-        BuildError::DeterministicWall => ("M0301", deterministic()),
-        BuildError::DeterministicZeroDt => ("M0302", deterministic()),
-        BuildError::DeterministicEpoch => ("M0303", deterministic()),
-        BuildError::DuplicateId { .. } => ("M0304", Some("give each system its own id".into())),
+        BuildError::DeterministicWall => deterministic("M0301"),
+        BuildError::DeterministicZeroDt => deterministic("M0302"),
+        BuildError::DeterministicEpoch => deterministic("M0303"),
+        BuildError::DuplicateId { .. } => help("M0304", "give each system its own id"),
         BuildError::DuplicateInput { .. } => ("M0305", None),
         BuildError::DuplicateOutput { .. } => ("M0306", None),
-        BuildError::UnknownType { .. } => (
+        BuildError::UnknownType { .. } => help(
             "M0307",
-            Some("check that the target lists the pack this type comes from".into()),
+            "check that the target lists the pack this type comes from",
         ),
         BuildError::UnknownSystem { .. } => ("M0308", None),
         BuildError::UnknownInput { .. } => ("M0309", None),
@@ -260,10 +256,9 @@ fn build_info(error: &BuildError) -> Info {
         BuildError::IdMismatch { .. } => ("M0311", None),
         BuildError::UnsupportedFrameAlignment { .. } => ("M0312", None),
         BuildError::RingTooLarge { .. } => ("M0313", None),
-        BuildError::DynamicFromLater { .. } => (
-            "M0314",
-            Some("add the producer before the system that reads it".into()),
-        ),
+        BuildError::DynamicFromLater { .. } => {
+            help("M0314", "add the producer before the system that reads it")
+        }
         BuildError::RecordConflict { .. } => ("M0315", None),
         BuildError::RecordIdConflict { .. } => ("M0316", None),
         BuildError::MessageIdConflict { .. } => ("M0317", None),
@@ -275,9 +270,9 @@ fn build_info(error: &BuildError) -> Info {
         BuildError::Ungranted { .. } => ("M0323", None),
         BuildError::DuplicateGrant { .. } => ("M0324", None),
         BuildError::UnknownGrant { .. } => ("M0325", None),
-        BuildError::NoIoStep { .. } => ("M0326", Some("add an fsw.io system to the target".into())),
+        BuildError::NoIoStep { .. } => help("M0326", "add an fsw.io system to the target"),
         BuildError::NoIoStepAfter { system } => {
-            ("M0327", Some(format!("add fsw.io after `{system}`")))
+            help("M0327", &format!("add fsw.io after `{system}`"))
         }
         BuildError::TooManyIoOps { .. } => ("M0328", None),
         BuildError::TooManyResources { .. } => ("M0329", None),
@@ -300,24 +295,24 @@ fn pack_dev_info(error: &PackDevError) -> Info {
         PackDevError::Write { .. } => ("M0402", None),
         PackDevError::Toml { .. } => ("M0403", None),
         PackDevError::Schema { .. } => ("M0404", None),
-        PackDevError::NameClash { .. } => ("M0405", Some("rename the param or the port".into())),
+        PackDevError::NameClash { .. } => help("M0405", "rename the param or the port"),
         PackDevError::Template(_) => ("M0406", None),
         PackDevError::AlreadyLoaded(_) => ("M0407", None),
         PackDevError::DescriptorMismatch => ("M0408", None),
-        PackDevError::NoWasmTarget => (
+        PackDevError::NoWasmTarget => help(
             "M0413",
-            Some(format!("rustup target add {}", crate::dl::WASM_TRIPLE)),
+            &format!("rustup target add {}", crate::dl::WASM_TRIPLE),
         ),
     }
 }
 
 fn cargo_info(error: &CargoError) -> Info {
     match error {
-        CargoError::Spawn(_) => ("M0410", Some("is cargo on your PATH?".into())),
-        CargoError::Cargo { .. } => ("M0411", Some("cargo's errors are above".into())),
-        CargoError::NoArtifact(..) => (
+        CargoError::Spawn(_) => help("M0410", "is cargo on your PATH?"),
+        CargoError::Cargo { .. } => help("M0411", "cargo's errors are above"),
+        CargoError::NoArtifact(..) => help(
             "M0412",
-            Some("set `crate-type = [\"cdylib\"]` in the pack's Cargo.toml".into()),
+            "set `crate-type = [\"cdylib\"]` in the pack's Cargo.toml",
         ),
     }
 }
@@ -326,9 +321,7 @@ fn pack_info(error: &PackError) -> Info {
     match error {
         PackError::Open(_) => ("M0420", None),
         PackError::MissingSymbol(_) => ("M0421", None),
-        PackError::AbiMismatch { .. } => {
-            ("M0422", Some("rebuild the pack against this metor".into()))
-        }
+        PackError::AbiMismatch { .. } => help("M0422", "rebuild the pack against this metor"),
         PackError::Decode => ("M0423", None),
         PackError::DescriptorTooLarge { .. } => ("M0424", None),
         PackError::DescriptorStatus(_) => ("M0425", None),

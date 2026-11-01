@@ -46,21 +46,23 @@ fn object(event: &Event<'_>) -> Option<Value> {
             "text": String::from_utf8_lossy(bytes),
         }),
         Event::Phase(phase) => {
-            let (state, extra) = match phase.state {
-                PhaseState::Started => ("started", json!({})),
-                PhaseState::Progress { done, current } => {
-                    ("progress", json!({ "done": done, "current": current }))
-                }
-                PhaseState::Done(took) => ("done", json!({ "secs": took.as_secs_f64() })),
-                PhaseState::Failed => ("failed", json!({})),
-            };
             let mut value = json!({
                 "type": "phase",
                 "phase": phase.verb.doing().to_lowercase(),
                 "subject": phase.subject,
-                "state": state,
             });
-            merge(&mut value, extra);
+            value["state"] = match phase.state {
+                PhaseState::Started => json!("started"),
+                PhaseState::Progress { done, current } => {
+                    (value["done"], value["current"]) = (json!(done), json!(current));
+                    json!("progress")
+                }
+                PhaseState::Done(took) => {
+                    value["secs"] = json!(took.as_secs_f64());
+                    json!("done")
+                }
+                PhaseState::Failed => json!("failed"),
+            };
             value
         }
         Event::Running(namespaces) => json!({ "type": "running", "targets": namespaces }),
@@ -85,12 +87,7 @@ fn object(event: &Event<'_>) -> Option<Value> {
                 "line": line,
             })
         }
-        Event::Data(kind, value) => {
-            let mut object = serde_json::Map::new();
-            object.insert("type".into(), json!(kind));
-            object.insert((*kind).into(), (*value).clone());
-            Value::Object(object)
-        }
+        Event::Data(kind, value) => json!({ "type": kind, *kind: value }),
     })
 }
 
@@ -104,19 +101,12 @@ fn location(diagnostic: &dyn miette::Diagnostic) -> Option<(String, usize)> {
     Some((contents.name()?.to_string(), contents.line() + 1))
 }
 
-fn merge(into: &mut Value, from: Value) {
-    if let (Value::Object(into), Value::Object(from)) = (into, from) {
-        into.extend(from);
-    }
-}
-
 impl<W: Write + Send> Reporter for Json<W> {
     fn event(&mut self, event: &Event<'_>) {
-        let Some(object) = object(event) else {
+        let Some(mut value) = object(event) else {
             return;
         };
-        let mut value = json!({ "v": VERSION });
-        merge(&mut value, object);
+        value["v"] = json!(VERSION);
         let _ = writeln!(self.out, "{value}").and_then(|()| self.out.flush());
     }
 }
