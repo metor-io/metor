@@ -7,16 +7,12 @@ use serde_json::json;
 
 use super::run::{RunError, print};
 use super::ui::event::Event;
-use super::ui::markdown;
 use super::ui::table::{Align, Table};
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 
-/// One `## M0201 Title` section per code.
+/// One `## M0201 Title` section per code, wrapped at 76 columns.
 const CODES: &str = include_str!("codes.md");
-
-/// The widest a wrapped line gets, for reading.
-const MAX_WIDTH: usize = 100;
 
 /// The arguments to `metor explain`.
 #[derive(clap::Args, Debug, Default)]
@@ -74,10 +70,7 @@ pub fn explain(args: Explain, ui: &Ui) -> Result<(), RunError> {
         ui.emit(Event::Data("explain", &value));
         return Ok(());
     }
-    print(ui, |out, theme, width| {
-        let width = width.unwrap_or(MAX_WIDTH).min(MAX_WIDTH);
-        render(out, &section, theme, width)
-    })
+    print(ui, |out, theme, _| render(out, &section, theme))
 }
 
 fn list(ui: &Ui) -> Result<(), RunError> {
@@ -93,13 +86,9 @@ fn list(ui: &Ui) -> Result<(), RunError> {
     })
 }
 
-/// The code and title, then the body.
-pub fn render(
-    out: &mut impl Write,
-    section: &Section<'_>,
-    theme: &Theme,
-    width: usize,
-) -> io::Result<()> {
+/// The code and title, then the body as written, with code muted and
+/// inline code in the accent colour.
+pub fn render(out: &mut impl Write, section: &Section<'_>, theme: &Theme) -> io::Result<()> {
     let code = theme.bold(theme.error);
     let title = theme.bold(Style::new());
     writeln!(
@@ -108,7 +97,37 @@ pub fn render(
         section.code, section.title
     )?;
     writeln!(out)?;
-    markdown::render(out, &markdown::parse(section.body), theme, width)
+    let muted = theme.muted;
+    let (mut fenced, mut open) = (false, false);
+    for line in section.body.lines() {
+        if line.starts_with("```") {
+            fenced = !fenced;
+        } else if line.is_empty() {
+            writeln!(out)?;
+        } else if fenced {
+            writeln!(out, "    {muted}{line}{muted:#}")?;
+        } else {
+            writeln!(out, "  {}", inline(line, theme.accent, &mut open))?;
+        }
+    }
+    Ok(())
+}
+
+/// `line` with its code spans in `accent`. `open` carries a span across
+/// lines. Without colour, the backticks stay.
+fn inline(line: &str, accent: Style, open: &mut bool) -> String {
+    if accent == Style::new() {
+        return line.to_string();
+    }
+    let mut text = String::with_capacity(line.len());
+    for (index, part) in line.split('`').enumerate() {
+        *open ^= index > 0;
+        match *open {
+            true => text.push_str(&format!("{accent}{part}{accent:#}")),
+            false => text.push_str(part),
+        }
+    }
+    text
 }
 
 const LIST_COLUMNS: [(&str, Align); 2] = [("CODE", Align::Left), ("TITLE", Align::Left)];
@@ -219,12 +238,29 @@ mod tests {
             .find(|s| s.code == "M0304")
             .expect("M0304 is documented");
         let mut out = Vec::new();
-        render(&mut out, &section, &Theme::new(&Caps::plain()), 60).expect("writes to a Vec");
+        render(&mut out, &section, &Theme::new(&Caps::plain())).expect("writes to a Vec");
         let text = String::from_utf8(out).expect("utf-8");
         assert!(text.starts_with("  M0304  "), "{text}");
-        assert!(
-            text.lines()
-                .all(|line| line.chars().count() <= 60 || line.starts_with("    "))
-        );
+        assert!(text.contains("`"), "plain keeps backticks: {text}");
+        assert!(!text.contains("```"), "{text}");
+    }
+
+    #[test]
+    fn test_codes_are_wrapped() {
+        let long = CODES.lines().find(|line| line.chars().count() > 76);
+        assert_eq!(long, None);
+    }
+
+    #[test]
+    fn test_inline_styles_spans_across_lines() {
+        let accent = Style::new().bold();
+        let mut open = false;
+        let first = inline("run `metor", accent, &mut open);
+        assert!(open, "the span runs on");
+        let second = inline("check` now", accent, &mut open);
+        assert!(!open);
+        assert_eq!(first, format!("run {accent}metor{accent:#}"));
+        assert_eq!(second, format!("{accent}check{accent:#} now"));
+        assert_eq!(inline("a `b`", Style::new(), &mut open), "a `b`");
     }
 }

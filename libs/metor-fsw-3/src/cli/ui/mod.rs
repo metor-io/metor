@@ -7,7 +7,6 @@ pub mod glyph;
 pub mod human;
 pub mod json;
 pub mod logline;
-pub mod markdown;
 pub mod table;
 pub mod theme;
 
