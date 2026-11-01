@@ -18,6 +18,7 @@ class Imu(Record):
     _kind = "frame"
     _name = "imu"
     _pack = PACK
+    _fields = {"gyro": "f64[3]", "accel": "f64[3]", "css": "f64[6]"}
 
 
 class LogEvent(Record):
@@ -36,6 +37,7 @@ class Est(Record):
     _kind = "frame"
     _name = "est"
     _pack = PACK
+    _fields = {"q": "f64[4]", "bias.a": "f64", "bias.b": "f64[3]"}
 
 
 class ModeCmd(Record):
@@ -48,6 +50,7 @@ class MotorCmd(Record):
     _kind = "frame"
     _name = "motor_cmd"
     _pack = PACK
+    _fields = {"torque": "f64[3]", "trim.b": "f64[3]", "trim.a": "f64"}
 
 
 class Ping(Record):

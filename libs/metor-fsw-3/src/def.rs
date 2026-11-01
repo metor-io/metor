@@ -99,13 +99,31 @@ impl DefCx<'_> {
             .iter()
             .filter(|output| !declared.iter().any(|taken| *taken == output.port))
             .map(|output| match &output.source {
-                OutputSource::Record(record) => self.records.port_def(&output.port, record),
+                OutputSource::Record(record) => self.record_output(&output.port, record),
                 OutputSource::Def(def) => Ok(PortDef {
                     name: output.port.clone().into(),
                     ..def.clone()
                 }),
             })
             .collect()
+    }
+
+    /// Returns a definition for output `port` carrying `record`, with a frame
+    /// re-rooted at the port's own path.
+    fn record_output(&self, port: &str, record: &str) -> Result<PortDef, DefError> {
+        let mut def = self.records.port_def(port, record)?;
+        let from = self
+            .records
+            .get(record)
+            .map_or("", |known| known.name.as_ref());
+        def.schema = def
+            .schema
+            .reroot(from, &self.port_path(port))
+            .map_err(|e| DefError::Reroot {
+                port: port.to_string(),
+                message: e.to_string(),
+            })?;
+        Ok(def)
     }
 
     /// Returns `{namespace}.{id}.{port}`, leaving out any part that is empty.
@@ -169,6 +187,9 @@ pub enum DefError {
 
     #[error("async system `{system}` takes `Alarms`, which only a stepped system takes")]
     AlarmsOnAsync { system: String },
+
+    #[error("output `{port}` cannot carry its frame under its own path: {message}")]
+    Reroot { port: String, message: String },
 }
 
 /// The smallest whole-MiB `conn_cap` whose packets carry a `max_len`-byte
@@ -213,6 +234,11 @@ impl Records {
         })
     }
 
+    /// Returns the definition of record `name`, rooted at its own port name.
+    pub fn get(&self, name: &str) -> Option<&PortDef> {
+        self.0.get(name)
+    }
+
     /// Returns the packet id of the message record `name`.
     pub fn msg_id(&self, name: &str) -> Result<PacketId, RecordError> {
         let def = self
@@ -238,7 +264,7 @@ pub enum RecordError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::utils::{Imu, ImuPair, Nav};
+    use crate::tests::utils::{Imu, ImuPair, Nav, Note};
     use crate::{Output, Record};
 
     #[test]
@@ -292,6 +318,81 @@ mod tests {
         );
         let port = records.port_def("out", Imu::NAME).expect("known record");
         assert!(port.same_record(&Output::<Imu>::def(&cx, "imu")));
+    }
+
+    fn outputs(record: &str, ports: &[&str]) -> Vec<OutputConfig> {
+        ports
+            .iter()
+            .map(|port| OutputConfig {
+                port: port.to_string(),
+                source: OutputSource::Record(record.to_string()),
+            })
+            .collect()
+    }
+
+    fn registry() -> Records {
+        let cx = DefCx::empty();
+        Records::from_port_defs(
+            [
+                Output::<Imu>::def(&cx, "imu"),
+                Output::<Note>::def(&cx, "note"),
+            ]
+            .iter(),
+        )
+    }
+
+    #[test]
+    fn test_record_outputs_reroot_frames() {
+        let records = registry();
+        let listed = outputs(Imu::NAME, &["a", "b"]);
+        let cx = DefCx {
+            id: "mux",
+            namespace: Some("ns"),
+            outputs: &listed,
+            records: &records,
+            ..DefCx::empty()
+        };
+        let defs = cx.dyn_output_defs(&[]).expect("frames re-root");
+        assert_eq!(defs[0].schema, Imu::schema_with_root("ns.mux.a"));
+        assert_ne!(defs[0].schema.packet_id(), defs[1].schema.packet_id());
+        assert_eq!(defs[0].layout, Imu::layout());
+    }
+
+    #[test]
+    fn test_record_outputs_keep_messages() {
+        let records = registry();
+        let listed = outputs(Note::NAME, &["note"]);
+        let cx = DefCx {
+            id: "subscribe",
+            outputs: &listed,
+            records: &records,
+            ..DefCx::empty()
+        };
+        let defs = cx.dyn_output_defs(&[]).expect("messages pass");
+        assert_eq!(
+            defs[0],
+            records.port_def("note", Note::NAME).expect("known")
+        );
+    }
+
+    #[test]
+    fn test_record_output_reroot_error() {
+        let mut imu = Output::<Imu>::def(&DefCx::empty(), "imu");
+        if let RecordSchema::Frame { metadata, .. } = &mut imu.schema {
+            metadata.clear();
+        }
+        let records = Records::from_port_defs([imu].iter());
+        let listed = outputs(Imu::NAME, &["a"]);
+        let cx = DefCx {
+            id: "mux",
+            outputs: &listed,
+            records: &records,
+            ..DefCx::empty()
+        };
+        assert!(matches!(
+            cx.dyn_output_defs(&[]),
+            Err(DefError::Reroot { port, .. }) if port == "a"
+        ));
     }
 
     #[test]

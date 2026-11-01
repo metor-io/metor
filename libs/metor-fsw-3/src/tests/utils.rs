@@ -180,6 +180,80 @@ pub struct Control {
     pub command: f64,
 }
 
+/// A stamped frame with a scalar and a shaped leaf.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[frame(name = "pair")]
+#[repr(C)]
+pub struct Pair {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub a: f64,
+    pub b: crate::FrameArray<f64, 3>,
+}
+
+impl Pair {
+    pub fn new(timestamp: i64, a: f64, b: [f64; 3]) -> Self {
+        Self {
+            timestamp: Timestamp(timestamp),
+            a,
+            b: crate::FrameArray(b),
+        }
+    }
+}
+
+/// The scalar half of a [`Pair`].
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[frame(name = "pair_a")]
+#[repr(C)]
+pub struct PairA {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub a: f64,
+}
+
+/// The shaped half of a [`Pair`].
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[frame(name = "pair_b")]
+#[repr(C)]
+pub struct PairB {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub b: crate::FrameArray<f64, 3>,
+}
+
+/// A struct nested in a frame.
+#[derive(
+    metor_component::AsVTable,
+    metor_component::Metadatatize,
+    metor_component::Componentize,
+    metor_component::Decomponentize,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    FromBytes,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+)]
+#[repr(C)]
+pub struct Inner {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A stamped frame with a nested struct.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[frame(name = "nested")]
+#[repr(C)]
+pub struct Nested {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    #[frame(nest)]
+    pub inner: Inner,
+    pub z: f64,
+}
+
 /// Declares an output under the coordinator's reserved name.
 #[crate::system]
 pub fn reserved(status: &mut Output<Imu>, now: Timestamp) {

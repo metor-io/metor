@@ -75,6 +75,10 @@ pub fn frame(input: TokenStream) -> TokenStream {
             quote! {{
                 let max_len: usize = #max_len;
                 assert!(
+                    <Self as #fsw::AsVTable>::DYNAMIC,
+                    "#[frame(max_len)] is only for a frame holding a FrameMap"
+                );
+                assert!(
                     max_len >= ::core::mem::size_of::<Self>(),
                     "#[frame(max_len)] is smaller than the frame"
                 );

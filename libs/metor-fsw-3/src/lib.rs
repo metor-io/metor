@@ -157,6 +157,7 @@ pub mod deploy;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
+pub mod frame_fields;
 pub mod frame_map;
 pub mod io;
 #[cfg(feature = "host")]
@@ -164,6 +165,7 @@ pub mod link;
 pub mod log;
 #[cfg(all(feature = "threads", not(target_family = "wasm")))]
 mod mirror;
+pub mod mux;
 pub mod pack;
 mod panic;
 pub mod port;
@@ -192,7 +194,8 @@ pub use def::{DefCx, DefError, Records};
 #[cfg(feature = "host")]
 pub use dl::{DlPack, DlStep, Pack, PackError};
 pub use fn_system::{
-    AsyncSystemFn, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamNames, SystemFn,
+    AsyncSystemFn, Bound, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamNames,
+    SystemFn, WithDef,
 };
 pub use frame::Frame;
 pub use frame_map::{FrameRef, FrameWriteError, FrameWriter, MapRef, MapWriter};
@@ -208,7 +211,9 @@ pub use port::{
     DynInputs, DynOutputs, Input, InputWake, Latest, Output, RecvError, Sample, SendError,
     ring_capacity,
 };
-pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
+pub use record::{
+    Bytes, DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema, RerootError,
+};
 pub use rng::Rng;
 pub use sequence::{OnAbort, Seq, SeqError, SequenceFn, Watch};
 pub use system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};

@@ -10,7 +10,128 @@ use metor_fsw_3::cli::module::{render, render_builtins};
 use metor_fsw_3::coordinator::SystemTable;
 use metor_fsw_3::dl::PackRef;
 use metor_fsw_3::pack::def::PackDef;
+use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use metor_fsw_3::{DefCx, Frame, FrameArray, FrameMap, Input, Output, PortDef, Record, Timestamp};
 use serde_json::{Value, json};
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "sample")]
+#[repr(C)]
+struct Sample {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    a: f64,
+    b: FrameArray<f64, 3>,
+}
+
+#[derive(
+    metor_component::AsVTable,
+    metor_component::Metadatatize,
+    metor_component::Componentize,
+    metor_component::Decomponentize,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    FromBytes,
+)]
+#[repr(C)]
+struct Wheel {
+    speed: f64,
+    torque: f64,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "wheels")]
+#[repr(C)]
+struct Wheels {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    #[frame(nest)]
+    wheel: Wheel,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "procs", max_len = 128)]
+#[repr(C)]
+struct Procs {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    procs: FrameMap<u32, u64>,
+}
+
+/// A group whose leaves share names with a `Field`'s attributes.
+#[derive(
+    metor_component::AsVTable,
+    metor_component::Metadatatize,
+    metor_component::Componentize,
+    metor_component::Decomponentize,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    FromBytes,
+)]
+#[repr(C)]
+struct Attrs {
+    signature: f64,
+    path: f64,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "signed")]
+#[repr(C)]
+struct Signed {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    #[frame(nest)]
+    g: Attrs,
+}
+
+/// A frame whose field is a Python keyword.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "kw")]
+#[repr(C)]
+struct Kw {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    class: f64,
+}
+
+#[derive(Record, metor_fsw_3::Schema, serde::Serialize, serde::Deserialize)]
+#[record(max_len = 32)]
+struct Note {
+    text: String,
+}
+
+/// A descriptor whose one system outputs `outputs`.
+fn emitting(outputs: Vec<PortDef>) -> PackDef {
+    let mut descriptor: PackDef = serde_json::from_value(json!({"systems": [{
+        "ty": "probe", "doc": "", "params": null,
+        "def": {"name": "probe", "inputs": [], "outputs": []}
+    }]}))
+    .expect("descriptor");
+    descriptor.systems[0].def.outputs = outputs;
+    descriptor
+}
+
+fn out<T: Record>(port: &'static str) -> PortDef {
+    Output::<T>::def(&DefCx::empty(), port)
+}
+
+/// A frame `tick` with no leaves. `derive(Frame)` needs one, so it is built
+/// by hand.
+fn tick() -> PortDef {
+    PortDef {
+        name: "tick".into(),
+        record: "tick".into(),
+        id: metor_fsw_3::metor_proto::types::ComponentId::new("tick"),
+        layout: Some(1),
+        schema: metor_fsw_3::RecordSchema::Frame {
+            vtable: metor_fsw_3::metor_proto::vtable::builder::vtable([]),
+            metadata: Vec::new(),
+        },
+        ..out::<Kw>("tick")
+    }
+}
 
 fn execute(schema: Value, text: &str, script: &str) {
     let descriptor: PackDef = serde_json::from_value(json!({"systems": [{
@@ -18,8 +139,13 @@ fn execute(schema: Value, text: &str, script: &str) {
         "def": {"name": "probe", "inputs": [], "outputs": []}
     }]}))
     .expect("descriptor");
+    run(&descriptor, text, script);
+}
+
+/// Renders `descriptor` to `generated.py` and runs `script` beside it.
+fn run(descriptor: &PackDef, text: &str, script: &str) {
     let reference = PackRef::dylib(text.into(), text.into(), "unused".into());
-    let module = render(&reference, ABI_VERSION, &descriptor).expect("renders");
+    let module = render(&reference, ABI_VERSION, descriptor).expect("renders");
     let dir = tempfile::tempdir().expect("temporary directory");
     std::fs::write(dir.path().join("generated.py"), module).expect("module");
     std::fs::write(dir.path().join("expected.json"), json!(text).to_string()).expect("expected");
@@ -174,6 +300,179 @@ assert config['packs'] == [PACK.to_json()]
 assert [system['ty'] for system in config['coordinator']['systems']] == ['fsw.subscribe', 'fsw.io', 'fsw.io']
 "#,
     );
+}
+
+#[test]
+fn test_record_fields() {
+    let descriptor = emitting(vec![
+        out::<Sample>("sample"),
+        out::<Wheels>("wheels"),
+        out::<Procs>("procs"),
+        out::<Note>("note"),
+    ]);
+    let script = r#"
+from generated import Note, Procs, Sample, Wheels
+from metor_config._generated import ChannelStatus, SystemStatus
+
+assert list(Sample._fields.items()) == [('a', 'f64'), ('b', 'f64[3]')], Sample._fields
+assert list(Wheels._fields) == ['wheel.speed', 'wheel.torque'], Wheels._fields
+assert SystemStatus._fields and ChannelStatus._fields
+assert Procs._kind == 'frame' and Procs._fields == {}
+assert '_fields' not in vars(Note) and Note._fields == {}
+"#;
+    run(&descriptor, "probe", script);
+}
+
+#[test]
+fn test_typed_ports() {
+    let descriptor = emitting(vec![
+        out::<Sample>("sample"),
+        out::<Wheels>("wheels"),
+        out::<Signed>("signed"),
+        out::<Kw>("kw"),
+        tick(),
+    ]);
+    run(
+        &descriptor,
+        "probe",
+        r#"
+from generated import Kw, Probe, Sample, SamplePort, Tick, TickPort, WheelsPort_wheel
+from metor_config import ConfigError, Deployment, Field, Listen, Peer, Publish, Subscribe, Target
+
+a = Target(1, namespace='a')
+probe = a.add('probe', Probe())
+assert type(probe.sample) is SamplePort
+b = probe.sample.b
+assert isinstance(b, Field) and (b.path, b.signature) == ('b', 'f64[3]')
+wheel = probe.wheels.wheel
+assert type(wheel) is WheelsPort_wheel and wheel.signature == '{speed:f64,torque:f64}'
+assert wheel.speed.path == 'wheel.speed'
+group = probe.signed.g
+assert group.signature_.path == 'g.signature' and group.path_.path == 'g.path'
+source = probe.kw.class_
+assert Kw(class_=source)._mapping == {'class': source}
+assert type(probe.tick) is TickPort
+Tick()
+try:
+    Sample(a=b)
+except ConfigError:
+    pass
+else:
+    raise AssertionError('a shape mismatch was accepted')
+pub = a.add('pub', Publish([probe], transport=Listen('0.0.0.0:2240')))
+other = Target(1, namespace='b')
+mirror = other.add('mirror', Subscribe(transport=Peer(pub), items=[probe]))
+assert type(mirror.port(probe.sample)) is SamplePort
+Deployment(targets=[a, other])
+"#,
+    );
+}
+
+/// Frames for the pyright checks in `python/metor-config/tests/typing`.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "sensors")]
+#[repr(C)]
+struct Sensors {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    gyro_b: FrameArray<f64, 3>,
+    css: FrameArray<f64, 6>,
+    #[frame(nest)]
+    wheel: Wheel,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "body")]
+#[repr(C)]
+struct Body {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    omega_b: FrameArray<f64, 3>,
+    sun: FrameArray<f64, 6>,
+    #[frame(nest)]
+    wheel: Wheel,
+}
+
+/// The `sensors_stub` module the typing files import: a `plant` system that
+/// reads a `Body` and writes `Sensors`, rendered by stubgen.
+fn sensors_stub() -> String {
+    let mut descriptor = emitting(vec![out::<Sensors>("sensors")]);
+    descriptor.systems[0].ty = "plant".into();
+    descriptor.systems[0].def.inputs = vec![Input::<Body>::def(&DefCx::empty(), "body")];
+    let reference = PackRef::dylib("sensors".into(), "sensors".into(), "unused".into());
+    render(&reference, ABI_VERSION, &descriptor).expect("renders")
+}
+
+/// Pyright reports an error on each `# expect-error` line of
+/// `tests/typing/fields_bad.py`, and none in `fields_ok.py`, against a stub
+/// stubgen renders.
+#[test]
+fn test_field_typing() {
+    let Some(pyright) = pyright() else {
+        return;
+    };
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("python/metor-config");
+    let dir = tempfile::tempdir().expect("temporary directory");
+    std::fs::write(dir.path().join("sensors_stub.py"), sensors_stub()).expect("writes");
+    let pyright_config = json!({"extraPaths": [config], "typeCheckingMode": "standard"});
+    std::fs::write(
+        dir.path().join("pyrightconfig.json"),
+        pyright_config.to_string(),
+    )
+    .expect("writes");
+    for file in ["fields_ok.py", "fields_bad.py"] {
+        let text = std::fs::read_to_string(config.join("tests/typing").join(file)).expect("reads");
+        let path = dir.path().join(file);
+        std::fs::write(&path, &text).expect("writes");
+        let expected: Vec<u64> = (1..)
+            .zip(text.lines())
+            .filter(|(_, line)| line.ends_with("# expect-error"))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(error_lines(&pyright, dir.path(), &path), expected, "{file}");
+    }
+}
+
+/// The 1-based lines pyright reports errors on.
+fn error_lines(pyright: &[String], cwd: &Path, file: &Path) -> Vec<u64> {
+    let output = Command::new(&pyright[0])
+        .args(&pyright[1..])
+        .arg("--outputjson")
+        .arg(file)
+        .current_dir(cwd)
+        .output()
+        .expect("pyright runs");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("pyright json");
+    let diagnostics = report["generalDiagnostics"].as_array().cloned();
+    diagnostics
+        .unwrap_or_default()
+        .iter()
+        .filter(|d| d["severity"] == "error")
+        .filter_map(|d| d["range"]["start"]["line"].as_u64().map(|l| l + 1))
+        .collect()
+}
+
+/// The command that runs pyright, or `None` if it is not available.
+///
+/// Under `CI`, a missing pyright fails the test instead of skipping it.
+fn pyright() -> Option<Vec<String>> {
+    let found = [vec!["pyright"], vec!["uvx", "pyright"]]
+        .into_iter()
+        .find(|command| {
+            Command::new(command[0])
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+        .map(|command| command.iter().map(|part| (*part).to_string()).collect());
+    if found.is_none() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "neither `pyright` nor `uvx` is on PATH"
+        );
+        println!("skipped: neither `pyright` nor `uvx` is on PATH");
+    }
+    found
 }
 
 /// The checked-in `metor_config/_generated.py` is what stubgen renders for

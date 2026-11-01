@@ -16,6 +16,7 @@ IO_TYPE = f"{Io._pack.id}.{Io._ty}"
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
+P = TypeVar("P", bound=OutPort[Any])
 
 _targets: list["Target"] = []
 
@@ -67,7 +68,7 @@ class SystemHandle:
         record = self._port_map().get(port)
         if record is None:
             raise AttributeError(f"system `{self._name}` has no output port `{port}`")
-        return OutPort(self._name, port, record, self._target)
+        return record._port(self._name, port, record, self._target)
 
     def _port_map(self) -> dict[str, type[Record]]:
         """Returns every output of this system, including a channel's outputs
@@ -77,7 +78,7 @@ class SystemHandle:
             return ports
         return {**ports, **CHANNEL_PORTS}
 
-    def port(self, source: OutPort[T]) -> OutPort[T]:
+    def port(self, source: P) -> P:
         """Returns this system's copy of ``source``. See `Subscribe.port`.
 
         Raises `ConfigError` unless the system is a `Subscribe`.

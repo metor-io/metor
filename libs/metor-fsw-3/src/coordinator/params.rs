@@ -86,6 +86,8 @@ pub enum MakeError {
     CopyRingTooLarge { port: String, len: usize },
     #[error("alarm id prefix `{prefix}` leaves no room for an alarm name")]
     AlarmPrefixTooLong { prefix: String },
+    #[error("mux: {message}")]
+    Mux { message: String },
 }
 
 #[cfg(test)]

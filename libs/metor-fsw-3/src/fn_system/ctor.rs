@@ -5,19 +5,37 @@ use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 
 use crate::coordinator::{MakeError, Params};
+use crate::def::Records;
 use crate::io::{Io, IoInit};
+use crate::system::SystemDef;
+
+/// What a ctor may read about the instance it builds.
+#[derive(Clone, Copy)]
+pub struct Bound<'a> {
+    /// The instance's ports, as bound.
+    pub def: &'a SystemDef,
+    /// Every record the system table knows about.
+    pub records: &'a Records,
+}
 
 /// Builds a system's state from its config params.
 ///
 /// It is implemented for fns that take no params, fns that take a
 /// deserializable params type, and fns that take params and may fail with a
 /// [`MakeError`]. A fn that allocates IO buffers takes a trailing
-/// `&mut IoInit` and may fail. `Marker` keeps these impls from overlapping.
+/// `&mut IoInit` and may fail. A fn that reads its bound ports takes a
+/// trailing `&Bound` and may fail. `Marker` keeps these impls from
+/// overlapping.
 pub trait Ctor<S, Marker> {
     /// Builds the state.
     ///
     /// Decodes `params` first if the constructor takes them.
-    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, MakeError>;
+    fn make(
+        &self,
+        params: Params<'_>,
+        io: &mut IoInit<'_>,
+        bound: &Bound<'_>,
+    ) -> Result<S, MakeError>;
 
     /// Returns the JSON Schema of the params type.
     ///
@@ -26,11 +44,37 @@ pub trait Ctor<S, Marker> {
 
     /// Builds the state of system `id` with an `IoInit` over `io`'s arena,
     /// or one that refuses every allocation when the system has no queue.
-    fn make_with_io(&self, id: &str, params: Params<'_>, io: Option<&Io>) -> Result<S, MakeError> {
+    fn make_with_io(
+        &self,
+        id: &str,
+        params: Params<'_>,
+        io: Option<&Io>,
+        bound: &Bound<'_>,
+    ) -> Result<S, MakeError> {
         let mut init = io.map_or_else(|| IoInit::empty(id), |io| IoInit::new(io.arena(), id));
-        let state = self.make(params, &mut init)?;
+        let state = self.make(params, &mut init, bound)?;
         init.finish();
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+impl Bound<'static> {
+    /// A bound with no ports and no records.
+    pub(crate) fn empty() -> Self {
+        static DEF: std::sync::LazyLock<SystemDef> = std::sync::LazyLock::new(|| SystemDef {
+            name: "".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            log: None,
+            grants: Vec::new(),
+            io: None,
+        });
+        static RECORDS: std::sync::LazyLock<Records> = std::sync::LazyLock::new(Records::default);
+        Self {
+            def: &DEF,
+            records: &RECORDS,
+        }
     }
 }
 
@@ -42,7 +86,7 @@ fn schema_of<P: JsonSchema>() -> Option<Box<RawValue>> {
 }
 
 impl<S, F: Fn() -> S> Ctor<S, ()> for F {
-    fn make(&self, _params: Params<'_>, _io: &mut IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, _: Params<'_>, _: &mut IoInit<'_>, _: &Bound<'_>) -> Result<S, MakeError> {
         Ok(self())
     }
 
@@ -52,7 +96,7 @@ impl<S, F: Fn() -> S> Ctor<S, ()> for F {
 }
 
 impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
-    fn make(&self, params: Params<'_>, _io: &mut IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, params: Params<'_>, _: &mut IoInit<'_>, _: &Bound<'_>) -> Result<S, MakeError> {
         Ok(self(params.decode()?))
     }
 
@@ -65,7 +109,7 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
 impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, MakeError>> Ctor<S, (P, MakeError)>
     for F
 {
-    fn make(&self, params: Params<'_>, _io: &mut IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, params: Params<'_>, _: &mut IoInit<'_>, _: &Bound<'_>) -> Result<S, MakeError> {
         self(params.decode()?)
     }
 
@@ -75,7 +119,7 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, MakeError>> Ctor
 }
 
 impl<S, F: Fn(&mut IoInit<'_>) -> Result<S, MakeError>> Ctor<S, (WithIo,)> for F {
-    fn make(&self, _params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, _: Params<'_>, io: &mut IoInit<'_>, _: &Bound<'_>) -> Result<S, MakeError> {
         self(io)
     }
 
@@ -89,8 +133,30 @@ where
     P: DeserializeOwned + JsonSchema,
     F: Fn(P, &mut IoInit<'_>) -> Result<S, MakeError>,
 {
-    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>, _: &Bound<'_>) -> Result<S, MakeError> {
         self(params.decode()?, io)
+    }
+
+    fn schema() -> Option<Box<RawValue>> {
+        schema_of::<P>()
+    }
+}
+
+/// Marks the constructor form that takes the instance's [`Bound`] ports.
+pub struct WithDef;
+
+impl<S, P, F> Ctor<S, (P, WithDef)> for F
+where
+    P: DeserializeOwned + JsonSchema,
+    F: Fn(P, &Bound<'_>) -> Result<S, MakeError>,
+{
+    fn make(
+        &self,
+        params: Params<'_>,
+        _: &mut IoInit<'_>,
+        bound: &Bound<'_>,
+    ) -> Result<S, MakeError> {
+        self(params.decode()?, bound)
     }
 
     fn schema() -> Option<Box<RawValue>> {
@@ -123,7 +189,12 @@ mod tests {
     ///
     /// The turbofish is needed because `Fn(P) -> S` also matches `build`.
     fn ctor(params: &serde_json::Value) -> Result<u16, MakeError> {
-        Ctor::<u16, (Port, MakeError)>::make(&build, Params(params), &mut IoInit::empty("a"))
+        Ctor::<u16, (Port, MakeError)>::make(
+            &build,
+            Params(params),
+            &mut IoInit::empty("a"),
+            &Bound::empty(),
+        )
     }
 
     #[test]
@@ -163,7 +234,7 @@ mod tests {
     ) -> Result<Vec<usize>, MakeError> {
         let arena = std::rc::Rc::new(crate::io::Arena::new());
         let mut init = IoInit::new(&arena, "a");
-        let bufs = ctor.make(Params(params), &mut init)?;
+        let bufs = ctor.make(Params(params), &mut init, &Bound::empty())?;
         init.finish();
         Ok(bufs.0.iter().map(|b| b.capacity()).collect())
     }
@@ -184,7 +255,7 @@ mod tests {
         let arena = std::rc::Rc::new(crate::io::Arena::new());
         let mut init = IoInit::new(&arena, "a");
         assert_eq!(
-            Ctor::<u16, ()>::make(&|| 5u16, Params(&json!(null)), &mut init),
+            Ctor::<u16, ()>::make(&|| 5u16, Params(&json!(null)), &mut init, &Bound::empty()),
             Ok(5)
         );
         init.finish();

@@ -4,8 +4,9 @@
 //! a GPS receiver on a serial port. [`gps`] reads that receiver, [`nav`]
 //! estimates attitude, [`ctrl`] commands the wheels and magnetorquers, and
 //! [`mode`] holds the commanded phase and pointing law. [`health`] checks the
-//! sun sensors and magnetometer.
+//! sun sensors and magnetometer, and [`beacon`] logs housekeeping.
 
+pub mod beacon;
 pub mod ctrl;
 pub mod gps;
 pub mod gps_receiver;
@@ -15,6 +16,7 @@ pub mod nav;
 pub mod plant;
 pub mod star_tracker;
 
+pub use beacon::Beacon;
 pub use ctrl::CtrlSystem;
 pub use gps::GpsDriver;
 pub use gps_receiver::GpsReceiver;
@@ -29,7 +31,7 @@ pub use star_tracker::StarTracker;
 use metor_fsw_3::SystemTable;
 
 /// Returns a table of the pack's systems, registered as `plant`,
-/// `star_tracker`, `nav`, `ctrl`, `mode`, `health`, `gps_driver`, and
+/// `star_tracker`, `nav`, `ctrl`, `mode`, `health`, `beacon`, `gps_driver`, and
 /// `gps_receiver`.
 pub fn pack() -> SystemTable {
     let mut table = SystemTable::new();
@@ -55,6 +57,9 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register("health", health::health(), Health::default)
+        .expect("valid records");
+    table
+        .register("beacon", beacon::beacon(), Beacon::new)
         .expect("valid records");
     table
         .register_sequence("gps_driver", gps::gps_driver(), GpsDriver::new)

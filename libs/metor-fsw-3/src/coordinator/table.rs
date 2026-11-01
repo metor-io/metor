@@ -11,7 +11,7 @@ use serde_json::value::RawValue;
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
-use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
+use crate::fn_system::{self, AsyncSystemFn, Bound, Ctor, FnSystem, InSet, OutSet, SystemFn};
 use crate::io::{Io, IoState, Sqe};
 use crate::port::{Input, Output};
 use crate::sequence::{self, SeqInputs, SeqOutputs, SequenceFn, SequenceStep};
@@ -280,7 +280,12 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |cx: LaunchCx<'_>| {
-            let state = ctor.make(cx.params, &mut crate::io::IoInit::empty(&cx.instance.id))?;
+            let bound = Bound {
+                def: cx.def,
+                records: cx.records,
+            };
+            let mut io = crate::io::IoInit::empty(&cx.instance.id);
+            let state = ctor.make(cx.params, &mut io, &bound)?;
             let bind = BindCx {
                 instance: cx.instance,
                 io: None,
@@ -475,7 +480,11 @@ impl TableEntry {
             schema: C::schema(),
             make: Arc::new(move |mut cx| {
                 let (inputs, outputs, io) = cx.bind_ports::<InSet<S>, OutSet<S>>()?;
-                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
+                let bound = Bound {
+                    def: cx.def,
+                    records: cx.records,
+                };
+                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref(), &bound)?;
                 Ok(Box::new(Runner {
                     system: FnSystem::default(),
                     state,
@@ -504,7 +513,11 @@ impl TableEntry {
             schema: C::schema(),
             make: Arc::new(move |mut cx| {
                 let (inputs, outs, io) = cx.bind_ports::<SeqInputs<S>, SeqOutputs<S>>()?;
-                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
+                let bound = Bound {
+                    def: cx.def,
+                    records: cx.records,
+                };
+                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref(), &bound)?;
                 let SeqInputs { abort, ins } = inputs;
                 Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
             }),

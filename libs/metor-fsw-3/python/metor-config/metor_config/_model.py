@@ -6,9 +6,10 @@ import dataclasses
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Generic, Sequence, TypeAlias, TypeVar, Union
+from typing import Any, ClassVar, Generic, Sequence, TypeAlias, TypeVar, Union
 
 from ._config import ConfigError
+from ._fields import Field, signature
 
 T = TypeVar("T", bound="Record")
 
@@ -19,12 +20,43 @@ class Record:
     A record is a type of data that flows between systems. Each pack module
     declares one `Record` subclass per record it uses. ``_name`` is the
     record's name on the host, ``_kind`` is ``"frame"`` or ``"msg"``, and
-    ``_pack`` is the pack that defines it.
+    ``_pack`` is the pack that defines it. A frame also sets ``_fields``,
+    each leaf's path and signature.
     """
 
     _name: str = ""
     _kind: str = "msg"
     _pack: Pack | None = None
+    _fields: dict[str, str] = {}
+    _mapping: dict[str, Field[Any]]
+    _port: ClassVar[type[OutPort[Any]]]
+    """The class of a port that carries this record."""
+
+    def __init__(self, **fields: Field[Any]) -> None:
+        """Maps each destination path to a source `Field`, for a `Mux` output.
+
+        Raises `ConfigError` for a message record, an unknown path, a value
+        that is not a `Field`, or a signature that differs from the source's.
+        """
+        cls = type(self)
+        if cls._kind != "frame":
+            raise ConfigError(f"`{cls.__name__}` is a message; only a frame maps fields")
+        for path, source in fields.items():
+            _check_mapping(cls, path, source)
+        self._mapping = dict(fields)
+
+
+def _check_mapping(record: type[Record], path: str, source: Any) -> None:
+    if not isinstance(source, Field):
+        raise ConfigError(f"`{record.__name__}.{path}` takes a port field, got {source!r}")
+    expected = signature(record._fields, path)
+    if expected is None:
+        raise ConfigError(f"`{record.__name__}` has no field `{path}`")
+    if expected != source.signature:
+        raise ConfigError(
+            f"`{record.__name__}.{path}` is `{expected}`, but "
+            f"`{source.port.name}.{source.path}` is `{source.signature}`"
+        )
 
 
 @dataclass(frozen=True)
@@ -62,6 +94,21 @@ class OutPort(Generic[T]):
     def name(self) -> str:
         """The port's name in a port list: `{system}.{port}`."""
         return f"{self.ref.system}.{self.ref.port}"
+
+    def field(self, path: str) -> Field[Any]:
+        """Returns the leaf, or group of leaves, at ``path`` in this port's frame.
+
+        Raises `ConfigError` for a message port or an unknown path.
+        """
+        if self.record is None or self.record._kind != "frame":
+            raise ConfigError(f"`{self.name}` carries a message; only a frame has fields")
+        found = signature(self.record._fields, path)
+        if found is None:
+            raise ConfigError(f"`{self.name}` has no field `{path}`")
+        return Field(self, path, found)
+
+
+Record._port = OutPort
 
 
 class Loop(Generic[T]):

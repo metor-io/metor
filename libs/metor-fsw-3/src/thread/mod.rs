@@ -20,12 +20,15 @@ use metor_fsw_3_ring::Notifier;
 
 use crate::async_system::AsyncSystem;
 use crate::coordinator::Params;
+use crate::def::Records;
 use crate::fn_system::Instance;
-use crate::system::{InputBinding, OutputBinding};
+use crate::system::{InputBinding, OutputBinding, SystemDef};
 
 /// What an async system's make takes on the thread that runs it.
 pub(crate) struct LaunchCx<'a> {
     pub(crate) params: Params<'a>,
+    pub(crate) def: &'a SystemDef,
+    pub(crate) records: &'a Records,
     pub(crate) inputs: Vec<InputBinding<Notifier>>,
     pub(crate) outputs: Vec<OutputBinding>,
     pub(crate) instance: Instance,

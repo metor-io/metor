@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
-from metor_config import Item, OutPort, Pack, Record, ResourceHandle, Sources, System
+from metor_config import Field, Item, OutPort, Pack, Record, ResourceHandle, Sources, System
+from metor_config._fields import _given
 
 PACK = Pack(
     id="echo",
@@ -50,12 +51,42 @@ class Sample(Record):
     _name = "sample"
     _kind = "frame"
     _pack = PACK
+    _fields = {"value": "f64"}
+
+    def __init__(self, *, value: Field[Literal["f64"]] | None = None) -> None:
+        super().__init__(**_given({"value": value}))
+
+
+class SamplePort(OutPort[Sample]):
+    @property
+    def value(self) -> Field[Literal["f64"]]:
+        return self.field("value")
+
+
+Sample._port = SamplePort
 
 
 class SystemStatus(Record):
     _name = "status"
     _kind = "frame"
     _pack = PACK
+    _fields = {"exec_time_ns": "u64", "exec_offset_ns": "u64"}
+
+    def __init__(self, *, exec_time_ns: Field[Literal["u64"]] | None = None, exec_offset_ns: Field[Literal["u64"]] | None = None) -> None:
+        super().__init__(**_given({"exec_time_ns": exec_time_ns, "exec_offset_ns": exec_offset_ns}))
+
+
+class SystemStatusPort(OutPort[SystemStatus]):
+    @property
+    def exec_time_ns(self) -> Field[Literal["u64"]]:
+        return self.field("exec_time_ns")
+
+    @property
+    def exec_offset_ns(self) -> Field[Literal["u64"]]:
+        return self.field("exec_offset_ns")
+
+
+SystemStatus._port = SystemStatusPort
 
 
 class Sampler(System):
@@ -68,9 +99,9 @@ class Sampler(System):
     def __init__(self) -> None:
         super().__init__({}, {})
 
-    sample: OutPort[Sample]
+    sample: SamplePort
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Meter(System):
@@ -85,7 +116,7 @@ class Meter(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Echo(System):
@@ -100,7 +131,7 @@ class Echo(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Dice(System):
@@ -115,7 +146,7 @@ class Dice(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Relay(System):
@@ -130,7 +161,7 @@ class Relay(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Tap(System):
@@ -146,7 +177,7 @@ class Tap(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Spin(System):
@@ -161,7 +192,7 @@ class Spin(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Tick(System):
@@ -176,7 +207,7 @@ class Tick(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Boom(System):
@@ -191,7 +222,7 @@ class Boom(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Gain(System):
@@ -210,7 +241,7 @@ class Gain(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class FailInput(System):
@@ -222,7 +253,7 @@ class FailInput(System):
         super().__init__({"input": input}, {})
 
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Retained(System):
@@ -235,7 +266,7 @@ class Retained(System):
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Gps(System):
@@ -251,7 +282,7 @@ class Gps(System):
 
     fix: OutPort[GpsFix]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class UartScript(System):
@@ -270,7 +301,7 @@ class UartScript(System):
         super().__init__({}, {"script": script}, grants={"uart": uart})
 
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Chatter(System):
@@ -285,7 +316,7 @@ class Chatter(System):
         super().__init__({}, {}, grants={"uart": uart})
 
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Reader(System):
@@ -301,7 +332,7 @@ class Reader(System):
 
     sums: OutPort[Ping]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Grower(System):
@@ -316,7 +347,7 @@ class Grower(System):
         super().__init__({}, {}, grants={"uart": uart})
 
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class UntilFix(System):
@@ -336,7 +367,7 @@ class UntilFix(System):
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class CountUp(System):
@@ -353,7 +384,7 @@ class CountUp(System):
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class CountDown(System):
@@ -370,7 +401,7 @@ class CountDown(System):
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class CountBy(System):
@@ -391,7 +422,7 @@ class CountBy(System):
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Level(System):
@@ -404,9 +435,9 @@ class Level(System):
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
 
-    sample: OutPort[Sample]
+    sample: SamplePort
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Hot(System):
@@ -422,7 +453,7 @@ class Hot(System):
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort
 
 
 class Burn(System):
@@ -438,4 +469,4 @@ class Burn(System):
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
     log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
+    status: SystemStatusPort

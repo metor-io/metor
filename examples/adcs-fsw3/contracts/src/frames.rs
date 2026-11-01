@@ -46,6 +46,23 @@ pub struct Magnetometer {
     pub mag_b: V3,
 }
 
+/// The ADCS housekeeping the beacon reports.
+#[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[repr(C)]
+#[frame(name = "housekeeping")]
+pub struct Housekeeping {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    /// Estimated body rate (rad/s).
+    pub omega_b: V3,
+    /// Estimated gyro bias (rad/s).
+    pub b_hat_b: V3,
+    /// Commanded wheel torque (N·m).
+    pub torque_b: V3,
+    /// Commanded dipole (A·m²).
+    pub dipole_b: V3,
+}
+
 /// A GPS fix: the plant's, or the GPS driver's from the receiver's logs.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]

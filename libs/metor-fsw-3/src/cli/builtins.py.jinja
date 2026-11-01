@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from ._model import Pack, Record, System
+from typing import Literal
+
+from ._fields import Field, _given
+from ._model import OutPort, Pack, Record, System
 
 ABI_VERSION = {{ abi_version }}
 """The host ABI version the built-in systems are compiled against."""
@@ -14,13 +17,7 @@ CONFIG_VERSION = {{ config_version }}
 
 PACK = Pack(id={{ pack_id | python_string }}, lib="", libs="", abi_version=ABI_VERSION)
 """The built-in systems' pack. It has no library, so no config lists it."""
-{% for record in records %}
-
-class {{ record.class }}(Record):
-    _name = {{ record.name | python_string }}
-    _kind = {{ record.kind | python_string }}
-    _pack = PACK
-{% endfor %}
+{% for record in records %}{% include "record" %}{% endfor %}
 
 FRAMEWORK_PORTS: dict[str, type[Record]] = {{ '{' }}{% for port in framework_ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
 """The outputs every system has, whether or not it declares them."""

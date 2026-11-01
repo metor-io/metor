@@ -1,0 +1,27 @@
+
+
+class {{ record.class }}(Record):
+    _name = {{ record.name | python_string }}
+    _kind = {{ record.kind | python_string }}
+    _pack = PACK
+{% if record.kind == "frame" %}    _fields = {{ '{' }}{% for field in record.fields %}{{ field[0] | python_string }}: {{ field[1] | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
+
+    def __init__(self
+        {%- if record.accessors.keywords %}, *{% endif %}
+        {%- for kw in record.accessors.keywords %}, {{ kw.name }}: {{ kw.annotation }} | None = None{% endfor %}) -> None:
+        super().__init__(**_given({{ '{' }}
+            {%- for kw in record.accessors.keywords %}{{ kw.key | python_string }}: {{ kw.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
+        {{ '}' }}))
+{% for class in record.accessors.classes %}
+
+class {{ class.name }}({{ class.base }}):
+{% if not class.accessors %}    pass
+{% endif %}
+{%- for accessor in class.accessors %}{% if not loop.first %}
+{% endif %}    @property
+    def {{ accessor.name }}(self) -> {{ accessor.returns }}:
+        return {{ accessor.body }}
+{% endfor %}{% endfor %}
+
+{{ record.class }}._port = {{ record.port }}
+{% endif %}
