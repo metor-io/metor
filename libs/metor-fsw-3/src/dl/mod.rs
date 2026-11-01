@@ -29,25 +29,34 @@ pub use pack::{DlPack, DlStep};
 pub use pack_ref::{PackKind, PackRef, WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
 /// An error from opening a pack.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum PackError {
     #[error("loading the pack: {0}")]
+    #[diagnostic(code(M0420))]
     Open(libloading::Error),
     #[error("the pack exports no `{0}`")]
+    #[diagnostic(code(M0421))]
     MissingSymbol(&'static str),
     #[error("the pack is built against ABI {found}, this host speaks {expected}")]
+    #[diagnostic(code(M0422), help("rebuild the pack against this metor"))]
     AbiMismatch { found: u32, expected: u32 },
     #[error("the pack's descriptor did not decode")]
+    #[diagnostic(code(M0423))]
     Decode,
     #[error("pack descriptor exceeds {capacity} bytes")]
+    #[diagnostic(code(M0424))]
     DescriptorTooLarge { capacity: usize },
     #[error("pack descriptor export failed with status {0}")]
+    #[diagnostic(code(M0425))]
     DescriptorStatus(u32),
     #[error("reading the module: {0}")]
+    #[diagnostic(code(M0426))]
     Read(std::io::Error),
     #[error("the module: {0}")]
+    #[diagnostic(code(M0427))]
     Wasm(#[from] WasmError),
     #[error("the module trapped: {0}")]
+    #[diagnostic(code(M0428))]
     Trap(#[from] Trap),
 }
 

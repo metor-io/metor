@@ -1,9 +1,6 @@
-//! Turns a command's error into a diagnostic: a code, a message, a help
-//! line, and the line of the target file it comes from.
-//!
-//! The runtime's error types stay free of presentation. Every code lives in
-//! the tables here, one match per error type, so a new variant cannot go
-//! without one.
+//! Turns a command's error into a diagnostic: its code and help, which each
+//! error variant names through `miette::Diagnostic`, the line of the target
+//! file it comes from, and a link to the code's text in `codes.md`.
 //!
 //! Codes group by family: `M01xx` names and flags, `M02xx` the target file
 //! and the deployment, `M03xx` the coordinator build, `M04xx` packs and
@@ -11,21 +8,15 @@
 
 use std::path::Path;
 
-use miette::{LabeledSpan, MietteDiagnostic, NamedSource, SourceSpan};
+use miette::{Diagnostic, LabeledSpan, MietteDiagnostic, NamedSource, SourceSpan};
 
-use super::cargo::CargoError;
-use super::pack_dev::PackDevError;
 use super::run::RunError;
 use crate::coordinator::{BuildError, Location};
-use crate::deploy::{ConfigError, DeployError};
-use crate::dl::PackError;
+use crate::deploy::DeployError;
 
-/// A code and an optional help line.
-type Info = (&'static str, Option<String>);
-
-fn help(code: &'static str, text: &str) -> Info {
-    (code, Some(text.into()))
-}
+/// Where each code's text is published, one `## M0201` heading per code.
+const CODES_URL: &str =
+    "https://github.com/metor-io/metor/blob/main/libs/metor-fsw-3/src/cli/codes.md";
 
 /// The diagnostic for `error`. A located error reads its line from the
 /// file, which the target file names relative to the working directory. If
@@ -36,12 +27,16 @@ pub fn report(error: &RunError) -> miette::Report {
 
 /// The diagnostic for `error`, reading its line relative to `base`.
 fn report_in(error: &RunError, base: &Path) -> miette::Report {
-    let (code, help) = run_info(error);
+    let code = error
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_default();
+    let help = error.help().map(|help| help.to_string());
     let located =
         located(error).and_then(|(location, inner)| Some((snippet(location, base)?, inner)));
     match located {
-        Some((snippet, inner)) => build(code.into(), inner, help, Some(snippet)),
-        None => build(code.into(), error.to_string(), help, None),
+        Some((snippet, inner)) => build(code, inner, help, Some(snippet)),
+        None => build(code, error.to_string(), help, None),
     }
 }
 
@@ -66,7 +61,8 @@ fn build(
     help: Option<String>,
     snippet: Option<Snippet>,
 ) -> miette::Report {
-    let mut diagnostic = MietteDiagnostic::new(message).with_code(code);
+    let url = format!("{CODES_URL}#{}", code.to_lowercase());
+    let mut diagnostic = MietteDiagnostic::new(message).with_code(code).with_url(url);
     if let Some(help) = help {
         diagnostic = diagnostic.with_help(help);
     }
@@ -113,190 +109,19 @@ pub fn exit_code(error: &RunError) -> i32 {
     }
 }
 
-fn run_info(error: &RunError) -> Info {
-    match error {
-        RunError::Config(error) => config_info(error),
-        RunError::Deploy(error) => deploy_info(error),
-        RunError::Build(error) => build_info(error),
-        RunError::PackDev(error) => pack_dev_info(error),
-        RunError::Pack(error) => pack_info(error),
-        RunError::EpochWall => help("M0101", "pass --sim-dt, or run a simulated target"),
-        RunError::NoTargetFile(_) => help(
-            "M0206",
-            "check the path; without one, metor finds the nearest target.py",
-        ),
-        RunError::NoSuchName { name, known } => help("M0104", &suggest(name, known, SHOW_NAMES)),
-        RunError::NoSuchCode { code, known } => help("M0106", &suggest(code, known, CODES)),
-        RunError::BadName { .. } => help(
-            "M0107",
-            "use lowercase letters, digits, and `-`, as in `my-sat`",
-        ),
-        RunError::Exists(_) => help("M0108", "pick a new directory"),
-        RunError::Doctor(_) => help("M0105", "each fix is listed under its check"),
-        RunError::NoProject(_) => help(
-            "M0209",
-            "pass the target file, or run from a project directory",
-        ),
-        RunError::NoDeployment => help(
-            "M0207",
-            "create a `Target` or a `Deployment` in the target file",
-        ),
-        RunError::Io { .. } => ("M0208", None),
-        RunError::Python { .. } => help("M0201", "the traceback above shows where"),
-        RunError::PythonPath(_) => ("M0202", None),
-        RunError::Spawn(_) => help("M0203", "set $METOR_PYTHON or activate a virtualenv"),
-        RunError::Latched(_) => help(
-            "M0501",
-            "a latched system stops for the rest of the run; its last log lines say why",
-        ),
-        RunError::Children(_) => help("M0502", "each target's own error is above"),
-        RunError::Interrupted => ("M0503", None),
-    }
-}
-
-fn config_info(error: &ConfigError) -> Info {
-    match error {
-        ConfigError::NoSuchTarget { name, known } => {
-            help("M0102", &suggest(name, known, SHOW_TARGETS))
-        }
-        ConfigError::SelectTarget(_) => ("M0103", None),
-        ConfigError::Version { .. } => help(
-            "M0204",
-            "install the metor-config that ships with this metor",
-        ),
-        ConfigError::Decode(_) => ("M0205", None),
-    }
-}
-
-fn deploy_info(error: &DeployError) -> Info {
-    match error {
-        DeployError::Located { source, .. } => deploy_info(source),
-        DeployError::Build { source, .. } => build_info(source),
-        DeployError::NoSuchTarget { .. } => ("M0210", None),
-        DeployError::NoSuchLink { .. } => ("M0211", None),
-        DeployError::NotAListener { .. } => help(
-            "M0212",
-            "give the link a `Listen` transport with a fixed port",
-        ),
-        DeployError::NoSuchPort { .. } => ("M0213", None),
-        DeployError::PortTaken { .. } => help("M0214", "give each listener its own port"),
-        DeployError::Cycle { .. } => ("M0215", None),
-        DeployError::Unresolved { .. } => ("M0216", None),
-        DeployError::UnresolvedDial { .. } => ("M0217", None),
-        DeployError::Slot { .. } => ("M0218", None),
-        DeployError::SlotContract { .. } => ("M0219", None),
-        DeployError::ArtifactName { .. } => ("M0220", None),
-    }
-}
-
-fn build_info(error: &BuildError) -> Info {
-    let deterministic = |code| help(code, "pass --sim-dt and --epoch with --deterministic");
-    match error {
-        BuildError::Located { source, .. } => build_info(source),
-        BuildError::DeterministicWall => deterministic("M0301"),
-        BuildError::DeterministicZeroDt => deterministic("M0302"),
-        BuildError::DeterministicEpoch => deterministic("M0303"),
-        BuildError::DuplicateId { .. } => help("M0304", "give each system its own id"),
-        BuildError::DuplicateInput { .. } => ("M0305", None),
-        BuildError::DuplicateOutput { .. } => ("M0306", None),
-        BuildError::UnknownType { .. } => help(
-            "M0307",
-            "check that the target lists the pack this type comes from",
-        ),
-        BuildError::UnknownSystem { .. } => ("M0308", None),
-        BuildError::UnknownInput { .. } => ("M0309", None),
-        BuildError::UnknownOutput { .. } => ("M0310", None),
-        BuildError::IdMismatch { .. } => ("M0311", None),
-        BuildError::UnsupportedFrameAlignment { .. } => ("M0312", None),
-        BuildError::RingTooLarge { .. } => ("M0313", None),
-        BuildError::DynamicFromLater { .. } => {
-            help("M0314", "add the producer before the system that reads it")
-        }
-        BuildError::RecordConflict { .. } => ("M0315", None),
-        BuildError::RecordIdConflict { .. } => ("M0316", None),
-        BuildError::MessageIdConflict { .. } => ("M0317", None),
-        BuildError::UnsupportedAdapter { .. } => ("M0318", None),
-        BuildError::ReservedPort { .. } => ("M0319", None),
-        BuildError::TypeDef { .. } => ("M0320", None),
-        BuildError::DuplicateChannel { .. } => ("M0321", None),
-        BuildError::ReservedChannelPort { .. } => ("M0322", None),
-        BuildError::Ungranted { .. } => ("M0323", None),
-        BuildError::DuplicateGrant { .. } => ("M0324", None),
-        BuildError::UnknownGrant { .. } => ("M0325", None),
-        BuildError::NoIoStep { .. } => help("M0326", "add an fsw.io system to the target"),
-        BuildError::NoIoStepAfter { system } => {
-            help("M0327", &format!("add fsw.io after `{system}`"))
-        }
-        BuildError::TooManyIoOps { .. } => ("M0328", None),
-        BuildError::TooManyResources { .. } => ("M0329", None),
-        BuildError::IoBackend { .. } => ("M0330", None),
-        BuildError::UnknownResource { .. } => ("M0331", None),
-        BuildError::Interface { .. } => ("M0332", None),
-        BuildError::SimGrant { .. } => ("M0333", None),
-        BuildError::UnknownHolder { .. } => ("M0334", None),
-        BuildError::Open { .. } => ("M0335", None),
-        BuildError::Def { .. } => ("M0336", None),
-        BuildError::Make { .. } => ("M0337", None),
-    }
-}
-
-fn pack_dev_info(error: &PackDevError) -> Info {
-    match error {
-        PackDevError::Cargo(error) => cargo_info(error),
-        PackDevError::Pack(error) => pack_info(error),
-        PackDevError::Read { .. } => ("M0401", None),
-        PackDevError::Write { .. } => ("M0402", None),
-        PackDevError::Toml { .. } => ("M0403", None),
-        PackDevError::Schema { .. } => ("M0404", None),
-        PackDevError::NameClash { .. } => help("M0405", "rename the param or the port"),
-        PackDevError::Template(_) => ("M0406", None),
-        PackDevError::AlreadyLoaded(_) => ("M0407", None),
-        PackDevError::DescriptorMismatch => ("M0408", None),
-        PackDevError::NoWasmTarget => help(
-            "M0413",
-            &format!("rustup target add {}", crate::dl::WASM_TRIPLE),
-        ),
-    }
-}
-
-fn cargo_info(error: &CargoError) -> Info {
-    match error {
-        CargoError::Spawn(_) => help("M0410", "is cargo on your PATH?"),
-        CargoError::Cargo { .. } => help("M0411", "cargo's errors are above"),
-        CargoError::NoArtifact(..) => help(
-            "M0412",
-            "set `crate-type = [\"cdylib\"]` in the pack's Cargo.toml",
-        ),
-    }
-}
-
-fn pack_info(error: &PackError) -> Info {
-    match error {
-        PackError::Open(_) => ("M0420", None),
-        PackError::MissingSymbol(_) => ("M0421", None),
-        PackError::AbiMismatch { .. } => help("M0422", "rebuild the pack against this metor"),
-        PackError::Decode => ("M0423", None),
-        PackError::DescriptorTooLarge { .. } => ("M0424", None),
-        PackError::DescriptorStatus(_) => ("M0425", None),
-        PackError::Read(_) => ("M0426", None),
-        PackError::Wasm(_) => ("M0427", None),
-        PackError::Trap(_) => ("M0428", None),
-    }
-}
-
 /// How many known names a help line lists in full.
 const LISTED: usize = 8;
 
 /// What a list of known names holds, and the command that lists them.
-type Noun = (&'static str, &'static str);
+pub(crate) type Noun = (&'static str, &'static str);
 
-const SHOW_NAMES: Noun = ("names", "metor show");
-const SHOW_TARGETS: Noun = ("targets", "metor show");
-const CODES: Noun = ("codes", "metor explain");
+pub(crate) const SHOW_NAMES: Noun = ("names", "metor show");
+pub(crate) const SHOW_TARGETS: Noun = ("targets", "metor show");
+pub(crate) const CODES: Noun = ("codes", "metor explain");
 
 /// A help line naming the closest of `known` to `name`, then all of them
 /// if there are few.
-fn suggest(name: &str, known: &[String], (noun, lister): Noun) -> String {
+pub(crate) fn suggest(name: &str, known: &[String], (noun, lister): Noun) -> String {
     let closest = known
         .iter()
         .map(|candidate| (strsim::damerau_levenshtein(name, candidate), candidate))

@@ -83,56 +83,92 @@ pub struct Run {
 }
 
 /// An error running a target.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum RunError {
     #[error("no target file at {}", .0.display())]
+    #[diagnostic(
+        code(M0206),
+        help("check the path; without one, metor finds the nearest target.py")
+    )]
     NoTargetFile(PathBuf),
     #[error("no target.py in {} or a directory above it", .0.display())]
+    #[diagnostic(
+        code(M0209),
+        help("pass the target file, or run from a project directory")
+    )]
     NoProject(PathBuf),
     #[error("these checks failed: {0}")]
+    #[diagnostic(code(M0105), help("each fix is listed under its check"))]
     Doctor(String),
     #[error("nothing in the deployment is named `{name}`")]
+    #[diagnostic(code(M0104), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_NAMES)))]
     NoSuchName { name: String, known: Vec<String> },
     #[error("no code is named `{code}`")]
+    #[diagnostic(code(M0106), help("{}", crate::cli::diagnostic::suggest(.code, .known, crate::cli::diagnostic::CODES)))]
     NoSuchCode { code: String, known: Vec<String> },
     #[error("`{name}` cannot name a project: {why}")]
+    #[diagnostic(
+        code(M0107),
+        help("use lowercase letters, digits, and `-`, as in `my-sat`")
+    )]
     BadName { name: String, why: &'static str },
     #[error("{} already exists", .0.display())]
+    #[diagnostic(code(M0108), help("pick a new directory"))]
     Exists(PathBuf),
     #[error("running the target file: {0}")]
+    #[diagnostic(code(M0203), help("set $METOR_PYTHON or activate a virtualenv"))]
     Spawn(std::io::Error),
     #[error("the target file made no deployment")]
+    #[diagnostic(
+        code(M0207),
+        help("create a `Target` or a `Deployment` in the target file")
+    )]
     NoDeployment,
     #[error("{}: {source}", path.display())]
+    #[diagnostic(code(M0208))]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
     #[error("the target file exited with {status}")]
+    #[diagnostic(code(M0201), help("the traceback above shows where"))]
     Python {
         status: ExitStatus,
         /// What the target file printed, for the caller to show.
         output: Vec<u8>,
     },
     #[error("building PYTHONPATH: {0}")]
+    #[diagnostic(code(M0202))]
     PythonPath(#[from] JoinPathsError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     PackDev(#[from] PackDevError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Pack(#[from] PackError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Build(#[from] BuildError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Deploy(#[from] DeployError),
     #[error("--epoch sets a simulated clock's start; pass --sim-dt or use a simulated target")]
+    #[diagnostic(code(M0101), help("pass --sim-dt, or run a simulated target"))]
     EpochWall,
     #[error("these systems latched off: {0}")]
+    #[diagnostic(
+        code(M0501),
+        help("a latched system stops for the rest of the run; its last log lines say why")
+    )]
     Latched(String),
     #[error("these targets did not exit cleanly: {0}")]
+    #[diagnostic(code(M0502), help("each target's own error is above"))]
     Children(String),
     #[error("interrupted")]
+    #[diagnostic(code(M0503))]
     Interrupted,
 }
 

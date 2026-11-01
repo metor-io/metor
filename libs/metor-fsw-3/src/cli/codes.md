@@ -1,4 +1,6 @@
-## M0101 `--epoch` needs a simulated clock
+## M0101
+
+**`--epoch` needs a simulated clock**
 
 `--epoch` sets the time a simulated clock starts at. The target runs on a
 wall clock, either because the target file gives it no `sim_dt` or because
@@ -15,7 +17,9 @@ metor run --sim-dt 10ms --epoch 2026-10-29T00:00Z
 fsw = Target(cycle_rate=100, sim_dt=0.01, epoch=0)
 ```
 
-## M0102 No target has that name
+## M0102
+
+**No target has that name**
 
 `--target` names a target the deployment does not have. Targets are named by
 their namespace, the `namespace` argument of `Target`.
@@ -28,7 +32,9 @@ target a namespace.
 metor run --target fsw
 ```
 
-## M0103 The deployment has several targets
+## M0103
+
+**The deployment has several targets**
 
 The command needed one target, and the deployment has more than one. The
 message lists their namespaces.
@@ -39,7 +45,9 @@ Pick one with `--target`.
 metor run --target fsw
 ```
 
-## M0104 Nothing in the deployment has that name
+## M0104
+
+**Nothing in the deployment has that name**
 
 `metor show` or `metor graph` was given a name that is neither a target nor
 a system. A target is named by its namespace, such as `fsw`. A system is
@@ -49,7 +57,9 @@ system's id alone also works.
 The help line suggests the closest name. Run `metor show` with no name to
 list every target and system.
 
-## M0105 Required checks failed
+## M0105
+
+**Required checks failed**
 
 `metor doctor` found a tool the project needs missing or out of date. The
 message names each failed check: `python`, `metor-config`, `cargo`, or
@@ -65,7 +75,9 @@ Each failed check prints its fix under it. The usual ones:
 - `cargo`: install Rust from rustup.rs.
 - `wasm32`: `rustup target add wasm32-unknown-unknown`.
 
-## M0106 No such code
+## M0106
+
+**No such code**
 
 `metor explain` was given a code it does not know. Codes are an `M` and four
 digits, such as `M0201`, and appear in brackets after `error` in a
@@ -74,7 +86,9 @@ diagnostic.
 Check the code against the diagnostic it came from. A code from a different
 version of metor may not exist in this one.
 
-## M0107 That name cannot name a project
+## M0107
+
+**That name cannot name a project**
 
 `metor new` names the pack, its Python module, and its crate after the last
 part of the path it is given, so that part must work as a Python and a Rust
@@ -86,13 +100,17 @@ language reserves.
 metor new target my-sat
 ```
 
-## M0108 The directory already exists
+## M0108
+
+**The directory already exists**
 
 `metor new` writes into a new directory and does not touch an existing one,
 so nothing is overwritten. Pick a path that does not exist yet, or remove
 the old directory first.
 
-## M0201 The target file failed
+## M0201
+
+**The target file failed**
 
 The target file exited with a non-zero status. Usually it raised an
 exception, and the traceback is printed above the diagnostic.
@@ -105,7 +123,9 @@ error in the file itself, or in a pack module it imports.
 Fix the line the traceback points at. Running the file with Python directly
 shows the same traceback.
 
-## M0202 PYTHONPATH could not be built
+## M0202
+
+**PYTHONPATH could not be built**
 
 metor runs the target file with a `PYTHONPATH` made of `$METOR_CONFIG_PY` or
 the in-repo metor-config, each dev pack's `.metor` directory, and the
@@ -115,7 +135,9 @@ so they cannot be joined.
 Move the project or the pack, or point `$METOR_CONFIG_PY` at a path without
 a `:`.
 
-## M0203 A program could not be started
+## M0203
+
+**A program could not be started**
 
 metor could not start a process. Most often this is the Python interpreter
 that runs the target file. metor uses `$METOR_PYTHON`, then
@@ -129,7 +151,9 @@ virtualenv. `metor doctor` shows which interpreter it finds.
 export METOR_PYTHON=.venv/bin/python
 ```
 
-## M0204 The config version does not match
+## M0204
+
+**The config version does not match**
 
 The deployment config was written for a different config version than this
 metor reads. The target file's metor-config is older or newer than the
@@ -140,7 +164,9 @@ Install the metor-config that ships with this metor. For a `.json`
 deployment, write it again with this version's `metor build`. `metor doctor`
 checks the metor-config the target file imports.
 
-## M0205 The config did not decode
+## M0205
+
+**The config did not decode**
 
 The deployment config is valid JSON with the right version, but its contents
 do not match what metor reads. A field is missing, has the wrong type, or is
@@ -151,14 +177,18 @@ whose version number matches but whose code does not, such as a local
 checkout on another branch. Install the metor-config that ships with this
 metor, and write `.json` deployments with `metor build` rather than by hand.
 
-## M0206 The target file does not exist
+## M0206
+
+**The target file does not exist**
 
 The path given on the command line is not a file.
 
 Check the path. Without a path, metor uses the nearest `target.py` in the
 working directory or a directory above it.
 
-## M0207 The target file made no deployment
+## M0207
+
+**The target file made no deployment**
 
 The target file ran and exited cleanly, but wrote no config. A target file
 writes its config when it exits, as long as it created a `Target` or a
@@ -177,7 +207,9 @@ Usual causes:
 fsw = Target(cycle_rate=100)
 ```
 
-## M0208 A file could not be read or written
+## M0208
+
+**A file could not be read or written**
 
 A file operation failed. The message names the path and the operating
 system's error. The usual paths are a `.json` deployment that `metor run`
@@ -186,7 +218,9 @@ temporary file.
 
 Check that the path exists and that you have permission to read or write it.
 
-## M0209 No project found
+## M0209
+
+**No project found**
 
 No path was given, and there is no `target.py` in the working directory or
 any directory above it. The search stops at the root of a git repository.
@@ -197,7 +231,9 @@ Run the command from the project directory, or pass the target file.
 metor run path/to/target.py
 ```
 
-## M0210 A peer reference names an unknown target
+## M0210
+
+**A peer reference names an unknown target**
 
 A system refers to a target, by namespace, that the deployment has no member
 of. References like this come from a `Peer` transport or a subscriber's
@@ -208,7 +244,9 @@ usually produce this. Check that every target the file creates is in its
 `Deployment`, and that a hand-edited `.json` deployment spells the namespace
 correctly.
 
-## M0211 A peer reference names an unknown link
+## M0211
+
+**A peer reference names an unknown link**
 
 A system refers to a link, `target.link`, and that target has no system with
 that id. As with M0210, the Python API takes a link's handle, so this
@@ -216,7 +254,9 @@ usually comes from a hand-edited `.json` deployment.
 
 Check the link's id with `metor show`.
 
-## M0212 A peer link does not listen on a fixed port
+## M0212
+
+**A peer link does not listen on a fixed port**
 
 A link dials a peer link, and the peer cannot be dialed: it does not listen,
 or it listens on port `0`, which the operating system picks at run time. A
@@ -229,7 +269,9 @@ link = plant.add("pub", Publish(all=True, transport=Listen("0.0.0.0:2240")))
 fsw.add("plant", Subscribe(transport=Peer(link)))
 ```
 
-## M0213 A peer link has no such port
+## M0213
+
+**A peer link has no such port**
 
 A subscriber copies a port from a peer link, and the peer link does not
 publish a port with that name. This usually means a `Subscribe`'s `items`
@@ -242,7 +284,9 @@ Add the port to the peer's `Publish`, or remove it from the subscriber's
 plant.add("pub", Publish([sensors.imu], transport=Listen("0.0.0.0:2240")))
 ```
 
-## M0214 Two listeners bind the same port
+## M0214
+
+**Two listeners bind the same port**
 
 Two systems listen on the same port of the same host. A link with a `Listen`
 transport, a `Db`'s `listen`, and a `TcpListen` resource all count. Targets
@@ -255,7 +299,9 @@ Give each listener its own port, or put the targets on different hosts.
 Deployment([plant, fsw], hosts={"plant": "10.0.0.2", "fsw": "10.0.0.3"})
 ```
 
-## M0215 Resolving peer ports loops
+## M0215
+
+**Resolving peer ports loops**
 
 To find the type of a copied port, `metor build` follows it back to the
 system that produces it. The message shows a path that leads back to where
@@ -265,7 +311,9 @@ through other links, from the first link.
 Publish a port from the target that produces it rather than from a copy of
 it, so that the copies do not form a loop.
 
-## M0216 A copied port was left unresolved
+## M0216
+
+**A copied port was left unresolved**
 
 A system's output still names a peer's port after resolution, which should
 have replaced it with the port's definition. metor's own resolution handles
@@ -275,7 +323,9 @@ deployment or a bug.
 Write the deployment again with `metor build`. If it persists, report it
 with the target file.
 
-## M0217 A peer dial has no holder
+## M0217
+
+**A peer dial has no holder**
 
 A resource dials a peer link, but no system is granted the resource, so
 `metor build` does not resolve its address. The Python API always grants a
@@ -284,7 +334,9 @@ deployment.
 
 Grant the resource to the link that uses it, or remove it.
 
-## M0218 A slot could not be resolved
+## M0218
+
+**A slot could not be resolved**
 
 A `DlSlot` could not be prepared. The message says why. Usual causes:
 
@@ -296,7 +348,9 @@ A `DlSlot` could not be prepared. The message says why. Usual causes:
 - The candidate's library could not be copied into `.metor/store` next to
   the target file.
 
-## M0219 A slot's candidates have different ports
+## M0219
+
+**A slot's candidates have different ports**
 
 Every system a `DlSlot` allows must have the same ports as the first one,
 since the slot is wired once and any candidate can be loaded into it. The
@@ -305,7 +359,9 @@ message names the first candidate and one that differs.
 Remove the candidate, or change its type so its inputs and outputs match the
 first.
 
-## M0220 A slot's library name is too long
+## M0220
+
+**A slot's library name is too long**
 
 A channel's status carries the file name of the library a slot loaded, in at
 most 64 bytes. The file name of a candidate's pack library is longer.
@@ -314,7 +370,9 @@ The file name comes from the pack's library name. Shorten `[lib] name` in
 the pack's `Cargo.toml`, or set `lib` under `[tool.metor.pack]` in its
 `pyproject.toml`, then run `metor pack dev`.
 
-## M0301 A deterministic run needs a simulated clock
+## M0301
+
+**A deterministic run needs a simulated clock**
 
 `--deterministic` runs every thread group on the coordinator thread, keyed
 on cycle times. That needs times that are fixed in advance, which a wall
@@ -331,7 +389,9 @@ metor run --deterministic --sim-dt 10ms --epoch 0
 fsw = Target(cycle_rate=100, sim_dt=0.01, epoch=0)
 ```
 
-## M0302 A deterministic run needs a step of at least 1 µs
+## M0302
+
+**A deterministic run needs a step of at least 1 µs**
 
 The simulated clock's step is under one microsecond. A deterministic run
 counts time in whole microseconds, so its cycle times would not increase.
@@ -342,7 +402,9 @@ Set `--sim-dt`, or `sim_dt` on the `Target`, to at least 1 µs.
 metor run --deterministic --sim-dt 10ms --epoch 0
 ```
 
-## M0303 A deterministic run needs an epoch
+## M0303
+
+**A deterministic run needs an epoch**
 
 A deterministic run's clock counts from zero, so the simulated clock needs a
 fixed start of 0 or later. The clock has no epoch, or a negative one.
@@ -354,7 +416,9 @@ microseconds since the Unix epoch.
 metor run --deterministic --sim-dt 10ms --epoch 2026-10-29T00:00Z
 ```
 
-## M0304 Two systems have the same id
+## M0304
+
+**Two systems have the same id**
 
 Two systems in one target share an id. `Target.add` refuses a name twice, so
 in a target file this usually means a system is named `io_submit` or
@@ -363,14 +427,18 @@ holds a `Cap`. In a hand-edited `.json` deployment, it can be any id.
 
 Give each system its own name.
 
-## M0305 A system declares an input twice
+## M0305
+
+**A system declares an input twice**
 
 A system type defines two input ports with the same name. Port names come
 from the pack, so this is a bug in the pack's system definition.
 
 Rename one of the inputs in the pack, then run `metor pack dev`.
 
-## M0306 A system declares an output twice
+## M0306
+
+**A system declares an output twice**
 
 A system has two output ports with the same name. Either the pack defines
 the name twice, or an output the config adds, such as a record port of a
@@ -378,7 +446,9 @@ the name twice, or an output the config adds, such as a record port of a
 
 Rename the port in the pack, or remove the duplicate from the target file.
 
-## M0307 A system's type is not registered
+## M0307
+
+**A system's type is not registered**
 
 A system names a type that no pack the target lists provides. Types are
 named `pack.system`. Usual causes:
@@ -391,7 +461,9 @@ named `pack.system`. Usual causes:
 
 `metor show` lists each system's type.
 
-## M0308 An input reads from an unknown system
+## M0308
+
+**An input reads from an unknown system**
 
 An input names a producer that is not a system of the same target. A system
 reads only ports of its own target. The Python API refuses a port from
@@ -405,7 +477,9 @@ plant_sub = fsw.add("plant", Subscribe(transport=Peer(link)))
 nav = fsw.add("nav", Nav(imu=plant_sub.port(sensors.imu)))
 ```
 
-## M0309 A system has no such input
+## M0309
+
+**A system has no such input**
 
 The config wires an input port the system's type does not define. The pack's
 generated module only offers the inputs the type has, so this usually means
@@ -415,7 +489,9 @@ hand.
 Run `metor pack dev` in the pack to regenerate its module, then check the
 input names with `metor show target.system`.
 
-## M0310 A system has no such output
+## M0310
+
+**A system has no such output**
 
 The config names an output port the system does not have, either as the
 source of an input or as an output entry of the system itself. A loop
@@ -425,7 +501,9 @@ hand-edited `.json` deployment are the usual causes.
 Check the producer's outputs with `metor show target.system`, and run `metor
 pack dev` if the pack changed.
 
-## M0311 An input and its producer carry different records
+## M0311
+
+**An input and its producer carry different records**
 
 An input reads from an output that carries a different record than the input
 expects. Each port carries one record type, and the two must match.
@@ -434,7 +512,9 @@ Wire the input to a port that carries its record. `metor show target.system`
 lists each port with its record. A pack module's type hints catch most of
 these in an editor before the run.
 
-## M0312 A port needs more alignment than a ring gives
+## M0312
+
+**A port needs more alignment than a ring gives**
 
 A port's record needs an alignment above 16 bytes, which is the most a ring
 payload is aligned to.
@@ -442,14 +522,18 @@ payload is aligned to.
 Change the record in the pack so its alignment is 16 bytes or less, then run
 `metor pack dev`.
 
-## M0313 An output's ring is too large
+## M0313
+
+**An output's ring is too large**
 
 The ring behind an output would be larger than this host can address. The
 record's maximum length is too large.
 
 Reduce the record's maximum size in the pack, then run `metor pack dev`.
 
-## M0314 An undeclared input reads a later system
+## M0314
+
+**An undeclared input reads a later system**
 
 Systems run in the order they are added. Some inputs are not declared by the
 system's type and take their record from the producer, such as the ports a
@@ -464,7 +548,9 @@ nav = fsw.add("nav", Nav(imu=imu.data))
 fsw.add("pub", Publish([nav], transport=Listen("0.0.0.0:2240")))
 ```
 
-## M0315 A record is defined two ways
+## M0315
+
+**A record is defined two ways**
 
 Two registered ports use the same record name with different definitions.
 Typically two packs, or a pack and metor's built-in types, were built
@@ -473,14 +559,18 @@ against different versions of the crate that defines the record.
 Build every pack against the same version of the record's crate and of
 metor-fsw-3, then run `metor pack dev` in each.
 
-## M0316 Two records share a record id
+## M0316
+
+**Two records share a record id**
 
 Two different records map to the same record id, so their data cannot be
 told apart. The message names both.
 
 Rename one of the records in its pack, then run `metor pack dev`.
 
-## M0317 Two messages share a message id
+## M0317
+
+**Two messages share a message id**
 
 Two message records use the same message id with different schemas. A
 message id names one schema on the wire.
@@ -488,7 +578,9 @@ message id names one schema on the wire.
 Give one of the messages a different id in its pack, then run `metor pack
 dev`.
 
-## M0318 A system cannot run that way
+## M0318
+
+**A system cannot run that way**
 
 A system's type does not support how the target file runs it:
 
@@ -504,14 +596,18 @@ fsw.add("db", Db(listen="0.0.0.0:2241", all=True), thread="db")
 fsw.add("slot", DlSlot(allow=[Detumble(), Point()]), channel="adcs")
 ```
 
-## M0319 A type declares a `status` output
+## M0319
+
+**A type declares a `status` output**
 
 The coordinator adds an output named `status` to every system, carrying its
 `SystemStatus`. The type declares its own output with that name.
 
 Rename the output in the pack, then run `metor pack dev`.
 
-## M0320 A type's definition is invalid
+## M0320
+
+**A type's definition is invalid**
 
 A system type was refused when its pack registered it. The message gives the
 reason. Common ones:
@@ -523,7 +619,9 @@ reason. Common ones:
 
 Fix the system in the pack, then run `metor pack dev`.
 
-## M0321 Two systems use the same channel
+## M0321
+
+**Two systems use the same channel**
 
 Commands find a channel by name, so each channel name in a target must be
 unique. Two systems were added with the same `channel=`.
@@ -535,7 +633,9 @@ fsw.add("detumble", Detumble(), channel="detumble")
 fsw.add("point", Point(), channel="point")
 ```
 
-## M0322 A port name is reserved for the channel
+## M0322
+
+**A port name is reserved for the channel**
 
 A system behind a channel gets a `commands` input and `channel_status` and
 `channel_message` outputs, and its `abort` input is written by the channel
@@ -544,7 +644,9 @@ wires its `abort` input.
 
 Rename the port in the pack, or remove the wiring to `abort`.
 
-## M0323 A `Cap` parameter has no grant
+## M0323
+
+**A `Cap` parameter has no grant**
 
 The system's type takes a `Cap`, a handle to a resource such as a serial
 port, and the target file grants it none. Each `Cap` parameter needs exactly
@@ -558,7 +660,9 @@ uart = fsw.resource("gps_uart", Tty("/dev/ttyS1", baud=115200))
 fsw.add("gps", Gps(uart=uart))
 ```
 
-## M0324 A `Cap` parameter is bound twice
+## M0324
+
+**A `Cap` parameter is bound twice**
 
 One `Cap` parameter of a system is bound to two resources. A target file
 grants each parameter once, so this comes from a hand-edited `.json`
@@ -567,7 +671,9 @@ parameter that also has a grant.
 
 Bind each parameter to one resource.
 
-## M0325 A grant names a parameter that is not a `Cap`
+## M0325
+
+**A grant names a parameter that is not a `Cap`**
 
 The config grants a resource to a parameter the system's type does not take
 as a `Cap`. The parameter is misspelled, the pack's module is stale, or the
@@ -576,7 +682,9 @@ parameter is a plain param.
 Check the type's `Cap` parameters, and run `metor pack dev` if the pack
 changed.
 
-## M0326 A system holds a `Cap` and there is no io step
+## M0326
+
+**A system holds a `Cap` and there is no io step**
 
 Systems that hold a `Cap` submit their IO through `fsw.io` steps. `Target`
 adds these, `io_submit` and `io_complete`, whenever a system it adds takes a
@@ -586,7 +694,9 @@ deployment, or a pack module older than the pack, are the usual causes.
 Run `metor pack dev` in the pack, or add an `fsw.io` system to a
 hand-written config.
 
-## M0327 No io step follows a system that holds a `Cap`
+## M0327
+
+**No io step follows a system that holds a `Cap`**
 
 A system that holds a `Cap` must have an `fsw.io` step after it, which
 submits its requests the same cycle. `Target` places `io_submit` after every
@@ -595,7 +705,9 @@ stale pack module.
 
 Add `fsw.io` after the named system.
 
-## M0328 Too many IO operations in flight
+## M0328
+
+**Too many IO operations in flight**
 
 The systems that hold a `Cap` ask, between them, for more operations in
 flight than an operation id can name, which is 65,536.
@@ -603,14 +715,18 @@ flight than an operation id can name, which is 65,536.
 Lower the op budgets of the systems in their packs, or hold fewer resources
 in one target.
 
-## M0329 Too many resources
+## M0329
+
+**Too many resources**
 
 The target creates more resources than a resource index can name, which is
 65,536.
 
 Create fewer resources, or split the target.
 
-## M0330 The IO backend did not start
+## M0330
+
+**The IO backend did not start**
 
 The host's IO backend could not be created. On Linux this is io_uring;
 elsewhere it is a poll-based backend. The message gives the operating
@@ -620,7 +736,9 @@ On Linux, io_uring can be disabled by the `kernel.io_uring_disabled` sysctl,
 by a container's seccomp profile, or limited by the locked-memory limit.
 Allow io_uring for the process, or run on a host where it is enabled.
 
-## M0331 A grant names an unknown resource
+## M0331
+
+**A grant names an unknown resource**
 
 A system is granted a resource that the target does not create. `Target`
 only accepts handles of its own resources, so this comes from a hand-edited
@@ -628,7 +746,9 @@ only accepts handles of its own resources, so this comes from a hand-edited
 
 Create the resource in the target's `resources`, or fix the grant's name.
 
-## M0332 A resource has the wrong interface
+## M0332
+
+**A resource has the wrong interface**
 
 A `Cap` parameter takes one interface, such as `uart`, and the resource
 granted to it provides another. `Tty` provides `uart`, `Can` `can`,
@@ -638,7 +758,9 @@ granted to it provides another. `Tty` provides `uart`, `Can` `can`,
 
 Grant the parameter a resource of the kind it takes.
 
-## M0333 A sim resource is granted directly
+## M0333
+
+**A sim resource is granted directly**
 
 A sim resource names its holders itself: the system and parameter at its
 host end and at its device end. It cannot also be granted through a system's
@@ -648,7 +770,9 @@ hand-edited `.json` deployment.
 Remove the grant, and name the holder in the resource's `host` or `device`
 entry.
 
-## M0334 A sim resource names an unknown holder
+## M0334
+
+**A sim resource names an unknown holder**
 
 A sim resource names a system as the holder of one of its ends, and the
 target has no system with that id. `Target` derives holders from the systems
@@ -656,7 +780,9 @@ it adds, so this comes from a hand-edited `.json` deployment.
 
 Fix the holder's id, or add the system.
 
-## M0335 A resource could not be prepared
+## M0335
+
+**A resource could not be prepared**
 
 A resource's backing could not be turned into something the IO backend
 opens. The message says why:
@@ -668,7 +794,9 @@ opens. The message says why:
 Fix the path or address. A dialed host name resolves on the target when the
 build runs, so it must be known there.
 
-## M0336 A system's definition failed
+## M0336
+
+**A system's definition failed**
 
 A system's type refused its config when its ports were computed. The message
 names the system and the reason. Common ones:
@@ -681,7 +809,9 @@ names the system and the reason. Common ones:
 Fix the system's arguments in the target file. `metor show target.system`
 lists its ports and params.
 
-## M0337 A system could not be made
+## M0337
+
+**A system could not be made**
 
 A system's constructor failed while the target was built. The message names
 the system and the reason. Common ones:
@@ -700,7 +830,9 @@ the system and the reason. Common ones:
 fsw.wasm(seqs, memory=16 << 20)
 ```
 
-## M0401 A pack file could not be read
+## M0401
+
+**A pack file could not be read**
 
 `metor pack dev`, or a run that rebuilds dev packs, could not read one of
 the pack's files, usually its `pyproject.toml` or `Cargo.toml`. The message
@@ -710,7 +842,9 @@ Check that the directory is a pack: it holds a `pyproject.toml` with a
 `[tool.metor.pack]` table and a `Cargo.toml`. `metor pack dev` takes the
 pack's directory, and defaults to the working directory.
 
-## M0402 A pack file could not be written
+## M0402
+
+**A pack file could not be written**
 
 Building a pack's module writes to `.metor/<module>/` in the pack's
 directory: the library, the wasm module if any, `__init__.py`, and
@@ -719,7 +853,9 @@ operating system's error.
 
 Check permissions and free space in the pack's directory.
 
-## M0403 A pack's TOML is invalid
+## M0403
+
+**A pack's TOML is invalid**
 
 The pack's `pyproject.toml` or `Cargo.toml` is not valid TOML, or lacks a
 field metor reads. `pyproject.toml` needs `[project] name`. `Cargo.toml`
@@ -735,7 +871,9 @@ name = "adcs-pack"
 [tool.metor.pack]
 ```
 
-## M0404 A system's params schema did not decode
+## M0404
+
+**A system's params schema did not decode**
 
 The pack's descriptor gives each system's params as a JSON schema, and one
 did not parse. The schema is generated from the params type in the pack, so
@@ -744,7 +882,9 @@ this points at a bug in the pack or in metor.
 Rebuild the pack against the metor-fsw-3 this metor ships with. If it
 persists, report it with the params type.
 
-## M0405 A name is used by two keywords
+## M0405
+
+**A name is used by two keywords**
 
 A pack module gives each system one keyword per input, param, and `Cap`, so
 these names must not collide. The system has an input and a param with the
@@ -753,7 +893,9 @@ reserved keywords `items`, `records`, and `grants`.
 
 Rename the param, the port, or the `Cap` in the pack.
 
-## M0406 The module could not be rendered
+## M0406
+
+**The module could not be rendered**
 
 Rendering a pack's Python module from its descriptor failed. This is a bug
 in metor's module template, or a descriptor it does not expect.
@@ -761,7 +903,9 @@ in metor's module template, or a descriptor it does not expect.
 Report it with the pack's descriptor. Rebuilding against the metor-fsw-3
 this metor ships with can avoid a descriptor mismatch.
 
-## M0407 The pack is already loaded
+## M0407
+
+**The pack is already loaded**
 
 The process has already loaded this pack's library, and a loaded library
 cannot be replaced. Rebuilding it in the same process would leave the old
@@ -770,7 +914,9 @@ code running.
 Restart the command. Each run of `metor run`, `metor check`, and `metor pack
 dev` is a fresh process, and `metor watch` starts a new one for every rerun.
 
-## M0408 The wasm module and the library differ
+## M0408
+
+**The wasm module and the library differ**
 
 A pack with `wasm = true` is built twice: as a native library and as a wasm
 module. The two describe different systems or ports.
@@ -779,7 +925,9 @@ Code that is compiled only for one target, such as behind `#[cfg(target_arch
 = "wasm32")]`, is the usual cause. Make the pack's systems the same on both
 targets.
 
-## M0410 cargo could not be started
+## M0410
+
+**cargo could not be started**
 
 metor runs cargo to build packs, and cargo could not be started. It uses
 `$CARGO`, or `cargo` from `PATH`.
@@ -787,7 +935,9 @@ metor runs cargo to build packs, and cargo could not be started. It uses
 Install Rust from rustup.rs, or put cargo on `PATH`. `metor doctor` checks
 it.
 
-## M0411 The pack did not compile
+## M0411
+
+**The pack did not compile**
 
 cargo failed to build the pack. The compiler's errors are printed above the
 diagnostic.
@@ -795,7 +945,9 @@ diagnostic.
 Fix the errors and run the command again. `cargo build` in the pack's
 directory shows the same errors.
 
-## M0412 cargo built no library
+## M0412
+
+**cargo built no library**
 
 cargo succeeded but produced no `cdylib`, or for a wasm build no module, for
 the pack's crate. metor loads a pack as a dynamic library, so the crate must
@@ -808,7 +960,9 @@ Set the crate type in the pack's `Cargo.toml`.
 crate-type = ["cdylib"]
 ```
 
-## M0413 The wasm32 target is not installed
+## M0413
+
+**The wasm32 target is not installed**
 
 The pack sets `wasm = true` under `[tool.metor.pack]`, so it is also built
 as a wasm module, and the toolchain cargo uses has no
@@ -820,7 +974,9 @@ Install it for that toolchain.
 rustup target add wasm32-unknown-unknown
 ```
 
-## M0420 The pack's library did not load
+## M0420
+
+**The pack's library did not load**
 
 The operating system could not load a pack's dynamic library. The message
 gives its error. Usual causes:
@@ -830,7 +986,9 @@ gives its error. Usual causes:
 - The library was built for another architecture.
 - The library depends on a shared library that is not installed.
 
-## M0421 The library is not a pack
+## M0421
+
+**The library is not a pack**
 
 The library loaded but does not export a function every pack exports. The
 message names it. The library is not a metor pack, or its crate does not
@@ -839,7 +997,9 @@ call `export_pack!`.
 Export the pack's systems with `export_pack!` in the crate's root, then run
 `metor pack dev`.
 
-## M0422 The pack was built for another ABI
+## M0422
+
+**The pack was built for another ABI**
 
 A pack and the host must agree on the pack ABI version. The pack was built
 against a different version of metor-fsw-3 than this metor.
@@ -847,7 +1007,9 @@ against a different version of metor-fsw-3 than this metor.
 Rebuild the pack against the metor-fsw-3 this metor ships with, then run
 `metor pack dev`. `metor doctor` shows this metor's ABI.
 
-## M0423 The pack's descriptor did not decode
+## M0423
+
+**The pack's descriptor did not decode**
 
 The pack describes its systems in a descriptor, and the host could not
 decode it. A pack built against another version of metor-fsw-3 with the same
@@ -855,7 +1017,9 @@ ABI number, or a library that is not a complete pack, are the usual causes.
 
 Rebuild the pack against the metor-fsw-3 this metor ships with.
 
-## M0424 The pack's descriptor is too large
+## M0424
+
+**The pack's descriptor is too large**
 
 A pack's descriptor must fit in a 1 MiB buffer, and this one does not.
 Descriptors grow with the number of systems and the size of their params
@@ -863,7 +1027,9 @@ schemas.
 
 Split the pack into smaller packs.
 
-## M0425 The pack's descriptor export failed
+## M0425
+
+**The pack's descriptor export failed**
 
 The pack's descriptor function returned a status the host does not expect,
 rather than a descriptor. The pack failed while describing itself, or was
@@ -872,14 +1038,18 @@ built against an ABI that uses other status codes.
 Rebuild the pack against the metor-fsw-3 this metor ships with. If it
 persists, the pack's table builder is failing.
 
-## M0426 The wasm module could not be read
+## M0426
+
+**The wasm module could not be read**
 
 A wasm pack's module file could not be read. It lives in the pack's
 `.metor/<module>/_libs/wasm32-unknown-unknown/` directory.
 
 Run `metor pack dev` in the pack to build it.
 
-## M0427 The wasm module did not load
+## M0427
+
+**The wasm module did not load**
 
 The host could not instantiate a wasm pack's module. The message says why.
 Common causes:
@@ -893,7 +1063,9 @@ Common causes:
 
 Rebuild with `metor pack dev`, and raise `memory` if the module needs it.
 
-## M0428 The wasm module trapped
+## M0428
+
+**The wasm module trapped**
 
 A wasm pack's module trapped while the host loaded it or asked for its
 descriptor. The message gives the trap. A guest panic traps as
@@ -901,7 +1073,9 @@ descriptor. The message gives the trap. A guest panic traps as
 
 Fix the panic in the pack, then run `metor pack dev`.
 
-## M0501 Systems latched off
+## M0501
+
+**Systems latched off**
 
 One or more systems panicked during the run. A system that panics is latched
 off: the coordinator stops stepping it for the rest of the run. The message
@@ -909,7 +1083,9 @@ names each one, and their last log lines say why.
 
 Fix the cause in the system's pack. metor exits with status 3.
 
-## M0502 Targets did not exit cleanly
+## M0502
+
+**Targets did not exit cleanly**
 
 In a multi-target run, each target runs as its own child process. One or
 more of them failed. Each target's own error is printed above, prefixed with
@@ -922,7 +1098,9 @@ status 4.
 metor run --target fsw
 ```
 
-## M0503 Interrupted
+## M0503
+
+**Interrupted**
 
 The run was stopped with SIGINT, usually Ctrl-C. The summary already says
 so, so no diagnostic is printed. metor exits with status 130.

@@ -25,41 +25,52 @@ use crate::pack::def::PackDef;
 static BUILD: Mutex<()> = Mutex::new(());
 
 /// An error building a pack or writing its editable module.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum PackDevError {
     #[error("reading {path}: {source}")]
+    #[diagnostic(code(M0401))]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
     #[error("writing {path}: {source}")]
+    #[diagnostic(code(M0402))]
     Write {
         path: PathBuf,
         source: std::io::Error,
     },
     #[error("reading {path}: {source}")]
+    #[diagnostic(code(M0403))]
     Toml {
         path: PathBuf,
         source: toml::de::Error,
     },
     #[error("the params schema of `{system}` did not decode: {source}")]
+    #[diagnostic(code(M0404))]
     Schema {
         system: String,
         source: serde_json::Error,
     },
     #[error("system `{system}` has an input port and a param both named `{name}`")]
+    #[diagnostic(code(M0405), help("rename the param or the port"))]
     NameClash { system: String, name: String },
     #[error("rendering the module: {0}")]
+    #[diagnostic(code(M0406))]
     Template(#[from] minijinja::Error),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Cargo(#[from] CargoError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Pack(#[from] PackError),
     #[error("{0} is already loaded; restart the process before rebuilding this pack")]
+    #[diagnostic(code(M0407))]
     AlreadyLoaded(PathBuf),
     #[error("the module describes other systems than the library")]
+    #[diagnostic(code(M0408))]
     DescriptorMismatch,
     #[error("the pack builds as wasm, and the wasm32 target is not installed")]
+    #[diagnostic(code(M0413), help("rustup target add {}", crate::dl::WASM_TRIPLE))]
     NoWasmTarget,
 }
 

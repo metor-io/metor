@@ -17,15 +17,22 @@ use super::DeployError;
 pub const CONFIG_VERSION: u32 = 2;
 
 /// An error reading a config file or picking a target from it.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
     #[error("the config is version {found}, this host reads {expected}")]
+    #[diagnostic(
+        code(M0204),
+        help("install the metor-config that ships with this metor")
+    )]
     Version { found: u32, expected: u32 },
     #[error("the config did not decode: {0}")]
+    #[diagnostic(code(M0205))]
     Decode(#[from] serde_json::Error),
     #[error("the deployment has several targets; pick one with --target: {0}")]
+    #[diagnostic(code(M0103))]
     SelectTarget(String),
     #[error("no target is named `{name}`")]
+    #[diagnostic(code(M0102), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_TARGETS)))]
     NoSuchTarget { name: String, known: Vec<String> },
 }
 

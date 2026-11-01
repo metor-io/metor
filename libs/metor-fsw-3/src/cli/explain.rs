@@ -11,7 +11,8 @@ use super::ui::table::{self, Align};
 use super::ui::theme::Theme;
 use super::ui::{Format, Ui};
 
-/// One `## M0201 Title` section per code, wrapped at 76 columns.
+/// One `## M0201` section per code, its title in bold, wrapped at 76
+/// columns. The bare heading gives each code a stable link anchor.
 const CODES: &str = include_str!("codes.md");
 
 /// The arguments to `metor explain`.
@@ -29,15 +30,20 @@ pub struct Section<'a> {
     pub body: &'a str,
 }
 
-/// The sections of `text`, each from its `## ` line to the next.
+/// The sections of `text`: a `## M0201` line, a `**title**` line, then the
+/// body up to the next section.
 pub fn sections(text: &str) -> impl Iterator<Item = Section<'_>> {
     text.split("\n## ").filter_map(|chunk| {
         let chunk = chunk.strip_prefix("## ").unwrap_or(chunk);
-        let (head, body) = chunk.split_once('\n').unwrap_or((chunk, ""));
-        let (code, title) = head.split_once(' ')?;
+        let (code, rest) = chunk.split_once('\n')?;
+        let (title, body) = rest
+            .trim_start()
+            .split_once('\n')
+            .unwrap_or((rest.trim(), ""));
+        let title = title.trim().strip_prefix("**")?.strip_suffix("**")?;
         code.starts_with('M').then_some(Section {
-            code,
-            title: title.trim(),
+            code: code.trim(),
+            title,
             body: body.trim(),
         })
     })
@@ -148,11 +154,26 @@ mod tests {
     use super::*;
     use crate::cli::ui::caps::Caps;
 
-    /// Every `"M0123"` literal in `source`.
-    fn codes_in(source: &str) -> Vec<&str> {
-        let mut codes: Vec<&str> = source
-            .match_indices("\"M")
-            .filter_map(|(at, _)| source.get(at + 1..at + 6))
+    /// The files whose error types name codes.
+    const SOURCES: [&str; 7] = [
+        include_str!("run.rs"),
+        include_str!("pack_dev.rs"),
+        include_str!("cargo.rs"),
+        include_str!("../deploy/config.rs"),
+        include_str!("../deploy/error.rs"),
+        include_str!("../coordinator/error.rs"),
+        include_str!("../dl/mod.rs"),
+    ];
+
+    /// Every `code(M0123)` in `sources`.
+    fn codes_in(sources: &[&'static str]) -> Vec<&'static str> {
+        let mut codes: Vec<&str> = sources
+            .iter()
+            .flat_map(|source| {
+                source
+                    .match_indices("code(M")
+                    .filter_map(|(at, _)| source.get(at + 5..at + 10))
+            })
             .filter(|code| code[1..].bytes().all(|b| b.is_ascii_digit()))
             .collect();
         codes.sort_unstable();
@@ -162,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_every_code_has_a_section_and_every_section_a_code() {
-        let used = codes_in(include_str!("diagnostic.rs"));
+        let used = codes_in(&SOURCES);
         let documented: Vec<&str> = sections(CODES).map(|s| s.code).collect();
         assert!(used.len() > 50, "{used:?}");
         let missing: Vec<_> = used
@@ -184,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_sections_split_on_headings() {
-        let text = "## M0001 One\n\nFirst.\n\n## M0002 Two\nSecond.\n## nope\n";
+        let text = "## M0001\n\n**One**\n\nFirst.\n\n## M0002\n**Two**\nSecond.\n## nope\n## M0003\nno title\n";
         let found: Vec<_> = sections(text).collect();
         assert_eq!(
             found,

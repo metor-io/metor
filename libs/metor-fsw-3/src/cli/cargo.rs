@@ -13,11 +13,13 @@ use super::pack_dev::PackDevError;
 use crate::dl::WASM_TRIPLE;
 
 /// An error building a pack's cdylib or wasm module.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum CargoError {
     #[error("running cargo: {0}")]
+    #[diagnostic(code(M0410), help("is cargo on your PATH?"))]
     Spawn(#[from] std::io::Error),
     #[error("cargo build failed: {status}")]
+    #[diagnostic(code(M0411), help("cargo's errors are above"))]
     Cargo {
         status: ExitStatus,
         /// The compiler's errors as cargo renders them, or cargo's stderr
@@ -25,6 +27,10 @@ pub enum CargoError {
         output: Vec<u8>,
     },
     #[error("cargo built no {0} for `{1}`")]
+    #[diagnostic(
+        code(M0412),
+        help("set `crate-type = [\"cdylib\"]` in the pack's Cargo.toml")
+    )]
     NoArtifact(&'static str, String),
 }
 

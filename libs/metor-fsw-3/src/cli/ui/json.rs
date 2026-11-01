@@ -83,6 +83,7 @@ fn object(event: &Event<'_>) -> Option<Value> {
                 "code": diagnostic.code().map(|code| code.to_string()),
                 "message": diagnostic.to_string(),
                 "help": diagnostic.help().map(|help| help.to_string()),
+                "url": diagnostic.url().map(|url| url.to_string()),
                 "file": file,
                 "line": line,
             })

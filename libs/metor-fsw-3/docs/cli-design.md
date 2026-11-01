@@ -262,7 +262,10 @@ On exit, a table says how the run ended:
 
 Errors are `miette` diagnostics: a code, a headline, the source location,
 and a help line, rendered by miette's graphical handler, with a footer
-naming `metor explain` and the code. A config error points at the `target.py` line that added the system;
+naming `metor explain` and the code. Each error variant names its code
+and help with `#[diagnostic(code(..), help(..))]`, next to its message.
+The code links to its section of `codes.md` on GitHub, a terminal
+hyperlink where the terminal supports one. A config error points at the `target.py` line that added the system;
 the Python recorder keeps each call site for this. A Python exception
 shows only the frames in the user's files.
 
