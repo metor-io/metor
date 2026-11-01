@@ -19,6 +19,7 @@ pub mod app;
 pub(crate) mod atlas;
 pub mod backfill;
 pub(crate) mod background_tasks;
+pub(crate) mod commands;
 pub mod config;
 pub mod connections;
 pub mod data_binding;

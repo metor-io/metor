@@ -32,6 +32,8 @@ facet-dessert = "=0.44.5"
 postcard = "1"
 # Schema-driven decode of unknown message ids for the plot event overlay.
 postcard-dyn = "0.2"
+# Names the announced schema types a command form is built from.
+postcard-schema = { version = "0.2", features = ["use-std"] }
 serde = "1"
 serde_json = "1"
 smallvec = "1"
@@ -124,5 +126,3 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-# Builds a concrete schema for the unknown-message decode test.
-postcard-schema = { version = "0.2", features = ["use-std"] }

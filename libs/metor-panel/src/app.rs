@@ -1649,6 +1649,7 @@ impl PanelApp {
         crate::logs::LogStore::init(db.clone(), cx);
         crate::presets::TargetPresetStore::init(db.clone(), cx);
         crate::sequences::SequenceStore::init(db.clone(), cx);
+        crate::commands::CommandCatalog::init(db.clone(), cx);
         crate::plot_events::EventSourceRegistry::init(cx);
         register_pane_item_deserializers(db.clone(), cx);
         for (kind, spec) in views {
