@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use metor_proto::types::{ComponentView, Timestamp};
@@ -27,6 +27,7 @@ use crate::{
     append_log::AppendLog,
     arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
     disruptor::ArcAtomic,
+    evict::LastAccess,
     manifest::{
         ComponentManifest, Coverage, GapVec, ManifestCell, NodeSpan, RangeVec, SpanSource,
         SpanState,
@@ -80,6 +81,10 @@ impl MirrorRun {
 pub struct TimeSeriesNode {
     pub index: AppendLog<Timestamp>,
     pub data: AppendLog<u64>,
+    /// When a reader last asked for this node's data; shared by the
+    /// shells a splice rebuilds, so a touch lands whichever one a reader
+    /// holds. See [`TimeSeries::touch`].
+    pub(crate) last_access: Arc<LastAccess>,
 }
 
 impl Debug for TimeSeriesNode {
@@ -120,16 +125,22 @@ impl TimeSeriesNode {
             path.join("data"),
             element_size,
         )?;
-        let time_series = Self { index, data };
-        Ok(time_series)
+        Ok(Self::from_logs(index, data))
+    }
+
+    pub(crate) fn from_logs(index: AppendLog<Timestamp>, data: AppendLog<u64>) -> Self {
+        Self {
+            index,
+            data,
+            last_access: Arc::new(LastAccess::now()),
+        }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let index = AppendLog::open(path.join("index"))?;
         let data = AppendLog::open(path.join("data"))?;
-        let time_series = Self { index, data };
-        Ok(time_series)
+        Ok(Self::from_logs(index, data))
     }
 
     pub fn timestamps(&self) -> &[Timestamp] {
@@ -553,6 +564,34 @@ impl TimeSeries {
         }
         if cursor < range.end.0 {
             out.push(Timestamp(cursor)..range.end);
+        }
+    }
+
+    /// Record that a reader used `range` at `now`: every resident node
+    /// overlapping it, and the newest node starting at or before its start,
+    /// which holds the sample a reader carries into the range (a plot's
+    /// line in from the left edge, the predecessor a value view shows).
+    ///
+    /// This is the working set [`crate::evict`] keeps. Only reads made for
+    /// someone looking at the data touch — views, playback read-ahead —
+    /// never internal scans (coverage, LoD folding, sealing, the evictor
+    /// itself), or nothing would ever go idle. In memory only, never
+    /// blocks or allocates, and walks only the nodes it touches plus the
+    /// newer ones above them; cheap enough per trace per frame.
+    pub fn touch(&self, range: Range<Timestamp>, now: Instant) {
+        let stamp = LastAccess::stamp(now);
+        let end = range.end.0.max(range.start.0.saturating_add(1));
+        for node in self.list.iter() {
+            let Some(first) = node.timestamps().first() else {
+                continue;
+            };
+            if first.0 >= end {
+                continue;
+            }
+            node.last_access.touch(stamp);
+            if first.0 <= range.start.0 {
+                break;
+            }
         }
     }
 
@@ -2495,11 +2534,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("0");
         std::fs::create_dir_all(&node_dir).unwrap();
-        let old = TimeSeriesNode {
-            index: AppendLog::with_size(NODE_SIZE, node_dir.join("index"), Timestamp(0)).unwrap(),
-            data: AppendLog::with_size(NODE_SIZE, node_dir.join("data"), IMAGE_SIZE as u64)
-                .unwrap(),
-        };
+        let old = TimeSeriesNode::from_logs(
+            AppendLog::with_size(NODE_SIZE, node_dir.join("index"), Timestamp(0)).unwrap(),
+            AppendLog::with_size(NODE_SIZE, node_dir.join("data"), IMAGE_SIZE as u64).unwrap(),
+        );
         let mut buf = vec![0u8; IMAGE_SIZE];
         for ts in 0..4i64 {
             buf.fill(ts as u8);
