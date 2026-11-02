@@ -97,6 +97,10 @@
 //! time and lets it wait in cycle time. An abort ends any wait with
 //! [`SeqError::Aborted`].
 //!
+//! A system raises [alarms](mod@alarm) through an [`Alarms`] parameter, and a sequence
+//! through [`alarm!`] and [`redline!`]. Both publish the wkt `AlarmRaised`
+//! and `AlarmCleared` messages.
+//!
 //! ```
 //! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 //! # use metor_fsw_3::{Frame, Timestamp};
@@ -138,6 +142,7 @@
 // The derives name this crate by its package name, in doctests as well as here.
 extern crate self as metor_fsw_3;
 
+pub mod alarm;
 pub mod async_system;
 #[cfg(feature = "host")]
 pub mod builtins;
@@ -173,6 +178,7 @@ pub mod wasm;
 #[cfg(test)]
 mod tests;
 
+pub use alarm::{AlarmCell, AlarmSpec, Alarms, Edge, Msg, Severity};
 pub use async_system::{AsyncSystem, Stop};
 pub use channel::{Abort, AbortRequest, ChannelMessage, ChannelStatus};
 #[cfg(feature = "host")]
@@ -204,7 +210,7 @@ pub use port::{
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
 pub use rng::Rng;
-pub use sequence::{OnAbort, Redline, Seq, SeqError, SequenceFn};
+pub use sequence::{OnAbort, Seq, SeqError, SequenceFn, Watch};
 pub use system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 
 pub use metor_fsw_3_ring as ring;

@@ -22,6 +22,8 @@ use crate::port::{Output, Sample};
 use crate::system::{InputBinding, OutputBinding};
 use crate::tests::utils::{self, Imu, Recorder};
 
+mod alarms;
+
 /// The phase a sequence has reached, shared with the test.
 #[derive(Clone, Default)]
 struct Phase(Rc<Cell<u32>>);
@@ -103,6 +105,15 @@ fn def_of<S: SequenceFn>(_sequence: S) -> crate::system::SystemDef {
 
 /// One step of `S` over fresh rings, with nothing feeding its inputs.
 fn step_of<S: SequenceFn>(sequence: S, state: S::State) -> (SequenceStep, Vec<RingBuffer>) {
+    step_named(sequence, state, "seq")
+}
+
+/// As `step_of`, for an instance called `id`.
+fn step_named<S: SequenceFn>(
+    sequence: S,
+    state: S::State,
+    id: &str,
+) -> (SequenceStep, Vec<RingBuffer>) {
     let def = def_of(sequence);
     let inputs = def
         .inputs
@@ -112,15 +123,26 @@ fn step_of<S: SequenceFn>(sequence: S, state: S::State) -> (SequenceStep, Vec<Ri
             views: Vec::new(),
         })
         .collect();
-    step_over::<S>(&def, state, inputs)
+    step_over::<S>(&def, state, inputs, id)
 }
 
-/// One step of `S`, defined by `def`, reading `inputs` and writing to fresh rings.
+/// One step of `S` called `id`, defined by `def`, reading `inputs` and
+/// writing to fresh rings.
 fn step_over<S: SequenceFn>(
     def: &crate::system::SystemDef,
     state: S::State,
     inputs: Vec<InputBinding>,
+    id: &str,
 ) -> (SequenceStep, Vec<RingBuffer>) {
+    let (outputs, rings) = output_bindings(def);
+    let cx = bind_cx(id);
+    let super::SeqInputs { abort, ins } = super::SeqInputs::<S>::bind(inputs, &cx).expect("binds");
+    let outs = super::SeqOutputs::<S>::bind(outputs, &cx).expect("binds");
+    (SequenceStep::new::<S>(state, abort, ins, outs), rings)
+}
+
+/// A writer on a fresh ring for each of `def`'s outputs.
+fn output_bindings(def: &crate::system::SystemDef) -> (Vec<OutputBinding>, Vec<RingBuffer>) {
     let rings: Vec<RingBuffer> = def
         .outputs
         .iter()
@@ -135,17 +157,27 @@ fn step_over<S: SequenceFn>(
             writer: ring.writer(NoWake).expect("a free writer"),
         })
         .collect();
-    let cx = crate::system::BindCx {
+    (outputs, rings)
+}
+
+fn bind_cx(id: &str) -> crate::system::BindCx {
+    crate::system::BindCx {
         instance: crate::fn_system::Instance {
-            id: "seq".into(),
+            id: id.into(),
             seed: 0,
             ..Default::default()
         },
         io: None,
-    };
-    let super::SeqInputs { abort, ins } = super::SeqInputs::<S>::bind(inputs, &cx).expect("binds");
-    let outs = crate::fn_system::OutSet::<S>::bind(outputs, &cx).expect("binds");
-    (SequenceStep::new::<S>(state, abort, ins, outs), rings)
+    }
+}
+
+/// Binds `S`'s outputs for an instance called `id`.
+fn bind_outputs<S: SequenceFn>(
+    sequence: S,
+    id: &str,
+) -> Result<super::SeqOutputs<S>, crate::MakeError> {
+    let (outputs, _rings) = output_bindings(&def_of(sequence));
+    super::SeqOutputs::<S>::bind(outputs, &bind_cx(id))
 }
 
 fn table(recorder: &Recorder) -> SystemTable {
@@ -183,8 +215,20 @@ fn test_def_reads_abort_first() {
     let inputs: Vec<_> = def.inputs.iter().map(|p| p.name.as_ref()).collect();
     let outputs: Vec<_> = def.outputs.iter().map(|p| p.name.as_ref()).collect();
     assert_eq!(inputs, ["abort"]);
-    assert_eq!(outputs, ["imu", "log"]);
+    assert_eq!(outputs, ["imu", "log", "alarm_raised", "alarm_cleared"]);
+    assert_eq!(def.log, Some(1));
     assert_eq!(def.name, "one_sample");
+}
+
+#[test]
+fn test_long_prefix_fails_make() {
+    let id = "s".repeat(90);
+    let err = bind_outputs(one_sample(), &id).err();
+    assert_eq!(
+        err,
+        Some(crate::MakeError::AlarmPrefixTooLong { prefix: id })
+    );
+    assert!(bind_outputs(one_sample(), "seq").is_ok());
 }
 
 #[test]
@@ -802,7 +846,10 @@ fn test_unnamed_redline_fault() {
     assert_eq!(trace.take(), ["closed"]);
     let lines = recorder.take_logs();
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].message, "redline");
+    assert_eq!(
+        lines[0].message,
+        "|| imu.get().is_some_and(|i| i.sample >= 2.0)"
+    );
 }
 
 #[test]
@@ -836,6 +883,7 @@ fn test_redline_is_checked_before_the_next_poll() {
     assert_eq!(trace.take(), ["linked"]);
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["closed"]);
+    coordinator.step(ms(3));
     let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("t", &EndReason::Aborted)]);
     assert_eq!(recorder.take_logs()[0].message, "at once");
@@ -845,7 +893,7 @@ fn test_redline_is_checked_before_the_next_poll() {
 #[crate::sequence]
 async fn cut_wire(#[state] trace: &mut Trace, seq: &Seq) -> Result<(), SeqError> {
     let _closed = seq.on_abort(|_| trace.push("closed"));
-    crate::redline!(seq, "wire", || panic!("sensor wire cut"));
+    crate::redline!(seq, "wire", || -> bool { panic!("sensor wire cut") });
     seq.sleep(Duration::from_secs(3600)).await
 }
 
@@ -899,7 +947,7 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
             views: vec![ring.view(NoWake).expect("a free slot")],
         },
     ];
-    let (step, mut rings) = step_over::<S>(&def, (), inputs);
+    let (step, mut rings) = step_over::<S>(&def, (), inputs, "seq");
     let imu = utils::output(&ring);
     rings.push(ring);
     (step, imu, rings)
@@ -966,10 +1014,12 @@ async fn leaks_a_future(seq: &Seq, imu: &Sample<Imu>) -> Result<(), SeqError> {
 /// Links a boxed redline over its imu and leaks it, then ends two cycles later.
 #[crate::sequence]
 async fn leaks_a_redline(seq: &Seq<'_>, imu: &Sample<Imu>) -> Result<(), SeqError> {
-    let redline = Box::pin(Redline::new("imu high", || {
-        imu.get().is_some_and(|i| i.sample >= 2.0)
-    }));
-    seq.redline(redline.as_ref());
+    let redline = Box::pin(Watch::redline(
+        "imu high",
+        || imu.get().is_some_and(|i| i.sample >= 2.0),
+        SpecName,
+    ));
+    seq.watch(redline.as_ref());
     leak(redline);
     seq.next_cycle().await;
     seq.next_cycle().await;

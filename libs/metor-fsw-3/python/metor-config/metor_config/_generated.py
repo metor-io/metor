@@ -16,6 +16,18 @@ PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)
 """The built-in systems' pack. It has no library, so no config lists it."""
 
 
+class AlarmCleared(Record):
+    _name = "alarm_cleared"
+    _kind = "msg"
+    _pack = PACK
+
+
+class AlarmRaised(Record):
+    _name = "alarm_raised"
+    _kind = "msg"
+    _pack = PACK
+
+
 class ChannelMessage(Record):
     _name = "channel_message"
     _kind = "frame"
@@ -86,14 +98,14 @@ class Publish(System):
     _pack = PACK
     _ty = "publish"
     _takes_inputs = True
-    _ports = {"link_status": LinkStatus, "log": LogEvent, "status": SystemStatus}
+    _ports = {"link_status": LinkStatus, "alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
 
 
 class Subscribe(System):
     _pack = PACK
     _ty = "subscribe"
     _takes_outputs = True
-    _ports = {"link_status": LinkStatus, "log": LogEvent, "status": SystemStatus}
+    _ports = {"link_status": LinkStatus, "alarm_raised": AlarmRaised, "alarm_cleared": AlarmCleared, "log": LogEvent, "status": SystemStatus}
 
 
 class Db(System):

@@ -69,10 +69,12 @@ nav = fsw.add(
 )
 
 fsw.wasm(adcs_seqs.PACK)
-# Detumbles, then points at nadir.
+# Detumbles, then points at nadir and watches the wheels hold the rate.
 commission = fsw.add(
     "commission",
-    Commission(estimate=nav.attitude_estimate, rate=0.02, detumble_timeout_s=1800.0),
+    Commission(
+        estimate=nav.attitude_estimate, rate=0.02, detumble_timeout_s=1800.0, handover_s=600.0
+    ),
     channel="commission",
 )
 ctrl = fsw.add(

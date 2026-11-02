@@ -16,7 +16,7 @@ use crate::fn_system::{Cycle, InSet, OutSet, Param, Refresh};
 use crate::log::{self, LogPort};
 use crate::port::Input;
 
-use super::{Seq, SeqError, SequenceFn};
+use super::{Seq, SeqError, SeqOutputs, SequenceFn};
 
 /// A sequence's body, boxed as a future.
 type Run = Pin<Box<dyn Future<Output = Result<(), SeqError>>>>;
@@ -45,11 +45,12 @@ impl SequenceStep {
         state: S::State,
         abort: Input<AbortRequest>,
         inputs: InSet<S>,
-        outputs: OutSet<S>,
+        outputs: SeqOutputs<S>,
     ) -> Self {
         let InSet { ins } = inputs;
-        let OutSet { outs, log, dropped } = outputs;
-        let seq = Rc::new(Seq::new());
+        let SeqOutputs { outs, alarms } = outputs;
+        let OutSet { outs, log, dropped } = outs;
+        let seq = Rc::new(Seq::with_alarms(alarms));
         Self {
             body: Body::Running(Box::pin(run::<S>(state, ins, outs, seq.clone()))),
             seq,

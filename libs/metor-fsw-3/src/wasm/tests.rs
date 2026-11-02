@@ -28,13 +28,14 @@ fn wat(memory: &str, extra: &str, execute: &str) -> String {
         r#"(module
             (import "env" "memory" (memory {memory}))
             {extra}
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 15)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const {ABI_VERSION})
             (func (export "metor_fsw_pack_def") (param i32 i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_create")
                 (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32) (result i32)
                 i32.const 3)
             (func (export "metor_fsw_execute") (param i32 i64) (result i32) {execute})
+            (func (export "metor_fsw_destroy") (param i32))
             (func (export "metor_fsw_alloc") (param i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_free") (param i32 i32 i32)))"#
     )
@@ -169,7 +170,7 @@ fn test_accesses_stay_in_memory() {
 #[test]
 fn test_calls_reach_each_export() {
     let mut guest = guest("1", "", "i32.const 4", PAGE);
-    assert_eq!(guest.abi_version(1_000), Ok(15));
+    assert_eq!(guest.abi_version(1_000), Ok(ABI_VERSION));
     assert_eq!(guest.execute(0, 0, 1_000), Ok(4));
     assert_eq!(guest.alloc(16, 16, 1_000), Ok(0));
     assert_eq!(guest.free(0, 16, 16, 1_000), Ok(()));
@@ -193,8 +194,10 @@ fn open(text: &str) -> Result<WasmPack, PackError> {
 
 #[test]
 fn test_wrong_abi_is_mismatch() {
-    let text = wat("1", "", "i32.const 0")
-        .replace("(result i32) i32.const 15)", "(result i32) i32.const 1)");
+    let text = wat("1", "", "i32.const 0").replace(
+        &format!("(result i32) i32.const {ABI_VERSION})"),
+        "(result i32) i32.const 1)",
+    );
     assert!(matches!(
         open(&text),
         Err(PackError::AbiMismatch {
@@ -231,8 +234,8 @@ fn test_raw_ring_layout() {
 ///
 /// The guest describes an empty pack and uses a bump allocator. At `create`, it
 /// saves the bases of its first input and output rings in `$in` and `$out`.
-/// `execute` is its step body.
-fn step_wat(execute: &str) -> String {
+/// `execute` is its step body, and `destroy` the body of `metor_fsw_destroy`.
+fn step_wat(execute: &str, destroy: &str) -> String {
     format!(
         r#"(module
             (import "env" "memory" (memory 32))
@@ -240,7 +243,7 @@ fn step_wat(execute: &str) -> String {
             (global $in (mut i32) (i32.const 0))
             (global $out (mut i32) (i32.const 0))
             (data (i32.const 16) "{json}")
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 15)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const {ABI_VERSION})
             (func (export "metor_fsw_pack_def") (param $dst i32) (param i32) (param $written i32)
                 (result i32)
                 (memory.copy (local.get $dst) (i32.const 16) (i32.const {len}))
@@ -256,6 +259,7 @@ fn step_wat(execute: &str) -> String {
                 (i32.store (local.get 7) (i32.const 1))
                 i32.const 0)
             (func (export "metor_fsw_execute") (param i32 i64) (result i32) {execute})
+            (func (export "metor_fsw_destroy") (param i32) {destroy})
             (func (export "metor_fsw_alloc") (param $len i32) (param $align i32) (result i32)
                 (local $at i32)
                 (local.set $at
@@ -317,11 +321,15 @@ fn ring(capacity: usize) -> RingBuffer {
 }
 
 fn rig(execute: &str) -> Rig {
+    rig_with_destroy(execute, "")
+}
+
+fn rig_with_destroy(execute: &str, destroy: &str) -> Rig {
     let limits = Limits {
         memory: Some(64 * PAGE),
         fuel: Some(100_000),
     };
-    let bytes = wat::parse_str(step_wat(execute)).expect("valid wat");
+    let bytes = wat::parse_str(step_wat(execute, destroy)).expect("valid wat");
     let pack = WasmPack::open(&bytes, &limits).expect("opens");
     let (input, output, log) = (ring(RING), ring(RING), ring(LOG_RING));
     let cx = DefCx::empty();
@@ -463,4 +471,35 @@ fn test_end_frees_input_reader_slot() {
     assert!(rig.input.view(NoWake).is_ok());
     rig.execute();
     assert_eq!(rig.lines(), ["trap: unreachable"]);
+}
+
+/// Drops `rig`'s step and returns the records it left on the host output.
+fn records_after_drop(rig: Rig) -> Vec<Vec<u8>> {
+    let Rig {
+        step, mut output, ..
+    } = rig;
+    drop(step);
+    output.drain().map(|r| r.expect("whole").to_vec()).collect()
+}
+
+#[test]
+fn test_drop_destroys_and_mirrors_its_writes() {
+    let mut rig = rig_with_destroy("i32.const 0", &record_stores(b"bye", false));
+    rig.execute();
+    assert_eq!(records_after_drop(rig), [b"bye".to_vec()]);
+}
+
+#[test]
+fn test_drop_after_guest_end_still_destroys() {
+    let mut rig = rig_with_destroy("i32.const 2", &record_stores(b"bye", false));
+    rig.execute();
+    assert_eq!(rig.step.ended(), Some(&EndReason::Completed));
+    assert_eq!(records_after_drop(rig), [b"bye".to_vec()]);
+}
+
+#[test]
+fn test_drop_after_trap_skips_destroy() {
+    let mut rig = rig_with_destroy("unreachable", &record_stores(b"bye", false));
+    rig.execute();
+    assert_eq!(records_after_drop(rig), Vec::<Vec<u8>>::new());
 }

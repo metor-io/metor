@@ -46,6 +46,10 @@ const SETTLED_RATE: f64 = 0.14;
 /// The longest detumble (s) `commission` waits out, well past its settling.
 const DETUMBLE_TIMEOUT_S: f64 = 60.0;
 
+/// How long (s) `commission` watches the wheels after detumbling. It ends near
+/// cycle 2660, inside the run.
+const HANDOVER_S: f64 = 10.0;
+
 /// The pointing law `mode` commands for the whole run, and `commission` ends on.
 const LAW: Law = Law::Nadir;
 
@@ -186,7 +190,11 @@ fn sequenced(config: &CoordinatorConfig) -> CoordinatorConfig {
     for system in &mut config.systems {
         if system.id == "mode" {
             *system = SystemConfig {
-                params: json!({ "rate": SETTLED_RATE, "detumble_timeout_s": DETUMBLE_TIMEOUT_S }),
+                params: json!({
+                    "rate": SETTLED_RATE,
+                    "detumble_timeout_s": DETUMBLE_TIMEOUT_S,
+                    "handover_s": HANDOVER_S,
+                }),
                 inputs: vec![input("estimate", PortRef::new("nav", "attitude_estimate"))],
                 ..SystemConfig::new("commission", "seqs.commission")
             };

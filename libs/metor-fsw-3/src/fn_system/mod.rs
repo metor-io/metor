@@ -101,6 +101,9 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         if defs.rng {
             return Err(DefError::RngOnAsync { system });
         }
+        if defs.alarms {
+            return Err(DefError::AlarmsOnAsync { system });
+        }
         set::system_def::<S>(cx)
     }
 

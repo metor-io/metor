@@ -350,6 +350,24 @@
                 ]
               },
               {
+                "port": "mirror.alarm_raised",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "alarm_raised"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.alarm_cleared",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "alarm_cleared"
+                  }
+                ]
+              },
+              {
                 "port": "mirror.log",
                 "from": [
                   {
@@ -585,6 +603,22 @@
                 }
               },
               {
+                "port": "mirror.alarm_raised",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.alarm_raised"
+                }
+              },
+              {
+                "port": "mirror.alarm_cleared",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.alarm_cleared"
+                }
+              },
+              {
                 "port": "mirror.status",
                 "peer": {
                   "target": "b",
@@ -698,6 +732,24 @@
                 ]
               },
               {
+                "port": "a.alarm_raised",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "alarm_raised"
+                  }
+                ]
+              },
+              {
+                "port": "a.alarm_cleared",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "alarm_cleared"
+                  }
+                ]
+              },
+              {
                 "port": "a.log",
                 "from": [
                   {
@@ -761,6 +813,24 @@
                 ]
               },
               {
+                "port": "b.mirror.alarm_raised",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.alarm_raised"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.alarm_cleared",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.alarm_cleared"
+                  }
+                ]
+              },
+              {
                 "port": "b.mirror.status",
                 "from": [
                   {
@@ -811,6 +881,24 @@
                   {
                     "system": "b",
                     "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.alarm_raised",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "alarm_raised"
+                  }
+                ]
+              },
+              {
+                "port": "b.alarm_cleared",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "alarm_cleared"
                   }
                 ]
               },

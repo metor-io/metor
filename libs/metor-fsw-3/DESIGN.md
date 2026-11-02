@@ -87,6 +87,11 @@ Other parameters a system may take:
 - `&Sample<T>`: the newest frame on an input, taken once at the cycle's
   start.
 - `DynInputs` and `DynOutputs`: ports its config lists rather than its type.
+- `&mut Alarms`: the `alarm_raised` and `alarm_cleared` outputs. `check`
+  steps an `AlarmCell` from the state with a condition's `Option<bool>`
+  and publishes `AlarmRaised` or `AlarmCleared` on an edge. Dropping `Alarms`,
+  as a `Reset` or `Load` does, clears every alarm still active. A cyclic
+  system takes at most one; an async system or a sequence takes none.
 
 A failed write returns its error. It also counts toward one
 `publish_dropped` fault on the system's `log` that cycle, so a caller that
@@ -136,10 +141,15 @@ timeout does not abort on its own.
 `seq.on_abort(|seq| ..)` returns a guard. When it drops with the flag up,
 its handler runs, innermost first, each under `catch_unwind`.
 `seq.on_abort_with(value, |seq, value| ..)` does the same for a handler that
-uses `value`, and the guard derefs to it. A redline is a
-condition checked every cycle before the body is polled:
-`redline!(seq, "name", || cond)`. The first that holds logs a `redline`
-fault and aborts the sequence.
+uses `value`, and the guard derefs to it.
+
+Every sequence also has `alarm_raised` and `alarm_cleared` outputs, after
+`log`. `alarm!(seq, &SPEC, || level)` steps an alarm every cycle before the
+body is polled, for the rest of the block, and clears it when the block
+ends. A redline is a critical alarm that also aborts:
+`redline!(seq, "name", || cond)`. Its id is `redline.` plus the name; an
+unnamed redline is named by its condition's text. The first that holds logs a `redline` fault and aborts the sequence,
+and dropping the body clears its alarm.
 
 ```rust
 #[sequence]

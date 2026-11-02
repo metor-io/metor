@@ -10,6 +10,7 @@ use crate::coordinator::{EndReason, Step, StepCx};
 use crate::mirror::{Corrupt, Mirrors};
 use crate::pack::Status;
 
+use super::DEFAULT_SETUP_FUEL;
 use super::guest::{Guest, Trap};
 use super::io::IoCopy;
 
@@ -19,7 +20,8 @@ use super::io::IoCopy;
 /// guest's copies, calls `metor_fsw_execute`, and then copies the guest's
 /// output records into the real output rings. Outputs are copied even if the
 /// call failed. A system with a `Cap` also has its IO buffer bytes copied
-/// around the call.
+/// around the call. Dropping it calls `metor_fsw_destroy` and copies the
+/// outputs once more, unless the host ended the guest.
 pub struct WasmStep {
     /// Must be declared before `guest`, because dropping these handles writes
     /// into guest memory.
@@ -29,7 +31,7 @@ pub struct WasmStep {
     guest: Guest,
     instance: u32,
     fuel: u64,
-    end: Option<EndReason>,
+    end: Option<End>,
 }
 
 impl WasmStep {
@@ -69,7 +71,7 @@ impl Step for WasmStep {
             if let Some((kind, message)) = end.line {
                 self.mirrors.write_line(now, LogLevel::Error, kind, message);
             }
-            self.end = Some(end.reason);
+            self.end = Some(end);
             self.mirrors.release_inputs();
         }
         self.mirrors.report_drops(now);
@@ -79,7 +81,17 @@ impl Step for WasmStep {
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
     fn ended(&self) -> Option<&EndReason> {
-        self.end.as_ref()
+        self.end.as_ref().map(|end| &end.reason)
+    }
+}
+
+impl Drop for WasmStep {
+    fn drop(&mut self) {
+        if self.end.as_ref().is_some_and(|end| end.line.is_some()) {
+            return;
+        }
+        let _ = self.guest.destroy(self.instance, DEFAULT_SETUP_FUEL);
+        let _ = self.mirrors.drain_outputs();
     }
 }
 

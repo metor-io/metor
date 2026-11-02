@@ -216,12 +216,14 @@ every frame input each cycle.
 
 ### F2. Alarms / limit checking
 
-The fsw-2 `AlarmSystem` was not ported. The wkt `AlarmDef*` messages exist,
-and the panel alarm pane and meter limits read them. FDIR needs yellow and red
-limits everywhere.
-- Workaround: a flight `limits` system in the example that publishes
-  `AlarmDefs`/`AlarmRaised`.
-- It moves into fsw-3 as a built-in afterwards.
+- [x] Framework: fsw-3 alarms (`libs/metor-fsw-3/docs/alarms.md`). A
+      `#[system]` takes `Alarms` and checks `AlarmCell`s; a sequence uses
+      `alarm!`, and every `redline!` is a critical alarm. Both publish
+      `AlarmRaised`/`AlarmCleared`. `ctrl` raises `wheel_momentum`,
+      `health` raises `css_dark` and `mag_field`, and `commission` raises
+      `detumbling` and `rate_rebound` and redlines a runaway rate.
+- [ ] `AlarmDefs` with targets and limits, for meter bands and names.
+- [ ] Limit alarms configured from Python.
 
 ### F3. Enums
 

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 
-from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
+from adcs_stub import PACK, Burn, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
 
 import metor_config._deployment as deploy_mod
 import metor_config._target as target_mod
@@ -420,11 +420,30 @@ class LinkTest(ConfigTest):
         )
         self.assertEqual(
             [item["port"] for item in second["inputs"]],
-            ["plant.imu", "plant.log", "plant.status", "pub1.link_status", "pub1.log", "pub1.status"],
+            [
+                "plant.imu",
+                "plant.log",
+                "plant.status",
+                "pub1.link_status",
+                "pub1.alarm_raised",
+                "pub1.alarm_cleared",
+                "pub1.log",
+                "pub1.status",
+            ],
         )
         self.assertEqual(fsw.to_config(), config)
         self.assertNotIn("link", publish._params)
         self.assertEqual(publish._inputs, {})
+
+    def test_publish_all_reads_earlier_alarm_ports_only(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("burn", Burn())
+        fsw.add("pub", Publish(all=True, transport=Listen("127.0.0.1:0")))
+        systems = {s["id"]: s for s in fsw.to_config()["coordinator"]["systems"]}
+        ports = [item["port"] for item in systems["pub"]["inputs"]]
+        self.assertIn("burn.alarm_raised", ports)
+        self.assertIn("burn.alarm_cleared", ports)
+        self.assertFalse([p for p in ports if p.startswith("pub.")], ports)
 
     def test_target_config_isolation(self) -> None:
         subscribe = Subscribe([Ping], transport=Listen("127.0.0.1:0"))

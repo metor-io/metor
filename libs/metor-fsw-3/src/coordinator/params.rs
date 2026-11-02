@@ -84,6 +84,8 @@ pub enum MakeError {
         "port `{port}` needs a {len}-byte copy ring that the guest's memory cannot hold; raise the pack's `memory` limit"
     )]
     CopyRingTooLarge { port: String, len: usize },
+    #[error("alarm id prefix `{prefix}` leaves no room for an alarm name")]
+    AlarmPrefixTooLong { prefix: String },
 }
 
 #[cfg(test)]

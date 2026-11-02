@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    BindCx, DefCx, DefError, DynInputs, Frame, Input, InputBinding, MakeError, Output,
-    OutputBinding, Payload, PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef,
-    SystemTable, Timestamp, sequence, system,
+    AlarmCell, AlarmSpec, Alarms, BindCx, DefCx, DefError, DynInputs, Frame, Input, InputBinding,
+    MakeError, Output, OutputBinding, Payload, PortDef, Ports, Record, Seq, SeqError, Stop, System,
+    SystemDef, SystemTable, Timestamp, alarm, redline, sequence, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -259,6 +259,46 @@ async fn count_down(
     seq.sleep(core::time::Duration::from_secs(3600)).await
 }
 
+/// Holds the newest ping's count as a sample, written every cycle.
+#[system]
+fn level(
+    #[state] s: &mut f64,
+    now: Timestamp,
+    input: &mut Input<Ping>,
+    sample: &mut Output<Sample>,
+) {
+    if let Ok(Some(ping)) = input.latest() {
+        *s = f64::from(ping.n);
+    }
+    let _ = sample.write(&Sample {
+        timestamp: now,
+        value: *s,
+    });
+}
+
+const HOT: AlarmSpec = AlarmSpec::warning("hot");
+
+/// Raises `hot` while the sample is 1 or more.
+#[system]
+fn hot(#[state] cell: &mut AlarmCell, sample: &metor_fsw_3::Sample<Sample>, alarms: &mut Alarms) {
+    let value = sample.get().map(|s| s.value);
+    alarms.check_with(cell, &HOT, value.map(|v| v >= 1.0), |m| {
+        write!(m, "at {}", value.unwrap_or(f64::NAN))
+    });
+}
+
+const WARM: AlarmSpec = AlarmSpec::warning("warm");
+
+/// Raises `warm` at a sample of 1 or more, and aborts at 2 or more.
+#[sequence]
+async fn burn(seq: &Seq, sample: &metor_fsw_3::Sample<Sample>) -> Result<(), SeqError> {
+    alarm!(seq, &WARM, || sample.get().map(|s| s.value >= 1.0));
+    redline!(seq, "too hot", || sample
+        .get()
+        .is_some_and(|s| s.value >= 2.0));
+    seq.sleep(core::time::Duration::from_secs(3600)).await
+}
+
 /// The params for `count_by`.
 #[derive(Deserialize, JsonSchema)]
 pub struct StrideParams {
@@ -367,6 +407,15 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register_sequence("count_by", count_by(), Stride::new)
+        .expect("valid records");
+    table
+        .register("level", level(), f64::default)
+        .expect("valid records");
+    table
+        .register("hot", hot(), AlarmCell::default)
+        .expect("valid records");
+    table
+        .register_sequence("burn", burn(), Default::default)
         .expect("valid records");
     table
 }

@@ -5,12 +5,18 @@
 //! detumble law the wheels idle and the magnetorquers damp the body rate.
 
 use adcs_contracts::{
-    AttitudeEstimate, CtrlParams, Gps, Law, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_TORQUE_MAX,
-    Sensors, TorqueCmd, V3, Wheels, clamp_dipole, desat_dipole, detumble_dipole, inertia_diag,
-    target_for,
+    AttitudeEstimate, CtrlParams, Gps, Law, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_MOMENTUM_MAX,
+    RW_TORQUE_MAX, Sensors, TorqueCmd, V3, Wheels, clamp_dipole, desat_dipole, detumble_dipole,
+    inertia_diag, target_for,
 };
-use metor_fsw_3::{Input, Output, Timestamp, system};
+use metor_fsw_3::{AlarmCell, AlarmSpec, Alarms, Input, Output, Timestamp, system};
 use nox::{Quaternion, tensor};
+
+/// Stored wheel momentum the magnetorquers have not unloaded.
+const WHEEL_MOMENTUM: AlarmSpec = AlarmSpec::warning("wheel_momentum").debounce(5);
+
+/// Stored momentum that raises `wheel_momentum`: 80 % of wheel capacity.
+const WHEEL_MOMENTUM_LIMIT: f64 = 0.8 * RW_MOMENTUM_MAX;
 
 /// The attitude controller and its magnetorquer gains.
 pub struct CtrlSystem {
@@ -19,6 +25,7 @@ pub struct CtrlSystem {
     law: Option<Law>,
     k_desat: f64,
     k_detumble: f64,
+    wheel_momentum: AlarmCell,
 }
 
 impl CtrlSystem {
@@ -31,6 +38,7 @@ impl CtrlSystem {
             law: None,
             k_desat: p.k_desat,
             k_detumble: p.k_detumble,
+            wheel_momentum: AlarmCell::default(),
         }
     }
 }
@@ -49,6 +57,7 @@ pub fn ctrl(
     wheels: &mut Input<Wheels>,
     torque_cmd: &mut Output<TorqueCmd>,
     mtq_cmd: &mut Output<MtqCmd>,
+    alarms: &mut Alarms,
 ) {
     let Ok(Some(e)) = estimate.latest() else {
         return;
@@ -73,6 +82,13 @@ pub fn ctrl(
             .iter()
             .fold(V3::zeros(), |acc, wheel| acc + wheel.ang_momentum)
     });
+    let h = h_w_b.as_ref().map(magnitude);
+    alarms.check_with(
+        &mut state.wheel_momentum,
+        &WHEEL_MOMENTUM,
+        h.map(|h| h > WHEEL_MOMENTUM_LIMIT),
+        |m| write!(m, "wheel momentum {:.4} N m s", h.unwrap_or(f64::NAN)),
+    );
 
     // The wheels idle while the magnetorquers damp the rate.
     if state.law == Some(Law::Detumble) {
@@ -125,4 +141,10 @@ pub fn ctrl(
         timestamp: now,
         dipole_b,
     });
+}
+
+/// `|v|`, summed in scalar order.
+pub(crate) fn magnitude(v: &V3) -> f64 {
+    let [x, y, z] = v.into_buf();
+    (x * x + y * y + z * z).sqrt()
 }

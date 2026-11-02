@@ -67,55 +67,105 @@
 //! do not run when the body fails, times out, or is dropped before it
 //! finishes for another reason (a `Reset`, a `Load`, or shutdown).
 //!
-//! A redline is a condition that aborts the sequence when it becomes true.
-//! [`redline!`](crate::redline) adds one that stays active until the end of
-//! the enclosing block. Each cycle, the step takes the input samples, then
-//! checks the active redlines in the order they were added, then polls the
-//! body. The first redline whose condition is true logs a `redline` fault
-//! with its name and aborts the sequence. A condition may borrow the
-//! sequence's parameters, but not the body's locals.
+//! An alarm is a condition the sequence publishes on its `alarm_raised` and
+//! `alarm_cleared` outputs. [`alarm!`](macro@crate::alarm) adds one that stays
+//! active until the end of the enclosing block, and clears it then. A
+//! redline is a critical alarm that also aborts the sequence when it becomes
+//! true. [`redline!`](crate::redline) adds one the same way. Each cycle, the
+//! step takes the input samples, then steps every active alarm and redline
+//! in the order they were added, then polls the body. The first redline
+//! whose condition is true logs a `redline` fault with its name and aborts
+//! the sequence; dropping the body clears its alarm. A condition may borrow
+//! the sequence's parameters, but not the body's locals.
 //!
 //! A stopped channel does not execute its step at all, so it takes no
-//! samples, checks no redlines, and runs no handlers.
+//! samples, steps no alarms, and runs no handlers.
 
-mod redline;
 mod seq;
 mod step;
 #[cfg(all(test, feature = "host"))]
 mod tests;
+mod watch;
 
 use metor_fsw_3_ring::NoWake;
 
+use crate::alarm::{ALARM_CLEARED_PORT, ALARM_RAISED_PORT, AlarmPorts, ClearedMsg, RaisedMsg};
 use crate::channel::{ABORT_PORT, AbortRequest};
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Defs, FnSignature, InSet, OutSet, Param};
 use crate::io::IoPorts;
-use crate::port::Input;
-use crate::system::{BindCx, InputBinding, PortDef, Ports, SystemDef};
+use crate::port::{Input, Output};
+use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
-pub use redline::Redline;
 pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};
 pub(crate) use step::SequenceStep;
+pub use watch::{Format, SpecName, Watch, formatter};
 
 /// Adds a redline to `seq` for the rest of the enclosing block.
 ///
 /// A redline is a condition that aborts the sequence when it is true. Each
 /// cycle, before the body is polled, the step calls the condition. The first
-/// time it returns true, the step logs a `redline` fault with `name` (or
-/// `"redline"` if no name is given) and aborts the sequence.
+/// time it returns true, the step raises a critical alarm, logs a `redline`
+/// fault with `name` (or the condition's text if no name is given), and
+/// aborts the sequence. The abort drops the body, which clears the alarm.
 ///
-/// The macro pins a [`Redline`] on the stack and links it
-/// into `seq`. When the block ends, the `Redline` is dropped and unlinks
-/// itself, so its condition is no longer checked.
+/// The alarm's id is `redline.` and the name. The message is the name, or
+/// what `fmt` writes.
+///
+/// The macro pins a [`Watch`] on the stack and links it into `seq`. When the
+/// block ends, the `Watch` is dropped and unlinks itself, so its condition is
+/// no longer checked.
+///
+/// There is no `redline!(seq, cond, fmt)`: a format closure takes the named
+/// form, `redline!(seq, name, cond, fmt)`.
 #[macro_export]
 macro_rules! redline {
     ($seq:expr, $cond:expr $(,)?) => {
-        $crate::redline!($seq, "redline", $cond)
+        $crate::redline!($seq, ::core::stringify!($cond), $cond)
     };
     ($seq:expr, $name:expr, $cond:expr $(,)?) => {
-        let __redline = ::core::pin::pin!($crate::Redline::new($name, $cond));
-        $seq.redline(__redline.as_ref());
+        let __redline = ::core::pin::pin!($crate::Watch::redline(
+            $name,
+            $cond,
+            $crate::sequence::SpecName
+        ));
+        $seq.watch(__redline.as_ref());
+    };
+    ($seq:expr, $name:expr, $cond:expr, $fmt:expr $(,)?) => {
+        let __redline = ::core::pin::pin!($crate::Watch::redline(
+            $name,
+            $cond,
+            $crate::sequence::formatter($fmt)
+        ));
+        $seq.watch(__redline.as_ref());
+    };
+}
+
+/// Adds an alarm to `seq` for the rest of the enclosing block.
+///
+/// Each cycle, before the body is polled, the step steps the alarm's cell
+/// with the condition, a `bool` or an `Option<bool>` whose `None` holds the
+/// counts, and publishes a raise or a clear on the sequence's `alarm_raised` and `alarm_cleared` outputs. The
+/// message is the spec's id, or what `fmt` writes. When the block ends, an
+/// active alarm is cleared.
+#[macro_export]
+macro_rules! alarm {
+    ($seq:expr, $spec:expr, $cond:expr $(,)?) => {
+        let __alarm = ::core::pin::pin!($crate::Watch::alarm(
+            $spec,
+            $cond,
+            $crate::sequence::SpecName
+        ));
+        $seq.watch(__alarm.as_ref());
+    };
+    ($seq:expr, $spec:expr, $cond:expr, $fmt:expr $(,)?) => {
+        let __alarm = ::core::pin::pin!($crate::Watch::alarm(
+            $spec,
+            $cond,
+            $crate::sequence::formatter($fmt)
+        ));
+        $seq.watch(__alarm.as_ref());
     };
 }
 
@@ -139,13 +189,15 @@ pub trait SequenceFn: FnSignature {
 /// Returns the port definitions for sequence `S`.
 ///
 /// The inputs are `abort` followed by the parameters' inputs. The outputs
-/// are the parameters' outputs followed by `log`.
+/// are the parameters' outputs, `log`, `alarm_raised`, and `alarm_cleared`.
 pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     let defs = Defs::of::<S>(cx)?;
     let mut inputs = vec![Input::<AbortRequest>::def(cx, ABORT_PORT)];
     let params_from = inputs.len();
     inputs.extend(defs.inputs);
-    let (outputs, log) = OutSet::<S>::defs_with_log(cx)?;
+    let (mut outputs, log) = OutSet::<S>::defs_with_log(cx)?;
+    outputs.push(Output::<RaisedMsg>::def(cx, ALARM_RAISED_PORT));
+    outputs.push(Output::<ClearedMsg>::def(cx, ALARM_CLEARED_PORT));
     Ok(SystemDef {
         name: S::NAME.into(),
         inputs,
@@ -183,5 +235,33 @@ impl<S: SequenceFn> Ports<InputBinding> for SeqInputs<S> {
 
     fn takes_config_ports() -> bool {
         InSet::<S>::takes_config_ports()
+    }
+}
+
+/// A sequence's outputs: its params' outputs and `log`, then its alarm ports.
+pub(crate) struct SeqOutputs<S: SequenceFn> {
+    pub(crate) outs: OutSet<S>,
+    pub(crate) alarms: AlarmPorts,
+}
+
+impl<S: SequenceFn> Ports<OutputBinding> for SeqOutputs<S> {
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(def::<S>(cx)?.outputs)
+    }
+
+    /// Binds the last two outputs as the alarm ports, and the rest as the
+    /// parameters' outputs and `log`.
+    fn bind(mut outputs: Vec<OutputBinding>, cx: &BindCx) -> Result<Self, MakeError> {
+        // PANIC Safety: `def` declares the two alarm ports last, and build
+        // binds one writer per declared output.
+        let cleared = outputs.pop().expect("the alarm_cleared binding");
+        let raised = outputs.pop().expect("the alarm_raised binding");
+        let outs = OutSet::<S>::bind(outputs, cx)?;
+        let alarms = AlarmPorts::bind(&cx.instance, raised, cleared, &outs.dropped)?;
+        Ok(Self { outs, alarms })
+    }
+
+    fn takes_config_ports() -> bool {
+        OutSet::<S>::takes_config_ports()
     }
 }

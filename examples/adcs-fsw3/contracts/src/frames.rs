@@ -25,6 +25,27 @@ pub struct Sensors {
     pub mag_b: V3,
 }
 
+/// The sun sensor heads alone, in [`Sensors::css`] order.
+#[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[repr(C)]
+#[frame(name = "sun_sensors")]
+pub struct SunSensors {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub css: [f64; 6],
+}
+
+/// The magnetometer alone.
+#[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[repr(C)]
+#[frame(name = "magnetometer")]
+pub struct Magnetometer {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    /// Measured magnetic field (T).
+    pub mag_b: V3,
+}
+
 /// A GPS fix: the plant's, or the GPS driver's from the receiver's logs.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
