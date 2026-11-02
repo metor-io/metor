@@ -24,14 +24,18 @@ struct Saved {
     captured_at: i64,
     destination: archive::Destination,
 }
-struct SessionGlobal {
-    storage: Option<SessionStorage>,
-    db: Arc<DB>,
+pub(super) struct SessionGlobal {
+    pub(super) storage: Option<SessionStorage>,
+    pub(super) db: Arc<DB>,
     selecting: bool,
     export: Option<Export>,
     saved: Option<Saved>,
     message: SharedString,
     open: OpenHandler,
+    /// Where per-peer caches live, for the Storage page; `None` when caching
+    /// has no directory.
+    pub(super) peer_cache: Option<metor_db::peer_cache::PeerCache>,
+    pub(super) usage: super::usage::SharedUsage,
 }
 impl Global for SessionGlobal {}
 
@@ -39,6 +43,7 @@ pub(crate) fn init(
     storage: Option<SessionStorage>,
     db: Arc<DB>,
     open: Option<OpenHandler>,
+    peer_cache: Option<metor_db::peer_cache::PeerCache>,
     cx: &mut App,
 ) {
     let message = if storage.as_ref().is_some_and(|s| s.source.is_some()) {
@@ -62,6 +67,8 @@ pub(crate) fn init(
                 Ok(())
             })
         }),
+        peer_cache,
+        usage: Default::default(),
     });
     ItemRegistry::register(
         cx,
@@ -72,6 +79,11 @@ pub(crate) fn init(
                     label: "Session database".into(),
                     summary: storage_summary(cx),
                     build: Arc::new(rows),
+                },
+                InspectionItem::SubMenu {
+                    label: "Storage".into(),
+                    summary: super::usage::summary(cx),
+                    build: Arc::new(super::usage::rows),
                 },
                 InspectionItem::Command {
                     label: "Save snapshot…".into(),
@@ -455,7 +467,7 @@ mod tests {
         let (storage, db) = SessionStorage::create().unwrap();
         cx.update(|cx| {
             ItemRegistry::init(cx);
-            init(Some(storage), db.clone(), None, cx);
+            init(Some(storage), db.clone(), None, None, cx);
         });
         let visual = cx.add_empty_window();
         visual.update(save);
@@ -482,7 +494,7 @@ mod tests {
         db.flush().unwrap();
         cx.update(|cx| {
             ItemRegistry::init(cx);
-            init(Some(storage), db.clone(), None, cx);
+            init(Some(storage), db.clone(), None, None, cx);
             crate::app::register_shutdown(db.clone(), Default::default(), cx);
         });
         let visual = cx.add_empty_window();

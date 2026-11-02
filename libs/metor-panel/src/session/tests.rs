@@ -175,7 +175,7 @@ fn quit_removes_temporary_storage_but_window_close_keeps_it(cx: &mut gpui::TestA
     let path = db.path.clone();
     cx.update(|cx| {
         crate::inspector::palette::ItemRegistry::init(cx);
-        init(Some(session), db.clone(), None, cx);
+        init(Some(session), db.clone(), None, None, cx);
         crate::app::register_shutdown(db, Default::default(), cx);
     });
     cx.add_empty_window()

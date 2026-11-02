@@ -1714,7 +1714,7 @@ impl PanelApp {
             .update(cx, |c, cx| c.set_session_lookback(session_lookback, cx));
         ItemRegistry::init(cx);
         let evicts = session.as_ref().is_some_and(|s| s.is_cache());
-        crate::session::init(session, db.clone(), open_handler, cx);
+        crate::session::init(session, db.clone(), open_handler, storage.peer_cache(), cx);
         crate::temporal::picker::register(cx);
         crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
         crate::views::dashboard::WidgetRegistry::init(cx);

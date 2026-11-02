@@ -12,6 +12,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 mod archive;
 mod commands;
 mod peer;
+mod usage;
 pub(crate) use peer::select_for_peer;
 pub(crate) mod startup;
 pub(crate) use commands::{
