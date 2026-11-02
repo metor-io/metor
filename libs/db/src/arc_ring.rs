@@ -88,8 +88,8 @@ impl<T> AtomicStack<T> {
                     .0
                     .ptr
                     .store(std::ptr::null_mut(), Ordering::Relaxed);
-                let node = Arc::into_inner(new_node)
-                    .expect("we are the only ones meant to have this");
+                let node =
+                    Arc::into_inner(new_node).expect("we are the only ones meant to have this");
                 Err(node.value)
             }
         }
@@ -181,10 +181,7 @@ impl<T: Clone> AtomicStack<T> {
                 }));
             }
 
-            let new_head_ptr = below
-                .as_ref()
-                .map(Arc::as_ptr)
-                .unwrap_or(std::ptr::null());
+            let new_head_ptr = below.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null());
             if self
                 .head
                 .ptr
