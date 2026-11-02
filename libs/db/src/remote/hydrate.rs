@@ -310,7 +310,10 @@ impl Hydrator {
             if gap.state != SpanState::RemoteOnly {
                 continue;
             }
-            let key = (component_id, gap.start_ts);
+            // Keyed by seal: a seal's pieces, and so their keys, move as
+            // its coverage is re-derived, but a failing download is the
+            // seal's.
+            let key = (component_id, gap.seal_start);
             if self.backed_off(key) {
                 continue;
             }

@@ -269,6 +269,12 @@ impl NodeStaging {
         Ok(Some((piece, seal)))
     }
 
+    /// The staging directory, which [`Self::commit`] renames into place
+    /// with everything in it.
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     fn node(&self) -> TimeSeriesNode {
         TimeSeriesNode {
             index: self.index.clone(),

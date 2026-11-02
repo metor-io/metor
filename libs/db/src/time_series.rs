@@ -1,4 +1,6 @@
 mod coverage;
+#[cfg(test)]
+mod coverage_tests;
 
 use std::{
     fmt::Debug,
@@ -48,7 +50,7 @@ pub struct TimeSeries {
     /// before a write rolls it. Zero means unbounded.
     max_node_age: Arc<AtomicI64>,
     /// The [`MirrorRun`] that last wrote here, or zero if no mirror ever
-    /// has. Any run at all makes the nodes the writer seals
+    /// has. Any run at all tags the nodes the writer creates as
     /// [`SpanSource::Mirrored`].
     mirror_run: Arc<AtomicU64>,
     /// A new mirror run began; the writer starts a fresh node on its next
@@ -140,15 +142,30 @@ impl TimeSeriesNode {
     }
 }
 
+/// Marks a node directory as holding [`SpanSource::Mirrored`] data. Written
+/// when the node is created (by a mirror run's writer, or as a hydration
+/// piece), so the tag survives a crash or a restart that seals the node
+/// before the manifest ever records it.
+const MIRRORED_TAG: &str = "mirrored";
+
+fn tag_mirrored(node_dir: &Path) -> Result<(), Error> {
+    std::fs::File::create(node_dir.join(MIRRORED_TAG))?.sync_all()?;
+    Ok(())
+}
+
+fn is_tagged_mirrored(node_dir: &Path) -> bool {
+    node_dir.join(MIRRORED_TAG).exists()
+}
+
 /// Rebuild the manifest on open: the directory scan (already loaded into
 /// `list`) is authoritative for residency; the persisted manifest
-/// contributes remote coverage, shadowed seals, and flags (`acked`,
-/// `source`) for spans that are still resident. Nodes without a seal
-/// record stay out of the manifest until the lifecycle task seals them.
-/// Corrupt sidecars degrade the same way — a bad manifest behaves as
-/// absent, a bad seal leaves its node unsealed — so one torn file never
-/// blocks opening the component. Remote coverage is derived afresh, since
-/// what was resident when it was persisted may not be now.
+/// contributes remote coverage, shadowed seals, settled stretches, and
+/// flags (`acked`, `source`) for spans that are still resident. Nodes
+/// without a seal record stay out of the manifest until the lifecycle task
+/// seals them. Corrupt sidecars degrade the same way — a bad manifest
+/// behaves as absent, a bad seal leaves its node unsealed — so one torn
+/// file never blocks opening the component. Remote coverage is derived
+/// afresh, since what was resident when it was persisted may not be now.
 fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> ComponentManifest {
     let persisted = match ComponentManifest::read_from(path) {
         Ok(persisted) => persisted.unwrap_or_default(),
@@ -160,6 +177,7 @@ fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> Compon
     let mut draft = Draft {
         spans: Vec::new(),
         shadowed: persisted.shadowed.to_vec(),
+        settled: persisted.settled.to_vec(),
     };
     for node in list.iter() {
         let Some(start_ts) = node.timestamps().first().copied() else {
@@ -174,12 +192,25 @@ fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> Compon
                 continue;
             }
         };
-        let flags = persisted.span(start_ts);
+        // Older writes could persist a stale remote entry under a resident
+        // node's key; flags only ever come from a resident entry.
+        let lo = persisted
+            .spans
+            .partition_point(|s| s.cover_start.0 < start_ts.0);
+        let flags = persisted.spans[lo..]
+            .iter()
+            .take_while(|s| s.cover_start == start_ts)
+            .find(|s| s.state == SpanState::Resident);
+        let source = if is_tagged_mirrored(&node_dir) {
+            SpanSource::Mirrored
+        } else {
+            flags.map(|s| s.source).unwrap_or(SpanSource::LocalIngest)
+        };
         draft.spans.push(NodeSpan::whole(
             seal,
             SpanState::Resident,
-            flags.map(|s| s.source).unwrap_or(SpanSource::LocalIngest),
-            flags.map(|s| s.acked).unwrap_or(false),
+            source,
+            flags.is_some_and(|s| s.acked),
         ));
     }
     let resident = draft.spans.len();
@@ -189,6 +220,10 @@ fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> Compon
             .any(|s| s.cover_start == span.cover_start)
         {
             continue;
+        }
+        if span.state == SpanState::Resident {
+            // Its data is gone, so nothing is reconciled over it any more.
+            draft.unsettle(span.seal.start_ts.0, span.seal.end_ts.0);
         }
         match (span.state, span.source) {
             // Mirrored data only ever had the peer's seals behind it, which
@@ -533,12 +568,10 @@ impl TimeSeries {
         }
     }
 
-    /// The source the writer's nodes seal as.
-    pub(crate) fn ingest_source(&self) -> SpanSource {
-        match self.mirror_run.load(Ordering::Acquire) {
-            0 => SpanSource::LocalIngest,
-            _ => SpanSource::Mirrored,
-        }
+    /// Whether a mirror run has written here.
+    #[cfg(test)]
+    pub(crate) fn is_mirrored(&self) -> bool {
+        self.mirror_run.load(Ordering::Acquire) != 0
     }
 
     /// Seal every resident node the writer has rolled past, summarize it,
@@ -548,7 +581,6 @@ impl TimeSeries {
     pub fn seal_rolled_nodes(&self) -> Result<bool, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
-        let source = self.ingest_source();
         let mut sealed: Vec<NodeSpan> = Vec::new();
         // Newest-first; the first node is the live head and must not be
         // sealed — the writer may still be appending to it.
@@ -556,7 +588,10 @@ impl TimeSeries {
             let Some(start_ts) = node.timestamps().first().copied() else {
                 continue;
             };
-            if manifest.span(start_ts).is_some() {
+            if manifest
+                .span(start_ts)
+                .is_some_and(|s| s.state == SpanState::Resident)
+            {
                 continue;
             }
             let node_dir = self.path.join(start_ts.0.to_string());
@@ -566,6 +601,10 @@ impl TimeSeries {
                     Some(seal) => seal,
                     None => continue,
                 },
+            };
+            let source = match is_tagged_mirrored(&node_dir) {
+                true => SpanSource::Mirrored,
+                false => SpanSource::LocalIngest,
             };
             sealed.push(NodeSpan::whole(seal, SpanState::Resident, source, false));
         }
@@ -627,27 +666,57 @@ impl TimeSeries {
 
     /// Claim the remote-only span keyed `cover_start` for fetching, along
     /// with every other piece of its seal, since one download settles them
-    /// all. Returns the claimed span (its seal keys the fetch) when the
-    /// claim won; `None` means the span is missing, already resident, or
-    /// another fetch is in flight.
+    /// all. The seal is re-derived against what is resident now first: the
+    /// live head may have grown over it since it was last derived.
+    ///
+    /// Returns a claimed span (its seal keys the fetch) when the claim won;
+    /// `None` means the span is missing, already resident, another fetch is
+    /// in flight, or what is left of it lies above an unsealed head, where
+    /// no install could land.
     pub fn begin_fetch(&self, cover_start: Timestamp) -> Option<NodeSpan> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
-        let span = manifest.span(cover_start)?;
-        if span.state != SpanState::RemoteOnly {
+        let span = *manifest.span(cover_start)?;
+        let claimed = |s: &NodeSpan| s.seal == span.seal && s.state == SpanState::Fetching;
+        if span.state != SpanState::RemoteOnly || manifest.spans.iter().any(claimed) {
             return None;
         }
-        let claimed = *span;
-        self.update_in_memory(|span| {
-            if span.seal == claimed.seal && span.state == SpanState::RemoteOnly {
-                span.state = SpanState::Fetching;
+        let ceiling = self.install_ceiling();
+        if ceiling.is_some_and(|c| span.cover_end >= c) {
+            return None;
+        }
+        let resident = extents(self.list.iter(), None);
+        self.publish_manifest(false, |draft| {
+            draft
+                .spans
+                .retain(|s| !(s.seal == span.seal && s.state == SpanState::RemoteOnly));
+            draft.derive(&resident, None, [RemoteSeal::of(&span)]);
+            for piece in draft.spans.iter_mut() {
+                if piece.seal == span.seal && ceiling.is_none_or(|c| piece.cover_end < c) {
+                    piece.state = SpanState::Fetching;
+                }
             }
-        });
-        Some(claimed)
+        })
+        .expect("non-persisted manifest publish cannot fail");
+        let manifest = self.manifest.load();
+        manifest.spans.iter().find(|s| claimed(s)).copied()
+    }
+
+    /// The start of an unsealed head, which nothing may be installed above.
+    fn install_ceiling(&self) -> Option<Timestamp> {
+        let head = self.list.head()?;
+        let start = *head.timestamps().first()?;
+        let sealed = self
+            .manifest
+            .load()
+            .span(start)
+            .is_some_and(|s| s.state == SpanState::Resident);
+        (!sealed || self.has_writer.load(Ordering::Acquire)).then_some(start)
     }
 
     /// Release a fetch claim after a failed download so a later request
-    /// can retry.
+    /// can retry. The seal is re-derived against what is resident now
+    /// rather than restored, since residency may have moved meanwhile.
     pub fn abort_fetch(&self, cover_start: Timestamp) {
         let _guard = self.structural.lock().unwrap();
         let Some(claimed) = self
@@ -655,15 +724,18 @@ impl TimeSeries {
             .load()
             .span(cover_start)
             .filter(|span| span.state == SpanState::Fetching)
-            .map(|span| span.seal)
+            .copied()
         else {
             return;
         };
-        self.update_in_memory(|span| {
-            if span.seal == claimed && span.state == SpanState::Fetching {
-                span.state = SpanState::RemoteOnly;
-            }
-        });
+        let resident = extents(self.list.iter(), None);
+        self.publish_manifest(false, |draft| {
+            draft
+                .spans
+                .retain(|s| !(s.seal == claimed.seal && s.state != SpanState::Resident));
+            draft.derive(&resident, None, [RemoteSeal::of(&claimed)]);
+        })
+        .expect("non-persisted manifest publish cannot fail");
     }
 
     /// Record that a store holds a durable, verified copy of the span.
@@ -686,18 +758,18 @@ impl TimeSeries {
     /// Drop a resident span's local bytes. A span qualifies when something
     /// else can give the data back: an ack (a store holds this exact node),
     /// or, for [`SpanSource::Mirrored`] data, remote seals the manifest
-    /// still records around every one of its samples. The live head
-    /// belongs to the writer and never qualifies.
+    /// records as fetchable right now (none with a fetch in flight) around
+    /// every one of its samples. The live head belongs to the writer and
+    /// never qualifies.
     ///
-    /// An acked span flips to remote-only under its own seal. An unacked
-    /// mirrored span leaves the manifest, and the remote seals over its range are
-    /// re-derived to cover it, so it reads as fetchable at once.
-    ///
-    /// Ordering is crash-safe: the manifest changes durably first, then
-    /// the node is unlinked and its directory removed; a crash in between
-    /// resurrects the node as resident on reopen and it is simply purged
-    /// again. Readers holding slices keep the unmapped bytes alive until
-    /// they finish.
+    /// An acked span flips to remote-only under its own seal; the manifest
+    /// changes durably before the node is unlinked, so a crash in between
+    /// resurrects it as resident and it is simply purged again. An unacked
+    /// mirrored span leaves the manifest and the remote seals over its
+    /// range are re-derived to cover it, so it reads as fetchable at once;
+    /// here the node goes first, so a crash in between finds a resident
+    /// entry with no node, which reopening drops. Readers holding slices
+    /// keep the unmapped bytes alive until they finish.
     pub fn purge_span(&self, start_ts: Timestamp) -> Result<bool, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
@@ -725,16 +797,15 @@ impl TimeSeries {
         if node_is_head && self.has_writer.load(Ordering::Acquire) {
             return Ok(false);
         }
+        let (start, end) = (span.seal.start_ts.0, span.seal.end_ts.0);
 
         if mirrored {
             let resident = extents(self.list.iter(), Some(&node));
+            self.unlink_node(&node, start_ts)?;
             self.publish_manifest(true, |draft| {
                 draft.spans.retain(|s| s.cover_start != start_ts);
-                draft.derive(
-                    &resident,
-                    Some(span.seal.start_ts.0..=span.seal.end_ts.0),
-                    [],
-                );
+                draft.unsettle(start, end);
+                draft.derive(&resident, Some(start..=end), []);
             })?;
         } else {
             self.publish_manifest(true, |draft| {
@@ -743,13 +814,22 @@ impl TimeSeries {
                         span.state = SpanState::RemoteOnly;
                     }
                 }
+                draft.unsettle(start, end);
             })?;
+            self.unlink_node(&node, start_ts)?;
         }
+        Ok(true)
+    }
 
-        self.list.unlink(&node);
+    fn unlink_node(
+        &self,
+        node: &Arc<AtomicNode<TimeSeriesNode>>,
+        start_ts: Timestamp,
+    ) -> Result<(), Error> {
+        self.list.unlink(node);
         std::fs::remove_dir_all(self.path.join(start_ts.0.to_string()))?;
         std::fs::File::open(&self.path)?.sync_all()?;
-        Ok(true)
+        Ok(())
     }
 
     /// Re-derive the coverage of every idle remote seal meeting `range`
@@ -762,17 +842,10 @@ impl TimeSeries {
         let resident = extents(self.list.iter(), None);
         let mut derived = false;
         self.publish_manifest(true, |draft| {
+            draft.unsettle(range.start().0, range.end().0);
             derived = draft.derive(&resident, Some(range.start().0..=range.end().0), []);
         })?;
         Ok(derived)
-    }
-
-    /// Swap in a snapshot with every span passed through `f`. In-memory
-    /// only — transient states (`Fetching`) never persist. Caller holds
-    /// the structural mutex.
-    fn update_in_memory(&self, f: impl Fn(&mut NodeSpan)) {
-        self.publish_manifest(false, |draft| draft.spans.iter_mut().for_each(f))
-            .expect("non-persisted manifest publish cannot fail");
     }
 
     /// Publish a manifest snapshot derived from the current one by `f`,
@@ -797,8 +870,82 @@ impl TimeSeries {
     /// Idempotent — re-installing an already-resident span with the same
     /// checksum is `Ok`. Remote coverage the node now answers is re-derived
     /// around it.
+    pub fn install_node(
+        &self,
+        staging: crate::store::NodeStaging,
+        seal: &SealRecord,
+        source: SpanSource,
+    ) -> Result<(), Error> {
+        let _guard = self.structural.lock().unwrap();
+        self.install_node_locked(staging, seal, source, false)
+    }
+
+    /// [`Self::install_node`] with the structural mutex already held; `tie`
+    /// as for [`Self::splice_node`].
+    fn install_node_locked(
+        &self,
+        staging: crate::store::NodeStaging,
+        seal: &SealRecord,
+        source: SpanSource,
+        tie: bool,
+    ) -> Result<(), Error> {
+        let manifest = self.manifest.load();
+        if let Some(span) = manifest.span(seal.start_ts)
+            && span.state == SpanState::Resident
+        {
+            return if span.seal.checksum == seal.checksum {
+                Ok(())
+            } else {
+                Err(crate::store::StoreError::ChecksumMismatch.into())
+            };
+        }
+        self.splice_node(staging, seal, tie)?;
+        let resident = extents(self.list.iter(), None);
+        self.publish_manifest(true, |draft| {
+            // A whole remote span this node fulfils gives way to it.
+            draft
+                .spans
+                .retain(|s| !(s.cover_start == seal.start_ts && s.seal == *seal));
+            // A fetch claimed coverage this node now answers; drop the claim
+            // so the seal re-derives below, and its fetch finds it lost.
+            let stale: SmallVec<[SealRecord; 2]> = draft
+                .spans
+                .iter()
+                .filter(|s| {
+                    s.state == SpanState::Fetching
+                        && s.cover_start <= seal.end_ts
+                        && seal.start_ts <= s.cover_end
+                })
+                .map(|s| s.seal)
+                .collect();
+            for span in draft.spans.iter_mut() {
+                if span.state == SpanState::Fetching && stale.contains(&span.seal) {
+                    span.state = SpanState::RemoteOnly;
+                }
+            }
+            // Whatever store this came from holds a copy by definition.
+            let acked = matches!(source, SpanSource::RemoteFetch);
+            draft
+                .spans
+                .push(NodeSpan::whole(*seal, SpanState::Resident, source, acked));
+            draft.derive(&resident, Some(seal.start_ts.0..=seal.end_ts.0), []);
+        })?;
+        self.data_waker.wake_all();
+        // A span that arrives whole is as final as one the lifecycle task
+        // seals, and the LoD engine sleeps on this queue.
+        self.seal_waker.wake_all();
+        Ok(())
+    }
+
+    /// Verify `staging` against `seal`, promote it into place and splice
+    /// the node into the list, without touching the manifest. Caller holds
+    /// the structural mutex.
     ///
-    /// A span above the head is rejected whenever the head is *unsealed* —
+    /// The node must fill a hole: overlap with resident data is refused,
+    /// except, with `tie`, a shared edge timestamp — a peer node whose
+    /// first samples tie with its predecessor's last.
+    ///
+    /// A node above the head is rejected whenever the head is *unsealed* —
     /// the working node a writer is appending to, which sealing always
     /// skips and so never has a manifest span (even across restarts,
     /// before the first live sample re-creates the writer). Hydration only
@@ -809,46 +956,26 @@ impl TimeSeries {
     /// `install_node`, which publishes a Resident span), so pushes above it
     /// legitimately land. A live writer over an empty-timestamp head still
     /// rejects, keyed off `has_writer`.
-    pub fn install_node(
+    fn splice_node(
         &self,
         staging: crate::store::NodeStaging,
         seal: &SealRecord,
-        source: SpanSource,
-    ) -> Result<(), Error> {
-        let _guard = self.structural.lock().unwrap();
-        self.install_node_locked(staging, seal, source)
-    }
-
-    /// [`Self::install_node`] with the structural mutex already held.
-    fn install_node_locked(
-        &self,
-        staging: crate::store::NodeStaging,
-        seal: &SealRecord,
-        source: SpanSource,
+        tie: bool,
     ) -> Result<(), Error> {
         use crate::store::StoreError;
         let manifest = self.manifest.load();
-        if let Some(span) = manifest.span(seal.start_ts)
-            && span.state == SpanState::Resident
-        {
-            return if span.seal.checksum == seal.checksum {
-                Ok(())
-            } else {
-                Err(StoreError::ChecksumMismatch.into())
-            };
-        }
-        // Reject overlap with any resident data; an installed node must
-        // fill a hole, not shadow samples that already exist.
         let mut succ: Option<Arc<AtomicNode<TimeSeriesNode>>> = None;
         for node in self.list.iter() {
             let timestamps = node.timestamps();
             let (Some(start), Some(end)) = (timestamps.first(), timestamps.last()) else {
                 continue;
             };
-            if seal.start_ts.0 <= end.0 && start.0 <= seal.end_ts.0 {
+            let overlaps = seal.start_ts.0 <= end.0 && start.0 <= seal.end_ts.0;
+            let edge = seal.start_ts == *end || seal.end_ts == *start;
+            if overlaps && !(tie && edge) {
                 return Err(StoreError::Other("span overlaps resident data".to_string()).into());
             }
-            if start.0 > seal.end_ts.0 {
+            if start.0 > seal.start_ts.0 {
                 // Iteration is newest-first, so the last node we see that
                 // is newer than the install is its direct successor.
                 succ = Some(node);
@@ -881,24 +1008,6 @@ impl TimeSeries {
             }
             None => self.list.push(node),
         }
-
-        let resident = extents(self.list.iter(), None);
-        self.publish_manifest(true, |draft| {
-            // A whole remote span this node fulfils gives way to it.
-            draft
-                .spans
-                .retain(|s| !(s.cover_start == seal.start_ts && s.seal == *seal));
-            // Whatever store this came from holds a copy by definition.
-            let acked = matches!(source, SpanSource::RemoteFetch);
-            draft
-                .spans
-                .push(NodeSpan::whole(*seal, SpanState::Resident, source, acked));
-            draft.derive(&resident, Some(seal.start_ts.0..=seal.end_ts.0), []);
-        })?;
-        self.data_waker.wake_all();
-        // A span that arrives whole is as final as one the lifecycle task
-        // seals, and the LoD engine sleeps on this queue.
-        self.seal_waker.wake_all();
         Ok(())
     }
 
@@ -907,14 +1016,17 @@ impl TimeSeries {
     /// whole installs unchanged. Otherwise local data overlaps it, and each
     /// claimed piece is cut from the download into a node of its own,
     /// marked [`SpanSource::Mirrored`]: those nodes do not match any node
-    /// the peer serves, and the seal itself moves to the shadowed list, so
-    /// dropping them later hands their range back to it.
+    /// the peer serves.
+    ///
+    /// Every piece lands in one publish, together with the stretches the
+    /// download settled (including pieces that held no samples), and the
+    /// seal is re-derived against what is resident by then, so it ends up
+    /// shadowed unless local data moved during the fetch.
     pub fn install_fetched(
         &self,
         staging: crate::store::NodeStaging,
         seal: &SealRecord,
     ) -> Result<(), Error> {
-        use crate::store::StoreError;
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
         let pieces: SmallVec<[NodeSpan; 2]> = manifest
@@ -924,46 +1036,60 @@ impl TimeSeries {
             .copied()
             .collect();
         match &pieces[..] {
-            [] => return Err(StoreError::Other("fetch claim was lost".to_string()).into()),
+            [] => {
+                return Err(
+                    crate::store::StoreError::Other("fetch claim was lost".to_string()).into(),
+                );
+            }
             [piece] if piece.is_whole() => {
-                return self.install_node_locked(staging, seal, SpanSource::RemoteFetch);
+                return self.install_node_locked(staging, seal, SpanSource::RemoteFetch, true);
             }
             _ => {}
         }
+        let mut landed: SmallVec<[(NodeSpan, Option<SealRecord>); 2]> = SmallVec::new();
         let mut installed: Result<(), Error> = Ok(());
         for piece in &pieces {
-            installed =
-                staging
-                    .cut(piece.cover_start..=piece.cover_end)
-                    .and_then(|cut| match cut {
-                        Some((node, piece_seal)) => {
-                            self.install_node_locked(node, &piece_seal, SpanSource::Mirrored)
-                        }
-                        None => Ok(()),
-                    });
+            let cut = staging.cut(piece.cover_start..=piece.cover_end);
+            installed = cut.and_then(|cut| match cut {
+                Some((node, piece_seal)) => {
+                    tag_mirrored(node.dir())?;
+                    self.splice_node(node, &piece_seal, true)?;
+                    landed.push((*piece, Some(piece_seal)));
+                    Ok(())
+                }
+                None => {
+                    landed.push((*piece, None));
+                    Ok(())
+                }
+            });
             if installed.is_err() {
                 break;
             }
         }
-        // Settle the claim: every piece landed, so the seal is shadowed;
-        // otherwise re-derive it around whatever did.
         let resident = extents(self.list.iter(), None);
-        let remote = RemoteSeal {
-            seal: *seal,
-            source: pieces[0].source,
-            acked: pieces[0].acked,
-        };
-        let settled = installed.is_ok();
+        let remote = RemoteSeal::of(&pieces[0]);
         self.publish_manifest(true, |draft| {
+            // Pieces left above an unsealed head re-derive with the rest.
             draft
                 .spans
-                .retain(|s| !(s.seal == *seal && s.state == SpanState::Fetching));
-            if settled {
-                draft.shadowed.push(*seal);
-            } else {
-                draft.derive(&resident, None, [remote]);
+                .retain(|s| !(s.seal == *seal && s.state != SpanState::Resident));
+            for (piece, piece_seal) in &landed {
+                if let Some(piece_seal) = piece_seal {
+                    draft.spans.push(NodeSpan::whole(
+                        *piece_seal,
+                        SpanState::Resident,
+                        SpanSource::Mirrored,
+                        false,
+                    ));
+                }
+                draft.settle(seal, piece.cover_start, piece.cover_end);
             }
+            draft.derive(&resident, None, [remote]);
         })?;
+        if landed.iter().any(|(_, piece_seal)| piece_seal.is_some()) {
+            self.data_waker.wake_all();
+            self.seal_waker.wake_all();
+        }
         installed
     }
 
@@ -1028,8 +1154,28 @@ impl TimeSeries {
         &self,
         seals: impl IntoIterator<Item = SealRecord>,
     ) -> Result<usize, Error> {
+        self.update_remote_spans(seals.into_iter().collect(), false)
+    }
+
+    /// [`Self::merge_remote_spans`] for a peer's complete listing: seals
+    /// recorded from the peer earlier that it no longer lists (its own
+    /// tiering dropped them) are forgotten, so nothing counts on the peer
+    /// for data it can no longer serve. Seals with a fetch in flight are
+    /// left to that fetch. Returns the number of seals recorded.
+    pub fn sync_remote_spans(&self, listing: Vec<SealRecord>) -> Result<usize, Error> {
+        self.update_remote_spans(listing, true)
+    }
+
+    fn update_remote_spans(
+        &self,
+        mut seals: Vec<SealRecord>,
+        complete: bool,
+    ) -> Result<usize, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
+        seals.retain(|seal| seal.count > 0 && seal.start_ts.0 <= seal.end_ts.0);
+        seals.sort_unstable_by_key(|seal| (seal.start_ts.0, seal.checksum));
+        seals.dedup();
         let known = |seal: &SealRecord| {
             let first = manifest
                 .spans
@@ -1046,19 +1192,67 @@ impl TimeSeries {
                     .take_while(|s| s.start_ts == seal.start_ts)
                     .any(|s| s == seal)
         };
-        let mut added: Vec<SealRecord> = seals
-            .into_iter()
-            .filter(|seal| seal.count > 0 && seal.start_ts.0 <= seal.end_ts.0 && !known(seal))
-            .collect();
-        added.sort_unstable_by_key(|seal| (seal.start_ts.0, seal.checksum));
-        added.dedup();
-        if added.is_empty() {
+        let listed = |seal: &SealRecord| {
+            seals
+                .binary_search_by_key(&(seal.start_ts.0, seal.checksum), |s| {
+                    (s.start_ts.0, s.checksum)
+                })
+                .is_ok()
+        };
+        let mut stale: Vec<SealRecord> = Vec::new();
+        if complete {
+            let fetching: Vec<&SealRecord> = manifest
+                .spans
+                .iter()
+                .filter(|s| s.state == SpanState::Fetching)
+                .map(|s| &s.seal)
+                .collect();
+            stale.extend(
+                manifest
+                    .spans
+                    .iter()
+                    .filter(|s| {
+                        s.state == SpanState::RemoteOnly && s.source == SpanSource::RemoteFetch
+                    })
+                    .map(|s| s.seal)
+                    .chain(manifest.shadowed.iter().copied())
+                    .filter(|seal| !listed(seal) && !fetching.contains(&seal)),
+            );
+            stale.sort_unstable_by_key(|seal| (seal.start_ts.0, seal.checksum));
+            stale.dedup();
+        }
+        let stale_settled = complete
+            && manifest.settled.iter().any(|s| {
+                seals
+                    .binary_search_by_key(&(s.seal_start.0, s.checksum), |seal| {
+                        (seal.start_ts.0, seal.checksum)
+                    })
+                    .is_err()
+            });
+        let added: Vec<SealRecord> = seals.iter().filter(|seal| !known(seal)).copied().collect();
+        if added.is_empty() && stale.is_empty() && !stale_settled {
             return Ok(0);
         }
         let count = added.len();
+        let freed = stale
+            .iter()
+            .map(|s| s.start_ts.0..=s.end_ts.0)
+            .reduce(|a, b| *a.start().min(b.start())..=*a.end().max(b.end()));
         let resident = extents(self.list.iter(), None);
         self.publish_manifest(true, |draft| {
-            draft.derive(&resident, None, added.into_iter().map(RemoteSeal::peer));
+            for seal in &stale {
+                draft.forget(seal);
+            }
+            if complete {
+                draft.settled.retain(|s| {
+                    seals
+                        .binary_search_by_key(&(s.seal_start.0, s.checksum), |seal| {
+                            (seal.start_ts.0, seal.checksum)
+                        })
+                        .is_ok()
+                });
+            }
+            draft.derive(&resident, freed, added.into_iter().map(RemoteSeal::peer));
         })?;
         Ok(count)
     }
@@ -1343,11 +1537,12 @@ impl TimerSeriesWriter {
             if self.try_push_buf(timestamp, buf)? {
                 break;
             }
-            let _ = self.time_series.list.try_push(TimeSeriesNode::create(
-                self.time_series.path.join(timestamp.0.to_string()),
-                timestamp,
-                buf.len() as u64,
-            )?);
+            let node_dir = self.time_series.path.join(timestamp.0.to_string());
+            let node = TimeSeriesNode::create(&node_dir, timestamp, buf.len() as u64)?;
+            if self.time_series.mirror_run.load(Ordering::Acquire) != 0 {
+                tag_mirrored(&node_dir)?;
+            }
+            let _ = self.time_series.list.try_push(node);
             rolled = true;
         }
         if rolled {
@@ -1563,37 +1758,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn seal_with_every_sample_resident_is_shadowed() {
-        let dir = tempfile::tempdir().unwrap();
-        // Two local nodes holding exactly the peer's samples, split where
-        // the peer did not split: the stretch between them looks
-        // uncovered by range, but holds nothing.
-        for (start, stamps) in [(0i64, [0i64, 10, 20]), (30, [30, 40, 50])] {
-            let node =
-                TimeSeriesNode::create(dir.path().join(start.to_string()), Timestamp(start), 8)
-                    .unwrap();
-            for ts in stamps {
-                node.data.write(&ts.to_le_bytes()).unwrap();
-                node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
-            }
-        }
-        let series = TimeSeries::open(dir.path()).unwrap();
-        let peer = SealRecord {
-            count: 6,
-            ..remote_seal(0, 50)
-        };
-        assert_eq!(series.merge_remote_spans([peer]).unwrap(), 1);
-        let manifest = series.manifest();
-        assert!(
-            manifest
-                .spans
-                .iter()
-                .all(|s| s.state == SpanState::Resident)
-        );
-        assert_eq!(&*manifest.shadowed, &[peer]);
-    }
-
     /// The peer's node spans `[0, 140]` every 10; this side holds samples
     /// at 100 and 101, sealed. Returns the series and the peer's node.
     fn split_fixture(dir: &Path) -> (TimeSeries, TimeSeriesNode) {
@@ -1747,7 +1911,7 @@ mod tests {
             other.manifest().span(seal.start_ts).unwrap().source,
             SpanSource::LocalIngest
         );
-        assert_eq!(other.ingest_source(), SpanSource::LocalIngest);
+        assert!(!other.is_mirrored());
     }
 
     #[test]

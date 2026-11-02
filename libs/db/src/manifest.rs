@@ -97,6 +97,9 @@ pub struct Gap {
     pub state: SpanState,
     /// The span's key (its `cover_start`), which the hydrator claims.
     pub start_ts: Timestamp,
+    /// Where the span's seal starts: the seal, not the key, identifies
+    /// what a fetch downloads, and stays put as coverage is re-derived.
+    pub seal_start: Timestamp,
 }
 
 pub type GapVec = SmallVec<[Gap; 4]>;
@@ -127,6 +130,28 @@ pub struct ComponentManifest {
     /// data shadowing them is dropped, their range becomes fetchable
     /// again (see `TimeSeries::rederive_coverage`).
     pub shadowed: Box<[SealRecord]>,
+    /// Stretches of remote seals a fetch already reconciled, sorted by
+    /// seal. Whatever a seal holds there is resident (or was nothing at
+    /// all, such as the gap between two mirrored nodes), so derivation
+    /// stops offering them until local data inside is dropped.
+    pub settled: Box<[Settled]>,
+}
+
+/// A stretch of a remote seal that needs no fetch: everything the seal
+/// holds in `start..=end` is resident. Recorded when a fetch of the seal
+/// lands, and cut back when local data in the stretch goes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settled {
+    pub seal_start: Timestamp,
+    pub checksum: u64,
+    pub start: Timestamp,
+    pub end: Timestamp,
+}
+
+impl Settled {
+    pub fn of(&self, seal: &SealRecord) -> bool {
+        self.seal_start == seal.start_ts && self.checksum == seal.checksum
+    }
 }
 
 impl ComponentManifest {
@@ -156,6 +181,7 @@ impl ComponentManifest {
                     range: start..end,
                     state: span.state,
                     start_ts: span.cover_start,
+                    seal_start: span.seal.start_ts,
                 });
             }
         }
@@ -200,14 +226,18 @@ impl ComponentManifest {
             Err(err) => return Err(err.into()),
         };
         let (version, rest) = postcard::take_from_bytes::<u32>(&buf)?;
-        let (mut spans, mut shadowed) = match version {
+        let (mut spans, mut shadowed, mut settled) = match version {
             MANIFEST_VERSION => {
                 let file = postcard::from_bytes::<ManifestBody>(rest)?;
-                (file.spans, file.shadowed)
+                (file.spans, file.shadowed, file.settled)
             }
             2 => {
                 let spans = postcard::from_bytes::<Vec<NodeSpanV2>>(rest)?;
-                (spans.into_iter().map(NodeSpan::from).collect(), Vec::new())
+                (
+                    spans.into_iter().map(NodeSpan::from).collect(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
             version => return Err(Error::UnsupportedManifestVersion(version)),
         };
@@ -219,10 +249,12 @@ impl ComponentManifest {
         }
         spans.sort_unstable_by_key(|s| s.cover_start.0);
         shadowed.sort_unstable_by_key(|s| s.start_ts.0);
+        settled.sort_unstable_by_key(|s| (s.seal_start.0, s.checksum, s.start.0));
         Ok(Some(Self {
             generation: 0,
             spans: spans.into_boxed_slice(),
             shadowed: shadowed.into_boxed_slice(),
+            settled: settled.into_boxed_slice(),
         }))
     }
 
@@ -248,6 +280,7 @@ impl ComponentManifest {
             body: ManifestBody {
                 spans,
                 shadowed: self.shadowed.to_vec(),
+                settled: self.settled.to_vec(),
             },
         })?)
     }
@@ -263,6 +296,7 @@ struct ManifestFile {
 struct ManifestBody {
     spans: Vec<NodeSpan>,
     shadowed: Vec<SealRecord>,
+    settled: Vec<Settled>,
 }
 
 /// A version-2 span, which could only trim its coverage's tail.
@@ -412,6 +446,7 @@ mod tests {
                             range: Timestamp(s)..Timestamp(e),
                             state: span.state,
                             start_ts: span.cover_start,
+                            seal_start: span.seal.start_ts,
                         });
                     }
                 }
@@ -509,6 +544,7 @@ mod tests {
                 body: ManifestBody {
                     spans: Vec::new(),
                     shadowed: Vec::new(),
+                    settled: Vec::new(),
                 },
             })
             .unwrap(),
