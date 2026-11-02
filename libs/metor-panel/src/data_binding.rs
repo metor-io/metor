@@ -356,11 +356,11 @@ impl BoundHistory {
                 .spans
                 .iter()
                 .rev()
-                .find(|span| span.seal.start_ts < range.start)
+                .find(|span| span.cover_start < range.start)
             {
                 hydrate(
                     port,
-                    span.seal.start_ts..range.start,
+                    span.cover_start..range.start,
                     HydratePriority::Visible,
                     cx,
                 );
@@ -438,7 +438,7 @@ pub fn component_extent(
     let start = series
         .start_timestamp()
         .into_iter()
-        .chain(manifest.spans.first().map(|s| s.seal.start_ts))
+        .chain(manifest.spans.first().map(|s| s.cover_start))
         .min()?;
     let end = series
         .latest()

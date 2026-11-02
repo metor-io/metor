@@ -369,7 +369,7 @@ fn import_directory(
                     .filter(|s| s.state != metor_db::manifest::SpanState::Resident)
                     .map(|s| HistoryGap {
                         component,
-                        start: s.seal.start_ts.0,
+                        start: s.cover_start.0,
                         end: s.cover_end.0,
                     }),
             );

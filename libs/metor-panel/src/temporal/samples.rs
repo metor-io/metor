@@ -281,15 +281,10 @@ impl SelectedReader {
                 t.0.saturating_add((super::config(cx).rate * 1_000_000.0) as i64);
             if let Some(span) = component.time_series.manifest().spans.iter().find(|s| {
                 s.state == SpanState::RemoteOnly
-                    && s.seal.start_ts.0 > t.0
-                    && s.seal.start_ts.0 <= horizon
+                    && s.cover_start.0 > t.0
+                    && s.cover_start.0 <= horizon
             }) {
-                hydrator.request(
-                    self.id,
-                    span.seal.start_ts..Timestamp(span.cover_end.0.saturating_add(1)),
-                    HydratePriority::Prefetch,
-                    cx,
-                );
+                hydrator.request(self.id, span.cover(), HydratePriority::Prefetch, cx);
             }
         }
         if plan_current
@@ -603,18 +598,16 @@ fn latest_at_or_before(
     }
     let predecessor = result.sample.as_ref()?.timestamp;
     if manifest.spans.iter().rev().any(|span| {
-        span.state != SpanState::Resident && span.seal.start_ts <= t && span.cover_end > predecessor
+        span.state != SpanState::Resident && span.cover_start <= t && span.cover_end > predecessor
     }) {
         return None;
     }
-    let next = manifest
-        .spans
-        .partition_point(|span| span.seal.start_ts <= t);
+    let next = manifest.spans.partition_point(|span| span.cover_start <= t);
     if let Some(span) = manifest.spans.get(next) {
         result.next = Some(
             result
                 .next
-                .map_or(span.seal.start_ts, |t| t.min(span.seal.start_ts)),
+                .map_or(span.cover_start, |t| t.min(span.cover_start)),
         );
     }
     (component.time_series.manifest().generation == manifest.generation).then_some(result)
@@ -676,21 +669,16 @@ fn at_or_before(component: &Component, t: Timestamp, tail: &[SelectedSample]) ->
         .rev()
         .find(|span| {
             span.state != SpanState::Resident
-                && span.seal.start_ts <= t
+                && span.cover_start <= t
                 && predecessor.is_none_or(|s| span.cover_end > s)
         })
-        .map(|span| {
-            (
-                component.component_id,
-                span.seal.start_ts..Timestamp(span.cover_end.0.saturating_add(1)),
-            )
-        });
+        .map(|span| (component.component_id, span.cover()));
     for span in &manifest.spans {
-        if span.seal.start_ts > t {
+        if span.cover_start > t {
             result.next = Some(
                 result
                     .next
-                    .map_or(span.seal.start_ts, |next| next.min(span.seal.start_ts)),
+                    .map_or(span.cover_start, |next| next.min(span.cover_start)),
             );
         }
     }
