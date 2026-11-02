@@ -238,19 +238,35 @@ impl NodeStaging {
         SealRecord::compute(&self.node())
     }
 
-    /// Discard staged samples newer than `cover_end` and return the seal
-    /// of what remains. This is how a coverage-trimmed span installs: the
-    /// fetch moves the peer's whole node, but only the prefix this side
-    /// is missing may land — the tail already exists as resident data.
-    /// Call after the full payload verified against the peer's seal, then
-    /// [`Self::commit`] with the returned seal.
-    pub fn trim_to(&self, cover_end: Timestamp) -> Result<SealRecord, Error> {
+    /// Copy the staged samples stamped within `cover` into a node of their
+    /// own, returning it with its seal, or `None` when none fall inside.
+    /// This is how a remote seal partly overlapped by local data installs:
+    /// the fetch moves the peer's whole node, but only the pieces this side
+    /// is missing may land. Call after the full payload verified against
+    /// the peer's seal, then [`Self::commit`] the piece with its seal.
+    pub fn cut(
+        &self,
+        cover: std::ops::RangeInclusive<Timestamp>,
+    ) -> Result<Option<(NodeStaging, SealRecord)>, Error> {
         let node = self.node();
-        let keep = node.timestamps().partition_point(|ts| ts.0 <= cover_end.0);
-        self.index.truncate((keep * size_of::<Timestamp>()) as u64);
-        self.data.truncate((keep * node.element_size()) as u64);
-        self.seal()
-            .ok_or_else(|| StoreError::Other("trim left an empty node".to_string()).into())
+        let timestamps = node.timestamps();
+        let lo = timestamps.partition_point(|ts| ts.0 < cover.start().0);
+        let hi = timestamps.partition_point(|ts| ts.0 <= cover.end().0);
+        if lo >= hi {
+            return Ok(None);
+        }
+        let size = node.element_size();
+        let component_dir = self
+            .dir
+            .parent()
+            .ok_or_else(|| StoreError::Other("staging has no component dir".to_string()))?;
+        let piece = Self::with_capacity(component_dir, timestamps[lo], size as u64, hi - lo)?;
+        let data = node.data.data();
+        for (i, ts) in timestamps.iter().enumerate().take(hi).skip(lo) {
+            piece.push(*ts, &data[i * size..(i + 1) * size])?;
+        }
+        let seal = piece.seal().expect("cut holds at least one sample");
+        Ok(Some((piece, seal)))
     }
 
     fn node(&self) -> TimeSeriesNode {

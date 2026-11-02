@@ -14,12 +14,19 @@ use crate::{
 };
 
 pub const MANIFEST_FILE: &str = "manifest";
-const MANIFEST_VERSION: u32 = 2;
+const MANIFEST_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanSource {
     LocalIngest,
     RemoteFetch,
+    /// A local copy of data a peer is the authority for, in node boundaries
+    /// the peer does not share: what a mirror's live ingest writes, and the
+    /// pieces hydration cuts from a peer node around data already resident.
+    /// The peer's seals stay in the manifest beside it (as pieces or
+    /// [`ComponentManifest::shadowed`]), so dropping a mirrored node only
+    /// gives its range back to them.
+    Mirrored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +36,16 @@ pub enum SpanState {
     Fetching,
 }
 
+/// One entry of a component's manifest: a sealed node this side holds, or
+/// a stretch of a remote seal it can fetch.
+///
+/// An entry's identity is `cover_start`. Every entry covers a non-empty
+/// range disjoint from every other entry's (resident nodes never overlap,
+/// and remote coverage is derived as its seal minus everything else), so
+/// the key is unique and sorting by it sorts coverage too. A resident
+/// entry covers exactly its seal, so its key is also its node's start.
+/// A remote seal partly overlapped by local data is recorded as one entry
+/// per uncovered piece, each carrying the whole seal it is fetched by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSpan {
     pub seal: SealRecord,
@@ -36,31 +53,38 @@ pub struct NodeSpan {
     pub source: SpanSource,
     /// A store holds a durable, checksum-verified copy of this span.
     pub acked: bool,
-    /// Inclusive end of the span's effective coverage. Always within the
-    /// seal's range, and equal to `seal.end_ts` except for spans merged
-    /// from a peer whose tail overlapped locally-resident data — those are
-    /// trimmed rather than dropped, so coverage math sees only the part
-    /// this side is missing. Fetches still move the whole node; the trim
-    /// is applied at install. The span's identity stays `seal.start_ts`
-    /// (coverage never trims the front, which would change identity).
+    /// Inclusive start of the span's effective coverage, within the seal.
+    pub cover_start: Timestamp,
+    /// Inclusive end of the span's effective coverage, within the seal.
     pub cover_end: Timestamp,
 }
 
 impl NodeSpan {
-    /// A span covering its seal's full range — every span that does not
-    /// come from a trimmed peer merge.
+    /// A span covering its seal's full range.
     pub fn whole(seal: SealRecord, state: SpanState, source: SpanSource, acked: bool) -> Self {
         Self {
             seal,
             state,
             source,
             acked,
+            cover_start: seal.start_ts,
             cover_end: seal.end_ts,
         }
     }
 
     pub fn bytes(&self) -> u64 {
         self.seal.index_len + self.seal.data_len
+    }
+
+    /// The covered range, half-open.
+    pub fn cover(&self) -> Range<Timestamp> {
+        self.cover_start..Timestamp(self.cover_end.0.saturating_add(1))
+    }
+
+    /// Whether the span covers its whole seal, so fetching it installs the
+    /// seal's node unchanged.
+    pub fn is_whole(&self) -> bool {
+        self.cover_start == self.seal.start_ts && self.cover_end == self.seal.end_ts
     }
 }
 
@@ -71,7 +95,7 @@ impl NodeSpan {
 pub struct Gap {
     pub range: Range<Timestamp>,
     pub state: SpanState,
-    /// Identifies the span (and so the node) to fetch.
+    /// The span's key (its `cover_start`), which the hydrator claims.
     pub start_ts: Timestamp,
 }
 
@@ -91,19 +115,25 @@ pub enum Coverage {
 }
 
 /// An immutable snapshot of every sealed span a component knows about,
-/// sorted by start timestamp. Mutators clone-and-swap whole snapshots
+/// sorted by `cover_start`. Mutators clone-and-swap whole snapshots
 /// through [`ManifestCell`]; readers hold a snapshot for as long as they
 /// like without blocking anyone.
 #[derive(Debug, Default, Clone)]
 pub struct ComponentManifest {
     pub generation: u64,
     pub spans: Box<[NodeSpan]>,
+    /// Remote seals whose whole range local data already answers, sorted
+    /// by start. They cover nothing, but are kept so that when the local
+    /// data shadowing them is dropped, their range becomes fetchable
+    /// again (see `TimeSeries::rederive_coverage`).
+    pub shadowed: Box<[SealRecord]>,
 }
 
 impl ComponentManifest {
-    pub fn span(&self, start_ts: Timestamp) -> Option<&NodeSpan> {
+    /// The span keyed by `cover_start`.
+    pub fn span(&self, cover_start: Timestamp) -> Option<&NodeSpan> {
         self.spans
-            .binary_search_by_key(&start_ts.0, |s| s.seal.start_ts.0)
+            .binary_search_by_key(&cover_start.0, |s| s.cover_start.0)
             .ok()
             .map(|i| &self.spans[i])
     }
@@ -119,13 +149,13 @@ impl ComponentManifest {
             if span.state == SpanState::Resident {
                 continue;
             }
-            let start = Timestamp(range.start.0.max(span.seal.start_ts.0));
+            let start = Timestamp(range.start.0.max(span.cover_start.0));
             let end = Timestamp(range.end.0.min(span.cover_end.0.saturating_add(1)));
             if end.0 > start.0 {
                 out.push(Gap {
                     range: start..end,
                     state: span.state,
-                    start_ts: span.seal.start_ts,
+                    start_ts: span.cover_start,
                 });
             }
         }
@@ -139,7 +169,7 @@ impl ComponentManifest {
     pub fn count_in(&self, range: &Range<Timestamp>) -> u64 {
         let mut total = 0u64;
         for span in self.overlapping(range) {
-            let ov_start = range.start.0.max(span.seal.start_ts.0);
+            let ov_start = range.start.0.max(span.cover_start.0);
             let ov_end = (range.end.0 - 1).min(span.cover_end.0);
             if ov_end < ov_start {
                 continue;
@@ -160,7 +190,7 @@ impl ComponentManifest {
         let end = range.end.0;
         self.spans[lo..]
             .iter()
-            .take_while(move |s| s.seal.start_ts.0 < end)
+            .take_while(move |s| s.cover_start.0 < end)
     }
 
     pub fn read_from(dir: &Path) -> Result<Option<Self>, Error> {
@@ -170,20 +200,29 @@ impl ComponentManifest {
             Err(err) => return Err(err.into()),
         };
         let (version, rest) = postcard::take_from_bytes::<u32>(&buf)?;
-        if version != MANIFEST_VERSION {
-            return Err(Error::UnsupportedManifestVersion(version));
-        }
-        let mut spans = postcard::from_bytes::<Vec<NodeSpan>>(rest)?;
+        let (mut spans, mut shadowed) = match version {
+            MANIFEST_VERSION => {
+                let file = postcard::from_bytes::<ManifestBody>(rest)?;
+                (file.spans, file.shadowed)
+            }
+            2 => {
+                let spans = postcard::from_bytes::<Vec<NodeSpanV2>>(rest)?;
+                (spans.into_iter().map(NodeSpan::from).collect(), Vec::new())
+            }
+            version => return Err(Error::UnsupportedManifestVersion(version)),
+        };
         for span in &mut spans {
             // In-flight fetches do not survive a restart.
             if span.state == SpanState::Fetching {
                 span.state = SpanState::RemoteOnly;
             }
         }
-        spans.sort_unstable_by_key(|s| s.seal.start_ts.0);
+        spans.sort_unstable_by_key(|s| s.cover_start.0);
+        shadowed.sort_unstable_by_key(|s| s.start_ts.0);
         Ok(Some(Self {
             generation: 0,
             spans: spans.into_boxed_slice(),
+            shadowed: shadowed.into_boxed_slice(),
         }))
     }
 
@@ -206,7 +245,10 @@ impl ComponentManifest {
             .collect();
         Ok(postcard::to_allocvec(&ManifestFile {
             version: MANIFEST_VERSION,
-            spans,
+            body: ManifestBody {
+                spans,
+                shadowed: self.shadowed.to_vec(),
+            },
         })?)
     }
 }
@@ -214,7 +256,32 @@ impl ComponentManifest {
 #[derive(Serialize, Deserialize)]
 struct ManifestFile {
     version: u32,
+    body: ManifestBody,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ManifestBody {
     spans: Vec<NodeSpan>,
+    shadowed: Vec<SealRecord>,
+}
+
+/// A version-2 span, which could only trim its coverage's tail.
+#[derive(Serialize, Deserialize)]
+struct NodeSpanV2 {
+    seal: SealRecord,
+    state: SpanState,
+    source: SpanSource,
+    acked: bool,
+    cover_end: Timestamp,
+}
+
+impl From<NodeSpanV2> for NodeSpan {
+    fn from(v2: NodeSpanV2) -> Self {
+        Self {
+            cover_end: v2.cover_end,
+            ..NodeSpan::whole(v2.seal, v2.state, v2.source, v2.acked)
+        }
+    }
 }
 
 /// The swap point between background mutators and readers. Reads clone an
@@ -273,10 +340,18 @@ mod tests {
         }
     }
 
+    fn piece(start: i64, end: i64, from: i64, to: i64, state: SpanState) -> NodeSpan {
+        NodeSpan {
+            cover_start: Timestamp(from),
+            cover_end: Timestamp(to),
+            ..span(start, end, state)
+        }
+    }
+
     fn manifest(spans: Vec<NodeSpan>) -> ComponentManifest {
         ComponentManifest {
-            generation: 0,
             spans: spans.into_boxed_slice(),
+            ..Default::default()
         }
     }
 
@@ -313,6 +388,10 @@ mod tests {
             span(20, 29, SpanState::Resident),
             trimmed(30, 49, 39, SpanState::RemoteOnly),
             span(50, 59, SpanState::Fetching),
+            // One seal split around resident data at [70, 89].
+            piece(60, 99, 60, 69, SpanState::RemoteOnly),
+            span(70, 89, SpanState::Resident),
+            piece(60, 99, 90, 99, SpanState::RemoteOnly),
             span(100, 199, SpanState::RemoteOnly),
         ]);
         for start in -5..210 {
@@ -326,13 +405,13 @@ mod tests {
                     if span.state == SpanState::Resident {
                         continue;
                     }
-                    let s = range.start.0.max(span.seal.start_ts.0);
+                    let s = range.start.0.max(span.cover_start.0);
                     let e = range.end.0.min(span.cover_end.0 + 1);
                     if e > s {
                         reference.push(Gap {
                             range: Timestamp(s)..Timestamp(e),
                             state: span.state,
-                            start_ts: span.seal.start_ts,
+                            start_ts: span.cover_start,
                         });
                     }
                 }
@@ -365,6 +444,20 @@ mod tests {
         assert_eq!(m.count_in(&(Timestamp(0)..Timestamp(1))), 1);
         assert_eq!(m.count_in(&(Timestamp(200)..Timestamp(300))), 0);
         assert_eq!(m.count_in(&(Timestamp(-100)..Timestamp(0))), 0);
+    }
+
+    #[test]
+    fn front_trimmed_piece_gap_starts_at_cover_start() {
+        let m = manifest(vec![piece(0, 99, 50, 99, SpanState::RemoteOnly)]);
+        let mut gaps = GapVec::new();
+        m.gaps(&(Timestamp(0)..Timestamp(100)), &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].range, Timestamp(50)..Timestamp(100));
+        assert_eq!(gaps[0].start_ts, Timestamp(50));
+        assert_eq!(m.span(Timestamp(50)).unwrap().seal.start_ts, Timestamp(0));
+        assert!(m.span(Timestamp(0)).is_none());
+        assert_eq!(m.count_in(&(Timestamp(0)..Timestamp(50))), 0);
+        assert_eq!(m.count_in(&(Timestamp(0)..Timestamp(100))), 50);
     }
 
     #[test]
@@ -413,7 +506,10 @@ mod tests {
             MANIFEST_FILE,
             &postcard::to_allocvec(&ManifestFile {
                 version: 99,
-                spans: Vec::new(),
+                body: ManifestBody {
+                    spans: Vec::new(),
+                    shadowed: Vec::new(),
+                },
             })
             .unwrap(),
         )
@@ -422,6 +518,53 @@ mod tests {
             ComponentManifest::read_from(dir.path()),
             Err(Error::UnsupportedManifestVersion(99))
         ));
+    }
+
+    #[test]
+    fn version_2_migrates_with_cover_start_at_seal_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let trimmed = trimmed(0, 99, 49, SpanState::Fetching);
+        let v2 = |span: NodeSpan| NodeSpanV2 {
+            seal: span.seal,
+            state: span.state,
+            source: span.source,
+            acked: span.acked,
+            cover_end: span.cover_end,
+        };
+        let mut bytes = postcard::to_allocvec(&2u32).unwrap();
+        bytes.extend(
+            postcard::to_allocvec(&vec![v2(span(100, 199, SpanState::Resident)), v2(trimmed)])
+                .unwrap(),
+        );
+        atomic_write(dir.path(), MANIFEST_FILE, &bytes).unwrap();
+
+        let read = ComponentManifest::read_from(dir.path()).unwrap().unwrap();
+        assert_eq!(read.spans.len(), 2);
+        assert_eq!(read.spans[0].cover_start, Timestamp(0));
+        assert_eq!(read.spans[0].cover_end, Timestamp(49));
+        assert_eq!(read.spans[0].state, SpanState::RemoteOnly);
+        assert!(read.spans[1].is_whole());
+        assert!(read.shadowed.is_empty());
+
+        // Writing back upgrades the file.
+        read.write_to(dir.path()).unwrap();
+        let buf = std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap();
+        let (version, _) = postcard::take_from_bytes::<u32>(&buf).unwrap();
+        assert_eq!(version, MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn shadowed_seals_survive_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let shadow = span(0, 99, SpanState::RemoteOnly).seal;
+        let m = ComponentManifest {
+            spans: vec![span(0, 99, SpanState::Resident)].into_boxed_slice(),
+            shadowed: vec![shadow].into_boxed_slice(),
+            ..Default::default()
+        };
+        m.write_to(dir.path()).unwrap();
+        let read = ComponentManifest::read_from(dir.path()).unwrap().unwrap();
+        assert_eq!(&*read.shadowed, &[shadow]);
     }
 
     #[test]

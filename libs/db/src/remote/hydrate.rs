@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::{
     AtomicTimestampExt, ComponentSchema, DB, Error,
-    manifest::{GapVec, SpanSource, SpanState},
+    manifest::{GapVec, SpanState},
     store::{NodeKey, NodeStaging, NodeStore, StoreError},
     time_series::TimeSeries,
 };
@@ -45,18 +45,20 @@ struct Backoff {
     retry_at: Instant,
 }
 
-/// Fetch one remote-only span into residency. Returns `Ok(false)` when
-/// there is nothing to do — the span is unknown, already resident, or
-/// another fetch holds the claim.
+/// Fetch one remote-only span, keyed by its `cover_start`, into
+/// residency. The download is the span's whole seal, so every other piece
+/// of that seal lands with it. Returns `Ok(false)` when there is nothing
+/// to do — the span is unknown, already resident, or another fetch holds
+/// the claim.
 pub async fn hydrate_span(
     time_series: &TimeSeries,
     store: &dyn NodeStore,
     component_id: ComponentId,
     component_name: &str,
     schema: &ComponentSchema,
-    start_ts: Timestamp,
+    cover_start: Timestamp,
 ) -> Result<bool, Error> {
-    let Some(span) = time_series.begin_fetch(start_ts) else {
+    let Some(span) = time_series.begin_fetch(cover_start) else {
         return Ok(false);
     };
     let seal = span.seal;
@@ -67,27 +69,20 @@ pub async fn hydrate_span(
             component_id,
             component_name,
             schema: &wire_schema,
-            start_ts,
+            start_ts: seal.start_ts,
             checksum: seal.checksum,
         };
         let fetched = store.get(key, &staging).await?;
         if fetched.checksum != seal.checksum {
             return Err(StoreError::ChecksumMismatch.into());
         }
-        // A coverage-trimmed span only installs the prefix this side is
-        // missing; the rest of the node already exists as resident data.
-        let install_seal = if span.cover_end.0 < seal.end_ts.0 {
-            staging.trim_to(span.cover_end)?
-        } else {
-            seal
-        };
-        time_series.install_node(staging, &install_seal, SpanSource::RemoteFetch)
+        time_series.install_fetched(staging, &seal)
     }
     .await;
     match result {
         Ok(()) => Ok(true),
         Err(err) => {
-            time_series.abort_fetch(start_ts);
+            time_series.abort_fetch(cover_start);
             Err(err)
         }
     }
