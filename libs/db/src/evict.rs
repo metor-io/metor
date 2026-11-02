@@ -436,6 +436,48 @@ mod tests {
     }
 
     #[test]
+    fn a_span_the_peer_stopped_listing_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let (staging, seal) = staged(dir.path(), 0..10);
+        series
+            .install_node(staging, &seal, SpanSource::RemoteFetch)
+            .unwrap();
+        let (_, other) = staged(&dir.path().join("peer"), 100..110);
+
+        // The peer's listing no longer has the hydrated node: this side's
+        // copy is the only one left.
+        series.sync_remote_spans(vec![other]).unwrap();
+        let now = later(GRACE * 2);
+        assert_eq!(evict(&series, now, GRACE, |_| true).unwrap().spans, 0);
+        assert_eq!(state(&series, 0), Some(SpanState::Resident));
+        // An incremental merge doesn't speak for what the peer dropped.
+        series.merge_remote_spans([other]).unwrap();
+        assert!(!series.manifest().span(Timestamp(0)).unwrap().acked);
+
+        // Listed again, the peer can give it back.
+        series.sync_remote_spans(vec![seal, other]).unwrap();
+        assert!(series.manifest().span(Timestamp(0)).unwrap().acked);
+        assert_eq!(evict(&series, now, GRACE, |_| true).unwrap().spans, 1);
+        assert_eq!(state(&series, 0), Some(SpanState::RemoteOnly));
+    }
+
+    #[test]
+    fn a_withdrawn_ack_survives_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let series = TimeSeries::create(dir.path()).unwrap();
+            hydrated(&series, dir.path(), 0..10);
+            series.sync_remote_spans(vec![]).unwrap();
+        }
+        let series = TimeSeries::open(dir.path()).unwrap();
+        assert!(!series.manifest().span(Timestamp(0)).unwrap().acked);
+        let evicted = evict(&series, later(GRACE * 2), GRACE, |_| true).unwrap();
+        assert_eq!(evicted.spans, 0);
+        assert!(series.get(Timestamp(5)).is_some());
+    }
+
+    #[test]
     fn live_head_and_local_ingest_are_kept() {
         let dir = tempfile::tempdir().unwrap();
         let series = TimeSeries::create(dir.path()).unwrap();
