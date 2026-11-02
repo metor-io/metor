@@ -510,7 +510,7 @@ impl LinePlot {
                 // what lets a full-range view span the whole archive.
                 let manifest = comp.time_series.manifest();
                 if let Some(span) = manifest.spans.first() {
-                    start = start.min(span.seal.start_ts.0 as f64);
+                    start = start.min(span.cover_start.0 as f64);
                     any_time = true;
                 }
                 if let Some(span) = manifest.spans.last() {
