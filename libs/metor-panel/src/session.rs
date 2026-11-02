@@ -127,7 +127,7 @@ impl SessionStorage {
         result
     }
 
-    fn is_temporary(&self) -> bool {
+    pub(crate) fn is_temporary(&self) -> bool {
         matches!(self.directory, StorageDirectory::Temporary(_))
     }
 

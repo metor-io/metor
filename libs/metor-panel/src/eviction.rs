@@ -1,0 +1,192 @@
+//! Working-set eviction for the panel's session DB.
+//!
+//! A mirror is a cache, not an archive: what a peer can serve again is kept
+//! only while someone reads it. Every per-frame read path marks the history
+//! it reads with [`TimeSeries::touch`](metor_db::time_series::TimeSeries::touch)
+//! — plots for the series they draw (raw, or the selected LoD level), value
+//! views for their selected instant, playback for its read-ahead — and a
+//! task here purges, about once a second, every evictable span nobody has
+//! touched within the grace period. A plot that zooms out switches to an
+//! LoD level, stops touching the raw nodes, and they go a few seconds
+//! later; zooming back fetches them again.
+//!
+//! What may go is [`metor_db::evict`]'s rule: acked spans (hydrated from a
+//! peer) and mirrored spans the peer's seals cover, never the live head or
+//! locally produced data. On top of that this module adds the panel's
+//! policy:
+//!
+//! - **Only a temporary session evicts.** A recording, or a database the
+//!   embedding application owns, exists to keep what arrived.
+//! - **Paused unless every connection is up, and at least one can serve
+//!   history.** A peer that dropped may hold the only other copy, or none:
+//!   an ephemeral gateway deletes its DB when it stops. Spans aren't
+//!   attributed to the connection they came from yet, so one connection
+//!   down pauses eviction for all of them; and data from a peer that was
+//!   disconnected *and removed* is not protected once the remaining
+//!   connections are up. Per-connection attribution is the follow-up.
+//! - **The coarsest LoD level of every source stays.** It is what a
+//!   zoomed-out view reads and is tiny (a month at 4096× is ~10 MB per
+//!   component), so refetching it on every zoom-out would cost more than
+//!   keeping it.
+//! - **Views that aren't repainting still count as reading.** gpui only
+//!   renders on change, so a paused plot stops touching what it shows.
+//!   Before purging, the task repaints every window and has every value
+//!   view touch its selected instant, then purges only what is still idle.
+//!   A window the platform doesn't draw (minimized, occluded) can lose its
+//!   history this way and fetches it again when shown.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use gpui::{App, AsyncApp};
+use metor_db::DB;
+use metor_db::evict::{self, Evicted};
+use metor_db::lod::{LOD_RATIO_KEY, LOD_SOURCE_ID_KEY};
+use metor_proto::types::ComponentId;
+
+use crate::connections::ConnectionStatus;
+
+/// How long history may go unread before it is evicted.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+/// How often the evictor looks for idle history.
+const TICK: Duration = Duration::from_secs(1);
+/// How long the pre-purge repaint gets to land, so views that are on screen
+/// but idle have touched what they show.
+const SETTLE: Duration = Duration::from_millis(250);
+
+/// What the panel does with history it holds but nobody is reading. Set with
+/// [`PanelApp::eviction`](crate::PanelApp::eviction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Eviction {
+    /// Keep only what views have read within `grace`, as long as a peer
+    /// can serve the rest again.
+    WorkingSet { grace: Duration },
+    /// Keep everything that arrives for the life of the session.
+    Off,
+}
+
+impl Default for Eviction {
+    fn default() -> Self {
+        Self::WorkingSet {
+            grace: DEFAULT_GRACE,
+        }
+    }
+}
+
+/// Start the evictor for `db` under `eviction`. Runs until the app quits.
+pub(crate) fn spawn(db: Arc<DB>, eviction: Eviction, cx: &mut App) {
+    let Eviction::WorkingSet { grace } = eviction else {
+        return;
+    };
+    if !evict::SUPPORTED {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(TICK).await;
+            tick(&db, grace, cx).await;
+        }
+    })
+    .detach();
+}
+
+/// One pass: find idle history, let every view on screen claim what it
+/// shows, then purge what is still idle.
+async fn tick(db: &Arc<DB>, grace: Duration, cx: &mut AsyncApp) {
+    if !cx.update(|cx| peers_reachable(cx)) {
+        return;
+    }
+    let any_idle = {
+        let db = db.clone();
+        cx.background_executor()
+            .spawn(async move { any_idle(&db, Instant::now(), grace) })
+            .await
+    };
+    if !any_idle {
+        return;
+    }
+    cx.update(|cx| {
+        crate::temporal::samples::touch_selected(Instant::now(), cx);
+        cx.refresh_windows();
+    });
+    cx.background_executor().timer(SETTLE).await;
+    if !cx.update(|cx| peers_reachable(cx)) {
+        return;
+    }
+    let db = db.clone();
+    let evicted = cx
+        .background_executor()
+        .spawn(async move { sweep(&db, Instant::now(), grace) })
+        .await;
+    if evicted.spans > 0 {
+        tracing::debug!(
+            spans = evicted.spans,
+            bytes = evicted.bytes,
+            "evicted idle history"
+        );
+    }
+}
+
+/// Whether [`sweep`] would find anything to purge.
+fn any_idle(db: &DB, now: Instant, grace: Duration) -> bool {
+    let kept = coarsest_lod_levels(db);
+    evict::any_idle(db, now, grace, |id, _| !kept.contains(&id))
+}
+
+/// Purge everything idle past `grace` but each source's coarsest LoD level.
+fn sweep(db: &DB, now: Instant, grace: Duration) -> Evicted {
+    let kept = coarsest_lod_levels(db);
+    evict::sweep(db, now, grace, |id, _| !kept.contains(&id))
+}
+
+fn peers_reachable(cx: &App) -> bool {
+    crate::connections::try_global(cx).is_some_and(|store| {
+        peers_can_refetch(
+            store
+                .read(cx)
+                .active()
+                .iter()
+                .map(|conn| (conn.status(), conn.fetches_history())),
+        )
+    })
+}
+
+/// Whether history evicted now could be fetched back: at least one
+/// connection serves history, and none is anything but connected.
+fn peers_can_refetch(connections: impl IntoIterator<Item = (ConnectionStatus, bool)>) -> bool {
+    let mut any_fetches = false;
+    for (status, fetches) in connections {
+        if status != ConnectionStatus::Connected {
+            return false;
+        }
+        any_fetches |= fetches;
+    }
+    any_fetches
+}
+
+/// Each LoD source's coarsest level. Levels are recognised by metadata, so
+/// they are found however their source is named.
+fn coarsest_lod_levels(db: &DB) -> HashSet<ComponentId> {
+    db.with_state(|state| {
+        let mut coarsest: HashMap<&str, (ComponentId, u64)> = HashMap::new();
+        for (id, meta) in state.component_metadata_iter() {
+            let (Some(source), Some(ratio)) = (
+                meta.metadata.get(LOD_SOURCE_ID_KEY),
+                meta.metadata
+                    .get(LOD_RATIO_KEY)
+                    .and_then(|r| r.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            let entry = coarsest.entry(source.as_str()).or_insert((*id, ratio));
+            if ratio > entry.1 {
+                *entry = (*id, ratio);
+            }
+        }
+        coarsest.into_values().map(|(id, _)| id).collect()
+    })
+}
+
+#[cfg(test)]
+mod tests;

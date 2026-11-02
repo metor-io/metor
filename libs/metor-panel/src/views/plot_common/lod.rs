@@ -131,11 +131,14 @@ fn exceeds(was: bool, cost: u64, budget: u64) -> bool {
 
 /// Accumulates [`GapBands`] across a plot's sources for one visible window,
 /// asking the installed hydrator (if any) for remote-only stretches on the
-/// way past — bounded, deduplicated, cheap to call per frame.
+/// way past — bounded, deduplicated, cheap to call per frame. On the way it
+/// marks the series each source draws as read, which is what keeps them
+/// from [`eviction`](crate::eviction).
 pub(crate) struct GapCollector {
     min_x: f64,
     span: f64,
     visible: Range<Timestamp>,
+    now: std::time::Instant,
     hydrator: Option<crate::hydration::Hydrators>,
     gaps: metor_db::manifest::GapVec,
     bands: GapBands,
@@ -149,6 +152,7 @@ impl GapCollector {
             min_x,
             span: (max_x - min_x).max(1.0),
             visible: Timestamp(min_x as i64)..Timestamp(max_x as i64),
+            now: std::time::Instant::now(),
             hydrator: crate::hydration::hydrator(cx),
             gaps: metor_db::manifest::GapVec::new(),
             bands: GapBands::new(),
@@ -174,6 +178,20 @@ impl GapCollector {
             None if lod.over_budget() => (&component.time_series, source, false),
             None => (&component.time_series, source, true),
         };
+        series.touch(self.visible.clone(), self.now);
+        // Over a level, raw samples still draw the live tail past its last
+        // bucket; the raw history behind it is left to go.
+        if let Some(level) = lod.selected() {
+            let tail = level
+                .time_series
+                .latest()
+                .map_or(self.visible.start, |last| last.timestamp());
+            if tail < self.visible.end {
+                component
+                    .time_series
+                    .touch(tail.max(self.visible.start)..self.visible.end, self.now);
+            }
+        }
         self.gaps.clear();
         series.coverage(self.visible.clone(), &mut self.gaps);
         let (min_x, span) = (self.min_x, self.span);

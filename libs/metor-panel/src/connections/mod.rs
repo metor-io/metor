@@ -93,6 +93,12 @@ impl ActiveConnection {
     pub fn status(&self) -> ConnectionStatus {
         self.status.get()
     }
+
+    /// Whether this connection can fetch history back on demand, which is
+    /// what lets the panel evict its copy.
+    pub fn fetches_history(&self) -> bool {
+        self.hydrator.is_some()
+    }
 }
 
 /// One picker line: a target when it's live (registered or re-materialized
