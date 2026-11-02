@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use gpui::{App, AppContext, Context, Entity, Global, SharedString, Subscription, Task};
-use metor_db::{Component, DB};
+use metor_db::{Component, DB, remote::HydratePriority};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use metor_proto_wkt::SequenceChannelState;
 
@@ -204,7 +204,7 @@ impl SequenceHistory {
                 let range =
                     Timestamp(extent.start.0.max(extent.end.0 - FETCH_WINDOW_US))..extent.end;
                 for component in [Some(&message), state.as_ref()].into_iter().flatten() {
-                    hydrate(component, range.clone(), cx);
+                    hydrate(component, range.clone(), HydratePriority::Visible, cx);
                 }
             }
         }

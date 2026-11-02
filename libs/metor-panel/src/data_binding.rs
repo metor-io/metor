@@ -7,6 +7,7 @@
 use crate::dynamic::expressions::{self, Expression, SIGIL};
 use gpui::App;
 use metor_db::DB;
+use metor_db::remote::HydratePriority;
 use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -267,6 +268,10 @@ impl InputChanges {
     }
 }
 
+/// Input samples a view that has no budget of its own (maps, XY plots) lets
+/// one window's expression replay read; the time-series plot's raw budget.
+pub const REPLAY_SAMPLE_BUDGET: u64 = 1_000_000;
+
 /// History orchestration shared by plots, maps and sample tables. Rendering
 /// and LoD selection stay with the consumer; replay ownership stays here.
 pub struct BoundHistory {
@@ -302,12 +307,37 @@ impl BoundHistory {
         gaps.is_empty()
     }
 
-    pub fn request(&self, range: std::ops::Range<metor_proto::types::Timestamp>, cx: &App) {
-        hydrate(&self.component, range.clone(), cx);
-        self.request_replay(range, cx);
+    /// Make `range` resident: hydrate the output, and compute what an
+    /// expression never produced there when that costs at most
+    /// `replay_budget` input samples (see [`Self::replay_cost`]). Past the
+    /// budget the inputs stay where they are — a month-wide window must not
+    /// pull a month of raw inputs — and the gaps stay gaps.
+    pub fn request(
+        &self,
+        range: std::ops::Range<metor_proto::types::Timestamp>,
+        replay_budget: u64,
+        cx: &App,
+    ) {
+        hydrate(&self.component, range.clone(), HydratePriority::Visible, cx);
+        if self.replay_cost(range.clone()) <= replay_budget {
+            self.request_replay(range, cx);
+        }
     }
 
-    /// Returns missing output ranges, also used to paint plot gap bands.
+    /// Input samples computing `range` would read; zero for a plain
+    /// component. The output's own estimate can't stand in for this: an
+    /// expression nobody has computed yet holds nothing, so it always looks
+    /// cheap.
+    pub fn replay_cost(&self, range: std::ops::Range<metor_proto::types::Timestamp>) -> u64 {
+        self.plan
+            .as_ref()
+            .map_or(0, |plan| plan.estimate_samples(range))
+    }
+
+    /// Hydrate the inputs over `range` and queue a backfill of what the
+    /// output is missing there. Returns the missing output ranges, also
+    /// used to paint plot gap bands. Unbudgeted: callers weigh
+    /// [`Self::replay_cost`] first.
     pub fn request_replay(
         &self,
         range: std::ops::Range<metor_proto::types::Timestamp>,
@@ -318,7 +348,7 @@ impl BoundHistory {
             return uncovered;
         };
         for port in &plan.ports {
-            hydrate(port, range.clone(), cx);
+            hydrate(port, range.clone(), HydratePriority::Visible, cx);
             // Held inputs seed from their last value before the requested range.
             if let Some(span) = port
                 .time_series
@@ -328,7 +358,12 @@ impl BoundHistory {
                 .rev()
                 .find(|span| span.seal.start_ts < range.start)
             {
-                hydrate(port, span.seal.start_ts..range.start, cx);
+                hydrate(
+                    port,
+                    span.seal.start_ts..range.start,
+                    HydratePriority::Visible,
+                    cx,
+                );
             }
         }
         crate::backfill::wanted(&self.component, plan, range, &mut uncovered);
@@ -339,11 +374,48 @@ impl BoundHistory {
         }
         uncovered
     }
+
+    /// The stretches of `range` an expression could compute but hasn't,
+    /// without asking for any of them: what a window too wide to replay
+    /// shows instead. Bounded by the inputs' extent and the backfill
+    /// ceiling; unlike [`crate::backfill::wanted`] it doesn't trim to where
+    /// the driving input has resident samples, since over budget the inputs
+    /// are deliberately left unfetched.
+    pub fn uncomputed(
+        &self,
+        range: std::ops::Range<metor_proto::types::Timestamp>,
+    ) -> metor_db::manifest::RangeVec {
+        let mut uncovered = metor_db::manifest::RangeVec::new();
+        let Some(plan) = &self.plan else {
+            return uncovered;
+        };
+        let Some(ceiling) = crate::backfill::ceiling(&self.component, plan) else {
+            return uncovered;
+        };
+        let Some(inputs_start) = plan
+            .ports
+            .iter()
+            .filter_map(component_extent)
+            .map(|extent| extent.start)
+            .min()
+        else {
+            return uncovered;
+        };
+        let start = range.start.max(inputs_start);
+        let end = range.end.min(ceiling);
+        if start < end {
+            self.component
+                .time_series
+                .uncovered(start..end, &mut uncovered);
+        }
+        uncovered
+    }
 }
 
 pub(crate) fn hydrate(
     component: &metor_db::Component,
     range: std::ops::Range<metor_proto::types::Timestamp>,
+    priority: HydratePriority,
     cx: &App,
 ) {
     if let Some(hydrator) = crate::hydration::hydrator(cx) {
@@ -351,7 +423,7 @@ pub(crate) fn hydrate(
         component.time_series.coverage(range, &mut gaps);
         for gap in gaps {
             if gap.state == metor_db::manifest::SpanState::RemoteOnly {
-                hydrator.request(component.component_id, gap.range);
+                hydrator.request(component.component_id, gap.range, priority, cx);
             }
         }
     }

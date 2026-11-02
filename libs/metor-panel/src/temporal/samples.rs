@@ -1,6 +1,6 @@
 //! Shared asynchronous predecessor reads. Views retain leases; the registry is weak.
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, WeakEntity};
-use metor_db::{Component, DB, manifest::SpanState};
+use metor_db::{Component, DB, manifest::SpanState, remote::HydratePriority};
 use metor_proto::types::{ComponentId, Timestamp};
 use std::{
     collections::{HashMap, VecDeque},
@@ -287,6 +287,8 @@ impl SelectedReader {
                 hydrator.request(
                     self.id,
                     span.seal.start_ts..Timestamp(span.cover_end.0.saturating_add(1)),
+                    HydratePriority::Prefetch,
+                    cx,
                 );
             }
         }
@@ -434,7 +436,7 @@ impl SelectedReader {
                 if let Some((id, range)) = result.missing.clone() {
                     this.retry = Some((Instant::now() + RETRY_BACKOFF, result.manifest));
                     if let Some(hydrator) = crate::hydration::hydrator(cx) {
-                        hydrator.request(id, range);
+                        hydrator.request(id, range, HydratePriority::Selected, cx);
                         this.publish(None, SampleStatus::Loading, Some(t), cx);
                     } else {
                         this.publish(

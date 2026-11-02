@@ -144,7 +144,11 @@ mod tests {
         }
         assert!(seeded, "local db never seeded the remote manifest");
 
-        hydrator.request(component_id, Timestamp(1_000)..Timestamp(1_064));
+        hydrator.request(
+            component_id,
+            Timestamp(1_000)..Timestamp(1_064),
+            metor_db::remote::HydratePriority::Visible,
+        );
         let mut hydrated = false;
         for _ in 0..40 {
             sleep(Duration::from_millis(50)).await;

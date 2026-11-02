@@ -388,6 +388,7 @@ impl SpectrogramPlot {
                 &self.db,
                 cfg.source.id(),
                 component,
+                tracking.plan.as_ref(),
                 range.clone(),
                 ELEMENT_SCAN_BUDGET,
                 cfg.len.max(1) as u64,
