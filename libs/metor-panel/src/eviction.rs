@@ -163,6 +163,7 @@ fn peers_reachable(cx: &App) -> bool {
                 .read(cx)
                 .active()
                 .iter()
+                .filter(|conn| !conn.is_refused())
                 .map(|conn| (conn.status(), conn.fetches_history())),
         )
     })

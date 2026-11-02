@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, DumpSchema, DumpSchemaResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo,
+    DbInfoResp, DumpSchema, InstanceId, DumpSchemaResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo,
     GetNodeManifest, NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, OfferNode,
     OfferNodeResp, PushNodeDone,
 };
@@ -45,6 +45,10 @@ async fn bounded<T>(
 /// transport error.
 pub struct PeerStore {
     addr: SocketAddr,
+    /// The database this store must be talking to, when the caller knows
+    /// it (see [`crate::remote::RemoteDb::expect_instance`]); any other
+    /// answer at `addr` is refused rather than fetched from or listed.
+    expected: Option<InstanceId>,
     client: Mutex<Option<Client>>,
 }
 
@@ -52,8 +56,15 @@ impl PeerStore {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
+            expected: None,
             client: Mutex::new(None),
         }
+    }
+
+    /// Refuse to talk to any database at `addr` but `id`.
+    pub fn expect_instance(mut self, id: Option<InstanceId>) -> Self {
+        self.expected = id;
+        self
     }
 
     async fn lock_connected(&self) -> Result<MutexGuard<'_, Option<Client>>, StoreError> {
@@ -71,6 +82,14 @@ impl PeerStore {
                 .await
                 .map_err(unavailable)?
                 .map_err(unavailable)?;
+            if let Some(expected) = self.expected
+                && info.instance_id != Some(expected)
+            {
+                return Err(StoreError::Unavailable(format!(
+                    "{} is no longer database {expected}",
+                    self.addr
+                )));
+            }
             if info.protocol_version > NODE_PROTOCOL_VERSION {
                 warn!(
                     peer = info.protocol_version,

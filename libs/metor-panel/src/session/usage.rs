@@ -118,7 +118,7 @@ fn peer_rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
     };
     let current = match &state.storage {
         Some(SessionStorage {
-            directory: StorageDirectory::Cached(cached),
+            directory: StorageDirectory::Cached(cached, _),
             ..
         }) => Some(cached.path().to_owned()),
         _ => None,
