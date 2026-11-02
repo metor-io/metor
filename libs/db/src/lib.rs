@@ -70,6 +70,7 @@ pub mod time_series;
 mod vtable_stream;
 
 pub mod snapshot;
+pub mod storage;
 
 pub struct DB {
     pub vtable_gen: AtomicCell<u64>,

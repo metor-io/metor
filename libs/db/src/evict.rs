@@ -2,7 +2,9 @@
 //! as something else can give them back.
 //!
 //! Readers mark what they use with [`TimeSeries::touch`]; this module purges
-//! the sealed spans no touch has reached within a grace period. Whether a
+//! the sealed spans no touch has reached within a grace period ([`sweep`]),
+//! or, under a byte budget, the least recently touched spans until the rest
+//! fits ([`budget`]). Whether a
 //! span *can* go is [`TimeSeries::purge_span`]'s call — an acked span (a
 //! store or the peer it was hydrated from holds this exact node), or a
 //! mirrored span whose peer seals cover every sample — so eviction never
@@ -24,6 +26,7 @@ use std::{
 };
 
 use metor_proto::types::{ComponentId, Timestamp};
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tracing::warn;
 
@@ -39,6 +42,34 @@ use crate::{
 /// file at all, and `purge_span` would leave a half-purged node behind.
 /// Until purges there wait for the last slice to drop, eviction is off.
 pub const SUPPORTED: bool = cfg!(unix);
+
+/// How long history may go unread before working-set eviction takes it.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+
+/// What a mirroring client does with history it holds but nobody is
+/// reading. Only data something else can give back is ever evicted, under
+/// any policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eviction {
+    /// Keep only what readers touched within `grace` ([`sweep`]). The
+    /// default: a mirror holds the live head and what is on screen.
+    WorkingSet { grace: Duration },
+    /// Keep the most recently touched history up to `max_bytes` ([`budget`]),
+    /// for a cache that is reopened day after day and is worth more than
+    /// the disk it takes.
+    Budget { max_bytes: u64 },
+    /// Keep everything that arrives.
+    Off,
+}
+
+impl Default for Eviction {
+    fn default() -> Self {
+        Self::WorkingSet {
+            grace: DEFAULT_GRACE,
+        }
+    }
+}
 
 /// What one pass purged.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -80,30 +111,23 @@ impl LastAccess {
         }
     }
 
-    fn idle_before(&self, cutoff: u64) -> bool {
-        self.0.load(Ordering::Relaxed) < cutoff
+    fn last(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
 type Victims = SmallVec<[(Timestamp, u64); 8]>;
 
-/// Append the keys (and sizes) of `series`' spans eviction would take now:
-/// resident, sealed, not locally produced, untouched since `now - grace`,
-/// and accepted by `evictable`. Whether `purge_span` agrees is only known
-/// when it runs.
-fn idle_spans(
+/// Call `found` with each span of `series` eviction may take, and its
+/// node's last access: resident, sealed, not locally produced, and accepted
+/// by `evictable`. Whether `purge_span` agrees is only known when it runs.
+fn evictable_spans(
     series: &TimeSeries,
-    now: Instant,
-    grace: Duration,
     evictable: &mut impl FnMut(&NodeSpan) -> bool,
-    out: &mut Victims,
+    mut found: impl FnMut(u64, &NodeSpan),
 ) {
-    let cutoff = LastAccess::stamp(now).saturating_sub(grace.as_micros() as u64);
     let manifest = series.manifest();
     for node in series.list.iter() {
-        if !node.last_access.idle_before(cutoff) {
-            continue;
-        }
         let Some(start) = node.timestamps().first().copied() else {
             continue;
         };
@@ -116,9 +140,31 @@ fn idle_spans(
             && span.source != SpanSource::LocalIngest
             && evictable(span)
         {
-            out.push((start, span.bytes()));
+            found(node.last_access.last(), span);
         }
     }
+}
+
+/// The access stamp below which a node has gone `grace` unread at `now`.
+fn idle_cutoff(now: Instant, grace: Duration) -> u64 {
+    LastAccess::stamp(now).saturating_sub(grace.as_micros() as u64)
+}
+
+/// Append the keys (and sizes) of `series`' evictable spans untouched since
+/// `now - grace`.
+fn idle_spans(
+    series: &TimeSeries,
+    now: Instant,
+    grace: Duration,
+    evictable: &mut impl FnMut(&NodeSpan) -> bool,
+    out: &mut Victims,
+) {
+    let cutoff = idle_cutoff(now, grace);
+    evictable_spans(series, evictable, |last, span| {
+        if last < cutoff {
+            out.push((span.cover_start, span.bytes()));
+        }
+    });
 }
 
 /// Purge `series`' spans nobody touched within `grace` of `now` that
@@ -192,6 +238,63 @@ pub fn sweep(
         }
     }
     total
+}
+
+/// Purge `db`'s least recently touched evictable spans until the evictable
+/// bytes left fit in `max_bytes`.
+///
+/// Only what [`sweep`] could take counts toward the budget or is purged, so
+/// the live head, unsealed spans and locally produced data neither count
+/// nor go. Spans touched within `grace` of `now` stay even over budget: a
+/// budget smaller than what views are reading would otherwise purge and
+/// refetch it on every pass. Sizes are a span's sealed index and data
+/// bytes, which is what its sparse node files hold on disk.
+pub fn budget(
+    db: &DB,
+    now: Instant,
+    max_bytes: u64,
+    grace: Duration,
+    mut evictable: impl FnMut(ComponentId, &NodeSpan) -> bool,
+) -> Evicted {
+    let mut evicted = Evicted::default();
+    if !SUPPORTED {
+        return evicted;
+    }
+    let components = components(db);
+    let mut candidates = Vec::new();
+    let mut total = 0u64;
+    for (index, component) in components.iter().enumerate() {
+        let id = component.component_id;
+        evictable_spans(
+            &component.time_series,
+            &mut |span| evictable(id, span),
+            |last, span| {
+                total += span.bytes();
+                candidates.push((last, index, span.cover_start, span.bytes()));
+            },
+        );
+    }
+    if total <= max_bytes {
+        return evicted;
+    }
+    let cutoff = idle_cutoff(now, grace);
+    candidates.sort_unstable_by_key(|(last, ..)| *last);
+    for (last, index, start, bytes) in candidates {
+        if total <= max_bytes || last >= cutoff {
+            break;
+        }
+        let component = &components[index];
+        match component.time_series.purge_span(start) {
+            Ok(true) => {
+                total -= bytes;
+                evicted.spans += 1;
+                evicted.bytes += bytes;
+            }
+            Ok(false) => {}
+            Err(err) => warn!(?err, id = ?component.component_id, "eviction failed"),
+        }
+    }
+    evicted
 }
 
 fn components(db: &DB) -> Vec<Component> {
@@ -405,5 +508,84 @@ mod tests {
                 .spans,
             1
         );
+    }
+
+    /// A db with one component holding `spans` hydrated spans of ten
+    /// samples each, returning the db and the component's series.
+    fn hydrated_db(dir: &std::path::Path, spans: i64) -> (DB, TimeSeries) {
+        let db = DB::create(dir.join("db")).unwrap();
+        let id = ComponentId::new("a");
+        db.with_state_mut(|state| {
+            state.insert_component(
+                id,
+                crate::ComponentSchema::new(
+                    metor_proto::types::PrimType::I64,
+                    SmallVec::<[usize; 4]>::new(),
+                ),
+                &db.path,
+            )
+        })
+        .unwrap();
+        let series = db.with_state(|state| state.get_component(id).unwrap().time_series.clone());
+        let component_dir = db.path.join(id.to_string());
+        for n in 0..spans {
+            hydrated(&series, &component_dir, n * 100..n * 100 + 10);
+        }
+        (db, series)
+    }
+
+    #[test]
+    fn budget_purges_least_recently_touched_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, series) = hydrated_db(dir.path(), 3);
+        let span = series.manifest().span(Timestamp(0)).unwrap().bytes();
+        let now = later(GRACE * 4);
+        series.touch(Timestamp(0)..Timestamp(10), now - GRACE * 3);
+        series.touch(Timestamp(200)..Timestamp(210), now - GRACE * 2);
+        // 100 was touched least recently (at creation).
+
+        let all = |_: ComponentId, _: &NodeSpan| true;
+        assert_eq!(budget(&db, now, 3 * span, GRACE, all).spans, 0, "fits");
+        let evicted = budget(&db, now, 2 * span, GRACE, all);
+        assert_eq!(
+            evicted,
+            Evicted {
+                spans: 1,
+                bytes: span
+            }
+        );
+        assert_eq!(state(&series, 100), Some(SpanState::RemoteOnly));
+        let evicted = budget(&db, now, span, GRACE, all);
+        assert_eq!(evicted.spans, 1);
+        assert_eq!(state(&series, 0), Some(SpanState::RemoteOnly));
+        assert_eq!(state(&series, 200), Some(SpanState::Resident));
+    }
+
+    #[test]
+    fn budget_keeps_what_was_just_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, series) = hydrated_db(dir.path(), 2);
+        let now = later(GRACE * 4);
+        series.touch(Timestamp(100)..Timestamp(110), now);
+        let evicted = budget(&db, now, 0, GRACE, |_, _| true);
+        assert_eq!(evicted.spans, 1, "over budget, but one span is in use");
+        assert_eq!(state(&series, 0), Some(SpanState::RemoteOnly));
+        assert_eq!(state(&series, 100), Some(SpanState::Resident));
+    }
+
+    #[test]
+    fn budget_respects_the_predicate_and_counts_only_evictable_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, series) = hydrated_db(dir.path(), 2);
+        let span = series.manifest().span(Timestamp(0)).unwrap().bytes();
+        let now = later(GRACE * 4);
+        // The span at 0 is exempt, so only the other counts: it fits.
+        let not_first = |_: ComponentId, span: &NodeSpan| span.cover_start != Timestamp(0);
+        assert_eq!(budget(&db, now, span, GRACE, not_first).spans, 0);
+        assert_eq!(budget(&db, now, 0, GRACE, not_first).spans, 1);
+        assert_eq!(state(&series, 0), Some(SpanState::Resident));
+        assert_eq!(state(&series, 100), Some(SpanState::RemoteOnly));
+        assert_eq!(budget(&db, now, 0, GRACE, |_, _| false).spans, 0);
+        assert_eq!(state(&series, 0), Some(SpanState::Resident));
     }
 }
