@@ -195,7 +195,7 @@ async fn ingest(
     tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
     db: &Arc<DB>,
 ) -> Error {
-    let mut conn = ConnState::downlink();
+    let mut conn = ConnState::mirror();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
     loop {
@@ -291,6 +291,56 @@ mod tests {
         RemoteDb::new(addr).on_event(sink).spawn(mirror_db);
         wait_for(&log, MirrorEvent::Connected).await;
         assert_eq!(log.lock().unwrap().first(), Some(&MirrorEvent::Connecting));
+    }
+
+    /// What the mirror's live ingest writes is mirrored data, while the
+    /// peer's own ingest of the same component stays local.
+    #[stellarator::test]
+    async fn mirrored_components_ingest_as_mirrored() {
+        use crate::manifest::SpanSource;
+        use metor_proto::types::PrimType;
+        use metor_proto::vtable::builder::{
+            component, raw_field, raw_table, schema, timestamp, vtable,
+        };
+
+        const ID: metor_proto::types::PacketId = [9, 2];
+        let dir = tempfile::tempdir().unwrap();
+        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
+        server_db
+            .insert_vtable(metor_proto_wkt::VTableMsg {
+                id: ID,
+                vtable: vtable([raw_field(
+                    8,
+                    8,
+                    timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
+                )]),
+            })
+            .unwrap();
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::Server {
+            listener,
+            db: server_db.clone(),
+        };
+        stellarator::struc_con::stellar(move || server.run());
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        RemoteDb::new(addr).spawn(mirror_db.clone());
+
+        let id = ComponentId::new("a");
+        let source = |db: &crate::DB| {
+            db.with_state(|s| s.get_component(id).map(|c| c.time_series.ingest_source()))
+        };
+        for ts in 1i64.. {
+            let mut table = ts.to_le_bytes().to_vec();
+            table.extend_from_slice(&1.5f64.to_le_bytes());
+            server_db.ingest_table(ID, &table).unwrap();
+            if source(&mirror_db) == Some(SpanSource::Mirrored) {
+                break;
+            }
+            assert!(ts < 100, "mirror never ingested the live stream");
+            stellarator::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(source(&server_db), Some(SpanSource::LocalIngest));
     }
 }
 

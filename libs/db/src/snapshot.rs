@@ -74,7 +74,7 @@ impl DB {
                         .filter(|span| span.state != SpanState::Resident)
                         .map(|span| HistoryGap {
                             component: id.0,
-                            start: span.seal.start_ts.0,
+                            start: span.cover_start.0,
                             end: span.cover_end.0,
                         })
                         .collect::<Vec<_>>()
@@ -143,7 +143,7 @@ impl DB {
                     .filter(|s| s.state != SpanState::Resident)
                     .map(|s| HistoryGap {
                         component: id.0,
-                        start: s.seal.start_ts.0,
+                        start: s.cover_start.0,
                         end: s.cover_end.0,
                     }),
             );

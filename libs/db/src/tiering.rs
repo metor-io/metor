@@ -87,7 +87,9 @@ struct Victim {
     end_ts: Timestamp,
     bytes: u64,
     acked: bool,
-    /// Hydrated from a store — purging is free, no upload needed.
+    /// Hydrated from a store, or mirrored from a peer that is its
+    /// authority — purging needs no upload (`purge_span` still refuses a
+    /// mirrored span the peer's seals do not cover).
     cache_copy: bool,
     /// Set once the age pass purges this span, so the budget pass skips it
     /// without a second survivor buffer.
@@ -222,7 +224,7 @@ fn collect_victims(
                 end_ts: span.seal.end_ts,
                 bytes: span.bytes(),
                 acked: span.acked,
-                cache_copy: span.source == SpanSource::RemoteFetch,
+                cache_copy: matches!(span.source, SpanSource::RemoteFetch | SpanSource::Mirrored),
                 evicted: false,
             });
         }
@@ -258,7 +260,7 @@ async fn evict(
     victim: &Victim,
     store: Option<&dyn NodeStore>,
 ) -> Result<bool, Error> {
-    if !victim.acked {
+    if !victim.acked && !victim.cache_copy {
         let Some(store) = store else {
             warn!(
                 component_id = victim.component_id.0,

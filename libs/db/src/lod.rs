@@ -209,9 +209,9 @@ async fn downsample_source(db: Arc<DB>, src: Component) {
 /// until at least two samples are sealed.
 fn estimate_period_us(series: &TimeSeries) -> Option<i64> {
     let manifest = series.manifest();
-    let first = manifest.spans.first()?.seal.start_ts.0;
-    let last = manifest.spans.last()?.seal.end_ts.0;
-    let count: u64 = manifest.spans.iter().map(|s| s.seal.count).sum();
+    let first = manifest.spans.first()?.cover_start.0;
+    let last = manifest.spans.last()?.cover_end.0;
+    let count = manifest.count_in(&(Timestamp(first)..Timestamp(last.saturating_add(1))));
     if count < 2 || last <= first {
         return None;
     }
@@ -358,7 +358,7 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
                 .manifest()
                 .spans
                 .first()
-                .map(|s| s.seal.start_ts.0.div_euclid(bucket_us) * bucket_us)
+                .map(|s| s.cover_start.0.div_euclid(bucket_us) * bucket_us)
                 .unwrap_or(0),
         };
         levels.push(Level::new(
@@ -505,7 +505,7 @@ impl Level {
                 .spans
                 .iter()
                 .filter(|s| s.state != SpanState::Resident)
-                .map(|s| (s.seal.start_ts.0, s.cover_end.0))
+                .map(|s| (s.cover_start.0, s.cover_end.0))
                 .filter(|(start, end)| *start < to && *end >= from),
         );
 
@@ -589,7 +589,7 @@ impl Level {
         let Some(first) = manifest.spans.first() else {
             return Ok(false);
         };
-        let floor = first.seal.start_ts.0.div_euclid(d) * d;
+        let floor = first.cover_start.0.div_euclid(d) * d;
         if self.series.list.head().is_none() {
             // Nothing to splice behind, and an install could not outrank a
             // writer's empty head anyway; the forward pass starts from the

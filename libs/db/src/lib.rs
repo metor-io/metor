@@ -367,10 +367,25 @@ impl DB {
     /// A new component, or a first sample into an empty series, bumps
     /// `vtable_gen` so subscribers re-derive membership.
     pub fn ingest_table(&self, id: PacketId, buf: &[u8]) -> Result<(), Error> {
-        let received = Timestamp::now();
-        let pushed = match self.ingest_static(id, buf, received)? {
+        self.ingest_table_from(id, buf, None)
+    }
+
+    /// [`Self::ingest_table`] for a table a mirror receives during `mirror`,
+    /// which marks every component it writes as mirrored (see
+    /// [`time_series::MirrorRun`]).
+    pub fn ingest_table_from(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        mirror: Option<time_series::MirrorRun>,
+    ) -> Result<(), Error> {
+        let arrival = Arrival {
+            received: Timestamp::now(),
+            mirror,
+        };
+        let pushed = match self.ingest_static(id, buf, arrival)? {
             StaticIngest::Pushed(pushed) => pushed,
-            StaticIngest::Dynamic => self.ingest_dynamic(id, buf, received)?,
+            StaticIngest::Dynamic => self.ingest_dynamic(id, buf, arrival)?,
         };
         if pushed.new_series {
             self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
@@ -387,7 +402,7 @@ impl DB {
         &self,
         id: PacketId,
         buf: &[u8],
-        received: Timestamp,
+        arrival: Arrival,
     ) -> Result<StaticIngest, Error> {
         self.with_state(|state| {
             let vtable = state
@@ -402,7 +417,7 @@ impl DB {
                 let component = state
                     .get_component(rf.component_id)
                     .ok_or(Error::ComponentNotFound(rf.component_id))?;
-                pushed.merge(push_field(component, &rf, received)?);
+                pushed.merge(push_field(component, &rf, arrival)?);
                 Ok(())
             })?;
             Ok(StaticIngest::Pushed(pushed))
@@ -410,16 +425,11 @@ impl DB {
     }
 
     /// Sinks a dynamic table, taking the write lock only when a member is new.
-    fn ingest_dynamic(
-        &self,
-        id: PacketId,
-        buf: &[u8],
-        received: Timestamp,
-    ) -> Result<Pushed, Error> {
-        let pushed = match self.with_state(|state| state.push_known_fields(id, buf, received))? {
+    fn ingest_dynamic(&self, id: PacketId, buf: &[u8], arrival: Arrival) -> Result<Pushed, Error> {
+        let pushed = match self.with_state(|state| state.push_known_fields(id, buf, arrival))? {
             Some(pushed) => pushed,
             None => {
-                self.with_state_mut(|state| state.realize_and_push(id, buf, received, &self.path))?
+                self.with_state_mut(|state| state.realize_and_push(id, buf, arrival, &self.path))?
             }
         };
         self.with_state(|state| state.cache_latest_table(id, buf));
@@ -702,7 +712,7 @@ impl State {
         &self,
         id: PacketId,
         buf: &[u8],
-        received: Timestamp,
+        arrival: Arrival,
     ) -> Result<Option<Pushed>, Error> {
         let vtable = self.dynamic_vtable(id)?;
         let known = vtable.for_each_field::<Error>(Some(buf), &mut |rf| match self
@@ -721,7 +731,7 @@ impl State {
             let component = self
                 .get_component(rf.component_id)
                 .ok_or(Error::ComponentNotFound(rf.component_id))?;
-            pushed.merge(push_field(component, &rf, received)?);
+            pushed.merge(push_field(component, &rf, arrival)?);
             Ok(())
         })?;
         Ok(Some(pushed))
@@ -732,7 +742,7 @@ impl State {
         &mut self,
         id: PacketId,
         buf: &[u8],
-        received: Timestamp,
+        arrival: Arrival,
         db_path: &Path,
     ) -> Result<Pushed, Error> {
         // Cloned out so realizing a member can take `&mut self`.
@@ -740,7 +750,7 @@ impl State {
         let mut pushed = Pushed::default();
         vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
             let component = self.realize_component(&rf, db_path)?;
-            pushed.merge(push_field(component, &rf, received)?);
+            pushed.merge(push_field(component, &rf, arrival)?);
             Ok(())
         })?;
         Ok(pushed)
@@ -1034,16 +1044,36 @@ impl Pushed {
     }
 }
 
-/// Pushes one realized field into `component`, stamped `received` when its
-/// vtable names no timestamp.
+/// How a table reached this db: when, and whether through a mirror.
+#[derive(Clone, Copy)]
+struct Arrival {
+    received: Timestamp,
+    mirror: Option<time_series::MirrorRun>,
+}
+
+impl Arrival {
+    #[cfg(test)]
+    fn local(received: Timestamp) -> Self {
+        Self {
+            received,
+            mirror: None,
+        }
+    }
+}
+
+/// Pushes one realized field into `component`, stamped with its arrival
+/// when its vtable names no timestamp.
 fn push_field(
     component: &Component,
     rf: &RealizedField,
-    received: Timestamp,
+    arrival: Arrival,
 ) -> Result<Pushed, Error> {
     // PANIC Safety: the callers walk a table, so every field realizes a view.
     let view = rf.view.as_ref().expect("table provided to for_each_field");
-    let ts = rf.timestamp.unwrap_or(received);
+    let ts = rf.timestamp.unwrap_or(arrival.received);
+    if let Some(run) = arrival.mirror {
+        component.time_series.enter_mirror_run(run);
+    }
     let new_series = component.time_series.is_empty();
     component.push_buf(ts, view.as_bytes())?;
     Ok(Pushed {
@@ -1338,6 +1368,9 @@ struct ConnState {
     /// command lands on sends the same table back down, and logging that
     /// echo as a command would forward it up again, round and round.
     downlink: bool,
+    /// Set on a db mirror's connection: the peer is the authority for
+    /// everything it streams, so the components it writes are mirrored.
+    mirror: Option<time_series::MirrorRun>,
 }
 
 impl ConnState {
@@ -1346,6 +1379,15 @@ impl ConnState {
         Self {
             downlink: true,
             ..Self::default()
+        }
+    }
+
+    /// The state for a db mirror's connection, a downlink whose peer can
+    /// serve back everything it streams.
+    pub(crate) fn mirror() -> Self {
+        Self {
+            mirror: Some(time_series::MirrorRun::next()),
+            ..Self::downlink()
         }
     }
 }
@@ -1815,7 +1857,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let command = !conn.downlink && db.with_state(|s| s.frame_command(table.id).is_some());
             match command {
                 true => db.push_msg(Timestamp::now(), table.id, buf)?,
-                false => db.ingest_table(table.id, buf)?,
+                false => db.ingest_table_from(table.id, buf, conn.mirror)?,
             }
         }
 
@@ -3128,7 +3170,7 @@ mod dynamic_ingest_tests {
             .unwrap();
         let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
         let pushed = db
-            .with_state(|s| s.push_known_fields(id, &t2, Timestamp(0)))
+            .with_state(|s| s.push_known_fields(id, &t2, Arrival::local(Timestamp(0))))
             .unwrap();
         assert!(pushed.is_some());
         let t3 = map_table(3000, &[("htop", 5, 0.5), ("init", 6, 0.25)]);
@@ -3152,7 +3194,7 @@ mod dynamic_ingest_tests {
 
         let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
         let pushed = db
-            .with_state(|s| s.push_known_fields(id, &t2, Timestamp(0)))
+            .with_state(|s| s.push_known_fields(id, &t2, Arrival::local(Timestamp(0))))
             .unwrap();
         assert!(pushed.is_none());
         let gen_before = db.vtable_gen.latest();

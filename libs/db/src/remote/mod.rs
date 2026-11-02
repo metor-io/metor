@@ -179,7 +179,7 @@ mod tests {
     use super::*;
     use crate::{
         manifest::{SpanSource, SpanState},
-        seal::SealRecord,
+        seal::{SealRecord, SealRecordExt},
         store::{LocalDirStore, NodeKey, NodeStore},
         time_series::{TimeSeries, TimeSeriesNode},
     };
@@ -352,5 +352,185 @@ mod tests {
             .filter_map(|n| n.timestamps().first().map(|t| t.0))
             .collect();
         assert_eq!(starts, vec![30, 20, 10]);
+    }
+
+    /// A peer node holding a sample every 10 µs over `stamps`, put in
+    /// `store`.
+    async fn peer_node(
+        dir: &Path,
+        store: &LocalDirStore,
+        stamps: std::ops::RangeInclusive<i64>,
+    ) -> SealRecord {
+        let start = *stamps.start();
+        let node =
+            TimeSeriesNode::create(dir.join(start.to_string()), Timestamp(start), 8).unwrap();
+        for ts in stamps.step_by(10) {
+            node.data.write(&(ts as u64).to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
+        }
+        let seal = SealRecord::compute(&node).unwrap();
+        let schema = schema();
+        store
+            .put(
+                key(&schema, &seal),
+                crate::store::SealedNode::from_node(&node, seal).unwrap(),
+            )
+            .await
+            .unwrap();
+        seal
+    }
+
+    async fn hydrate(series: &TimeSeries, store: &LocalDirStore, cover_start: i64) -> bool {
+        hydrate_span(
+            series,
+            store,
+            COMPONENT,
+            "round.trip",
+            &component_schema(),
+            Timestamp(cover_start),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn gaps(series: &TimeSeries, range: std::ops::Range<i64>) -> Vec<(std::ops::Range<i64>, i64)> {
+        let mut gaps = crate::manifest::GapVec::new();
+        series.coverage(Timestamp(range.start)..Timestamp(range.end), &mut gaps);
+        gaps.iter()
+            .map(|g| (g.range.start.0..g.range.end.0, g.start_ts.0))
+            .collect()
+    }
+
+    /// The mirror saw the live stream up to 1200, lost its connection, and
+    /// came back at 1300; meanwhile the peer sealed a node over
+    /// 1130..=1230. Its tail is the only copy of what the mirror missed.
+    #[stellarator::test]
+    async fn reconnect_gap_hydrates_only_the_missed_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path().join("component")).unwrap();
+        let store = LocalDirStore::new(dir.path().join("store"));
+        let peer_dir = dir.path().join("peer");
+
+        let mut writer = series.writer().unwrap();
+        series.enter_mirror_run(crate::time_series::MirrorRun::next());
+        for ts in (1000..=1200).step_by(10) {
+            writer
+                .push_buf(Timestamp(ts), &(ts as u64).to_le_bytes())
+                .unwrap();
+        }
+        series.enter_mirror_run(crate::time_series::MirrorRun::next());
+        for ts in (1300..=1400).step_by(10) {
+            writer
+                .push_buf(Timestamp(ts), &(ts as u64).to_le_bytes())
+                .unwrap();
+        }
+        series.seal_rolled_nodes().unwrap();
+        assert_eq!(
+            series.manifest().span(Timestamp(1000)).unwrap().source,
+            SpanSource::Mirrored
+        );
+
+        let peer = peer_node(&peer_dir, &store, 1130..=1230).await;
+        assert_eq!(series.merge_remote_spans([peer]).unwrap(), 1);
+        assert_eq!(gaps(&series, 900..1500), [(1201..1231, 1201)]);
+        let span = *series.manifest().span(Timestamp(1201)).unwrap();
+        assert_eq!(span.state, SpanState::RemoteOnly);
+        assert_eq!(span.seal, peer);
+
+        assert!(hydrate(&series, &store, 1201).await);
+        assert!(gaps(&series, 900..1500).is_empty());
+        let manifest = series.manifest();
+        let piece = manifest.span(Timestamp(1210)).unwrap();
+        assert_eq!(piece.state, SpanState::Resident);
+        assert_eq!(piece.source, SpanSource::Mirrored);
+        assert_eq!((piece.seal.start_ts.0, piece.seal.end_ts.0), (1210, 1230));
+        assert_eq!(&*manifest.shadowed, &[peer]);
+        // Exactly the missed samples landed, between the two runs.
+        let stamps: Vec<i64> = series
+            .get_range(Timestamp(1150)..Timestamp(1310))
+            .unwrap()
+            .as_iter()
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .flat_map(|n| n.timestamps().iter().map(|t| t.0).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            stamps,
+            [
+                1150, 1160, 1170, 1180, 1190, 1200, 1210, 1220, 1230, 1300, 1310
+            ]
+        );
+        assert_eq!(
+            series.get(Timestamp(1220)).unwrap().data(),
+            1220u64.to_le_bytes()
+        );
+    }
+
+    /// A peer seal entirely under mirrored data is kept, and dropping the
+    /// mirrored node makes its range fetchable again.
+    #[stellarator::test]
+    async fn shadowed_seal_becomes_fetchable_after_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path().join("component")).unwrap();
+        let store = LocalDirStore::new(dir.path().join("store"));
+        let peer_dir = dir.path().join("peer");
+
+        let mut writer = series.writer().unwrap();
+        series.enter_mirror_run(crate::time_series::MirrorRun::next());
+        for ts in (1000..=1200).step_by(10) {
+            writer
+                .push_buf(Timestamp(ts), &(ts as u64).to_le_bytes())
+                .unwrap();
+        }
+        series.enter_mirror_run(crate::time_series::MirrorRun::next());
+        writer
+            .push_buf(Timestamp(1300), &1300u64.to_le_bytes())
+            .unwrap();
+        series.seal_rolled_nodes().unwrap();
+
+        let early = peer_node(&peer_dir, &store, 1000..=1120).await;
+        assert_eq!(series.merge_remote_spans([early]).unwrap(), 1);
+        assert_eq!(&*series.manifest().shadowed, &[early]);
+        assert!(gaps(&series, 900..1500).is_empty());
+
+        // Samples 1130..=1200 have no peer seal behind them yet.
+        assert!(!series.purge_span(Timestamp(1000)).unwrap());
+
+        let late = peer_node(&peer_dir, &store, 1130..=1230).await;
+        series.merge_remote_spans([late]).unwrap();
+        assert!(hydrate(&series, &store, 1201).await);
+
+        // Now every mirrored sample is held by a peer seal.
+        assert!(series.purge_span(Timestamp(1000)).unwrap());
+        assert!(series.get(Timestamp(1100)).is_none());
+        let manifest = series.manifest();
+        assert!(manifest.shadowed.is_empty());
+        assert_eq!(
+            gaps(&series, 900..1500),
+            [(1000..1121, 1000), (1130..1210, 1130)]
+        );
+        let early_span = manifest.span(Timestamp(1000)).unwrap();
+        assert!(early_span.is_whole());
+        assert_eq!(early_span.seal, early);
+
+        assert!(hydrate(&series, &store, 1000).await);
+        assert!(hydrate(&series, &store, 1130).await);
+        assert!(gaps(&series, 900..1500).is_empty());
+        let manifest = series.manifest();
+        assert_eq!(
+            manifest.span(Timestamp(1000)).unwrap().source,
+            SpanSource::RemoteFetch
+        );
+        assert_eq!(
+            manifest.span(Timestamp(1130)).unwrap().source,
+            SpanSource::Mirrored
+        );
+        for ts in [1050, 1150, 1200, 1220] {
+            assert_eq!(
+                series.get(Timestamp(ts)).unwrap().data(),
+                (ts as u64).to_le_bytes()
+            );
+        }
     }
 }
