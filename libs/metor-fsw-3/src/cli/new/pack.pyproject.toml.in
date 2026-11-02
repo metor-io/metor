@@ -1,0 +1,26 @@
+# The pack as a Python distribution. `metor run` builds it and writes its
+# typed module to `.metor/{{module}}/`; `uv sync` does the same through
+# metor-build.
+
+[project]
+name = "{{dist}}"
+version = "0.1.0"
+description = "The {{id}} pack"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "{{id}}"
+
+[tool.uv.sources]
+metor-build = { {{metor_build}} }
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+]

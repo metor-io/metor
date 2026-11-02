@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use metor_fsw_3::cli::cargo::{cargo_build, wasm_build};
+use metor_fsw_3::cli::cargo::{Watch, cargo_build, wasm_build};
 use metor_fsw_3::coordinator::{
     Coordinator, CoordinatorConfig, EndReason, SystemConfig, SystemTable,
 };
@@ -195,7 +195,7 @@ pub fn fixture_lib() -> &'static Path {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT.get_or_init(|| {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        cargo_build("echo-pack", root).expect("the fixture builds")
+        cargo_build("echo-pack", root, &mut Watch::quiet()).expect("the fixture builds")
     })
 }
 
@@ -205,7 +205,7 @@ pub fn fixture_wasm() -> &'static [u8] {
     static BUILT: OnceLock<Vec<u8>> = OnceLock::new();
     BUILT.get_or_init(|| {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = wasm_build("echo-pack", root).expect("the module builds");
+        let path = wasm_build("echo-pack", root, &mut Watch::quiet()).expect("the module builds");
         std::fs::read(&path).expect("the module was written")
     })
 }

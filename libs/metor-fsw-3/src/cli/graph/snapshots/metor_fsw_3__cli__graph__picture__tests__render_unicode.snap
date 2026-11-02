@@ -1,0 +1,23 @@
+---
+source: libs/metor-fsw-3/src/cli/graph/picture.rs
+expression: "rendered(&fixture(), &unicode(), Detail::Ports)"
+---
+         ╭─────────────────────╮
+         │ cmds  fsw.subscribe │  ⇄ ground.cmd
+  ╭──────┤ ping ▸              │
+  │      ╰─────────────────────╯
+  │      ╭─────────────────────╮
+  │      │ gain  echo.Gain     │
+  │ ╭───▶┤ input               │
+  │ ├────┤ output ▸            │
+  │ │    ╰─────────────────────╯
+  │ │    ╭─────────────────────╮
+  │ │    │ echo  echo.Echo     │
+  ╰─┼───▶┤ input               │
+    │ ╭──┤ output ▸            │
+    │ │  ╰─────────────────────╯
+    │ │  ╭─────────────────────╮
+    │ │  │ pub   fsw.publish   │
+    │ ╰─▶┤ echo                │
+    ╰───▶┤ gain                │
+         ╰─────────────────────╯

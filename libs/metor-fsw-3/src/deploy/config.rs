@@ -17,16 +17,23 @@ use super::DeployError;
 pub const CONFIG_VERSION: u32 = 2;
 
 /// An error reading a config file or picking a target from it.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
     #[error("the config is version {found}, this host reads {expected}")]
+    #[diagnostic(
+        code(M0204),
+        help("install the metor-config that ships with this metor")
+    )]
     Version { found: u32, expected: u32 },
     #[error("the config did not decode: {0}")]
+    #[diagnostic(code(M0205))]
     Decode(#[from] serde_json::Error),
     #[error("the deployment has several targets; pick one with --target: {0}")]
+    #[diagnostic(code(M0103))]
     SelectTarget(String),
-    #[error("no target is named `{0}`")]
-    NoSuchTarget(String),
+    #[error("no target is named `{name}`")]
+    #[diagnostic(code(M0102), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_TARGETS)))]
+    NoSuchTarget { name: String, known: Vec<String> },
 }
 
 /// A port on a link of another target in the same deployment.
@@ -182,7 +189,10 @@ impl<S, R> DeploymentConfig<S, R> {
                 .targets
                 .iter()
                 .position(|target| target.namespace() == name)
-                .ok_or_else(|| ConfigError::NoSuchTarget(name.to_string())),
+                .ok_or_else(|| ConfigError::NoSuchTarget {
+                    name: name.to_string(),
+                    known: self.namespaces().into_iter().map(String::from).collect(),
+                }),
             None if self.targets.len() == 1 => Ok(0),
             None => Err(ConfigError::SelectTarget(self.namespaces().join(", "))),
         }
@@ -299,7 +309,7 @@ mod tests {
         let config = envelope(vec![member("a"), member("b")]);
         assert_eq!(config.target(Some("b")).expect("named"), 1);
         assert!(
-            matches!(config.target(Some("c")), Err(ConfigError::NoSuchTarget(name)) if name == "c")
+            matches!(config.target(Some("c")), Err(ConfigError::NoSuchTarget { name, .. }) if name == "c")
         );
         let Err(ConfigError::SelectTarget(names)) = config.target(None) else {
             panic!("two targets need a name")

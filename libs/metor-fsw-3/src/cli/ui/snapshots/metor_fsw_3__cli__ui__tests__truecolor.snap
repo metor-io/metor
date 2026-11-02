@@ -1,0 +1,11 @@
+---
+source: libs/metor-fsw-3/src/cli/ui/tests.rs
+expression: human(caps)
+---
+  [38;2;127;216;143m✓[0m Built       adcs_pack                 [38;2;138;143;152m  2.1s[0m
+  [38;2;127;216;143m✓[0m Evaluated   target.py
+  [38;2;180;142;255m●[0m Running     [1m[38;2;86;180;233mplant[0m  [1m[38;2;230;159;0mfsw[0m
+[31mM0101[0m
+
+  [31m×[0m no target `fws`
+[36m  help: [0mdid you mean `fsw`?

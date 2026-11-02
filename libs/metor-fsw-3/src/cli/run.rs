@@ -7,19 +7,29 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 use core::time::Duration;
-use std::collections::BTreeMap;
 use std::env::JoinPathsError;
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
+use std::io::{self as stdio, StdoutLock, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::sync::Arc;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use serde::Deserialize;
+use metor_proto_wkt::LogLevel;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::cargo::read_toml;
+use super::console::{self, ConsoleLayer, Origin, Route, Settings, Tap};
 use super::pack_dev::{PackDevError, pack_dev};
+use super::relay::Relay;
+use super::show::{plural, target_name};
+use super::ui::Ui;
+use super::ui::event::{Event, Phase, PhaseState, Summary, TargetSummary, Verb};
+use super::ui::theme::Theme;
+use super::units;
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
 };
@@ -33,27 +43,38 @@ use crate::dl::{Pack, PackError, PackRef};
 /// when it exists.
 const IN_REPO_CONFIG_PY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/python/metor-config");
 
+/// The file `metor` looks for when it is not given one.
+const TARGET_FILE: &str = "target.py";
+
 /// The arguments to `metor run`.
 #[derive(clap::Args, Debug, Default)]
 pub struct Run {
-    /// The target file to evaluate. Defaults to `./target.py`.
+    /// The target file to evaluate. Defaults to the nearest `target.py` in
+    /// this directory or one above it.
+    #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
     /// The namespace of the target to run. Without it, a deployment with
     /// several targets runs all of them.
-    #[arg(long = "target", value_name = "NS")]
+    #[arg(long = "target", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
     pub member: Option<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
     pub cycles: Option<u64>,
-    /// Pace the loop at this wall rate in Hz, overriding the target's clock.
-    #[arg(long, conflicts_with = "sim_dt", value_parser = wall_rate)]
+    /// Stop after this much clock time, such as `30s`, instead of on SIGINT.
+    #[arg(long = "for", value_name = "TIME", conflicts_with = "cycles", value_parser = units::nonzero_duration)]
+    pub run_for: Option<Duration>,
+    /// Pace the loop at this wall rate, such as `100hz`, overriding the
+    /// target's clock.
+    #[arg(long, value_name = "RATE", conflicts_with = "sim_dt", value_parser = units::rate)]
     pub wall: Option<WallRate>,
-    /// Step a simulated clock by this many seconds per cycle.
-    #[arg(long, value_parser = sim_dt)]
+    /// Step a simulated clock by this much per cycle, such as `10ms`. A bare
+    /// number is seconds.
+    #[arg(long, value_name = "TIME", value_parser = units::nonzero_duration)]
     pub sim_dt: Option<Duration>,
-    /// Start the simulated clock at this time, in microseconds since the Unix
+    /// Start the simulated clock at this UTC time, such as
+    /// `2026-10-29T00:00Z`. A bare number is microseconds since the Unix
     /// epoch.
-    #[arg(long)]
+    #[arg(long, value_name = "TIME", value_parser = units::epoch)]
     pub epoch: Option<i64>,
     /// Turn every thread group on the coordinator thread, so a sim run gives
     /// the same results every time. Needs a simulated clock with an epoch.
@@ -62,113 +83,306 @@ pub struct Run {
 }
 
 /// An error running a target.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum RunError {
+    #[error("no target file at {}", .0.display())]
+    #[diagnostic(
+        code(M0206),
+        help("check the path; without one, metor finds the nearest target.py")
+    )]
+    NoTargetFile(PathBuf),
+    #[error("no target.py in {} or a directory above it", .0.display())]
+    #[diagnostic(
+        code(M0209),
+        help("pass the target file, or run from a project directory")
+    )]
+    NoProject(PathBuf),
+    #[error("these checks failed: {0}")]
+    #[diagnostic(code(M0105), help("each fix is listed under its check"))]
+    Doctor(String),
+    #[error("nothing in the deployment is named `{name}`")]
+    #[diagnostic(code(M0104), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_NAMES)))]
+    NoSuchName { name: String, known: Vec<String> },
+    #[error("`{name}` cannot name a project: {why}")]
+    #[diagnostic(
+        code(M0107),
+        help("use lowercase letters, digits, and `-`, as in `my-sat`")
+    )]
+    BadName { name: String, why: &'static str },
+    #[error("{} already exists", .0.display())]
+    #[diagnostic(code(M0108), help("pick a new directory"))]
+    Exists(PathBuf),
     #[error("running the target file: {0}")]
-    Spawn(#[from] std::io::Error),
-    #[error("the target file exited with {0}")]
-    Python(ExitStatus),
+    #[diagnostic(code(M0203), help("set $METOR_PYTHON or activate a virtualenv"))]
+    Spawn(std::io::Error),
+    #[error("the target file made no deployment")]
+    #[diagnostic(
+        code(M0207),
+        help("create a `Target` or a `Deployment` in the target file")
+    )]
+    NoDeployment,
+    #[error("{}: {source}", path.display())]
+    #[diagnostic(code(M0208))]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("the target file exited with {status}")]
+    #[diagnostic(code(M0201), help("the traceback above shows where"))]
+    Python {
+        status: ExitStatus,
+        /// What the target file printed, for the caller to show.
+        output: Vec<u8>,
+    },
     #[error("building PYTHONPATH: {0}")]
+    #[diagnostic(code(M0202))]
     PythonPath(#[from] JoinPathsError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     PackDev(#[from] PackDevError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Pack(#[from] PackError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Build(#[from] BuildError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Deploy(#[from] DeployError),
     #[error("--epoch sets a simulated clock's start; pass --sim-dt or use a simulated target")]
+    #[diagnostic(code(M0101), help("pass --sim-dt, or run a simulated target"))]
     EpochWall,
     #[error("these systems latched off: {0}")]
+    #[diagnostic(
+        code(M0501),
+        help("a latched system stops for the rest of the run; its last log lines say why")
+    )]
     Latched(String),
     #[error("these targets did not exit cleanly: {0}")]
+    #[diagnostic(code(M0502), help("each target's own error is above"))]
     Children(String),
     #[error("interrupted")]
+    #[diagnostic(code(M0503))]
     Interrupted,
 }
 
-/// Parses `--sim-dt` seconds into a [`Duration`].
-fn sim_dt(arg: &str) -> Result<Duration, String> {
-    let secs: f64 = arg.parse().map_err(|e| format!("{e}"))?;
-    Duration::try_from_secs_f64(secs).map_err(|e| e.to_string())
+/// Returns a closure that turns an IO error into an `Io` error for `path`.
+pub(super) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
+    |source| RunError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
-/// Parses `--wall` into a [`WallRate`].
-fn wall_rate(arg: &str) -> Result<WallRate, String> {
-    let rate: f64 = arg.parse().map_err(|e| format!("{e}"))?;
-    WallRate::try_from(rate).map_err(|e| e.to_string())
+/// Writes to stdout with the theme and width it can show.
+pub(super) fn print(
+    ui: &Ui,
+    write: impl FnOnce(&mut StdoutLock<'static>, &Theme, Option<usize>) -> stdio::Result<()>,
+) -> Result<(), RunError> {
+    let theme = Theme::new(&ui.stdout_caps());
+    let mut out = stdio::stdout().lock();
+    write(&mut out, &theme, ui.stdout_width())
+        .and_then(|()| out.flush())
+        .map_err(io(Path::new("stdout")))
 }
 
 /// Runs `metor run`.
 ///
 /// Rebuilds every dev pack, evaluates the target file, and cycles the target
-/// until it is stopped.
-pub fn run(args: Run) -> Result<(), RunError> {
-    install_logging();
-    let config = prepare(args.target.as_deref())?;
-    if config.targets.len() > 1 && args.member.is_none() {
-        return run_children(&config, &args);
+/// until it is stopped. A child of a multi-target run catches SIGINT from
+/// the start, so a stop during its build still reports.
+pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
+    if super::children::is_child() {
+        watch_sigint();
+    }
+    let route = Arc::new(Mutex::new(Route::default()));
+    install_logging(ConsoleLayer {
+        ui: ui.clone(),
+        route: route.clone(),
+    });
+    let config = prepare(args.target.as_deref(), ui)?;
+    let namespaces = config.namespaces();
+    if namespaces.len() > 1 && args.member.is_none() {
+        ui.emit(Event::Running(&namespaces));
+        return run_children(&config, &args, ui);
     }
     let member = config.target(args.member.as_deref())?;
-    let coordinator = load(&config.targets[member], &args)?;
+    let latched = run_member(&config, member, &args, &route, ui)?;
+    if !latched.is_empty() {
+        return Err(RunError::Latched(latched.join(", ")));
+    }
+    if interrupted() && !super::children::is_child() {
+        return Err(RunError::Interrupted);
+    }
+    Ok(())
+}
+
+/// Runs the `member`th target of `config` in this process until it stops,
+/// then shows the summary. Returns the systems that latched off.
+fn run_member(
+    config: &ResolvedDeployment,
+    member: usize,
+    args: &Run,
+    route: &Mutex<Route>,
+    ui: &Ui,
+) -> Result<Vec<String>, RunError> {
+    let namespaces = config.namespaces();
+    let target = (namespaces.len() > 1).then(|| (namespaces[member].to_string(), member));
+    lock(route).target = target.clone();
+    let (tx, rx) = console::channel();
+    let tap = Tap {
+        tx: tx.clone(),
+        stats: Arc::default(),
+    };
+    let stats = tap.stats.clone();
+    let (coordinator, systems) = load(&config.targets[member], args, Some(tap))?;
+    let name = target_name(&config.targets[member]).to_string();
+    ui.emit(Event::SourceWidth(source_width(config)));
+    ui.emit(Event::Running(&[&name]));
+    let origin = Origin {
+        target,
+        console: console::console_id(&systems),
+        systems,
+    };
+    let started = Instant::now();
+    let limit = cycle_limit(&config.targets[member], args)?;
+    let (latched, cycles) = cycle(coordinator, limit, origin, rx, tx, route, ui);
+    let target = TargetSummary {
+        name,
+        cycles,
+        max_cycle: stats.max_cycle(),
+        overruns: stats.overruns(),
+    };
+    end(ui, started, vec![target]);
+    Ok(latched)
+}
+
+/// Shows the summary of a run that started at `started`.
+fn end(ui: &Ui, started: Instant, targets: Vec<TargetSummary>) {
+    ui.emit(Event::Ended(&Summary {
+        took: started.elapsed(),
+        interrupted: interrupted(),
+        targets,
+    }));
+}
+
+/// Cycles `coordinator` until it stops, with its console printing through
+/// `ui`. Returns the path of every system that latched off, and the cycles
+/// run.
+fn cycle(
+    coordinator: Coordinator,
+    limit: Option<u64>,
+    origin: Origin,
+    rx: Receiver<console::Message>,
+    tx: SyncSender<console::Message>,
+    route: &Mutex<Route>,
+    ui: &Ui,
+) -> (Vec<String>, u64) {
+    let namespace = origin.target.as_ref().map(|(name, _)| name.clone());
+    let printer = console::spawn_printer(rx, origin, ui.clone());
+    lock(route).tx = Some(tx);
 
     watch_sigint();
-    let cycles = args.cycles;
     let coordinator = stellarator::run(move || async move {
         let mut coordinator = coordinator;
-        coordinator.run(stop(cycles)).await;
+        coordinator.run(stop(limit)).await;
         coordinator
     });
 
-    let latched: Vec<&str> = coordinator
+    let latched = coordinator
         .systems()
         .filter(|(_, end)| *end == Some(&EndReason::Panicked))
-        .map(|(id, _)| id)
+        .map(|(id, _)| match &namespace {
+            Some(namespace) => format!("{namespace}.{id}"),
+            None => id.to_string(),
+        })
         .collect();
-    if latched.is_empty() {
-        return Ok(());
-    }
-    Err(RunError::Latched(latched.join(", ")))
+    let cycles = coordinator.cycle();
+    drop(coordinator);
+    lock(route).tx = None;
+    let _ = printer.join();
+    (latched, cycles)
+}
+
+fn lock(route: &Mutex<Route>) -> std::sync::MutexGuard<'_, Route> {
+    route.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The widest `target.system` in `config`, or `system` in a deployment of
+/// one.
+fn source_width(config: &ResolvedDeployment) -> usize {
+    let several = config.targets.len() > 1;
+    config
+        .targets
+        .iter()
+        .zip(config.namespaces())
+        .flat_map(|(target, namespace)| {
+            let prefix = if several { namespace.len() + 1 } else { 0 };
+            target
+                .coordinator
+                .systems
+                .iter()
+                .map(move |system| prefix + system.id.len())
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Runs every target in `config` as a child process.
 ///
 /// The resolved config is written to a temp file for the children to read.
 /// Returns once every child has exited.
-fn run_children(config: &ResolvedDeployment, args: &Run) -> Result<(), RunError> {
+fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
-    std::fs::write(
-        &path,
-        serde_json::to_vec(config).map_err(ConfigError::Decode)?,
-    )?;
+    let bytes = serde_json::to_vec(config).map_err(ConfigError::Decode)?;
+    std::fs::write(&path, bytes).map_err(io(&path))?;
     watch_sigint();
-    let waited = super::children::spawn_all(&path, &config.namespaces(), args)
-        .map(super::children::wait_all);
+    let started = Instant::now();
+    let namespaces = config.namespaces();
+    let relay = Relay::new(ui.clone(), &namespaces);
+    ui.emit(Event::SourceWidth(source_width(config)));
+    let waited = super::children::spawn_all(&path, &namespaces, args, &relay)
+        .map(super::children::wait_all)
+        .map_err(RunError::Spawn);
     let _ = std::fs::remove_file(&path);
-    waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
+    end(ui, started, relay.rows());
+    let failed = waited?;
     if interrupted() {
         return Err(RunError::Interrupted);
     }
-    Ok(())
+    failed.map_err(|failed| RunError::Children(failed.join(", ")))
 }
 
-/// Sets up tracing to print to stderr and to forward lines to `log` ports.
+/// Sets up tracing to print through `console` and to forward lines to `log`
+/// ports.
 ///
 /// The level comes from `$RUST_LOG`, and defaults to `INFO`.
-fn install_logging() {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|level| level.parse().ok())
-        .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
+fn install_logging(console: ConsoleLayer) {
+    let level = log_level();
     let subscriber = tracing_subscriber::registry()
         .with(level)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(console)
         .with(crate::log::LogLayer);
     // If the host already installed a subscriber, keep it.
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// The level from `$RUST_LOG`, or `INFO`.
+fn log_level() -> LevelFilter {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|level| level.parse().ok())
+        .unwrap_or(LevelFilter::INFO)
+}
+
+/// The lowest level the console prints for `filter`. `OFF` prints errors.
+fn console_level(filter: LevelFilter) -> LogLevel {
+    filter
+        .into_level()
+        .map_or(LogLevel::Error, |level| crate::log::level_of(&level))
 }
 
 /// Loads a target file and returns its resolved deployment.
@@ -176,25 +390,102 @@ fn install_logging() {
 /// Rebuilds every dev pack next to `target` first. A `.py` file is evaluated,
 /// and a `.json` file is read as is. If the config still has peer references,
 /// every target's packs are opened to resolve them.
-pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
-    let target = target.unwrap_or(Path::new("target.py"));
-    let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
-    for pack in &packs {
-        pack_dev(pack)?;
+pub fn prepare(target: Option<&Path>, ui: &Ui) -> Result<ResolvedDeployment, RunError> {
+    let target = &target_file(target)?;
+    if !target.is_file() {
+        return Err(RunError::NoTargetFile(target.clone()));
     }
-    let mut config = if target.extension().is_some_and(|ext| ext == "json") {
-        DeploymentConfig::from_slice(&std::fs::read(target)?)?
+    let packs = dev_packs(dir_of(target));
+    for pack in &packs {
+        pack_dev(pack, ui)?;
+    }
+    let config = if target.extension().is_some_and(|ext| ext == "json") {
+        DeploymentConfig::from_slice(&std::fs::read(target).map_err(io(target))?)?
     } else {
-        eval_target(target, &packs)?
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        phased(ui, Verb::EVALUATE, &name, || {
+            eval_target(target, &packs, ui)
+        })?
     };
+    let subject = plural(config.targets.len(), "target");
+    let config = phased(ui, Verb::RESOLVE, &subject, || resolve(config, target))?;
+    if target.extension().is_some_and(|ext| ext == "py") && !super::children::is_child() {
+        super::completions::write_cache(target, &config);
+    }
+    Ok(config)
+}
+
+/// `named`, or the nearest target file to the working directory.
+pub(super) fn target_file(named: Option<&Path>) -> Result<PathBuf, RunError> {
+    if let Some(named) = named {
+        return Ok(named.to_path_buf());
+    }
+    let cwd = std::env::current_dir().map_err(io(Path::new(".")))?;
+    find_target(&cwd).ok_or(RunError::NoProject(cwd))
+}
+
+/// The directory of the target file `target`.
+pub(super) fn dir_of(target: &Path) -> &Path {
+    let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
+    dir.unwrap_or(Path::new("."))
+}
+
+/// The nearest `target.py` in `start` or a directory above it, stopping at
+/// the root of a git repository.
+pub fn find_target(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let target = dir.join(TARGET_FILE);
+        if target.is_file() {
+            return Some(target);
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Runs `f` as a phase on `ui`. On failure, shows the output the failed
+/// program left after the phase's line.
+pub(super) fn phased<T>(
+    ui: &Ui,
+    verb: Verb,
+    subject: &str,
+    f: impl FnOnce() -> Result<T, RunError>,
+) -> Result<T, RunError> {
+    let phase = |state| {
+        ui.emit(Event::Phase(Phase {
+            verb,
+            subject,
+            state,
+        }))
+    };
+    let started = Instant::now();
+    phase(PhaseState::Started);
+    let result = f();
+    match &result {
+        Ok(_) => phase(PhaseState::Done(started.elapsed())),
+        Err(error) => {
+            phase(PhaseState::Failed);
+            if let RunError::Python { output, .. } = error {
+                ui.emit(Event::Output(output));
+            }
+        }
+    }
+    result
+}
+
+/// Resolves the peer references in `config`, opening every target's packs
+/// if any are left.
+fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeployment, RunError> {
     if let Some(pending) = deploy::pending(&config)? {
         let tables: Vec<SystemTable> = config
             .targets
             .iter()
             .map(table_for)
             .collect::<Result<_, _>>()?;
-        let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
-        let dir = std::path::absolute(dir.unwrap_or(Path::new(".")))?;
+        let dir = dir_of(target);
+        let dir = std::path::absolute(dir).map_err(io(dir))?;
         pending.resolve(&mut config, &tables, &store::dir(&dir))?;
     }
     Ok(config.into_runtime()?)
@@ -205,15 +496,16 @@ pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
 /// A dev pack is a `[tool.uv.sources]` path that is both a cargo crate and a
 /// metor pack.
 pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
-    let Ok(project) = read_toml::<UvProject>(&target_dir.join("pyproject.toml")) else {
+    let Ok(project) = read_toml::<toml::Table>(&target_dir.join("pyproject.toml")) else {
         return Vec::new();
     };
-    let mut packs: Vec<_> = project
-        .tool
-        .uv
-        .sources
-        .into_values()
-        .filter_map(|source| source.path)
+    let sources = project
+        .get("tool")
+        .and_then(|tool| tool.get("uv")?.get("sources")?.as_table());
+    let mut packs: Vec<_> = sources
+        .into_iter()
+        .flat_map(toml::Table::values)
+        .filter_map(|source| source.get("path")?.as_str())
         .map(|path| target_dir.join(path))
         .filter(|root| is_dev_pack(root))
         .filter_map(|root| root.canonicalize().ok())
@@ -223,74 +515,54 @@ pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
     packs
 }
 
+/// Whether `root` is a cargo crate with a `[tool.metor.pack]` table.
 fn is_dev_pack(root: &Path) -> bool {
-    root.join("Cargo.toml").is_file()
-        && read_toml::<PackProject>(&root.join("pyproject.toml"))
-            .is_ok_and(|project| project.tool.metor.pack.is_some())
-}
-
-/// The `[tool.uv.sources]` of a target's `pyproject.toml`.
-#[derive(Deserialize)]
-struct UvProject {
-    #[serde(default)]
-    tool: UvTool,
-}
-
-#[derive(Default, Deserialize)]
-struct UvTool {
-    #[serde(default)]
-    uv: Uv,
-}
-
-#[derive(Default, Deserialize)]
-struct Uv {
-    #[serde(default)]
-    sources: BTreeMap<String, UvSource>,
-}
-
-/// One uv source. Only a `path` source can be a dev pack.
-#[derive(Deserialize)]
-struct UvSource {
-    path: Option<PathBuf>,
-}
-
-/// The `[tool.metor.pack]` table of a `pyproject.toml`, if it has one.
-#[derive(Deserialize)]
-struct PackProject {
-    #[serde(default)]
-    tool: PackTool,
-}
-
-#[derive(Default, Deserialize)]
-struct PackTool {
-    #[serde(default)]
-    metor: PackMetor,
-}
-
-#[derive(Default, Deserialize)]
-struct PackMetor {
-    pack: Option<toml::Table>,
+    let pack = |project: toml::Table| {
+        let pack = project
+            .get("tool")
+            .and_then(|tool| tool.get("metor")?.get("pack"));
+        pack.is_some_and(toml::Value::is_table)
+    };
+    root.join("Cargo.toml").is_file() && read_toml(&root.join("pyproject.toml")).is_ok_and(pack)
 }
 
 /// Runs the target file as a script and reads the deployment it emitted.
-pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfig, RunError> {
+///
+/// What it prints is kept, so a traceback shows after the phase line and
+/// never in `--format json`'s stream. On success, any of it, such as a
+/// warning, is shown on `ui`.
+pub fn eval_target(
+    path: &Path,
+    dev_packs: &[PathBuf],
+    ui: &Ui,
+) -> Result<DeploymentConfig, RunError> {
     let out = std::env::temp_dir().join(format!("metor-config-{}.json", std::process::id()));
-    let status = Command::new(interpreter())
+    let result = Command::new(interpreter())
         .arg(path)
         .env("PYTHONPATH", python_path(dev_packs)?)
         .env("METOR_CONFIG_OUT", &out)
-        .status()?;
-    if !status.success() {
-        return Err(RunError::Python(status));
+        .stdin(Stdio::null())
+        .output()
+        .map_err(RunError::Spawn)?;
+    let mut output = result.stdout;
+    output.extend_from_slice(&result.stderr);
+    if !result.status.success() {
+        return Err(RunError::Python {
+            status: result.status,
+            output,
+        });
     }
-    let bytes = std::fs::read(&out)?;
+    if !output.is_empty() {
+        ui.emit(Event::Output(&output));
+    }
+    let bytes = std::fs::read(&out).map_err(|_| RunError::NoDeployment)?;
     let _ = std::fs::remove_file(&out);
     Ok(DeploymentConfig::from_slice(&bytes)?)
 }
 
 /// Returns the Python interpreter to use: `$METOR_PYTHON`, then the active
 /// virtualenv's, then `python3`.
-fn interpreter() -> OsString {
+pub(super) fn interpreter() -> OsString {
     if let Some(python) = std::env::var_os("METOR_PYTHON") {
         return python;
     }
@@ -304,7 +576,7 @@ fn interpreter() -> OsString {
 ///
 /// It lists `metor-config` and every dev pack's generated module, followed
 /// by the inherited `PYTHONPATH`.
-fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
+pub(super) fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
     let mut entries: Vec<PathBuf> = match std::env::var_os("METOR_CONFIG_PY") {
         Some(config_py) => vec![config_py.into()],
         None if Path::new(IN_REPO_CONFIG_PY).is_dir() => vec![IN_REPO_CONFIG_PY.into()],
@@ -320,14 +592,52 @@ fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
 /// Builds a target's coordinator.
 ///
 /// Applies the clock overrides from the command line, then opens the target's
-/// packs.
-pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
-    let config = apply_overrides(config, overrides)?;
-    let table = table_for(&config)?;
+/// packs. With `console`, appends the console sending to it. Returns the ids
+/// of the systems the console reads.
+pub fn load(
+    config: &TargetConfig,
+    overrides: &Run,
+    console: Option<Tap>,
+) -> Result<(Coordinator, Vec<String>), RunError> {
+    let mut config = apply_overrides(config, overrides)?;
+    let mut table = table_for(&config)?;
+    let systems = match console {
+        Some(Tap { tx, stats }) => {
+            let settings = Settings {
+                min: console_level(log_level()),
+                budget: budget(&config.coordinator.clock),
+                stats,
+            };
+            console::attach(&mut config, &mut table, tx, settings)?
+        }
+        None => Vec::new(),
+    };
     let options = BuildOptions {
         deterministic: overrides.deterministic,
     };
-    Ok(config.coordinator.build_with(&table, options)?)
+    Ok((config.coordinator.build_with(&table, options)?, systems))
+}
+
+/// The cycles to run: `--cycles`, or `--for` in cycles of the target's
+/// clock after the overrides, or `None` to run until SIGINT.
+fn cycle_limit(config: &TargetConfig, args: &Run) -> Result<Option<u64>, RunError> {
+    let Some(span) = args.run_for else {
+        return Ok(args.cycles);
+    };
+    let cycles = match apply_overrides(config, args)?.coordinator.clock {
+        Clock::Wall { rate } => units::cycles_at(span, rate.get()),
+        Clock::Simulated { dt, .. } => units::cycles_in(span, dt),
+    };
+    Ok(Some(cycles))
+}
+
+/// The longest a cycle may take on `clock`: its period on a wall clock,
+/// none on a simulated one.
+fn budget(clock: &Clock) -> Option<Duration> {
+    match clock {
+        Clock::Wall { rate } => Duration::try_from_secs_f64(rate.get().recip()).ok(),
+        Clock::Simulated { .. } => None,
+    }
 }
 
 /// `config` with the clock overrides from the command line applied.
@@ -378,7 +688,7 @@ pub fn interrupted() -> bool {
 }
 
 /// Makes SIGINT flip [`INTERRUPTED`] instead of killing the process.
-fn watch_sigint() {
+pub(super) fn watch_sigint() {
     // SAFETY: the handler only stores to an `AtomicBool`, which is
     // async-signal-safe, and no other code installs a SIGINT handler.
     unsafe { libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t) };
@@ -432,7 +742,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let target = dir.path().join("target.py");
         std::fs::write(&target, "raise SystemExit(3)\n").expect("writes");
-        let Err(RunError::Python(status)) = eval_target(&target, &[]) else {
+        let Err(RunError::Python { status, .. }) = eval_target(&target, &[], &Ui::silent()) else {
             panic!("a raising target is an error")
         };
         assert_eq!(status.code(), Some(3));
@@ -466,13 +776,16 @@ mod tests {
             epoch: Some(0),
             ..Default::default()
         };
-        assert!(matches!(load(&config, &epoch), Err(RunError::EpochWall)));
+        assert!(matches!(
+            load(&config, &epoch, None),
+            Err(RunError::EpochWall)
+        ));
         let deterministic = Run {
             deterministic: true,
             ..Default::default()
         };
         assert!(matches!(
-            load(&config, &deterministic),
+            load(&config, &deterministic, None),
             Err(RunError::Build(BuildError::DeterministicWall))
         ));
         let simulated = Run {
@@ -481,15 +794,70 @@ mod tests {
             epoch: Some(0),
             ..Default::default()
         };
-        assert!(load(&config, &simulated).is_ok());
+        assert!(load(&config, &simulated, None).is_ok());
     }
 
     #[test]
-    fn test_sim_dt_parses_seconds() {
-        assert_eq!(sim_dt("0.01"), Ok(Duration::from_millis(10)));
-        assert_eq!(sim_dt("0"), Ok(Duration::ZERO));
-        assert!(sim_dt("-1").is_err());
-        assert!(sim_dt("fast").is_err());
+    fn test_console_level_follows_the_filter() {
+        assert_eq!(console_level(LevelFilter::DEBUG), LogLevel::Debug);
+        assert_eq!(console_level(LevelFilter::INFO), LogLevel::Info);
+        assert_eq!(console_level(LevelFilter::OFF), LogLevel::Error);
+    }
+
+    #[test]
+    fn test_find_target_walks_up_to_the_repo_root() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let repo = dir.path().join("repo");
+        let deep = repo.join("a/b");
+        std::fs::create_dir_all(&deep).expect("makes dirs");
+        std::fs::create_dir(repo.join(".git")).expect("makes .git");
+        assert_eq!(find_target(&deep), None, "stops at the repo root");
+
+        std::fs::write(dir.path().join("target.py"), "").expect("writes");
+        assert_eq!(find_target(&deep), None, "never looks above .git");
+
+        std::fs::write(repo.join("target.py"), "").expect("writes");
+        assert_eq!(find_target(&deep), Some(repo.join("target.py")));
+
+        std::fs::write(deep.join("target.py"), "").expect("writes");
+        assert_eq!(find_target(&deep), Some(deep.join("target.py")));
+    }
+
+    #[test]
+    fn test_for_counts_cycles_of_the_clock() {
+        let mut config = TargetConfig::default();
+        config.coordinator.clock = Clock::Simulated {
+            dt: Duration::from_millis(10),
+            epoch: None,
+        };
+        let one_second = Run {
+            run_for: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert_eq!(cycle_limit(&config, &one_second).ok(), Some(Some(100)));
+        let walled = Run {
+            wall: WallRate::try_from(50.0).ok(),
+            ..one_second
+        };
+        assert_eq!(cycle_limit(&config, &walled).ok(), Some(Some(50)));
+        for (hz, expected) in [(30.0, 30), (120.0, 120), (3.0, 3)] {
+            let walled = Run {
+                wall: WallRate::try_from(hz).ok(),
+                run_for: Some(Duration::from_secs(1)),
+                ..Default::default()
+            };
+            assert_eq!(
+                cycle_limit(&config, &walled).ok(),
+                Some(Some(expected)),
+                "{hz} Hz"
+            );
+        }
+        let counted = Run {
+            cycles: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(cycle_limit(&config, &counted).ok(), Some(Some(7)));
+        assert_eq!(cycle_limit(&config, &Run::default()).ok(), Some(None));
     }
 
     #[test]

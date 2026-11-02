@@ -1,0 +1,9 @@
+---
+source: libs/metor-fsw-3/src/cli/ui/human.rs
+expression: render(caps)
+---
+  [38;2;138;143;152m+00:01.500[0m     [38;2;86;180;233mplant[0m.pub       listening on [::]:2240
+  [38;2;138;143;152m+00:01.500[0m  [38;2;245;194;107m▲[0m  [38;2;230;159;0mfsw[0m.ctrl        [38;2;245;194;107msaturated[0m  [38;2;138;143;152maxis=[0mz  [38;2;138;143;152mnote=[0m"two words"  [38;2;138;143;152mempty=[0m""
+  [38;2;138;143;152m+00:01.500[0m  [38;2;255;107;107m✗[0m  [38;2;230;159;0mfsw[0m.commission  [38;2;255;107;107mlatched off[0m
+  [38;2;138;143;152m+00:01.500[0m  [38;2;138;143;152m·[0m  nav             [38;2;138;143;152mconverged[0m
+                 metor           outside the run

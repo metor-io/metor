@@ -44,9 +44,8 @@ fn test_missing_target_returns_error() {
         .expect("metor runs");
     assert_eq!(output.status.code(), Some(1));
     let message = String::from_utf8_lossy(&output.stderr);
-    // Python's traceback goes to stderr first, then the host's error line.
     assert!(
-        message.contains("metor: the target file exited"),
+        message.contains("no target file at no-such-target.py"),
         "{message}"
     );
 }
@@ -87,8 +86,93 @@ fn test_build_error_cites_the_target_file() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("metor: deploy.py:6: `b.mirror` names link `a.out`, which does not listen on a fixed port"),
+        stderr.contains("`b.mirror` names link `a.out`, which does not listen on a fixed port")
+            && stderr.contains("[deploy.py:6:"),
         "{stderr}"
+    );
+}
+
+/// The target file names itself relative to the working directory, so its
+/// line shows from a parent directory too.
+#[test]
+fn test_build_error_cites_the_target_file_from_a_parent_dir() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).expect("makes sub");
+    two_targets(
+        &sub,
+        "from metor_config import Connect, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Connect(\"127.0.0.1:1\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let output = metor()
+        .args(["build", "sub/deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("[sub/deploy.py:6:"), "{stderr}");
+    assert!(stderr.contains("b.add(\"mirror\""), "{stderr}");
+}
+
+#[test]
+fn test_target_without_a_deployment_says_so() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(dir.path().join("target.py"), "x = 1\n").expect("writes");
+    let output = metor()
+        .args(["build", "target.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("M0207"), "{stderr}");
+}
+
+/// With `--format json`, stdout is one versioned object per line, even when
+/// the target file prints.
+#[test]
+fn test_json_stdout_is_one_object_per_line() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(dir.path(), "print(\"hello from stdout\")");
+    for command in [
+        vec!["build", "deploy.py"],
+        vec!["run", "deploy.py", "--cycles", "2"],
+    ] {
+        let output = metor()
+            .args(&command)
+            .args(["--format", "json"])
+            .current_dir(dir.path())
+            .output()
+            .expect("metor runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{command:?}: {stdout}");
+        for line in stdout.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+            assert_eq!(value["v"], 1, "{line}");
+        }
+        assert!(stdout.contains("hello from stdout"), "{stdout}");
+    }
+    let ended: serde_json::Value = {
+        let output = metor()
+            .args(["run", "deploy.py", "--cycles", "2", "--format", "json"])
+            .current_dir(dir.path())
+            .output()
+            .expect("metor runs");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(r#""type":"ended""#))
+            .unwrap_or_else(|| panic!("an ended event: {stdout}"))
+            .to_string();
+        serde_json::from_str(&line).expect("JSON")
+    };
+    assert_eq!(
+        ended["targets"].as_array().map(Vec::len),
+        Some(2),
+        "{ended}"
     );
 }
 
@@ -102,14 +186,34 @@ fn test_deployment_runs_every_target_as_a_child() {
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(stderr.is_empty(), "a clean target prints nothing: {stderr}");
+    assert_eq!(stderr.matches("Resolved").count(), 1, "{stderr}");
+    let expected = [
+        "Evaluated",
+        "Resolved",
+        "Running",
+        "Finished after",
+        "TARGET",
+    ];
+    let row = |line: &str| {
+        ["a ", "b "]
+            .iter()
+            .any(|name| line.trim_start().starts_with(name))
+    };
+    assert!(
+        stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| row(line) || expected.iter().any(|phase| line.contains(phase))),
+        "a clean deployment prints only its phases and summary: {stderr}"
+    );
+    let rows: Vec<&str> = stderr.lines().filter(|line| row(line)).collect();
+    assert_eq!(rows.len(), 2, "one summary row per target: {stderr}");
 }
 
-/// A system's log lines go to its log port, not stderr. The only thing a
-/// child prints is its final CLI error, which the parent prefixes with the
-/// child's name.
+/// A child's lines name its target, since the parent relays them as they
+/// are.
 #[test]
-fn test_every_child_is_prefixed() {
+fn test_every_child_names_its_target() {
     let fixture = fixture_dir();
     let dir = tempfile::tempdir().expect("a temp dir");
     let target = two_targets(
@@ -122,15 +226,16 @@ fn test_every_child_is_prefixed() {
         .output()
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
     let failed = stderr
         .lines()
-        .find_map(|line| line.strip_prefix("metor: these targets did not exit cleanly: "))
+        .find_map(|line| line.split_once("these targets did not exit cleanly: "))
+        .map(|(_, failed)| failed)
         .unwrap_or_default();
     assert!(failed.contains('a') && failed.contains('b'), "{stderr}");
     assert!(
-        stderr.contains("a │ metor: these systems latched off: boom")
-            || stderr.contains("b │ metor: these systems latched off: boom"),
+        stderr.contains("these systems latched off: a.boom")
+            || stderr.contains("these systems latched off: b.boom"),
         "{stderr}"
     );
 }
@@ -149,10 +254,10 @@ fn test_latched_child_fails_the_deployment() {
         .output()
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
     assert!(stderr.contains("did not exit cleanly: b"), "{stderr}");
     assert!(
-        stderr.contains("b │ metor: these systems latched off: boom"),
+        stderr.contains("these systems latched off: b.boom"),
         "{stderr}"
     );
 }
@@ -218,7 +323,7 @@ fn test_sigint_ends_every_child() {
     let status = wait_bounded(&mut parent).expect("the deployment ends on SIGINT");
     let output = parent.wait_with_output().expect("its output is ours");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert_eq!(status.code(), Some(130), "{stderr}");
     assert!(
         !stderr.contains("did not exit cleanly"),
         "an interrupted child is not a failed one: {stderr}"
@@ -256,10 +361,143 @@ fn test_wasm_pack_loads_and_runs() {
         }],
         coordinator: chain(),
     };
-    let mut coordinator = load(&config, &Run::default()).expect("loads");
+    let (mut coordinator, _) = load(&config, &Run::default(), None).expect("loads");
     for cycle in 1..=3 {
         coordinator.step(Timestamp(cycle));
     }
     assert_eq!(coordinator.cycle(), 3);
     assert_eq!(panicked(&coordinator).len(), 0);
+}
+
+#[test]
+fn test_check_builds_every_target_and_runs_none() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(dir.path(), "");
+    let output = metor()
+        .args(["check", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("Checked").count(), 2, "{stderr}");
+    assert!(!stderr.contains("Running"), "{stderr}");
+}
+
+#[test]
+fn test_check_fails_with_the_errors_code() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(
+        dir.path(),
+        "from metor_config import Connect, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Connect(\"127.0.0.1:1\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let output = metor()
+        .args(["check", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("M0212"), "{stderr}");
+}
+
+#[test]
+fn test_check_writes_the_names_completion_reads() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(dir.path(), "");
+    let output = metor()
+        .args(["check", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let names = std::fs::read_to_string(dir.path().join(".metor/names")).expect("check wrote it");
+    assert!(names.starts_with("target a\ntarget b\n"), "{names}");
+}
+
+/// A link's two ends are joined, in the picture and in Mermaid.
+#[test]
+fn test_graph_joins_a_link_across_targets() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(
+        dir.path(),
+        "from metor_config import Listen, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Listen(\"127.0.0.1:47811\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let graph = |args: &[&str]| {
+        let output = metor()
+            .arg("graph")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("metor runs");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        String::from_utf8(output.stdout).expect("utf-8")
+    };
+    let picture = graph(&["deploy.py"]);
+    assert!(
+        picture.contains("b.mirror") && picture.contains("a.out"),
+        "{picture}"
+    );
+    let mermaid = graph(&["deploy.py", "--as", "mermaid"]);
+    assert!(mermaid.contains("t1_0 <-.-> t0_0"), "{mermaid}");
+    let one = graph(&["deploy.py", "b"]);
+    assert!(!one.contains("  a  "), "one target: {one}");
+    assert!(
+        picture.contains("io_submit, io_complete  fsw.io"),
+        "{picture}"
+    );
+    let ports = graph(&["deploy.py", "--ports"]);
+    assert!(
+        ports.contains("b.mirror") && ports.contains("io_submit, io_complete  fsw.io"),
+        "idle systems are listed by kind: {ports}"
+    );
+}
+
+/// `metor new target` makes a project that checks as written. The
+/// workspace's lockfile and a shared target dir keep the pack build short.
+#[test]
+fn test_new_target_checks() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let new = metor()
+        .args(["new", "target", "my-sat"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    assert!(
+        new.status.success(),
+        "{}",
+        String::from_utf8_lossy(&new.stderr)
+    );
+    let project = dir.path().join("my-sat");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::copy(
+        workspace.join("Cargo.lock"),
+        project.join("systems/my-sat/Cargo.lock"),
+    )
+    .expect("copies the lockfile");
+    let check = metor()
+        .arg("check")
+        .current_dir(&project)
+        .env("CARGO_TARGET_DIR", workspace.join("target/scaffold"))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(check.status.success(), "{stderr}");
+    assert!(stderr.contains("Checked"), "{stderr}");
+    let again = metor()
+        .args(["new", "pack", "my-sat"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("M0108"));
 }

@@ -1,0 +1,11 @@
+[project]
+name = "{{dist}}"
+version = "0.1.0"
+description = "The {{name}} target"
+requires-python = ">=3.11"
+dependencies = ["{{pack_dist}}", "metor-config"]
+
+# `metor run` builds each pack listed here by path.
+[tool.uv.sources]
+{{pack_dist}} = { path = "systems/{{name}}", editable = true }
+metor-config = { {{metor_config}} }

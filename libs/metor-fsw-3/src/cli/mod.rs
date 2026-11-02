@@ -5,37 +5,113 @@
 
 pub mod build;
 pub mod cargo;
+pub mod check;
 pub mod children;
+pub mod completions;
+pub mod console;
+pub mod diagnostic;
+pub mod doctor;
+pub mod graph;
 pub mod module;
+pub mod new;
 pub mod pack_dev;
 mod port_class;
+pub mod relay;
 pub mod run;
+pub mod show;
+pub mod ui;
+pub mod units;
+pub mod watch;
 
+use anstyle::Style;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::builder::Styles;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::pack::ABI_VERSION;
+use clap::ColorChoice;
+use diagnostic::exit_code;
+use run::RunError;
+use ui::caps::Caps;
+use ui::event::Event;
+use ui::theme::Theme;
+use ui::{OutputArgs, Ui};
 
 #[derive(Parser)]
-#[command(name = "metor", about = "Build and run metor flight software")]
+#[command(
+    name = "metor",
+    version,
+    about = "Build and run metor flight software",
+    after_help = EXAMPLES
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Makes a pack crate, or a target project that runs as is.
+    #[command(
+        after_help = "Examples:\n  metor new target my-sat       a project with a pack, ready for metor run\n  metor new pack systems/nav    a pack crate with one system"
+    )]
+    New(new::New),
+    /// Evaluates a target file and runs its targets.
+    #[command(after_help = RUN_EXAMPLES)]
+    Run(run::Run),
+    /// Runs the target, and runs it again when a source changes.
+    #[command(
+        after_help = "Examples:\n  metor watch                  rerun the nearest target.py on change\n  metor watch --sim-dt 10ms    with run's flags"
+    )]
+    Watch(watch::Watch),
+    /// Builds everything `run` would, and stops before the first cycle.
+    #[command(
+        after_help = "Examples:\n  metor check                  the nearest target.py\n  metor check deploy.py"
+    )]
+    Check(check::Check),
+    /// Prints the deployment's targets, systems, and wiring.
+    #[command(after_help = SHOW_EXAMPLES)]
+    Show(show::Show),
+    /// Draws the deployment's wiring.
+    #[command(
+        after_help = "Examples:\n  metor graph                  every target\n  metor graph fsw              one target\n  metor graph --as mermaid     text for docs"
+    )]
+    Graph(graph::Graph),
+    /// Evaluates a target file and writes out the resolved deployment.
+    #[command(
+        after_help = "Examples:\n  metor build -o deploy.json   resolve once, run anywhere\n  metor run deploy.json"
+    )]
+    Build(build::Build),
+    /// Checks the tools a project needs.
+    Doctor,
     /// Commands for pack authors.
     #[command(subcommand)]
     Pack(PackCommand),
     /// Prints the pack ABI version this binary supports.
+    #[command(hide = true)]
     AbiVersion,
-    /// Evaluates a target file and runs its targets.
-    Run(run::Run),
-    /// Evaluates a target file and writes out the resolved deployment.
-    Build(build::Build),
 }
+
+const EXAMPLES: &str = "Examples:
+  metor run                      run the nearest target.py
+  metor check                    find errors without running
+  metor show fsw                 list a target's systems
+  metor doctor                   check python, cargo, and wasm32
+  source <(COMPLETE=bash metor)  shell completion; also zsh, fish";
+
+const RUN_EXAMPLES: &str = "Examples:
+  metor run                            the nearest target.py
+  metor run --target fsw               one target of a deployment
+  metor run --sim-dt 10ms --for 30s    30 s of simulated time
+  metor run --wall 50hz --cycles 500   pace at 50 Hz, stop after 500 cycles";
+
+const SHOW_EXAMPLES: &str = "Examples:
+  metor show                   every target
+  metor show fsw               one target
+  metor show fsw.nav           one system, with its params and grants";
 
 #[derive(Subcommand)]
 pub enum PackCommand {
@@ -48,21 +124,134 @@ pub enum PackCommand {
     },
 }
 
-/// Runs the command line. On failure, prints the error to stderr and exits
-/// with status 1.
+/// Runs the command line. On failure, reports the error and exits with its
+/// status. An interrupted run's summary already says so.
 pub fn main() {
-    if let Err(message) = run(Cli::parse()) {
-        eprintln!("metor: {message}");
-        std::process::exit(1);
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+    let early = Early::scan(std::env::args_os().skip(1));
+    let caps = Caps::detect(early.color, early.query);
+    let cli = parse(&caps, early.color);
+    let ui = Ui::new(&cli.output, caps);
+    let Err(error) = run(cli.command, &ui) else {
+        return;
+    };
+    if !matches!(error, RunError::Interrupted) {
+        ui.emit(Event::Diagnostic(&*diagnostic::report(&error)));
+    }
+    std::process::exit(exit_code(&error));
+}
+
+/// Parses the command line, with help styled for `caps`.
+fn parse(caps: &Caps, color: ColorChoice) -> Cli {
+    let command = Cli::command()
+        .color(color)
+        .styles(styles(&Theme::new(caps)));
+    let matches = command.get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+/// The output flags, read before clap parses, so help and the terminal
+/// probe honour them.
+#[derive(Debug, PartialEq, Eq)]
+struct Early {
+    color: ColorChoice,
+    /// Whether the terminal's background is worth asking for: not for JSON,
+    /// help, or the version.
+    query: bool,
+}
+
+impl Early {
+    fn scan(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let value = |flag: &str| {
+            let prefix = format!("{flag}=");
+            args.iter()
+                .enumerate()
+                .find_map(|(i, arg)| match arg.strip_prefix(&prefix) {
+                    Some(value) => Some(value.to_string()),
+                    None if arg == flag => args.get(i + 1).cloned(),
+                    None => None,
+                })
+        };
+        let color = match value("--color").as_deref() {
+            Some("always") => ColorChoice::Always,
+            Some("never") => ColorChoice::Never,
+            _ => ColorChoice::Auto,
+        };
+        let quick = ["-h", "--help", "-V", "--version", "help"];
+        let json = value("--format").as_deref() == Some("json");
+        Self {
+            color,
+            query: !json && !args.iter().any(|arg| quick.contains(&arg.as_str())),
+        }
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match cli.command {
-        Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root)?,
+/// Help's styles from `theme`.
+fn styles(theme: &Theme) -> Styles {
+    Styles::styled()
+        .header(theme.bold(theme.accent))
+        .usage(theme.bold(theme.accent))
+        .literal(theme.bold(Style::new()))
+        .placeholder(theme.muted)
+        .error(theme.bold(theme.error))
+        .valid(theme.ok)
+        .invalid(theme.warn)
+}
+
+fn run(command: Command, ui: &Ui) -> Result<(), RunError> {
+    match command {
+        Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root, ui)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
-        Command::Run(args) => run::run(args)?,
-        Command::Build(args) => build::build(args)?,
+        Command::Doctor => doctor::doctor(ui)?,
+        Command::Run(args) => run::run(args, ui)?,
+        Command::Build(args) => build::build(args, ui)?,
+        Command::Check(args) => check::check(args, ui)?,
+        Command::Watch(args) => watch::watch(args, ui)?,
+        Command::Show(args) => show::show(args, ui)?,
+        Command::Graph(args) => graph::graph(args, ui)?,
+        Command::New(args) => new::new(args, ui)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(args: &[&str]) -> Early {
+        Early::scan(args.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn test_early_reads_output_flags() {
+        let early = scan(&["run", "--color", "never"]);
+        assert_eq!(early.color, ColorChoice::Never);
+        assert!(early.query);
+        assert_eq!(scan(&["--color=always"]).color, ColorChoice::Always);
+        assert_eq!(scan(&["run", "--color"]).color, ColorChoice::Auto);
+        assert!(!scan(&["run", "--format", "json"]).query);
+        assert!(!scan(&["--format=json"]).query);
+        assert!(!scan(&["run", "--help"]).query);
+        assert!(!scan(&["-V"]).query);
+    }
+
+    #[test]
+    fn test_cli_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_help_has_examples_and_plain_styles_add_no_escapes() {
+        let theme = Theme::new(&Caps::plain());
+        let mut command = Cli::command().styles(styles(&theme));
+        let help = command.render_help().ansi().to_string();
+        assert!(help.contains("metor check"), "{help}");
+        assert!(!help.contains('\x1b'), "{help:?}");
+        let run = command.find_subcommand_mut("run").expect("run exists");
+        assert!(run.render_long_help().to_string().contains("--for 30s"));
+    }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "{{crate}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The host loads the cdylib.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+metor-fsw-3 = { {{metor_fsw}}, default-features = false, features = ["threads"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+
+# The pack builds on its own, outside any enclosing workspace.
+[workspace]

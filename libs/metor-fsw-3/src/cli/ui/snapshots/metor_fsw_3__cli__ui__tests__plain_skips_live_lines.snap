@@ -1,0 +1,11 @@
+---
+source: libs/metor-fsw-3/src/cli/ui/tests.rs
+expression: "human(Caps::plain())"
+---
+  ✓ Built       adcs_pack                   2.1s
+  ✓ Evaluated   target.py
+  ● Running     plant  fsw
+M0101
+
+  × no target `fws`
+  help: did you mean `fsw`?

@@ -1,0 +1,57 @@
+//! The {{id}} pack.
+
+use metor_fsw_3::{Output, Record, SystemTable, system};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// How many cycles `hello` has run.
+#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
+#[postcard(crate = metor_fsw_3::postcard_schema)]
+#[record(max_len = 8)]
+pub struct Count {
+    pub n: u64,
+}
+
+/// The params for `hello`.
+#[derive(Deserialize, JsonSchema)]
+pub struct HelloParams {
+    /// How many cycles pass between log lines.
+    pub every: u64,
+}
+
+/// `hello`'s state.
+pub struct Hello {
+    every: u64,
+    n: u64,
+}
+
+impl Hello {
+    fn new(params: HelloParams) -> Self {
+        Self {
+            every: params.every.max(1),
+            n: 0,
+        }
+    }
+}
+
+/// Counts cycles, and logs every `every`th.
+#[system]
+fn hello(#[state] s: &mut Hello, count: &mut Output<Count>) {
+    s.n += 1;
+    if s.n % s.every == 0 {
+        metor_fsw_3::tracing::info!(n = s.n, "hello");
+    }
+    let _ = count.write(&Count { n: s.n });
+}
+
+/// The systems this pack exports.
+pub fn pack() -> SystemTable {
+    let mut table = SystemTable::new();
+    // PANIC Safety: `Count` is the only record, so its schema cannot clash.
+    table
+        .register("hello", hello(), Hello::new)
+        .expect("one record");
+    table
+}
+
+metor_fsw_3::export_pack!(pack);

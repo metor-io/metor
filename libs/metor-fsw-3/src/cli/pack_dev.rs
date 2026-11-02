@@ -7,9 +7,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
-use super::cargo::{CargoError, PackConfig, cargo_build, wasm_build};
+use super::cargo::{CargoError, PackConfig, Watch, cargo_build, wasm_build};
+use super::doctor::Status;
 use super::module::render;
+use super::ui::Ui;
+use super::ui::caps::Depth;
+use super::ui::event::{Event, Phase, PhaseState, Verb};
 use crate::dl::store::{copy_atomic, write_atomic};
 use crate::dl::{DlPack, Pack, PackError, PackKind, PackRef, cdylib_name, triple};
 use crate::pack::ABI_VERSION;
@@ -20,40 +25,53 @@ use crate::pack::def::PackDef;
 static BUILD: Mutex<()> = Mutex::new(());
 
 /// An error building a pack or writing its editable module.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum PackDevError {
     #[error("reading {path}: {source}")]
+    #[diagnostic(code(M0401))]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
     #[error("writing {path}: {source}")]
+    #[diagnostic(code(M0402))]
     Write {
         path: PathBuf,
         source: std::io::Error,
     },
     #[error("reading {path}: {source}")]
+    #[diagnostic(code(M0403))]
     Toml {
         path: PathBuf,
         source: toml::de::Error,
     },
     #[error("the params schema of `{system}` did not decode: {source}")]
+    #[diagnostic(code(M0404))]
     Schema {
         system: String,
         source: serde_json::Error,
     },
     #[error("system `{system}` has an input port and a param both named `{name}`")]
+    #[diagnostic(code(M0405), help("rename the param or the port"))]
     NameClash { system: String, name: String },
     #[error("rendering the module: {0}")]
+    #[diagnostic(code(M0406))]
     Template(#[from] minijinja::Error),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Cargo(#[from] CargoError),
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Pack(#[from] PackError),
     #[error("{0} is already loaded; restart the process before rebuilding this pack")]
+    #[diagnostic(code(M0407))]
     AlreadyLoaded(PathBuf),
     #[error("the module describes other systems than the library")]
+    #[diagnostic(code(M0408))]
     DescriptorMismatch,
+    #[error("the pack builds as wasm, and the wasm32 target is not installed")]
+    #[diagnostic(code(M0413), help("rustup target add {}", crate::dl::WASM_TRIPLE))]
+    NoWasmTarget,
 }
 
 impl PackDevError {
@@ -68,14 +86,68 @@ impl PackDevError {
 }
 
 /// Builds the pack at `root` and writes its module to
-/// `<root>/.metor/<module>/`.
+/// `<root>/.metor/<module>/`, reporting the build as a phase on `ui`.
 ///
 /// Only one call runs at a time. A library this process has already loaded
-/// cannot be replaced, so rebuilding it requires a new process. The written
-/// paths are printed to stderr, next to cargo's output.
-pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
+/// cannot be replaced, so rebuilding it requires a new process. With
+/// `--verbose`, the written paths follow cargo's output.
+pub fn pack_dev(root: &Path, ui: &Ui) -> Result<(), PackDevError> {
     let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     let config = PackConfig::read(root)?;
+    let phase = |state: PhaseState<'_>| {
+        ui.emit(Event::Phase(Phase {
+            verb: Verb::BUILD,
+            subject: &config.module,
+            state,
+        }))
+    };
+    let started = Instant::now();
+    phase(PhaseState::Started);
+    let mut done = 0;
+    let mut watch = Watch {
+        verbose: ui.verbose,
+        color: ui.caps.depth != Depth::None,
+        artifact: Box::new(|name: &str| {
+            done += 1;
+            phase(PhaseState::Progress {
+                done,
+                current: name,
+            });
+        }),
+    };
+    match build(root, &config, &mut watch) {
+        Ok(written) => {
+            phase(PhaseState::Done(started.elapsed()));
+            if ui.verbose {
+                list(&written, ui);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            phase(PhaseState::Failed);
+            if let PackDevError::Cargo(CargoError::Cargo { output, .. }) = &error {
+                ui.emit(Event::Output(output));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Shows each path in `written`, one per line.
+fn list(written: &[PathBuf], ui: &Ui) {
+    for path in written {
+        ui.emit(Event::Output(
+            format!("    {}\n", path.display()).as_bytes(),
+        ));
+    }
+}
+
+/// Builds the pack and writes its module. Returns the paths written.
+fn build(
+    root: &Path,
+    config: &PackConfig,
+    watch: &mut Watch<'_>,
+) -> Result<Vec<PathBuf>, PackDevError> {
     let module = root.join(".metor").join(&config.module);
     let mut reference = PackRef::dylib(config.id.clone(), config.lib.clone(), module.join("_libs"));
     let libs = reference.libs.join(triple());
@@ -83,7 +155,7 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     if crate::dl::is_loaded(&dylib) {
         return Err(PackDevError::AlreadyLoaded(dylib));
     }
-    let built = cargo_build(&config.krate, root)?;
+    let built = cargo_build(&config.krate, root, watch)?;
     std::fs::create_dir_all(&libs).map_err(PackDevError::write(&libs))?;
     copy_atomic(&built, &dylib).map_err(PackDevError::write(&dylib))?;
     // SAFETY: this library was just built from the pack crate, against this
@@ -92,17 +164,20 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     let mut staged = vec![dylib];
     if config.wasm {
         reference.kind = PackKind::Wasm(Default::default());
-        staged.push(stage_module(&config, root, &reference, pack.descriptor())?);
+        staged.push(stage_module(
+            config,
+            root,
+            &reference,
+            pack.descriptor(),
+            watch,
+        )?);
     }
     let text = render(&reference, ABI_VERSION, pack.descriptor())?;
     let init = module.join("__init__.py");
     write_atomic(&init, text.as_bytes()).map_err(PackDevError::write(&init))?;
     let typed = module.join("py.typed");
     write_atomic(&typed, b"").map_err(PackDevError::write(&typed))?;
-    for path in [&init, &typed].into_iter().chain(&staged) {
-        eprintln!("{}", path.display());
-    }
-    Ok(())
+    Ok([init, typed].into_iter().chain(staged).collect())
 }
 
 /// Builds the pack as a wasm module and copies it to where `reference`
@@ -115,8 +190,12 @@ fn stage_module(
     root: &Path,
     reference: &PackRef,
     library: &PackDef,
+    watch: &mut Watch<'_>,
 ) -> Result<PathBuf, PackDevError> {
-    let built = wasm_build(&config.krate, root)?;
+    if super::doctor::wasm32(root).status != Status::Ok {
+        return Err(PackDevError::NoWasmTarget);
+    }
+    let built = wasm_build(&config.krate, root, watch)?;
     let staged = reference.artifact();
     if let Some(dir) = staged.parent() {
         std::fs::create_dir_all(dir).map_err(PackDevError::write(dir))?;

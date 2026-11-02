@@ -14,16 +14,24 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-stellar = { path = "../metor-proto/stellar", optional = true }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+anstyle = { version = "1", optional = true }
+anstyle-lossy = { version = "1", optional = true }
 blake3 = { version = "1.8", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "wrap_help"], optional = true }
+clap_complete = { version = "4.5", features = ["unstable-dynamic"], optional = true }
+unicode-width = { version = "0.2", optional = true }
 const-fnv1a-hash = "1.1.0"
 cordyceps = { version = "0.3.4", default-features = false }
 futures-lite = "2"
 heapless = { version = "0.8", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
+jiff = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 libloading = { version = "0.8", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
+miette = { version = "7", features = ["fancy"], optional = true }
+notify = { version = "8", optional = true }
+notify-debouncer-mini = { version = "0.6", optional = true }
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"], optional = true }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
@@ -31,12 +39,18 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
+strsim = { version = "0.11", optional = true }
+supports-color = { version = "3", optional = true }
+terminal-colorsaurus = { version = "1", optional = true }
+terminal_size = { version = "0.4", optional = true }
 thiserror = "2.0"
 toml = { version = "0.8", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 wasmi = { version = "1.1", default-features = false, features = ["std"], optional = true }
 zerocopy = { version = "0.8.2", features = ["alloc", "derive"] }
+indicatif = { version = "0.18", optional = true }
+comfy-table = { version = "7.2", default-features = false, features = ["custom_styling"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stellarator = { path = "../stellarator", optional = true }
@@ -52,22 +66,37 @@ io-uring = { version = "0.7.1", optional = true }
 default = ["host", "db"]
 host = [
     "threads",
+    "dep:anstyle",
+    "dep:anstyle-lossy",
     "dep:blake3",
     "dep:clap",
+    "dep:clap_complete",
+    "dep:comfy-table",
+    "dep:unicode-width",
+    "dep:indicatif",
+    "dep:jiff",
     "dep:libc",
     "dep:libloading",
     "dep:metor-proto-stellar",
+    "dep:miette",
     "dep:minijinja",
+    "dep:notify",
+    "dep:notify-debouncer-mini",
     "dep:polling",
     "dep:io-uring",
     "dep:toml",
     "dep:wasmi",
+    "dep:strsim",
+    "dep:supports-color",
+    "dep:terminal-colorsaurus",
+    "dep:terminal_size",
 ]
 
 threads = ["dep:stellarator", "dep:thingbuf"]
 db = ["host", "dep:metor-db"]
 
 [dev-dependencies]
+insta = "1"
 tempfile = "3"
 trybuild = "1"
 wat = "1"

@@ -1,0 +1,13 @@
+---
+source: libs/metor-fsw-3/src/cli/diagnostic.rs
+expression: "String::from_utf8(out).expect(\"utf-8\")"
+---
+M0327 (https://github.com/metor-io/metor/blob/main/libs/metor-fsw-3/src/cli/codes.md#m0327)
+
+  × `gps` holds a `Cap`, so an fsw.io must follow it
+   ╭─[t.py:2:1]
+ 1 │ a = 1
+ 2 │ fsw.io = 2
+   · ──────────
+   ╰────
+  help: add fsw.io after `gps`

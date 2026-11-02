@@ -1,0 +1,11 @@
+---
+source: libs/metor-fsw-3/src/cli/show.rs
+expression: "rendered(Selection::System(1, 0))"
+---
+  fsw.nav  adcs.Nav
+
+    INPUT    FROM
+    sensors  plant.sensors
+
+    GRANT  RESOURCE
+    uart   gps_port
