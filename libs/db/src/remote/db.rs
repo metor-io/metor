@@ -358,17 +358,20 @@ mod tests {
         panic!("never saw {what}");
     }
 
+    /// What a session opened: its db, whether the cache was fresh, and its
+    /// hydrator.
+    type Opened = (Arc<DB>, bool, Hydrator);
+
     /// One mirror session into `id`'s peer cache, on a runtime of its own
     /// so cancelling it ends the session: its tasks stop, and the cache's
-    /// lock is released. Hands back the db, whether the cache was fresh,
-    /// and the session's hydrator.
+    /// lock is released.
     fn cached_session(
         cache: crate::peer_cache::PeerCache,
         id: metor_proto_wkt::InstanceId,
         addr: SocketAddr,
         cancel: stellarator::util::CancelToken,
     ) -> (
-        std::sync::mpsc::Receiver<(Arc<DB>, bool, Hydrator)>,
+        std::sync::mpsc::Receiver<Opened>,
         stellarator::struc_con::Thread<Option<()>>,
     ) {
         let (tx, rx) = std::sync::mpsc::channel();
