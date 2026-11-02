@@ -457,7 +457,9 @@ enum Kind {
 fn classify(path: &str) -> Option<Kind> {
     let names: Vec<_> = path.split('/').collect();
     match names.as_slice() {
-        ["manifest.json" | "workspace.json"] | ["db", "db_state"] => Some(Kind::Metadata),
+        ["manifest.json" | "workspace.json"] | ["db", "db_state" | "instance_id"] => {
+            Some(Kind::Metadata)
+        }
         ["db", component, "schema" | "metadata" | "manifest"] if number::<u64>(component) => {
             Some(Kind::Metadata)
         }
