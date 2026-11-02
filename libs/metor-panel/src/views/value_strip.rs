@@ -17,6 +17,7 @@ pub use super::format::StripCell;
 use super::format::ValueFormatter;
 #[cfg(test)]
 use super::format::format_element;
+use super::gradient::{Gradient, Scale};
 use super::switch::Switch;
 
 /// Scalar interpretation of every cell in a strip.
@@ -153,6 +154,12 @@ pub struct StripStyle {
     pub align: StripAlign,
     /// Value text size in unscaled pixels, replacing the preset's own.
     pub value_size: Option<f32>,
+    /// The host's gradient setting, replacing what the component's
+    /// metadata asks for; `None` follows the metadata.
+    pub gradient: Option<Gradient>,
+    /// A range the host fitted over more values than this strip's own —
+    /// a table column's — which an `auto` gradient colours on.
+    pub fitted: Option<Scale>,
 }
 
 impl StripStyle {
@@ -167,6 +174,8 @@ impl StripStyle {
             states: None,
             align: StripAlign::Left,
             value_size: None,
+            gradient: None,
+            fitted: None,
         }
     }
 
@@ -181,6 +190,8 @@ impl StripStyle {
             states: None,
             align: StripAlign::Left,
             value_size: None,
+            gradient: None,
+            fitted: None,
         }
     }
 
@@ -206,6 +217,12 @@ impl StripStyle {
 
     pub fn with_value_size(mut self, size: Option<f32>) -> Self {
         self.value_size = size;
+        self
+    }
+
+    pub fn with_gradient(mut self, gradient: Option<Gradient>, fitted: Option<Scale>) -> Self {
+        self.gradient = gradient;
+        self.fitted = fitted;
         self
     }
 }
@@ -256,6 +273,8 @@ fn style_equivalent(a: &StripStyle, b: &StripStyle) -> bool {
         && a.unit == b.unit
         && a.placeholder == b.placeholder
         && a.states == b.states
+        && a.gradient == b.gradient
+        && a.fitted == b.fitted
         && a.align == b.align
         && a.value_size == b.value_size
 }
@@ -291,6 +310,8 @@ pub struct ComponentValueStrip {
     behavior: StripBehavior,
     cells: Vec<StripCell>,
     kind: CellKind,
+    /// What the component's metadata asks for.
+    gradient: Option<Gradient>,
     /// No sample for [`STALE_AFTER`](super::binding::STALE_AFTER); cells
     /// tint so a dead producer can't pass for a steady one.
     stale: bool,
@@ -328,6 +349,7 @@ impl ComponentValueStrip {
                         this.component_name = metadata.component_name;
                         this.element_names = metadata.element_names;
                         this.formatter = metadata.formatter;
+                        this.gradient = metadata.gradient;
                     }
                     StreamUpdate::Value((cells, raw_values)) => {
                         this.cells = cells;
@@ -357,6 +379,7 @@ impl ComponentValueStrip {
             behavior,
             cells: Vec::new(),
             kind: CellKind::Unknown,
+            gradient: None,
             stale: false,
             editing: None,
             focus: cx.focus_handle(),
@@ -647,6 +670,12 @@ impl Render for ComponentValueStrip {
         if !style.intrinsic_width {
             row = justify(row.flex_wrap(), style.align);
         }
+        // Strings and flags have no magnitude to shade.
+        let scale = style
+            .gradient
+            .or(self.gradient)
+            .filter(|_| matches!(kind, CellKind::Numeric))
+            .and_then(|g| g.scale(style.fitted, raw_values.iter().map(|v| v.as_f64())));
 
         for (idx, cell) in cells.iter().enumerate() {
             let is_pending = behavior.highlighted.contains(&idx);
@@ -679,6 +708,10 @@ impl Render for ComponentValueStrip {
             };
             // A named bool draws as its state; clicking still toggles it.
             let draws_as_toggle = is_bool && state.is_none();
+            let tint = scale
+                .filter(|_| state.is_none())
+                .zip(raw_values.get(idx))
+                .map(|(scale, v)| theme.gradient_fill(scale.position(v.as_f64())));
             let (display_cell, accent) = match state {
                 Some((text, accent)) => (
                     StripCell {
@@ -712,6 +745,7 @@ impl Render for ComponentValueStrip {
                     stale,
                     draws_as_toggle.then(|| Switch::new(bool_value, STRIP_BOX_HEIGHT, cx).scaled()),
                     accent,
+                    tint,
                     has_apply_group,
                 )
             };
@@ -925,6 +959,7 @@ fn build_cell_chrome(
     stale: bool,
     switch: Option<Switch>,
     accent: Option<gpui::Hsla>,
+    tint: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
     let mut atom = box_corners(
@@ -969,7 +1004,10 @@ fn build_cell_chrome(
     let chip_accent = (!is_pending && !stale).then_some(accent).flatten();
     match style.preset {
         StripPreset::Boxes => {
-            atom = atom.bg(box_fill(theme, is_pending, stale, chip_accent));
+            atom = atom.bg(match tint {
+                Some(tint) if !is_pending && !stale && chip_accent.is_none() => tint,
+                _ => box_fill(theme, is_pending, stale, chip_accent),
+            });
         }
         StripPreset::Dashboard => {
             if is_pending {
@@ -978,6 +1016,8 @@ fn build_cell_chrome(
                 atom = atom.bg(theme.stale_bg());
             } else if let Some(accent) = chip_accent {
                 atom = atom.bg(Theme::dim(accent, 0.18));
+            } else if let Some(tint) = tint {
+                atom = atom.bg(tint);
             }
         }
     }
@@ -1165,7 +1205,7 @@ pub(crate) fn render_static_cells(
     for (idx, cell) in cells.iter().enumerate() {
         let id_key = row_key.wrapping_mul(64).wrapping_add(idx);
         row = row.child(build_cell_chrome(
-            id_key, cell, style, theme, false, false, false, None, None, false,
+            id_key, cell, style, theme, false, false, false, None, None, None, false,
         ));
     }
     row
@@ -1176,6 +1216,7 @@ pub(crate) struct ResolvedMetadata {
     pub formatter: ValueFormatter,
     pub kind: CellKind,
     pub component_name: SharedString,
+    pub gradient: Option<Gradient>,
 }
 
 /// Look up the metadata the strip needs to decode and label elements.
@@ -1226,6 +1267,7 @@ pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMe
             formatter: ValueFormatter::new(is_string, enum_variants),
             kind,
             component_name,
+            gradient: meta.and_then(Gradient::from_metadata),
         }
     })
 }

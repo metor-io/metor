@@ -12,6 +12,7 @@
 //! them against what it last resolved at render time, so an inspector edit
 //! re-resolves without a setter, as the annunciator's pattern does.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use super::model::{Arrangement, Frame, Grid};
 use super::source::{FrameIndex, RowPattern, Sources};
 #[allow(unused_imports)]
 use crate::inspect;
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{theme, ui_px};
@@ -35,9 +37,10 @@ use crate::views::component_browser::component_tree::{
     ComponentNode, build_full_tree, natural_cmp,
 };
 use crate::views::component_browser::strip_cell_count;
+use crate::views::gradient::{Gradient, Scale};
 use crate::views::lazy_pool::VisibleEntityCache;
 use crate::views::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
-use crate::views::value_strip::ComponentValueStrip;
+use crate::views::value_strip::{ComponentValueStrip, StripStyle};
 use smallvec::SmallVec;
 
 /// Live strips kept alive; well above any visible cell count.
@@ -67,6 +70,9 @@ pub struct PivotTableConfig {
     /// Fields first, in this order.
     pub fields: Vec<String>,
     pub hidden: Vec<String>,
+    /// Per-field gradient settings (`auto`, `off` or `lo..hi`) that replace
+    /// what the field's metadata asks for.
+    pub gradients: BTreeMap<String, String>,
 }
 
 /// The text of every source, as last resolved.
@@ -117,7 +123,21 @@ impl PivotTable {
             hidden: cfg.hidden.into_iter().map(SharedString::from).collect(),
             rows: Vec::new(),
         };
-        let table = cx.new(|_| Table::new(PivotDelegate::new(db.clone(), arrangement)));
+        let gradients = cfg
+            .gradients
+            .iter()
+            .filter_map(|(field, text)| {
+                Some((
+                    SharedString::from(field.clone()),
+                    Gradient::parse(text).ok()??,
+                ))
+            })
+            .collect();
+        let table = cx.new(|_| {
+            let mut delegate = PivotDelegate::new(db.clone(), arrangement);
+            delegate.gradients = gradients;
+            Table::new(delegate)
+        });
         cx.observe(&table, |_, _, cx| cx.notify()).detach();
         let strings = |v: Vec<String>| v.into_iter().map(SharedString::from).collect();
         Self {
@@ -148,7 +168,8 @@ impl PivotTable {
 
     pub fn to_config(&self, cx: &App) -> PivotTableConfig {
         let strings = |v: &[SharedString]| v.iter().map(|s| s.to_string()).collect();
-        let arrangement = &self.table.read(cx).delegate().arrangement;
+        let delegate = self.table.read(cx).delegate();
+        let arrangement = &delegate.arrangement;
         let mut hidden: Vec<String> = arrangement.hidden.iter().map(|s| s.to_string()).collect();
         hidden.sort();
         PivotTableConfig {
@@ -161,6 +182,11 @@ impl PivotTable {
             exclude: self.exclude.to_string(),
             fields: strings(&arrangement.order),
             hidden,
+            gradients: delegate
+                .gradients
+                .iter()
+                .map(|(field, g)| (field.to_string(), g.text()))
+                .collect(),
         }
     }
 
@@ -322,19 +348,32 @@ pub struct PivotDelegate {
     /// The sorted column by name, as the table tracks it, so the sort
     /// follows its column when captures come and go.
     sort: Option<(SharedString, ColumnSort)>,
-    /// The sorted field's current value per grid instance, while a field
-    /// column is sorted; `None` where an instance lacks it or it doesn't
-    /// read as numbers.
-    sort_values: Vec<Option<SortValue>>,
-    /// One stream per instance feeding `sort_values`; dropped to stop.
-    sort_streams: Vec<gpui::Task<()>>,
-    /// A sort value changed since the order was last settled.
-    resort: bool,
+    /// Gradient settings the user chose per field, over the metadata's.
+    gradients: BTreeMap<SharedString, Gradient>,
+    /// Each grid field's gradient: the user's, else what the field's
+    /// metadata asks for.
+    column_gradients: Vec<Option<Gradient>>,
+    /// Live values of the grid fields that need them — the sorted one and
+    /// any coloured on a range fitted to the column — keyed by grid index.
+    watched: HashMap<usize, Watched>,
+    /// A watched value changed since the order and ranges were settled.
+    dirty: bool,
     strips: VisibleEntityCache<ComponentValueStrip>,
 }
 
 /// A field's elements as numbers, compared element by element.
 type SortValue = SmallVec<[f64; 4]>;
+
+/// One field's current value on every instance.
+struct Watched {
+    /// By grid instance; `None` where an instance lacks the field or it
+    /// doesn't read as numbers.
+    values: Vec<Option<SortValue>>,
+    /// The range an `auto` gradient colours the column on.
+    fitted: Option<Scale>,
+    /// One stream per instance feeding `values`; dropped to stop.
+    _streams: Vec<gpui::Task<()>>,
+}
 
 impl PivotDelegate {
     fn new(db: Arc<DB>, arrangement: Arrangement) -> Self {
@@ -346,9 +385,10 @@ impl PivotDelegate {
             grid: Arc::new(Grid::new(SharedString::default(), Vec::new(), None, &|_| 1)),
             order: Vec::new(),
             sort: None,
-            sort_values: Vec::new(),
-            sort_streams: Vec::new(),
-            resort: false,
+            gradients: BTreeMap::new(),
+            column_gradients: Vec::new(),
+            watched: HashMap::new(),
+            dirty: false,
             strips: VisibleEntityCache::new(CACHE_CAP),
         }
     }
@@ -372,9 +412,53 @@ impl PivotDelegate {
             Some(&self.arrangement),
             &|id| strip_cell_count(&db, id),
         ));
-        self.watch_sort(cx);
-        self.apply_sort();
+        self.column_gradients = self.resolve_gradients();
+        self.watch(cx);
+        self.settle();
         cx.notify();
+    }
+
+    /// The user's setting for each field, else the metadata of the first
+    /// instance that has it.
+    fn resolve_gradients(&self) -> Vec<Option<Gradient>> {
+        let grid = &self.grid;
+        self.db.with_state(|state| {
+            grid.fields
+                .iter()
+                .enumerate()
+                .map(|(field_ix, field)| {
+                    self.gradients.get(field).copied().or_else(|| {
+                        grid.instances
+                            .iter()
+                            .filter_map(|i| i.ids[field_ix])
+                            .find_map(|id| state.get_component_metadata(id))
+                            .and_then(Gradient::from_metadata)
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Choose a field's gradient, or with `None` go back to its metadata.
+    fn set_gradient(
+        &mut self,
+        field: &SharedString,
+        gradient: Option<Gradient>,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        match gradient {
+            Some(g) => self.gradients.insert(field.clone(), g),
+            None => self.gradients.remove(field),
+        };
+        self.relayout(cx);
+    }
+
+    /// Re-sort and refit the ranges after watched values change.
+    fn settle(&mut self) {
+        for watched in self.watched.values_mut() {
+            watched.fitted = Scale::fit(watched.values.iter().flatten().flatten().copied());
+        }
+        self.apply_sort();
     }
 
     /// The grid index of the sorted field, when a field column is sorted.
@@ -386,50 +470,82 @@ impl PivotDelegate {
         self.grid.fields.iter().position(|f| f == name)
     }
 
-    /// Follow the sorted field's value on every instance, so the order
-    /// tracks live data; a sort on anything else streams nothing.
-    fn watch_sort(&mut self, cx: &mut Context<Table<Self>>) {
-        self.sort_streams.clear();
-        self.sort_values = vec![None; self.grid.instances.len()];
-        let Some(field_ix) = self.sorted_field() else {
-            return;
-        };
-        for (ix, instance) in self.grid.instances.iter().enumerate() {
-            let Some(id) = instance.ids[field_ix] else {
-                continue;
-            };
-            self.sort_streams.push(spawn_seeded_stream(
-                self.db.clone(),
-                id,
-                cx,
-                |_, _| {
-                    ((), |view: metor_proto::types::ComponentView<'_>| {
-                        Some(view.iter().map(|v| v.as_f64()).collect::<SortValue>())
-                    })
+    /// Follow every instance's value of the sorted field and of each field
+    /// coloured on a fitted range, so the order and the colours track live
+    /// data; anything else streams nothing.
+    fn watch(&mut self, cx: &mut Context<Table<Self>>) {
+        self.watched.clear();
+        let fitted = self
+            .column_gradients
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| **g == Some(Gradient::Auto))
+            .map(|(ix, _)| ix);
+        let mut fields: Vec<usize> = self.sorted_field().into_iter().chain(fitted).collect();
+        fields.sort_unstable();
+        fields.dedup();
+        for field_ix in fields {
+            let streams = self
+                .grid
+                .instances
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, instance)| Some((ix, instance.ids[field_ix]?)))
+                .map(|(ix, id)| self.stream(field_ix, ix, id, cx))
+                .collect();
+            self.watched.insert(
+                field_ix,
+                Watched {
+                    values: vec![None; self.grid.instances.len()],
+                    fitted: None,
+                    _streams: streams,
                 },
-                move |table: &mut Table<Self>, update, cx| {
-                    let value = match update {
-                        StreamUpdate::Value(value) => Some(value),
-                        StreamUpdate::Unavailable => None,
-                        _ => return,
-                    };
-                    let delegate = table.delegate_mut();
-                    if let Some(slot) = delegate.sort_values.get_mut(ix)
-                        && *slot != value
-                    {
-                        *slot = value;
-                        delegate.resort = true;
-                        cx.notify();
-                    }
-                },
-            ));
+            );
         }
+    }
+
+    /// Feed instance `ix`'s value of `field_ix` into what's watched.
+    fn stream(
+        &self,
+        field_ix: usize,
+        ix: usize,
+        id: metor_proto::types::ComponentId,
+        cx: &mut Context<Table<Self>>,
+    ) -> gpui::Task<()> {
+        spawn_seeded_stream(
+            self.db.clone(),
+            id,
+            cx,
+            |_, _| {
+                ((), |view: metor_proto::types::ComponentView<'_>| {
+                    Some(view.iter().map(|v| v.as_f64()).collect::<SortValue>())
+                })
+            },
+            move |table: &mut Table<Self>, update, cx| {
+                let value = match update {
+                    StreamUpdate::Value(value) => Some(value),
+                    StreamUpdate::Unavailable => None,
+                    _ => return,
+                };
+                let delegate = table.delegate_mut();
+                if let Some(slot) = delegate
+                    .watched
+                    .get_mut(&field_ix)
+                    .and_then(|w| w.values.get_mut(ix))
+                    && *slot != value
+                {
+                    *slot = value;
+                    delegate.dirty = true;
+                    cx.notify();
+                }
+            },
+        )
     }
 
     /// Instance and key columns sort naturally, fields by their live value
     /// with instances lacking one last either way; unsorted is path order.
     fn apply_sort(&mut self) {
-        self.resort = false;
+        self.dirty = false;
         let grid = &self.grid;
         let mut order: Vec<usize> = (0..grid.instances.len()).collect();
         let Some((name, sort)) = self
@@ -447,8 +563,8 @@ impl PivotDelegate {
                 o
             }
         };
-        if self.sorted_field().is_some() {
-            let values = &self.sort_values;
+        if let Some(watched) = self.sorted_field().and_then(|f| self.watched.get(&f)) {
+            let values = &watched.values;
             order.sort_by(|&a, &b| match (&values[a], &values[b]) {
                 (Some(a), Some(b)) => directed(compare_values(a, b)),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -486,6 +602,66 @@ impl PivotDelegate {
     fn set_hidden(&mut self, field: &SharedString, hidden: bool, cx: &mut Context<Table<Self>>) {
         self.arrangement.set_hidden(field, hidden);
         self.relayout(cx);
+    }
+
+    /// Colour a field by value, on a range fitted to the column or one
+    /// typed in; stop; or go back to what its metadata says.
+    fn gradient_rows(
+        &self,
+        field: &SharedString,
+        cx: &mut Context<Table<Self>>,
+    ) -> Vec<Box<dyn InspectorRow>> {
+        let current = self
+            .grid
+            .fields
+            .iter()
+            .position(|f| f == field)
+            .and_then(|ix| self.column_gradients.get(ix).copied().flatten());
+        let table = cx.entity();
+        let set = move |gradient: Option<Gradient>| {
+            let (table, field) = (table.clone(), field.clone());
+            move |cx: &mut App| {
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().set_gradient(&field, gradient, cx);
+                })
+            }
+        };
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        if current != Some(Gradient::Auto) {
+            let apply = set(Some(Gradient::Auto));
+            rows.push(Box::new(CommandRow::new(
+                "Color by value",
+                Arc::new(move |_, cx| apply(cx)),
+            )));
+        }
+        let (table, field_name) = (cx.entity(), field.clone());
+        rows.push(Box::new(DefaultActionRow::new(
+            "Color range, e.g. 0..100",
+            Arc::new(move |input, _, cx| {
+                if let Ok(Some(gradient)) = Gradient::parse(&input) {
+                    table.update(cx, |table, cx| {
+                        table
+                            .delegate_mut()
+                            .set_gradient(&field_name, Some(gradient), cx);
+                    });
+                }
+            }),
+        )));
+        if current.is_some_and(|g| g != Gradient::Off) {
+            let apply = set(Some(Gradient::Off));
+            rows.push(Box::new(CommandRow::new(
+                "Stop coloring",
+                Arc::new(move |_, cx| apply(cx)),
+            )));
+        }
+        if self.gradients.contains_key(field) {
+            let apply = set(None);
+            rows.push(Box::new(CommandRow::new(
+                "Color as its metadata says",
+                Arc::new(move |_, cx| apply(cx)),
+            )));
+        }
+        rows
     }
 
     fn render_text(&self, text: SharedString, primary: bool, cx: &App) -> AnyElement {
@@ -544,8 +720,8 @@ impl TableDelegate for PivotDelegate {
     }
 
     fn before_render(&mut self, _cx: &mut Context<Table<Self>>) {
-        if self.resort {
-            self.apply_sort();
+        if self.dirty {
+            self.settle();
         }
     }
 
@@ -589,6 +765,10 @@ impl TableDelegate for PivotDelegate {
             field,
             n,
             CellFit::Fill,
+            StripStyle::boxes().with_gradient(
+                self.column_gradients.get(field_ix).copied().flatten(),
+                self.watched.get(&field_ix).and_then(|w| w.fitted),
+            ),
             cx,
         )
     }
@@ -598,8 +778,8 @@ impl TableDelegate for PivotDelegate {
             return;
         };
         self.sort = Some((column.name, sort));
-        self.watch_sort(cx);
-        self.apply_sort();
+        self.watch(cx);
+        self.settle();
         cx.notify();
     }
 
@@ -633,7 +813,10 @@ impl TableDelegate for PivotDelegate {
             return;
         }
         let table = cx.entity();
-        let rows = field_menu_rows(
+        let mut rows = field
+            .map(|field| self.gradient_rows(field, cx))
+            .unwrap_or_default();
+        rows.extend(field_menu_rows(
             &self.grid,
             field,
             Arc::new(move |field, hidden, cx| {
@@ -641,7 +824,7 @@ impl TableDelegate for PivotDelegate {
                     table.delegate_mut().set_hidden(&field, hidden, cx);
                 });
             }),
-        );
+        ));
         open(
             InspectorRequest {
                 rows,
@@ -888,11 +1071,12 @@ mod tests {
                 view.update(cx, |view, cx| {
                     view.table.update(cx, |table, cx| {
                         let delegate = table.delegate_mut();
-                        delegate.sort_values = values
+                        // `current` is grid field 0.
+                        delegate.watched.get_mut(&0).unwrap().values = values
                             .iter()
                             .map(|v| v.map(|v| SortValue::from_slice(&[v])))
                             .collect();
-                        delegate.resort = true;
+                        delegate.dirty = true;
                         delegate.before_render(cx);
                     });
                 })
@@ -906,7 +1090,7 @@ mod tests {
                         .delegate_mut()
                         .sort_column(2, ColumnSort::Ascending, cx);
                     // Each dut has a current, so each streams one.
-                    assert_eq!(table.delegate().sort_streams.len(), 3);
+                    assert_eq!(table.delegate().watched[&0]._streams.len(), 3);
                 });
             })
         });
@@ -926,6 +1110,60 @@ mod tests {
         });
         deliver([Some(0.5), Some(1.0), None], cx);
         assert_eq!(labels(&view, cx), ["dut2.psu", "dut1.psu", "dut3.psu"]);
+    }
+
+    #[gpui::test]
+    fn a_column_gradient_follows_metadata_until_overridden(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        db.with_state_mut(|s| {
+            let id = metor_proto::types::ComponentId::new("dut1.psu.voltage");
+            let mut meta = s.get_component_metadata(id).unwrap().clone();
+            meta.metadata.insert("gradient".into(), "0..5".into());
+            s.set_component_metadata(meta, &db.path)
+        })
+        .unwrap();
+        let cx = cx.add_empty_window();
+        let view = open(
+            &db,
+            PivotTableConfig {
+                frame: "psu".into(),
+                gradients: [("current".to_string(), "auto".to_string())].into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, cx| {
+                    let delegate = table.delegate_mut();
+                    // Fields are current, voltage.
+                    assert_eq!(
+                        delegate.column_gradients,
+                        [Some(Gradient::Auto), Some(Gradient::Range(0.0, 5.0))]
+                    );
+                    // Only the auto column streams, to fit its range.
+                    assert_eq!(delegate.watched.keys().collect::<Vec<_>>(), [&0]);
+                    delegate.watched.get_mut(&0).unwrap().values =
+                        vec![Some(SortValue::from_slice(&[4.0])), None];
+                    delegate.dirty = true;
+                    delegate.before_render(cx);
+                    let fitted = delegate.watched[&0].fitted.unwrap();
+                    assert_eq!(fitted.position(2.0), 0.5);
+                    delegate.set_gradient(&"voltage".into(), Some(Gradient::Off), cx);
+                    delegate.set_gradient(&"current".into(), None, cx);
+                    assert_eq!(
+                        table.delegate().column_gradients,
+                        [None, Some(Gradient::Off)]
+                    );
+                    assert!(table.delegate().watched.is_empty());
+                });
+            });
+            let config = view.read(cx).to_config(cx);
+            assert_eq!(
+                config.gradients,
+                BTreeMap::from([("voltage".to_string(), "off".to_string())])
+            );
+        });
     }
 
     #[test]

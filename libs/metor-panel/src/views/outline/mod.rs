@@ -40,6 +40,7 @@ use super::pivot::{
 };
 use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
+use super::value_strip::StripStyle;
 use super::value_strip::{ComponentValueStrip, strip_row_width};
 use crate::icons::Icon;
 use crate::inspector::plot_preview::shift_hover_listener;
@@ -1315,6 +1316,7 @@ impl OutlineDelegate {
                     field,
                     n,
                     CellFit::Sized,
+                    StripStyle::boxes(),
                     cx,
                 )
             })

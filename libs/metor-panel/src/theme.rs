@@ -278,6 +278,19 @@ impl Theme {
         }
     }
 
+    /// A box fill for a gradient position `t` in -1..=1: the plain box at
+    /// 0, moving toward the "on" colour for positives and the error colour
+    /// for negatives, never so far that the value text stops reading.
+    pub fn gradient_fill(&self, t: f32) -> Hsla {
+        const MAX_TINT: f32 = 0.6;
+        let hue = if t >= 0.0 {
+            self.control_active
+        } else {
+            self.error_accent
+        };
+        lerp_color(self.bg_secondary, hue, t.abs().min(1.0) * MAX_TINT)
+    }
+
     /// A theme token at reduced alpha, for tints and dimmed borders derived
     /// from accent colors without introducing new literals at call sites.
     pub fn dim(color: Hsla, alpha: f32) -> Hsla {

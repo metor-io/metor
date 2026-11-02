@@ -11,6 +11,7 @@ pub mod dashboard;
 pub mod filter_bar;
 pub mod format;
 pub mod gauge;
+pub(crate) mod gradient;
 pub(crate) mod image_source;
 pub mod image_view;
 pub mod inspector_pane;

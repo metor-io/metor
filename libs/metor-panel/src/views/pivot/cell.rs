@@ -61,8 +61,9 @@ pub(crate) enum CellFit {
     Fill,
 }
 
-/// One field of one instance: its strip, a muted stand-in for a value that
-/// doesn't strip, or a dash where the instance lacks the field.
+/// One field of one instance: its strip in the host's `style`, a muted
+/// stand-in for a value that doesn't strip, or a dash where the instance
+/// lacks the field.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn field_cell<T: 'static>(
     db: &Arc<DB>,
@@ -72,6 +73,7 @@ pub(crate) fn field_cell<T: 'static>(
     field: &SharedString,
     n: usize,
     fit: CellFit,
+    style: StripStyle,
     cx: &mut Context<T>,
 ) -> AnyElement {
     let theme = theme(cx);
@@ -110,7 +112,10 @@ pub(crate) fn field_cell<T: 'static>(
     let click = edit_click(db.clone(), id, name);
     let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
     behavior.on_element_right_click = Some(strip_menu(db.clone(), id));
-    strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
+    strip.update(cx, |s, cx| {
+        s.set_behavior(behavior, cx);
+        s.set_style(style, cx);
+    });
     // Hold the strip to one line: the cell is sized for it, and an element
     // that still doesn't fit should clip, not wrap.
     let mut line = div().min_w(ui_px(strip_row_width(n))).child(strip);
