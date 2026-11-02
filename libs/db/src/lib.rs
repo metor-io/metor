@@ -59,6 +59,7 @@ pub mod evict;
 pub mod lod;
 pub mod manifest;
 pub mod msg_log;
+pub mod peer_cache;
 pub mod remote;
 pub mod scratch;
 pub mod seal;

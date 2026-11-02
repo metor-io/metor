@@ -1104,14 +1104,16 @@ impl std::str::FromStr for InstanceId {
     type Err = InvalidInstanceId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.as_bytes();
-        if s.len() != 32 {
+        let (pairs, []) = s.as_bytes().as_chunks::<2>() else {
+            return Err(InvalidInstanceId);
+        };
+        if pairs.len() != 16 {
             return Err(InvalidInstanceId);
         }
         let mut id = [0u8; 16];
         let nibble = |c: u8| (c as char).to_digit(16).ok_or(InvalidInstanceId);
-        for (byte, pair) in id.iter_mut().zip(s.chunks_exact(2)) {
-            *byte = (nibble(pair[0])? << 4 | nibble(pair[1])?) as u8;
+        for (byte, [high, low]) in id.iter_mut().zip(pairs) {
+            *byte = (nibble(*high)? << 4 | nibble(*low)?) as u8;
         }
         Ok(InstanceId(id))
     }
