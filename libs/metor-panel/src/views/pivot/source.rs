@@ -24,7 +24,8 @@ use super::model::{Captures, Frame};
 use crate::query::Query;
 use crate::views::component_browser::component_tree::{ComponentNode, natural_cmp, node_at};
 
-/// Every tagged frame instance in the db: type name → roots.
+/// Every tagged frame instance in the db: type name → roots. A frame map's
+/// entries are instances of their own type, `{frame}.{map}`.
 #[derive(Default, Clone)]
 pub(crate) struct FrameIndex {
     roots: HashMap<SharedString, BTreeSet<SharedString>>,
@@ -33,12 +34,12 @@ pub(crate) struct FrameIndex {
 impl FrameIndex {
     pub fn from_db(db: &DB) -> Self {
         db.with_state(|state| {
-            Self::from_tags(
-                state
-                    .component_metadata_iter()
-                    .filter(|(_, meta)| !meta.is_hidden())
-                    .filter_map(|(_, meta)| meta.frame()),
-            )
+            let tags: Vec<(String, String)> = state
+                .component_metadata_iter()
+                .filter(|(_, meta)| !meta.is_hidden())
+                .flat_map(|(_, meta)| meta.frame_instances())
+                .collect();
+            Self::from_tags(tags.iter().map(|(t, r)| (t.as_str(), r.as_str())))
         })
     }
 

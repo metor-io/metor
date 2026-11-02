@@ -9,6 +9,11 @@ pub const LOD_KEY: &str = "lod";
 pub const FRAME_KEY: &str = "frame";
 /// The path a frame's fields sit under; one frame instance per root.
 pub const FRAME_ROOT_KEY: &str = "frame.root";
+/// The member templates of the frame maps a field sits in, comma
+/// separated: each map's path with no keys, as `{root}.ifaces`. A keyed
+/// member inherits it with the rest of its template's metadata, which is how
+/// the ground finds the key segments in the member's own path.
+pub const FRAME_MAPS_KEY: &str = "frame.maps";
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Schema)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
@@ -93,6 +98,60 @@ impl ComponentMetadata {
             self.metadata.get(FRAME_KEY)?.as_str(),
             self.metadata.get(FRAME_ROOT_KEY)?.as_str(),
         ))
+    }
+
+    /// Marks this component as a member of the frame map at `path`, the
+    /// map's template path. Called innermost map first.
+    pub fn with_frame_map(mut self, path: &str) -> Self {
+        let maps = self.metadata.entry(FRAME_MAPS_KEY.to_string()).or_default();
+        *maps = if maps.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path},{maps}")
+        };
+        self
+    }
+
+    /// Every frame instance this component is a field of: the frame's own
+    /// root, then one per enclosing frame map, whose type is the frame's name
+    /// and the map's path within it (`nics.ifaces`) and whose root is the
+    /// keyed entry (`{root}.ifaces.eth0`). A map of plain values has no
+    /// fields under its entries, so it names no instances.
+    pub fn frame_instances(&self) -> Vec<(String, String)> {
+        let Some((frame, root)) = self.frame() else {
+            return Vec::new();
+        };
+        let mut out = vec![(frame.to_string(), root.to_string())];
+        let Some(maps) = self.metadata.get(FRAME_MAPS_KEY) else {
+            return out;
+        };
+        let segments: Vec<&str> = self.name.split('.').collect();
+        let mut maps: Vec<&str> = maps.split(',').filter(|m| !m.is_empty()).collect();
+        maps.sort_by_key(|m| m.split('.').count());
+        let mut keys = Vec::new();
+        for map in maps {
+            let template: Vec<&str> = map.split('.').collect();
+            let key = template.len() + keys.len();
+            if segments.len() <= key + 1 {
+                break;
+            }
+            // The member's path with the outer keys taken out must lead
+            // with the map's template, or the tag doesn't describe it.
+            let unkeyed = segments[..key]
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| !keys.contains(ix))
+                .map(|(_, s)| *s);
+            if !unkeyed.eq(template.iter().copied()) {
+                break;
+            }
+            keys.push(key);
+            let Some(within) = map.strip_prefix(root).and_then(|m| m.strip_prefix('.')) else {
+                break;
+            };
+            out.push((format!("{frame}.{within}"), segments[..=key].join(".")));
+        }
+        out
     }
 
     pub fn group_name(&self) -> Option<&str> {
@@ -184,5 +243,61 @@ impl MetadataExt for EntityMetadata {
     }
     fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A field of an `ifaces` entry, inheriting the template's tags as the
+    /// db hands them down.
+    fn member(name: &str, maps: &[&str]) -> ComponentMetadata {
+        let mut meta = ComponentMetadata {
+            component_id: ComponentId::new(name),
+            name: name.to_string(),
+            metadata: Default::default(),
+        }
+        .with_frame("nics", "sys.nics");
+        // Innermost first, as the producer's metadata nests.
+        for map in maps.iter().rev() {
+            meta = meta.with_frame_map(map);
+        }
+        meta
+    }
+
+    #[test]
+    fn a_map_entry_is_an_instance_of_its_own_type() {
+        let meta = member("sys.nics.ifaces.eth0.rx_bytes", &["sys.nics.ifaces"]);
+        assert_eq!(
+            meta.frame_instances(),
+            [
+                ("nics".into(), "sys.nics".into()),
+                ("nics.ifaces".into(), "sys.nics.ifaces.eth0".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_maps_find_each_key_and_plain_values_name_nothing() {
+        let maps = ["sys.nics.ifaces", "sys.nics.ifaces.ethtool"];
+        let meta = member("sys.nics.ifaces.eth0.ethtool.rx_crc", &maps);
+        assert_eq!(
+            meta.frame_instances(),
+            [
+                ("nics".into(), "sys.nics".into()),
+                ("nics.ifaces".into(), "sys.nics.ifaces.eth0".into()),
+            ]
+        );
+        assert_eq!(
+            meta.metadata[FRAME_MAPS_KEY],
+            "sys.nics.ifaces,sys.nics.ifaces.ethtool"
+        );
+    }
+
+    #[test]
+    fn a_tag_that_does_not_fit_the_path_names_no_entry() {
+        let meta = member("sys.nics.other.eth0.rx_bytes", &["sys.nics.ifaces"]);
+        assert_eq!(meta.frame_instances().len(), 1);
     }
 }

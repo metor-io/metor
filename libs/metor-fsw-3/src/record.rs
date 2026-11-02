@@ -7,7 +7,7 @@ use core::borrow::Borrow;
 
 use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id, table_id};
 use metor_proto::vtable::{Op, OpRef, VTable};
-use metor_proto_wkt::{ComponentMetadata, FRAME_ROOT_KEY};
+use metor_proto_wkt::{ComponentMetadata, FRAME_MAPS_KEY, FRAME_ROOT_KEY};
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -201,8 +201,8 @@ pub enum RerootError {
     Malformed,
 }
 
-/// `meta` with its name moved from under `from` to under `to`, and its
-/// frame root moved with it.
+/// `meta` with its name moved from under `from` to under `to`, and the
+/// paths its frame tags name moved with it.
 fn renamed(meta: &ComponentMetadata, from: &str, to: &str) -> ComponentMetadata {
     let Some(name) = moved(&meta.name, from, to) else {
         return meta.clone();
@@ -212,6 +212,13 @@ fn renamed(meta: &ComponentMetadata, from: &str, to: &str) -> ComponentMetadata 
         && let Some(root_moved) = moved(root, from, to)
     {
         *root = root_moved;
+    }
+    if let Some(maps) = metadata.get_mut(FRAME_MAPS_KEY) {
+        *maps = maps
+            .split(',')
+            .map(|map| moved(map, from, to).unwrap_or_else(|| map.to_string()))
+            .collect::<Vec<_>>()
+            .join(",");
     }
     ComponentMetadata {
         component_id: ComponentId::new(&name),

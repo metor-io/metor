@@ -1479,8 +1479,12 @@ fn frame_type(db: &DB, node: &ComponentNode) -> Option<String> {
     collect_ids(node, &mut ids);
     db.with_state(|state| {
         ids.into_iter().find_map(|id| {
-            let (frame, root) = state.get_component_metadata(id)?.frame()?;
-            (root == node.full_name.as_ref()).then(|| frame.to_string())
+            state
+                .get_component_metadata(id)?
+                .frame_instances()
+                .into_iter()
+                .find(|(_, root)| root == node.full_name.as_ref())
+                .map(|(frame, _)| frame)
         })
     })
 }
