@@ -12,19 +12,24 @@ use common::{
     Camera, Deadline, Fsw, ImageFrame, Imu, Ping, Running, Source, Target, camera, dial_fsw,
     fixture_dir, lower_links, metor, source, within,
 };
+use metor_db::DB;
+use metor_db::remote::{RemoteDb, fsw_stream};
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig,
     SystemTable,
 };
 use metor_fsw_3::{
-    Clock, DefCx, DefError, Frame, Input, LinkStatus, Output, ResourceStatus, Timestamp, WallRate,
-    system,
+    Clock, DefCx, DefError, Frame, Input, LinkStatus, Output, RecordSchema, ResourceStatus,
+    Timestamp, WallRate, system,
 };
-use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
+use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket, PacketId, table_id};
 use metor_proto_stellar::PacketStream;
 use metor_proto_wkt::LogEvent;
-use metor_proto_wkt::{LinkInfo, SequenceCommand, SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{
+    CommandInfo, CommandKind, LINK_PROTOCOL_VERSION, LinkInfo, SequenceCommand,
+    SetComponentMetadata, VTableMsg,
+};
 use serde_json::json;
 use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
@@ -97,6 +102,19 @@ fn imu_sink(#[state] s: &mut ImuSink, imu: &mut Input<Imu>) {
     }
 }
 
+/// Records the bytes of every frame it receives.
+struct FrameSink(Arc<Mutex<Vec<Vec<u8>>>>);
+
+#[system]
+fn frame_sink(#[state] s: &mut FrameSink, imu: &mut Input<Imu>) {
+    for imu in imu.drain().flatten() {
+        // PANIC Safety: no test holds this lock across a panic.
+        s.0.lock()
+            .expect("an unpoisoned sink")
+            .push(imu.as_bytes().to_vec());
+    }
+}
+
 /// Records every ping it receives.
 struct PingSink(Arc<Mutex<Vec<u32>>>);
 
@@ -129,6 +147,7 @@ fn log_sink(#[state] s: &mut LogSink, log: &mut Input<LogEvent>) {
 struct Seen {
     statuses: Arc<Mutex<Vec<LinkStatus>>>,
     pings: Arc<Mutex<Vec<u32>>>,
+    frames: Arc<Mutex<Vec<Vec<u8>>>>,
     faults: Arc<Mutex<Vec<String>>>,
     io: Arc<Mutex<Vec<ResourceStatus>>>,
     cycles: Arc<AtomicU64>,
@@ -147,6 +166,11 @@ impl Seen {
     fn pings(&self) -> Vec<u32> {
         // PANIC Safety: as above.
         self.pings.lock().expect("an unpoisoned sink").clone()
+    }
+
+    fn frames(&self) -> Vec<Vec<u8>> {
+        // PANIC Safety: as above.
+        self.frames.lock().expect("an unpoisoned sink").clone()
     }
 
     fn faulted(&self, kind: &str) -> bool {
@@ -194,6 +218,12 @@ fn table(seen: &Seen) -> SystemTable {
     let samples = seen.pings.clone();
     table
         .register("imu_sink", imu_sink(), move || ImuSink(samples.clone()))
+        .expect("valid records");
+    let frames = seen.frames.clone();
+    table
+        .register("frame_sink", frame_sink(), move || {
+            FrameSink(frames.clone())
+        })
         .expect("valid records");
     table
         .register("camera", camera(), || Camera::new(10.0, Arc::default()))
@@ -364,7 +394,7 @@ async fn test_publish_announces_and_streams() {
     let Fsw {
         info, mut rx, buf, ..
     } = dial_fsw(addr).await;
-    assert_eq!(info.protocol_version, 2);
+    assert_eq!(info.protocol_version, LINK_PROTOCOL_VERSION);
     assert_eq!(info.namespace.as_deref(), Some("cube_sat"));
     assert_eq!(
         (info.link.as_str(), info.command_ids.as_slice()),
@@ -597,6 +627,7 @@ async fn test_subscribe_announces_and_routes() {
 
     let Fsw { info, tx, .. } = dial_fsw(addr).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
+    assert_described(&info.command_ids, &info.commands);
     assert_eq!(info.link, "cmds-routes");
 
     tx.send((&Ping { n: 7 }).into_len_packet())
@@ -1179,4 +1210,171 @@ async fn test_db_advertises_command_record_ids() {
         info.command_ids,
         vec![<SequenceCommand as Msg>::ID, <Ping as Msg>::ID]
     );
+    assert_described(&info.command_ids, &info.commands);
+}
+
+/// Every advertised command is described as the message it is.
+fn assert_described(ids: &[metor_proto::types::PacketId], commands: &[CommandInfo]) {
+    let described: Vec<_> = commands.iter().map(|command| command.id).collect();
+    assert_eq!(described, ids, "every command is described");
+    assert!(
+        commands
+            .iter()
+            .all(|command| matches!(command.kind, CommandKind::Msg(_))),
+        "{commands:?}"
+    );
+}
+
+/// Returns a `Subscribe` that takes the frame `imu` and the message `ping` as
+/// commands on endpoint `ep`, with sinks for both and for its faults.
+fn commanded(link: &str, ep: serde_json::Value) -> Vec<SystemConfig> {
+    vec![
+        SystemConfig {
+            params: json!({
+                "ep": ep,
+                "namespace": "cube_sat",
+                "link": link,
+            }),
+            outputs: vec![
+                OutputConfig::with_record("imu", "imu"),
+                OutputConfig::with_record("ping", "ping"),
+            ],
+            ..SystemConfig::new("cmds", "fsw.subscribe")
+        },
+        reading("frames", "frame_sink", "imu", PortRef::new("cmds", "imu")),
+        reading("pings", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+        reading("faults", "log_sink", "log", PortRef::new("cmds", "log")),
+    ]
+}
+
+/// The command a ground tool sees for the `imu` port of [`commanded`].
+fn imu_command() -> CommandInfo {
+    let cx = DefCx {
+        id: "cmds",
+        namespace: Some("cube_sat"),
+        ..DefCx::empty()
+    };
+    let RecordSchema::Frame { vtable, .. } = Output::<Imu>::def(&cx, "imu").schema else {
+        panic!("a frame")
+    };
+    CommandInfo {
+        id: table_id(&vtable),
+        kind: CommandKind::Frame {
+            name: "imu".into(),
+            vtable,
+        },
+    }
+}
+
+/// A ground database in a fresh directory.
+fn ground() -> (tempfile::TempDir, Arc<DB>) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = DB::create(dir.path().join("ground")).expect("a db");
+    (dir, Arc::new(db))
+}
+
+/// Logs `record` under command `id` in `ground` until `done`, since a link
+/// forwards only what is logged after it connects.
+async fn command_until(
+    what: &str,
+    seen: &Seen,
+    (ground, id): (&DB, PacketId),
+    record: &[u8],
+    mut done: impl FnMut() -> bool,
+) {
+    until_seen(what, seen, || {
+        let logged = ground.push_msg(Timestamp::now(), id, record);
+        logged.expect("the ground logs the command");
+        done()
+    })
+    .await;
+}
+
+/// The ground commands a listening `Subscribe` straight over its link: the
+/// link describes its frame port, and a frame logged under that port's
+/// table id arrives on it byte for byte.
+#[stellarator::test]
+async fn test_subscribe_takes_frame_commands() {
+    let seen = Seen::default();
+    let systems = commanded("cmds-frames", listen_any("cmds-frames"));
+    let _target = spawn(systems, &seen, 500.0);
+    let Fsw { info, rx, tx, buf } = dial_fsw(bound("cmds-frames")).await;
+    let command = imu_command();
+    assert_eq!(info.commands[0], command);
+    assert_eq!(
+        info.command_ids,
+        vec![command.id, <Ping as Msg>::ID],
+        "every port is a command"
+    );
+
+    let (_dir, ground) = ground();
+    let link_db = ground.clone();
+    let _link = stellarator::spawn(async move {
+        let LinkInfo {
+            command_ids,
+            commands,
+            ..
+        } = info;
+        fsw_stream(command_ids, &commands, rx, tx, buf, &link_db, |_| {}).await
+    })
+    .drop_guard();
+    let frame = Imu {
+        timestamp: Timestamp(41),
+        sample: 4.5,
+    };
+    let what = "the frame command never arrived";
+    command_until(what, &seen, (&ground, command.id), frame.as_bytes(), || {
+        !seen.frames().is_empty()
+    })
+    .await;
+    assert!(seen.frames().iter().all(|bytes| bytes == frame.as_bytes()));
+}
+
+/// The ground commands a target through a gateway's db: the db takes the
+/// frame laid out for the target's port, the ground forwards it as a
+/// table, and the target's `Subscribe`, dialing the db, receives it byte
+/// for byte. A message command crossing first does not trip the
+/// subscriber's table check.
+#[stellarator::test]
+async fn test_db_relays_frame_commands() {
+    let (gw_seen, seen) = (Seen::default(), Seen::default());
+    let addr = pick_port("db-frames");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = SystemConfig {
+        params: json!({
+            "listen": addr.to_string(),
+            "path": dir.path().join("db"),
+            "namespace": "gw",
+            "commands": ["ping", { "frame": "imu", "port": "cube_sat.cmds.imu" }],
+        }),
+        ..SystemConfig::new("db", "fsw.db")
+    };
+    let _gateway = spawn(vec![db], &gw_seen, 500.0);
+    let info = dial_db(addr).await;
+    let command = imu_command();
+    assert_eq!(info.commands[1], command);
+    let _target = spawn(commanded("cmds-gw", dial(addr)), &seen, 500.0);
+
+    let (_ground_dir, ground) = ground();
+    RemoteDb::new(addr).spawn(ground.clone());
+    let mut ping = [0u8; 8];
+    let ping = postcard::to_slice(&Ping { n: 3 }, &mut ping).expect("a ping encodes");
+    let what = "the message command never arrived";
+    command_until(what, &seen, (&ground, <Ping as Msg>::ID), ping, || {
+        seen.pings().contains(&3)
+    })
+    .await;
+    assert!(!seen.faulted("peer_schema_mismatch"));
+
+    let frame = Imu {
+        timestamp: Timestamp(42),
+        sample: 6.5,
+    };
+    let what = "the frame command never arrived";
+    command_until(what, &seen, (&ground, command.id), frame.as_bytes(), || {
+        !seen.frames().is_empty()
+    })
+    .await;
+    assert!(seen.frames().iter().all(|bytes| bytes == frame.as_bytes()));
+    assert!(!seen.faulted("peer_schema_mismatch"));
 }

@@ -62,7 +62,7 @@ use crate::{
 /// Operations that can be performed in a VTable
 ///
 /// Each operation represents a different way to reference or manipulate data within a VTable.
-#[derive(Debug, Serialize, Deserialize, Clone, postcard_schema::Schema)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, postcard_schema::Schema)]
 #[repr(u8)]
 pub enum Op {
     Data {
@@ -166,7 +166,7 @@ pub const MAX_DYNAMIC_DEPTH: usize = 8;
 /// A field within a VTable
 ///
 /// Each field has an offset, length, and an associated operation reference.
-#[derive(Debug, Serialize, Deserialize, Clone, postcard_schema::Schema)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, postcard_schema::Schema)]
 pub struct Field {
     pub offset: Offset,
     pub len: u32,
@@ -227,7 +227,7 @@ type DefaultFields = alloc::vec::Vec<Field>;
 type DefaultFields = heapless::Vec<Field, 32>;
 
 /// A description of the layout of a table
-#[derive(Debug, Serialize, Deserialize, Clone, Default, postcard_schema::Schema)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, postcard_schema::Schema)]
 pub struct VTable<
     Ops: Buf<Op> = DefaultOps,
     Data: Buf<u8> = DefaultData,

@@ -330,3 +330,19 @@ A gateway is a target whose `Db` embeds a metor-db. It subscribes to every
 peer and records what arrives. The ground reads one database, not each
 target's stream, and a slow reader never holds a target's rings.
 `gateway(..)` builds one.
+
+The ground commands a target through a `Subscribe` whose records are
+commands. Each command is described by its id and either its message
+metadata or, for a frame, its record name and vtable, so the ground can
+build and encode it. A message command is a `Msg` packet under its
+record's id. A frame command is a table: its vtable once per connection,
+then a `Table` packet per record. Its table id is the subscriber port's,
+so it reaches that one port.
+
+A listening `Subscribe` describes its ports as commands in its `LinkInfo`,
+followed by each frame port's vtable and component metadata. A `Subscribe`
+that peers a gateway's db dials it and asks for each port's stream, frame
+ports first. The db takes its subscribers' commands from the ground, keeps
+each in a message log, and streams it to the subscriber that asked. For a
+frame command it sends the vtable the moment it is asked, so the
+subscriber's table check passes before any command arrives.

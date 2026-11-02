@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use metor_proto::types::{LenPacket, PacketId, PacketTy};
 use metor_proto_stellar::{PacketSink, PacketStream};
+use metor_proto_wkt::CommandInfo;
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
 use stellarator::sync::Mutex;
@@ -27,27 +28,40 @@ use crate::{ConnState, DB, Error, PacketTx};
 /// returning the error that ended it (the caller loops). Two raced loops
 /// over the one socket: ingest every pushed packet through the local
 /// packet handler — the same shapes a directly-attached producer sends —
-/// and forward `command_ids`' msg logs up the link from their live edge
-/// (nothing queued before this call is replayed).
+/// and forward `command_ids`' logs up the link from their live edge
+/// (nothing queued before this call is replayed), each in the shape
+/// `commands` describes for it.
+///
+/// `db` advertises the forwarded set as its own commands, described by
+/// whichever of the link's `commands` it covers, so a client of `db` can
+/// build them and its commands ride on up the link.
 ///
 /// `on_packet` is called once per ingested packet with whether the db took
 /// it, so a caller keeping a gauge counts what crossed without parsing the
 /// stream twice; a caller with no gauge passes `|_| {}`.
 pub async fn fsw_stream(
     command_ids: Vec<PacketId>,
+    commands: &[CommandInfo],
     rx: PacketStream<OwnedReader<TcpStream>>,
     tx: PacketSink<OwnedWriter<TcpStream>>,
     buf: Vec<u8>,
     db: &Arc<DB>,
     on_packet: impl FnMut(bool),
 ) -> Error {
+    db.add_command_ids(&command_ids);
+    let described: Vec<CommandInfo> = commands
+        .iter()
+        .filter(|c| command_ids.contains(&c.id))
+        .cloned()
+        .collect();
+    db.add_commands(&described);
     // The sink is shared the way the mirror already shares it (`PacketTx`
     // holds it behind this same lock); the ingest arms never reply to an
     // fsw stream, so the forwarder's sends are uncontended in practice.
     let tx = Arc::new(Mutex::new(tx));
     futures_lite::future::race(
         ingest(rx, buf, tx.clone(), db, on_packet),
-        super::forward(command_ids, tx, db),
+        super::forward(command_ids, described, tx, db),
     )
     .await
 }
@@ -61,7 +75,7 @@ async fn ingest(
     db: &Arc<DB>,
     mut on_packet: impl FnMut(bool),
 ) -> Error {
-    let mut conn = ConnState::default();
+    let mut conn = ConnState::downlink();
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
     loop {
         let pkt = match rx.next_grow(buf).await {
@@ -98,10 +112,29 @@ mod tests {
     const CMD_B: PacketId = [0x52, 0];
     const DATA: PacketId = [0x33, 7];
 
+    /// Every command described as a message named for its id.
+    fn described(command_ids: &[PacketId]) -> Vec<CommandInfo> {
+        command_ids
+            .iter()
+            .map(|id| CommandInfo {
+                id: *id,
+                kind: metor_proto_wkt::CommandKind::Msg(metor_proto_wkt::MsgMetadata {
+                    name: format!("cmd_{}", id[0]),
+                    schema: postcard_schema::schema::owned::OwnedNamedType {
+                        name: "Cmd".into(),
+                        ty: postcard_schema::schema::owned::OwnedDataModelType::U8,
+                    },
+                    metadata: Default::default(),
+                }),
+            })
+            .collect()
+    }
+
     fn identity(command_ids: Vec<PacketId>) -> Vec<u8> {
         (&LinkInfo {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
+            commands: described(&command_ids),
             command_ids,
             namespace: None,
             link: String::new(),
@@ -159,6 +192,119 @@ mod tests {
         inbound
     }
 
+    /// A vehicle that records the port a frame command lands on publishes
+    /// that table, under the command's own id, back down the link. The
+    /// ground keeps the echo as telemetry: logging it as a command would
+    /// forward it straight back up, round and round.
+    #[stellarator::test]
+    async fn echoed_frame_command_is_telemetry() {
+        use metor_proto::types::{ComponentId, PrimType, table_id};
+        use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
+        use metor_proto_wkt::{CommandKind, VTableMsg};
+
+        let vtable = vtable([raw_field(
+            0,
+            8,
+            schema(PrimType::F64, &[1], component("sat.cmds.set_mode.mode")),
+        )]);
+        let id = table_id(&vtable);
+        let command = CommandInfo {
+            id,
+            kind: CommandKind::Frame {
+                name: "set_mode".into(),
+                vtable: vtable.clone(),
+            },
+        };
+
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tables_up = Arc::new(StdMutex::new(0usize));
+        let counted = tables_up.clone();
+        stellarator::struc_con::stellar(move || async move {
+            use stellarator::io::{AsyncWrite, SplitExt};
+            let stream = listener.accept().await.expect("accept");
+            let (rx, tx) = stream.split();
+            let info = LinkInfo {
+                protocol_version: LINK_PROTOCOL_VERSION,
+                features: 0,
+                command_ids: vec![id],
+                namespace: None,
+                link: String::new(),
+                commands: vec![command],
+            };
+            tx.write_all((&info).into_len_packet().inner)
+                .await
+                .0
+                .expect("identity");
+            let announce = VTableMsg { id, vtable };
+            tx.write_all((&announce).into_len_packet().inner)
+                .await
+                .0
+                .expect("vtable");
+            stellarator::spawn(async move {
+                let mut packets = PacketStream::new(rx);
+                let mut buf = vec![0u8; 1024];
+                loop {
+                    let Ok(pkt) = packets.next_grow(buf).await else {
+                        return;
+                    };
+                    if matches!(pkt, OwnedPacket::Table(_)) {
+                        *counted.lock().unwrap() += 1;
+                    }
+                    buf = pkt.into_buf().into_inner();
+                }
+            });
+            for _ in 0..40 {
+                let mut table = LenPacket::table(id, 8);
+                table.extend_from_slice(&2.5f64.to_le_bytes());
+                if tx.write_all(table.inner).await.0.is_err() {
+                    return;
+                }
+                stellarator::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::DB::create(dir.path().join("db")).unwrap());
+        let Peer::Fsw { info, rx, tx, buf } = identify(addr).await.expect("identify") else {
+            panic!("expected an fsw peer");
+        };
+        let stream_db = db.clone();
+        let _link = stellarator::spawn(async move {
+            fsw_stream(
+                info.command_ids,
+                &info.commands,
+                rx,
+                tx,
+                buf,
+                &stream_db,
+                |_| {},
+            )
+            .await;
+        })
+        .drop_guard();
+
+        let mode = ComponentId::new("sat.cmds.set_mode.mode");
+        wait_for(
+            || {
+                db.with_state(|s| {
+                    s.get_component(mode)
+                        .is_some_and(|c| c.time_series.latest().is_some())
+                })
+            },
+            "the echo as telemetry",
+        )
+        .await;
+        stellarator::sleep(Duration::from_millis(200)).await;
+        let logged = db.with_state(|s| s.msg_logs.get(&id).is_some_and(|log| !log.is_empty()));
+        assert!(!logged, "the echo is not logged as a command");
+        assert_eq!(
+            *tables_up.lock().unwrap(),
+            0,
+            "nothing is forwarded back up"
+        );
+    }
+
     #[stellarator::test]
     async fn identify_tells_a_db_server() {
         let dir = tempfile::tempdir().unwrap();
@@ -196,7 +342,16 @@ mod tests {
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            let err = fsw_stream(info.command_ids, rx, tx, buf, &stream_db, |_| {}).await;
+            let err = fsw_stream(
+                info.command_ids,
+                &info.commands,
+                rx,
+                tx,
+                buf,
+                &stream_db,
+                |_| {},
+            )
+            .await;
             tracing::info!(?err, "link ended");
         })
         .drop_guard();
@@ -216,6 +371,11 @@ mod tests {
             "the pushed msg ingested",
         )
         .await;
+        assert_eq!(
+            db.commands(),
+            described(&[CMD_A, CMD_B]),
+            "the link's commands are re-advertised"
+        );
 
         // Fresh commands on both advertised ids cross the link.
         db.push_msg(Timestamp(2), CMD_A, b"go").unwrap();
@@ -247,12 +407,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let inbound = fake_fsw(listener, vec![CMD_A, CMD_B]);
 
-        let Peer::Fsw { rx, tx, buf, .. } = identify(addr).await.expect("identify") else {
+        let Peer::Fsw { info, rx, tx, buf } = identify(addr).await.expect("identify") else {
             panic!("expected an fsw peer");
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            fsw_stream(vec![CMD_A], rx, tx, buf, &stream_db, |_| {}).await;
+            fsw_stream(vec![CMD_A], &info.commands, rx, tx, buf, &stream_db, |_| {}).await;
         })
         .drop_guard();
 
@@ -268,6 +428,7 @@ mod tests {
             "the link's push",
         )
         .await;
+        assert_eq!(db.commands(), described(&[CMD_A]), "only the forwarded set");
 
         db.push_msg(Timestamp(2), CMD_B, b"dropped").unwrap();
         db.push_msg(Timestamp(3), CMD_A, b"go").unwrap();

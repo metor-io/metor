@@ -477,6 +477,60 @@ mod tests {
         );
     }
 
+    /// A mirror re-advertises its peer's described commands, so a client of
+    /// the mirror can build one, and a command it sends rides the mirror's
+    /// own forwarder on up to the peer.
+    #[test]
+    async fn mirror_relays_described_commands_to_its_peer() {
+        let (src_addr, src_db) = setup_test_db().await.unwrap();
+        let command = CommandInfo {
+            id: MIRROR_CMD,
+            kind: CommandKind::Msg(MsgMetadata {
+                name: "fire".to_string(),
+                schema: OwnedNamedType {
+                    name: "Fire".to_string(),
+                    ty: postcard_schema::schema::owned::OwnedDataModelType::U8,
+                },
+                metadata: Default::default(),
+            }),
+        };
+        src_db.set_identity(None, vec![MIRROR_CMD]);
+        src_db.add_commands(std::slice::from_ref(&command));
+
+        // The relay must know the command before the client's handshake,
+        // which is when the client learns what to forward.
+        let (relay_addr, relay_db) = setup_test_db().await.unwrap();
+        metor_db::remote::RemoteDb::new(src_addr).spawn(relay_db.clone());
+        let probe = relay_db.clone();
+        wait_for(
+            move || !probe.commands().is_empty(),
+            "the relay learning the command",
+        )
+        .await;
+
+        let client_db = mirror_db(relay_addr);
+        let probe = client_db.clone();
+        let expected = vec![command.clone()];
+        wait_for(
+            move || probe.commands() == expected,
+            "the client learning the command through the relay",
+        )
+        .await;
+        sleep(Duration::from_millis(300)).await;
+        client_db.push_msg(Timestamp(2), MIRROR_CMD, b"go").unwrap();
+
+        let probe = src_db.clone();
+        wait_for(
+            move || {
+                log_records(&probe, MIRROR_CMD)
+                    .iter()
+                    .any(|(_, msg)| msg == b"go")
+            },
+            "the command relayed to the source",
+        )
+        .await;
+    }
+
     #[test]
     async fn test_send_data() {
         let (addr, db) = setup_test_db().await.unwrap();

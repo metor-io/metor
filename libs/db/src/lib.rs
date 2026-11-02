@@ -5,7 +5,7 @@ use metor_proto::types::{PacketHeader, PacketTy};
 use metor_proto::vtable::builder::{
     OpBuilder, component, raw_field, raw_table, schema, timestamp, vtable,
 };
-use metor_proto::vtable::{ElementKey, RealizedField, builder};
+use metor_proto::vtable::{ElementKey, Field, Op, RealizedField, builder};
 use metor_proto::{
     registry,
     schema::Schema,
@@ -95,6 +95,10 @@ pub struct State {
     /// Msg ids this db serves as commands: a client forwards them up, and
     /// they never ride a [`SyncMsgs`] stream back down.
     command_ids: Vec<PacketId>,
+    /// What a client needs to build each command in `command_ids`, one per
+    /// id at most. An id may have none: a peer that predates descriptions
+    /// only names its commands.
+    commands: Vec<CommandInfo>,
     /// This db's telemetry namespace, when it serves one target's prefix.
     namespace: Option<String>,
 
@@ -439,12 +443,53 @@ impl DB {
     }
 
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
-    /// components carry and the command set clients forward up.
+    /// components carry and the command set clients forward up. A
+    /// description whose id leaves the set goes with it; describe the new
+    /// set with [`add_commands`](Self::add_commands).
     pub fn set_identity(&self, namespace: Option<String>, command_ids: Vec<PacketId>) {
         self.with_state_mut(|s| {
             s.namespace = namespace;
+            s.commands.retain(|c| command_ids.contains(&c.id));
             s.command_ids = command_ids;
         });
+    }
+
+    /// Union described commands into the advertised set, a re-sent id
+    /// replacing its description. A message command's description is also
+    /// its log's metadata, so it reads like any announced message; the
+    /// metadata generation moves either way, waking anything that lists
+    /// commands.
+    ///
+    /// A client mirroring a peer calls this with the peer's descriptions,
+    /// and so re-advertises them: its own clients' commands land in its
+    /// logs, which its forwarder carries on up to the peer.
+    pub fn add_commands(&self, commands: &[CommandInfo]) {
+        if commands.is_empty() {
+            return;
+        }
+        self.with_state_mut(|s| {
+            for command in commands {
+                if let CommandKind::Msg(metadata) = &command.kind
+                    && let Err(err) = s.set_msg_metadata(command.id, metadata.clone(), &self.path)
+                {
+                    warn!(?err, name = %metadata.name, "failed to record command metadata");
+                }
+                if !s.command_ids.contains(&command.id) {
+                    s.command_ids.push(command.id);
+                }
+                match s.commands.iter_mut().find(|c| c.id == command.id) {
+                    Some(existing) => *existing = command.clone(),
+                    None => s.commands.push(command.clone()),
+                }
+            }
+            s.metadata_generation = s.metadata_generation.wrapping_add(1);
+        });
+    }
+
+    /// The commands this db advertises with a description, in the order
+    /// they were first described.
+    pub fn commands(&self) -> Vec<CommandInfo> {
+        self.with_state(|s| s.commands.clone())
     }
 
     /// Union more ids into the advertised command set.
@@ -782,6 +827,21 @@ impl State {
                 entry.insert(msg_log)
             }
         })
+    }
+
+    /// The vtable of frame command `id`, when `id` is one.
+    ///
+    /// A frame command is kept in a msg log like a message command, and
+    /// crosses the wire as its table: the vtable announced once per
+    /// connection, then a `Table` packet per record.
+    fn frame_command(&self, id: PacketId) -> Option<&VTable<Vec<Op>, Vec<u8>, Vec<Field>>> {
+        self.commands
+            .iter()
+            .find(|command| command.id == id)
+            .and_then(|command| match &command.kind {
+                CommandKind::Frame { vtable, .. } => Some(vtable),
+                CommandKind::Msg(_) => None,
+            })
     }
 
     pub fn set_msg_metadata(
@@ -1271,6 +1331,22 @@ pub async fn handle_conn(stream: TcpStream, db: Arc<DB>) {
 #[derive(Default)]
 struct ConnState {
     incoming_node: Option<IncomingNode>,
+    /// Whether this connection carries an upstream peer's stream down into
+    /// this db, as a mirror or fsw link does. Its tables are telemetry even
+    /// under a frame command's id: a vehicle that records the port a
+    /// command lands on sends the same table back down, and logging that
+    /// echo as a command would forward it up again, round and round.
+    downlink: bool,
+}
+
+impl ConnState {
+    /// The state for a connection that ingests an upstream peer's stream.
+    pub(crate) fn downlink() -> Self {
+        Self {
+            downlink: true,
+            ..Self::default()
+        }
+    }
 }
 
 struct IncomingNode {
@@ -1734,7 +1810,12 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         }
         Packet::Table(table) => {
             trace!(table.len = table.buf.len(), "sinking table");
-            db.ingest_table(table.id, stellarator::buf::deref(&table.buf))?;
+            let buf = stellarator::buf::deref(&table.buf);
+            let command = !conn.downlink && db.with_state(|s| s.frame_command(table.id).is_some());
+            match command {
+                true => db.push_msg(Timestamp::now(), table.id, buf)?,
+                false => db.ingest_table(table.id, buf)?,
+            }
         }
 
         Packet::Msg(m) if m.id == GetDbSettings::ID => {
@@ -1778,6 +1859,14 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         }
         Packet::Msg(m) if m.id == MsgStream::ID => {
             let MsgStream { msg_id } = m.parse::<MsgStream>()?;
+            if let Some(vtable) = db.with_state(|s| s.frame_command(msg_id).cloned()) {
+                let tail = remote::CommandTail::open(db, msg_id, remote::Shape::Table(None))?;
+                // Announced here, not by the tail, so it precedes every
+                // record any stream on this connection sends.
+                tx.send_msg(&VTableMsg { id: msg_id, vtable }).await?;
+                stellarator::spawn(remote::tail(vec![tail], tx.tx.clone()));
+                return Ok(());
+            }
             let msg_log =
                 db.with_state_mut(|s| s.get_or_insert_msg_log(msg_id, &db.path).cloned())?;
             let req_id = m.req_id;
@@ -1894,13 +1983,19 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             })?;
         }
         Packet::Msg(m) if m.id == GetDbInfo::ID => {
-            let (command_ids, namespace) =
-                db.with_state(|s| (s.command_ids.clone(), s.namespace.clone()));
+            let (command_ids, namespace, commands) = db.with_state(|s| {
+                (
+                    s.command_ids.clone(),
+                    s.namespace.clone(),
+                    s.commands.clone(),
+                )
+            });
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
                 features: FEATURE_MSG_SYNC,
                 command_ids,
                 namespace,
+                commands,
             })
             .await?;
         }
@@ -2439,8 +2534,12 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
                 visited_ids.insert(component.component_id);
                 let sink = sink.clone();
                 let component = component.clone();
-                let metadata = state.get_component_metadata(component.component_id).cloned();
-                stellarator::spawn(handle_real_time_component(sink, component, metadata, req_id));
+                let metadata = state
+                    .get_component_metadata(component.component_id)
+                    .cloned();
+                stellarator::spawn(handle_real_time_component(
+                    sink, component, metadata, req_id,
+                ));
                 Ok(())
             })
         })?;
@@ -3225,6 +3324,50 @@ mod msg_sync_tests {
         assert_ne!(info.features & FEATURE_MSG_SYNC, 0);
         assert_eq!(info.command_ids, vec![CMD]);
         assert_eq!(info.namespace.as_deref(), Some("sat"));
+        assert!(info.commands.is_empty(), "nothing described the command");
+    }
+
+    fn msg_command(id: PacketId, name: &str) -> CommandInfo {
+        CommandInfo {
+            id,
+            kind: CommandKind::Msg(MsgMetadata {
+                name: name.into(),
+                schema: Payload::SCHEMA.into(),
+                metadata: Default::default(),
+            }),
+        }
+    }
+
+    /// Descriptions union by id into the advertised set, a message's also
+    /// naming its log, and a narrower identity drops the ones it leaves out.
+    #[stellarator::test]
+    async fn db_info_describes_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
+        db.set_identity(None, vec![CMD]);
+        let generation = db.metadata_gen.latest();
+        db.add_commands(&[msg_command(CMD, "old"), msg_command(LOG_A, "log_a")]);
+        db.add_commands(&[msg_command(CMD, "fire")]);
+        assert_ne!(db.metadata_gen.latest(), generation, "watchers woke");
+        assert_eq!(
+            db.with_state(|s| s
+                .msg_log_iter()
+                .find(|(id, _)| *id == CMD)
+                .and_then(|(_, meta)| meta.map(|m| m.name.clone()))),
+            Some("fire".to_string()),
+        );
+
+        let addr = serve(db.clone());
+        let mut client = Client::connect(addr).await.unwrap();
+        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
+        assert_eq!(info.command_ids, vec![CMD, LOG_A]);
+        assert_eq!(
+            info.commands,
+            vec![msg_command(CMD, "fire"), msg_command(LOG_A, "log_a")]
+        );
+
+        db.set_identity(None, vec![LOG_A]);
+        assert_eq!(db.commands(), vec![msg_command(LOG_A, "log_a")]);
     }
 
     /// The seeded latest arrives with its source timestamp, live records
@@ -3995,5 +4138,151 @@ mod series_tests {
         lens.sort();
         lens.dedup();
         assert_eq!(lens, [16, 8 + IMAGE_SIZE]);
+    }
+}
+
+#[cfg(test)]
+mod frame_command_tests {
+    use super::*;
+    use metor_proto::types::table_id;
+    use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
+    use metor_proto_stellar::Client;
+    use std::sync::Mutex as StdMutex;
+
+    type Seen = Arc<StdMutex<Vec<(PacketTy, PacketId, Vec<u8>)>>>;
+
+    const MSG: PacketId = [0x51, 0];
+
+    fn command() -> CommandInfo {
+        let vtable = vtable([raw_field(
+            0,
+            8,
+            schema(PrimType::F64, &[1], component("sat.cmds.set_mode.mode")),
+        )]);
+        CommandInfo {
+            id: table_id(&vtable),
+            kind: CommandKind::Frame {
+                name: "set_mode".into(),
+                vtable,
+            },
+        }
+    }
+
+    fn serve(db: Arc<DB>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+        addr
+    }
+
+    /// Dials `addr` the way a subscriber does, asking for `id`'s stream, and
+    /// records every packet it is sent.
+    async fn subscribe(addr: SocketAddr, id: PacketId) -> Seen {
+        let mut client = Client::connect(addr).await.unwrap();
+        client
+            .send((&MsgStream { msg_id: id }).with_request_id(3))
+            .await
+            .0
+            .unwrap();
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        let Client { mut rx, .. } = client;
+        stellarator::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok(pkt) = rx.next_grow(buf).await else {
+                    return;
+                };
+                let entry = match &pkt {
+                    Packet::Msg(m) => Some((PacketTy::Msg, m.id, m.buf[..].to_vec())),
+                    Packet::Table(t) => Some((PacketTy::Table, t.id, t.buf[..].to_vec())),
+                    Packet::TimeSeries(_) => None,
+                };
+                sink.lock().unwrap().extend(entry);
+                buf = pkt.into_buf().into_inner();
+            }
+        });
+        seen
+    }
+
+    /// Calls `push` until `seen` holds a packet with `id`, failing after
+    /// five seconds.
+    async fn push_until_seen(seen: &Seen, id: PacketId, push: impl Fn(), what: &str) {
+        for _ in 0..200 {
+            if seen.lock().unwrap().iter().any(|(_, seen, _)| *seen == id) {
+                return;
+            }
+            push();
+            stellarator::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("never saw {what}");
+    }
+
+    /// The gateway hop: a ground db mirroring the server forwards a frame
+    /// command it logged as its vtable and a table, the server logs it as a
+    /// command rather than telemetry, and a subscriber that asked for it
+    /// gets the announce at once and the record with the bytes the ground
+    /// logged.
+    #[stellarator::test]
+    async fn frame_command_relays_from_ground_to_subscriber() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(DB::create(dir.path().join("server")).unwrap());
+        let command = command();
+        let id = command.id;
+        server.add_commands(std::slice::from_ref(&command));
+        let addr = serve(server.clone());
+
+        let seen = subscribe(addr, id).await;
+        let ground = Arc::new(DB::create(dir.path().join("ground")).unwrap());
+        remote::RemoteDb::new(addr).spawn(ground.clone());
+        let record = 2.5f64.to_le_bytes();
+        // The mirror forwards only what is logged after it connects, so the
+        // ground repeats the command until one crosses.
+        let push = || ground.push_msg(Timestamp::now(), id, &record).unwrap();
+        push_until_seen(&seen, id, push, "the command").await;
+
+        let seen = seen.lock().unwrap().clone();
+        let (ty, msg_id, bytes) = seen[0].clone();
+        assert_eq!(
+            (ty, msg_id),
+            (PacketTy::Msg, VTableMsg::ID),
+            "announce first"
+        );
+        let announce: VTableMsg = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(announce.id, id);
+        let tables = &seen[1..];
+        assert!(!tables.is_empty());
+        assert!(
+            tables
+                .iter()
+                .all(|t| *t == (PacketTy::Table, id, record.to_vec())),
+            "{tables:?}"
+        );
+
+        let sampled = server.with_state(|s| {
+            s.get_component(ComponentId::new("sat.cmds.set_mode.mode"))
+                .is_some_and(|c| c.time_series.latest().is_some())
+        });
+        assert!(!sampled, "a frame command is not telemetry");
+        assert!(
+            server.with_state(|s| s.msg_logs.contains_key(&id)),
+            "the server logs the command"
+        );
+    }
+
+    /// A message id outside the frame commands streams as messages, with no
+    /// announce.
+    #[stellarator::test]
+    async fn msg_stream_for_a_message_sends_no_announce() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(DB::create(dir.path().join("server")).unwrap());
+        server.add_commands(&[command()]);
+        let addr = serve(server.clone());
+        let seen = subscribe(addr, MSG).await;
+        let push = || server.push_msg(Timestamp::now(), MSG, b"go").unwrap();
+        push_until_seen(&seen, MSG, push, "the message").await;
+        let first = seen.lock().unwrap().first().cloned();
+        assert_eq!(first, Some((PacketTy::Msg, MSG, b"go".to_vec())));
     }
 }

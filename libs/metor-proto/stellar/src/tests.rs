@@ -44,6 +44,7 @@ fn identity(command_ids: Vec<PacketId>) -> Vec<u8> {
         command_ids,
         namespace: None,
         link: String::new(),
+        commands: Vec::new(),
     })
         .into_len_packet()
         .inner

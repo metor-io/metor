@@ -4,8 +4,7 @@
 use core::ops::{Deref, DerefMut};
 use std::collections::HashMap;
 
-use metor_proto::types::{IntoLenPacket, PacketId, PacketTy};
-use metor_proto_wkt::MsgStream;
+use metor_proto::types::{PacketId, PacketTy};
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
@@ -41,11 +40,12 @@ impl Subscribe {
 
 /// Runs the `Subscribe` link.
 ///
-/// A listening link sends each peer a `LinkInfo` listing the messages it
-/// accepts. A dialing link instead asks its peer to stream those messages,
-/// and checks that the peer announces every table an output port expects.
-/// Either way, every packet that arrives is routed to an output port by its
-/// type and id.
+/// A listening link sends each peer a `LinkInfo` describing every port as
+/// a command, then each frame port's table. A dialing link instead asks
+/// its peer to stream each port's records, and checks that the peer
+/// announces every table an output port expects; a db announces a frame
+/// command's table when asked for it. Either way, every packet that
+/// arrives is routed to an output port by its type and id.
 #[sequence]
 pub async fn subscribe(
     #[state] s: &mut Subscribe,
@@ -55,23 +55,18 @@ pub async fn subscribe(
     link_status: &mut Output<LinkStatus>,
     log: &mut Log,
 ) -> Result<(), SeqError> {
-    let mut routes = Routes::of(outputs);
-    let msgs = routes.ids(PacketTy::Msg);
     let LinkParams {
         namespace,
         link,
         dialing,
         ..
     } = &s.params;
-    let seed: Vec<u8> = match dialing {
-        // A db peer answers these by forwarding the message logs. A
-        // `Publish` peer ignores them.
-        true => msgs
-            .iter()
-            .flat_map(|&msg_id| (&MsgStream { msg_id }).into_len_packet().inner)
-            .collect(),
-        false => wire::link_info(msgs, namespace.as_deref(), link),
+    let defs = outputs.iter_mut().map(|(def, _)| def);
+    let seed = match dialing {
+        true => wire::stream_requests(defs),
+        false => wire::command_announce(defs, namespace.as_deref(), link),
     };
+    let mut routes = Routes::of(outputs);
     let tables = routes.ids(PacketTy::Table);
     let mem = s.mem.take().ok_or_else(made_once)?;
     let mut conns = Conns::new(mem, ep, &seed, tables.len()).map_err(failed)?;
@@ -92,7 +87,8 @@ pub async fn subscribe(
 /// Logs a fault for the frame port whose table the peer did not announce.
 ///
 /// This usually means the peer was rebuilt with a changed frame type, so its
-/// table id no longer matches.
+/// table id no longer matches. From a db, it means the db does not take the
+/// port's frame as a command.
 fn report_missing(missing: PacketId, tables: &[(PacketId, String)], log: &mut Log) {
     let Some((_, port)) = tables.iter().find(|(table, _)| *table == missing) else {
         return;

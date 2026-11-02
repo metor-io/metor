@@ -1,29 +1,92 @@
 use std::collections::HashMap;
 
 use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
+use metor_proto::vtable::{Field, Op, VTable};
 use metor_proto_wkt::{
-    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata, SetMsgMetadata, VTableMsg,
+    CommandInfo, CommandKind, ComponentMetadata, LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata,
+    MsgStream, SetComponentMetadata, SetMsgMetadata, VTableMsg,
 };
 
 use crate::record::{MsgCodec, RecordSchema};
 use crate::system::PortDef;
 
-/// Encodes a `LinkInfo` packet.
+/// Encodes a `LinkInfo` packet that takes `commands`.
 ///
-/// A link sends this first on every connection to identify itself.
+/// A link sends this first on every connection to identify itself, with the
+/// commands it takes described so a ground tool can build them.
 pub(crate) fn link_info(
-    command_ids: Vec<PacketId>,
+    commands: Vec<CommandInfo>,
     namespace: Option<&str>,
     link: &str,
 ) -> Vec<u8> {
     let info = LinkInfo {
         protocol_version: LINK_PROTOCOL_VERSION,
         features: 0,
-        command_ids,
+        command_ids: commands.iter().map(|command| command.id).collect(),
         namespace: namespace.map(str::to_string),
         link: link.to_string(),
+        commands,
     };
     (&info).into_len_packet().inner
+}
+
+/// Encodes what a listening `Subscribe` sends each new peer: a `LinkInfo`
+/// that takes every port as a command, then each frame port's vtable and
+/// component metadata, so the ground can name a frame command's fields.
+pub(crate) fn command_announce<'a>(
+    defs: impl Iterator<Item = &'a PortDef>,
+    namespace: Option<&str>,
+    link: &str,
+) -> Vec<u8> {
+    let defs: Vec<&PortDef> = defs.collect();
+    let commands = defs.iter().map(|def| def.schema.command(&def.record));
+    let mut blob = link_info(commands.collect(), namespace, link);
+    for def in defs {
+        if let RecordSchema::Frame { vtable, metadata } = &def.schema {
+            announce_frame(vtable, metadata, &mut blob);
+        }
+    }
+    blob
+}
+
+/// Encodes what a dialing `Subscribe` asks its peer for: a `MsgStream`
+/// for each port's id, frame ports first.
+///
+/// A db answers a frame command's request with its vtable at once, so
+/// that announce precedes any record a message stream sends. A `Publish`
+/// ignores them.
+pub(crate) fn stream_requests<'a>(defs: impl Iterator<Item = &'a PortDef>) -> Vec<u8> {
+    let (mut frames, mut msgs) = (Vec::new(), Vec::new());
+    for def in defs {
+        let request = (&MsgStream {
+            msg_id: def.schema.packet_id(),
+        })
+            .into_len_packet()
+            .inner;
+        match def.schema {
+            RecordSchema::Frame { .. } => frames.extend_from_slice(&request),
+            RecordSchema::Msg { .. } => msgs.extend_from_slice(&request),
+        }
+    }
+    frames.extend_from_slice(&msgs);
+    frames
+}
+
+/// Appends a frame's vtable and component metadata to `blob`.
+fn announce_frame(
+    vtable: &VTable<Vec<Op>, Vec<u8>, Vec<Field>>,
+    metadata: &[ComponentMetadata],
+    blob: &mut Vec<u8>,
+) {
+    let table = VTableMsg {
+        id: table_id(vtable),
+        vtable: vtable.clone(),
+    };
+    blob.extend_from_slice(&table.into_len_packet().inner);
+    for component in metadata {
+        let packet = SetComponentMetadata(component.clone()).into_len_packet();
+        blob.extend_from_slice(&packet.inner);
+    }
 }
 
 /// Encodes the announce a `Publish` sends on every new connection.
@@ -43,17 +106,8 @@ pub(crate) fn announce(
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             continue;
         };
-        let id = table_id(vtable);
-        ids[index] = id;
-        let table = VTableMsg {
-            id,
-            vtable: vtable.clone(),
-        };
-        blob.extend_from_slice(&table.into_len_packet().inner);
-        for component in metadata {
-            let packet = SetComponentMetadata(component.clone()).into_len_packet();
-            blob.extend_from_slice(&packet.inner);
-        }
+        ids[index] = table_id(vtable);
+        announce_frame(vtable, metadata, &mut blob);
     }
     let mut msgs: Vec<PacketId> = Vec::new();
     for (index, def) in defs.iter().enumerate() {
@@ -72,6 +126,27 @@ pub(crate) fn announce(
         blob.extend_from_slice(&announce.into_len_packet().inner);
     }
     (blob, ids)
+}
+
+impl RecordSchema {
+    /// Describes this schema as a command, for a record called `record`.
+    ///
+    /// A frame command's id is its table id.
+    pub(crate) fn command(&self, record: &str) -> CommandInfo {
+        match self {
+            Self::Frame { vtable, .. } => CommandInfo {
+                id: table_id(vtable),
+                kind: CommandKind::Frame {
+                    name: record.to_string(),
+                    vtable: vtable.clone(),
+                },
+            },
+            Self::Msg { id, name, codec } => CommandInfo {
+                id: *id,
+                kind: CommandKind::Msg(codec.msg_metadata(name)),
+            },
+        }
+    }
 }
 
 impl MsgCodec {
@@ -234,6 +309,74 @@ mod tests {
         let (blob, wire) = announced(&defs);
         assert_eq!(wire[0], wire[1]);
         assert_eq!(blob, announced(&defs[..1]).0);
+    }
+
+    /// Splits a blob of length-prefixed packets into each one's id and
+    /// payload.
+    fn packets(blob: &[u8]) -> Vec<(PacketId, &[u8])> {
+        let mut packets = Vec::new();
+        let mut rest = blob;
+        while let Some((len, body)) = rest.split_first_chunk::<4>() {
+            let len = u32::from_le_bytes(*len) as usize;
+            packets.push(([body[1], body[2]], &body[PACKET_HEADER_LEN..len]));
+            rest = &body[len..];
+        }
+        packets
+    }
+
+    #[test]
+    fn test_command_announce_describes_every_port() {
+        let defs = [
+            Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
+            imu_port(),
+        ];
+        let blob = command_announce(defs.iter(), Some("cube_sat"), "cmds");
+        let packets = packets(&blob);
+        let info: LinkInfo = postcard::from_bytes(packets[0].1).expect("a link identity");
+        let RecordSchema::Frame { vtable, metadata } = &defs[1].schema else {
+            panic!("a frame port")
+        };
+        let table = table_id(vtable);
+        assert_eq!(info.command_ids, [Fixed::schema().packet_id(), table]);
+        assert_eq!(
+            info.commands,
+            [
+                defs[0].schema.command(Fixed::NAME),
+                CommandInfo {
+                    id: table,
+                    kind: CommandKind::Frame {
+                        name: Imu::NAME.into(),
+                        vtable: vtable.clone(),
+                    },
+                },
+            ]
+        );
+        assert!(matches!(info.commands[0].kind, CommandKind::Msg(_)));
+        let ids: Vec<PacketId> = packets[1..].iter().map(|(id, _)| *id).collect();
+        let mut expected = vec![VTableMsg::ID];
+        expected.extend(metadata.iter().map(|_| SetComponentMetadata::ID));
+        assert_eq!(ids, expected, "only the frame port's table follows");
+    }
+
+    #[test]
+    fn test_stream_requests_ask_for_frames_first() {
+        let defs = [
+            Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
+            imu_port(),
+        ];
+        let blob = stream_requests(defs.iter());
+        let asked: Vec<PacketId> = packets(&blob)
+            .iter()
+            .map(|(id, payload)| {
+                assert_eq!(*id, MsgStream::ID);
+                let request: MsgStream = postcard::from_bytes(payload).expect("a request");
+                request.msg_id
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [defs[1].schema.packet_id(), Fixed::schema().packet_id()]
+        );
     }
 
     #[test]

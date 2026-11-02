@@ -371,7 +371,8 @@ async fn fsw_loop(addr: SocketAddr, db: Arc<DB>, status: StatusHandle, mut next:
                 status.set(ConnectionStatus::Connected);
                 connected_once = true;
                 backoff = LINK_BACKOFF_INITIAL;
-                let err = fsw_stream(info.command_ids, rx, tx, buf, &db, |_| {}).await;
+                let err =
+                    fsw_stream(info.command_ids, &info.commands, rx, tx, buf, &db, |_| {}).await;
                 tracing::info!(%err, %addr, "fsw link dropped; reconnecting");
                 status.set(ConnectionStatus::Reconnecting);
             }
