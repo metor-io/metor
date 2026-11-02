@@ -339,10 +339,10 @@ impl ConnectionPicker {
         }
         let key = event.keystroke.key.as_str();
         if let Some(startup) = &self.startup {
-            if key == "escape" {
-                startup.read(cx).cancel_open();
-            }
             if startup.read(cx).busy() {
+                if key == "escape" {
+                    startup.update(cx, |startup, cx| startup.cancel(cx));
+                }
                 return;
             }
             if key == "o" && event.keystroke.modifiers.platform {

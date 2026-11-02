@@ -1633,7 +1633,8 @@ impl PanelApp {
             if self.db.is_some() {
                 self.start(cx);
             } else if let Some(addr) = self.deferred_peer.take() {
-                let selected = crate::session::select_for_peer(addr, self.storage.clone());
+                let selected =
+                    crate::session::select_for_peer(addr, self.storage.clone(), Default::default());
                 cx.spawn(async move |cx| {
                     let selected = selected.await;
                     cx.update(|cx| match selected {

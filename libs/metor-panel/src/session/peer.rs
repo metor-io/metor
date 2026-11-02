@@ -14,6 +14,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use metor_db::peer_cache::PeerCache;
@@ -27,7 +28,7 @@ use super::{DbRuntime, SessionStorage, StorageDirectory};
 /// How long the startup probe waits for a peer to say who it is. Shorter
 /// than the mirror's own handshake bound: a slow answer costs only the
 /// cache, never the connection.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) type Selected = Result<(SessionStorage, Arc<DB>), metor_db::Error>;
 
@@ -42,14 +43,24 @@ pub(crate) struct CachedPeer {
 
 /// Probe `addr` and open the session DB for whatever answered, on a thread
 /// of its own so the caller's UI keeps drawing while it waits.
+///
+/// Setting `cancel` while the probe runs skips opening any DB (the result
+/// is an `Interrupted` error); once one is open, the caller gets it and
+/// owns its cleanup.
 pub(crate) fn select_for_peer(
     addr: SocketAddr,
     config: StorageConfig,
+    cancel: Arc<AtomicBool>,
 ) -> impl Future<Output = Selected> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let info = probe(addr);
-        let _ = tx.send(SessionStorage::for_peer(addr, info.as_ref(), &config));
+        let selected = if cancel.load(Ordering::Relaxed) {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into())
+        } else {
+            SessionStorage::for_peer(addr, info.as_ref(), &config)
+        };
+        let _ = tx.send(selected);
     });
     async move {
         rx.await
@@ -161,7 +172,8 @@ impl SessionStorage {
 mod tests {
     use super::*;
 
-    const ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 2240);
+    const ADDR: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 2240);
 
     fn info(id: Option<u8>, ephemeral: bool) -> DbInfoResp {
         DbInfoResp {
@@ -191,7 +203,8 @@ mod tests {
     fn a_named_lasting_peer_gets_its_cache_and_reopens_it() {
         let root = tempfile::tempdir().unwrap();
         let peer = info(Some(1), false);
-        let (storage, db) = SessionStorage::for_peer(ADDR, Some(&peer), &config(root.path())).unwrap();
+        let (storage, db) =
+            SessionStorage::for_peer(ADDR, Some(&peer), &config(root.path())).unwrap();
         assert!(is_cached(&storage));
         assert!(matches!(
             storage.directory,
@@ -208,7 +221,8 @@ mod tests {
         assert!(path.exists(), "a cache outlives the session");
         drop(db);
 
-        let (storage, db) = SessionStorage::for_peer(ADDR, Some(&peer), &config(root.path())).unwrap();
+        let (storage, db) =
+            SessionStorage::for_peer(ADDR, Some(&peer), &config(root.path())).unwrap();
         assert!(is_cached(&storage));
         assert_eq!(db.path, path, "the same peer reopens the same db");
         storage.finish(&db, Ok(())).unwrap();

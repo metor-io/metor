@@ -104,7 +104,12 @@ pub(crate) fn init(
 /// The peer this session's DB caches, when it is a peer cache: the only
 /// peer it may mirror.
 pub(crate) fn cached_peer(cx: &App) -> Option<super::CachedPeer> {
-    match &cx.try_global::<SessionGlobal>()?.storage.as_ref()?.directory {
+    match &cx
+        .try_global::<SessionGlobal>()?
+        .storage
+        .as_ref()?
+        .directory
+    {
         StorageDirectory::Cached(_, peer) => Some(*peer),
         _ => None,
     }

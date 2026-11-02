@@ -677,7 +677,11 @@ mod tests {
         // A session that ran longer than the idle limit.
         age(&dir, Duration::from_secs(3600));
         drop(cached);
-        assert!(cache.prune(u64::MAX, Duration::from_secs(600), None).is_empty());
+        assert!(
+            cache
+                .prune(u64::MAX, Duration::from_secs(600), None)
+                .is_empty()
+        );
         assert!(dir.is_dir());
     }
 }

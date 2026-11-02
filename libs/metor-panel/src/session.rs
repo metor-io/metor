@@ -16,8 +16,8 @@ mod usage;
 pub(crate) use peer::{CachedPeer, select_for_peer};
 pub(crate) mod startup;
 pub(crate) use commands::{
-    OpenHandler, OpenRecording, QuitPanel, SaveSnapshot, SaveSnapshotAs, finish_export, init,
-    cached_peer, open_recording, request_quit, rows, save, save_as, save_workspace, take,
+    OpenHandler, OpenRecording, QuitPanel, SaveSnapshot, SaveSnapshotAs, cached_peer,
+    finish_export, init, open_recording, request_quit, rows, save, save_as, save_workspace, take,
 };
 
 pub(crate) struct SessionStorage {

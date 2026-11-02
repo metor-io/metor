@@ -3,9 +3,9 @@ use std::net::SocketAddr;
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, DumpSchema, InstanceId, DumpSchemaResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo,
-    GetNodeManifest, NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, OfferNode,
-    OfferNodeResp, PushNodeDone,
+    DbInfoResp, DumpSchema, DumpSchemaResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo,
+    GetNodeManifest, InstanceId, NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp,
+    OfferNode, OfferNodeResp, PushNodeDone,
 };
 use stellarator::sync::{Mutex, MutexGuard};
 use tracing::warn;
