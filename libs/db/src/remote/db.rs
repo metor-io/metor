@@ -4,7 +4,7 @@ use metor_proto::schema::Schema;
 use metor_proto::types::{ComponentId, IntoLenPacket, LenPacket, PacketTy, Timestamp};
 use metor_proto_stellar::{Client, PacketSink, PacketStream};
 use metor_proto_wkt::{
-    DbInfoResp, DumpMetadata, DumpMetadataResp, FEATURE_MSG_SYNC, GetDbInfo, Stream,
+    DbInfoResp, DumpMetadata, DumpMetadataResp, FEATURE_MSG_SYNC, GetDbInfo, InstanceId, Stream,
     StreamBehavior, SyncMsgs,
 };
 use stellarator::io::{OwnedReader, OwnedWriter};
@@ -32,6 +32,14 @@ pub enum MirrorEvent {
     Disconnected,
     /// The attempt failed with an error; the supervisor will retry.
     Failed,
+    /// A database other than the one [`RemoteDb::expect_instance`] named
+    /// answered (`found` is its id, `None` from a server that doesn't say).
+    /// Terminal: the supervisor stops, since writing that peer into the
+    /// expected one's mirror would mix two histories.
+    WrongPeer {
+        expected: InstanceId,
+        found: Option<InstanceId>,
+    },
 }
 
 type EventFn = Arc<dyn Fn(MirrorEvent) + Send + Sync>;
@@ -47,6 +55,7 @@ type EventFn = Arc<dyn Fn(MirrorEvent) + Send + Sync>;
 /// the same packets the local ingest path already understands.
 pub struct RemoteDb {
     addr: SocketAddr,
+    expected: Option<InstanceId>,
     store: Arc<PeerStore>,
     hydrator: Hydrator,
     on_event: Option<EventFn>,
@@ -56,10 +65,23 @@ impl RemoteDb {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
+            expected: None,
             store: Arc::new(PeerStore::new(addr)),
             hydrator: Hydrator::new(),
             on_event: None,
         }
+    }
+
+    /// Mirror only the database `id` (when `Some`), checked on every
+    /// connect: a mirror kept in that peer's cache must not take in
+    /// whatever answers at the address after the peer was wiped or
+    /// replaced. Another answer ends the mirror with
+    /// [`MirrorEvent::WrongPeer`], and the bulk store refuses it too. Call
+    /// before [`store`](Self::store), whose handle this replaces.
+    pub fn expect_instance(mut self, id: Option<InstanceId>) -> Self {
+        self.expected = id;
+        self.store = Arc::new(PeerStore::new(self.addr).expect_instance(id));
+        self
     }
 
     /// Observe supervisor lifecycle transitions. The callback fires from the
@@ -85,6 +107,7 @@ impl RemoteDb {
     pub fn spawn(self, db: Arc<DB>) {
         let Self {
             addr,
+            expected,
             store,
             hydrator,
             on_event,
@@ -103,8 +126,12 @@ impl RemoteDb {
             loop {
                 let connected_at = std::time::Instant::now();
                 emit(MirrorEvent::Connecting);
-                match mirror(&db, addr, &emit).await {
-                    Ok(()) => emit(MirrorEvent::Disconnected),
+                match mirror(&db, addr, expected, &emit).await {
+                    Ok(event) => {
+                        warn!(?addr, ?event, "a different database answered; mirror stopped");
+                        emit(event);
+                        return;
+                    }
                     Err(err) if err.is_stream_closed() => {
                         info!(?addr, "remote db disconnected; reconnecting");
                         emit(MirrorEvent::Disconnected);
@@ -142,10 +169,25 @@ pub(super) async fn handshake_request<T>(
 /// One connection lifetime: handshake, metadata sync, then the real-time
 /// stream — plus the message logs when the peer answers [`SyncMsgs`] —
 /// ingested until the connection drops, raced against the forwarder for
-/// the commands the peer advertised.
-async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> Result<(), Error> {
+/// the commands the peer advertised. Returns only with the error that
+/// ended it, or with the [`MirrorEvent::WrongPeer`] that ends mirroring
+/// before anything was ingested.
+async fn mirror(
+    db: &Arc<DB>,
+    addr: SocketAddr,
+    expected: Option<InstanceId>,
+    emit: &impl Fn(MirrorEvent),
+) -> Result<MirrorEvent, Error> {
     let mut client = Client::connect(addr).await?;
     let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
+    if let Some(expected) = expected
+        && info.instance_id != Some(expected)
+    {
+        return Ok(MirrorEvent::WrongPeer {
+            expected,
+            found: info.instance_id,
+        });
+    }
     info!(
         ?addr,
         peer_version = info.protocol_version,
@@ -296,6 +338,55 @@ mod tests {
         RemoteDb::new(addr).on_event(sink).spawn(mirror_db);
         wait_for(&log, MirrorEvent::Connected).await;
         assert_eq!(log.lock().unwrap().first(), Some(&MirrorEvent::Connecting));
+    }
+
+    /// A mirror pinned to one database stops for good when another answers
+    /// at its address, and takes nothing in from it.
+    #[stellarator::test]
+    async fn a_different_database_at_the_address_stops_the_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
+        let found = server_db.instance_id();
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::Server {
+            listener,
+            db: server_db.clone(),
+        };
+        stellarator::struc_con::stellar(move || server.run());
+
+        let expected = InstanceId([9; 16]);
+        assert_ne!(found, expected);
+        let (log, sink) = event_log();
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        RemoteDb::new(addr)
+            .expect_instance(Some(expected))
+            .on_event(sink)
+            .spawn(mirror_db);
+        let wrong = MirrorEvent::WrongPeer {
+            expected,
+            found: Some(found),
+        };
+        wait_for(&log, wrong).await;
+        // Longer than the first reconnect backoff: no further attempt.
+        stellarator::sleep(Duration::from_millis(600)).await;
+        assert_eq!(*log.lock().unwrap(), [MirrorEvent::Connecting, wrong]);
+        assert!(matches!(
+            PeerStore::new(addr)
+                .expect_instance(Some(expected))
+                .dump_schema()
+                .await,
+            Err(crate::store::StoreError::Unavailable(_))
+        ));
+
+        // The right id mirrors as before.
+        let (log, sink) = event_log();
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror2")).unwrap());
+        RemoteDb::new(addr)
+            .expect_instance(Some(found))
+            .on_event(sink)
+            .spawn(mirror_db);
+        wait_for(&log, MirrorEvent::Connected).await;
     }
 
     /// What the mirror's live ingest writes is mirrored data, while the

@@ -432,3 +432,27 @@ fn a_role_beyond_fsw_shows_in_the_detail() {
     );
     assert_eq!(resolved("fsw").detail.as_ref(), "10.0.0.5:2240");
 }
+
+#[test]
+fn a_cached_session_connects_only_its_peer() {
+    let addr: std::net::SocketAddr = "127.0.0.1:2240".parse().unwrap();
+    let cached = Some(crate::session::CachedPeer {
+        id: metor_proto_wkt::InstanceId([1; 16]),
+        addr,
+    });
+    let peer = ConnectionTarget::tcp("Vehicle", addr);
+    assert!(cache_refusal(None, &target("a", "Alpha"), true).is_none());
+    assert!(cache_refusal(cached, &peer, false).is_none());
+    assert!(
+        cache_refusal(cached, &ConnectionTarget::db("Vehicle", addr), false).is_none(),
+        "the pinned mode is the same peer"
+    );
+    let other = ConnectionTarget::tcp("Other", "127.0.0.1:2241".parse().unwrap());
+    let refusal = cache_refusal(cached, &other, false).unwrap();
+    assert!(refusal.contains("127.0.0.1:2240"), "{refusal}");
+    assert!(cache_refusal(cached, &target("a", "Alpha"), false).is_some());
+    assert!(
+        cache_refusal(cached, &peer, true).is_some(),
+        "another system is already mirrored"
+    );
+}

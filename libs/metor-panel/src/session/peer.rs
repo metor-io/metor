@@ -31,6 +31,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) type Selected = Result<(SessionStorage, Arc<DB>), metor_db::Error>;
 
+/// The peer a cached session's DB belongs to. The session mirrors only it:
+/// a second system would write its history into this one's cache, and the
+/// same address answering with another id is a different database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CachedPeer {
+    pub(crate) id: InstanceId,
+    pub(crate) addr: SocketAddr,
+}
+
 /// Probe `addr` and open the session DB for whatever answered, on a thread
 /// of its own so the caller's UI keeps drawing while it waits.
 pub(crate) fn select_for_peer(
@@ -40,7 +49,7 @@ pub(crate) fn select_for_peer(
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let info = probe(addr);
-        let _ = tx.send(SessionStorage::for_peer(info.as_ref(), &config));
+        let _ = tx.send(SessionStorage::for_peer(addr, info.as_ref(), &config));
     });
     async move {
         rx.await
@@ -78,11 +87,15 @@ impl SessionStorage {
     /// A cached DB's head is raised to the peer's before anything reads
     /// it, so the temporal controller latches the session start at the
     /// peer's "now" rather than where the cache's old data ends.
-    pub(crate) fn for_peer(info: Option<&DbInfoResp>, config: &StorageConfig) -> Selected {
+    pub(crate) fn for_peer(
+        addr: SocketAddr,
+        info: Option<&DbInfoResp>,
+        config: &StorageConfig,
+    ) -> Selected {
         if let Some(id) = info.and_then(cache_key)
             && let Some(cache) = config.peer_cache()
         {
-            let opened = Self::cached(&cache, id);
+            let opened = Self::cached(&cache, CachedPeer { id, addr });
             let config = config.clone();
             std::thread::spawn(move || {
                 config.prune_cache(&cache, Some(id));
@@ -100,7 +113,8 @@ impl SessionStorage {
     /// Claim and open `id`'s cache, or `None` to fall back to a temporary
     /// DB. Opening an existing DB spawns its components' persistence and
     /// lifecycle tasks, so it runs on an executor the session keeps.
-    fn cached(cache: &PeerCache, id: InstanceId) -> Option<(Self, Arc<DB>)> {
+    fn cached(cache: &PeerCache, peer: CachedPeer) -> Option<(Self, Arc<DB>)> {
+        let id = peer.id;
         let mut cached = match cache.open(id) {
             Ok(Some(cached)) => cached,
             Ok(None) => {
@@ -135,7 +149,7 @@ impl SessionStorage {
         Some((
             Self {
                 runtime: Some(runtime),
-                directory: StorageDirectory::Cached(cached),
+                directory: StorageDirectory::Cached(cached, peer),
                 source: None,
             },
             db,
@@ -146,6 +160,8 @@ impl SessionStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 2240);
 
     fn info(id: Option<u8>, ephemeral: bool) -> DbInfoResp {
         DbInfoResp {
@@ -168,15 +184,19 @@ mod tests {
     }
 
     fn is_cached(storage: &SessionStorage) -> bool {
-        matches!(storage.directory, StorageDirectory::Cached(_))
+        matches!(storage.directory, StorageDirectory::Cached(..))
     }
 
     #[test]
     fn a_named_lasting_peer_gets_its_cache_and_reopens_it() {
         let root = tempfile::tempdir().unwrap();
         let peer = info(Some(1), false);
-        let (storage, db) = SessionStorage::for_peer(Some(&peer), &config(root.path())).unwrap();
+        let (storage, db) = SessionStorage::for_peer(ADDR, Some(&peer), &config(root.path())).unwrap();
         assert!(is_cached(&storage));
+        assert!(matches!(
+            storage.directory,
+            StorageDirectory::Cached(_, CachedPeer { id, addr }) if id == InstanceId([1; 16]) && addr == ADDR
+        ));
         let path = db.path.clone();
         assert!(path.starts_with(root.path().join(InstanceId([1; 16]).to_string())));
         assert_eq!(
@@ -188,7 +208,7 @@ mod tests {
         assert!(path.exists(), "a cache outlives the session");
         drop(db);
 
-        let (storage, db) = SessionStorage::for_peer(Some(&peer), &config(root.path())).unwrap();
+        let (storage, db) = SessionStorage::for_peer(ADDR, Some(&peer), &config(root.path())).unwrap();
         assert!(is_cached(&storage));
         assert_eq!(db.path, path, "the same peer reopens the same db");
         storage.finish(&db, Ok(())).unwrap();
@@ -204,7 +224,7 @@ mod tests {
             ("fsw link or no answer", None),
         ];
         for (case, info) in cases {
-            let (storage, db) = SessionStorage::for_peer(info.as_ref(), &config).unwrap();
+            let (storage, db) = SessionStorage::for_peer(ADDR, info.as_ref(), &config).unwrap();
             assert!(storage.is_temporary(), "{case}");
             storage.finish(&db, Ok(())).unwrap();
         }
@@ -215,9 +235,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = config(root.path());
         let peer = info(Some(2), false);
-        let (held, held_db) = SessionStorage::for_peer(Some(&peer), &config).unwrap();
+        let (held, held_db) = SessionStorage::for_peer(ADDR, Some(&peer), &config).unwrap();
         assert!(is_cached(&held));
-        let (storage, db) = SessionStorage::for_peer(Some(&peer), &config).unwrap();
+        let (storage, db) = SessionStorage::for_peer(ADDR, Some(&peer), &config).unwrap();
         assert!(
             storage.is_temporary(),
             "a second panel can't share the cache"

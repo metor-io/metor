@@ -13,11 +13,11 @@ mod archive;
 mod commands;
 mod peer;
 mod usage;
-pub(crate) use peer::select_for_peer;
+pub(crate) use peer::{CachedPeer, select_for_peer};
 pub(crate) mod startup;
 pub(crate) use commands::{
     OpenHandler, OpenRecording, QuitPanel, SaveSnapshot, SaveSnapshotAs, finish_export, init,
-    open_recording, request_quit, rows, save, save_as, save_workspace, take,
+    cached_peer, open_recording, request_quit, rows, save, save_as, save_workspace, take,
 };
 
 pub(crate) struct SessionStorage {
@@ -54,14 +54,14 @@ enum StorageDirectory {
     /// evicted while running like a temporary session, and removed only by
     /// the cache's own pruning once unused. Snapshots save from it like
     /// from any session.
-    Cached(metor_db::peer_cache::CachedDb),
+    Cached(metor_db::peer_cache::CachedDb, CachedPeer),
 }
 impl StorageDirectory {
     fn path(&self) -> &Path {
         match self {
             Self::Temporary(d) => d.path(),
             Self::Recording { path, .. } => path,
-            Self::Cached(cached) => cached.path(),
+            Self::Cached(cached, _) => cached.path(),
         }
     }
 }
@@ -160,7 +160,7 @@ impl SessionStorage {
     pub(crate) fn is_cache(&self) -> bool {
         matches!(
             self.directory,
-            StorageDirectory::Temporary(_) | StorageDirectory::Cached(_)
+            StorageDirectory::Temporary(_) | StorageDirectory::Cached(..)
         )
     }
 
@@ -241,7 +241,7 @@ impl SessionStorage {
                 }),
             // No fsync: a cache torn by a crash is replaced when it next
             // fails to open, and its history fetched again.
-            StorageDirectory::Cached(cached) => shutdown
+            StorageDirectory::Cached(cached, _) => shutdown
                 .and_then(|()| db.flush().map_err(io::Error::other))
                 .map_err(|error| FinishError {
                     recovery: cached.path().to_owned(),

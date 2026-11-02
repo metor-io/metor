@@ -101,6 +101,14 @@ pub(crate) fn init(
         }),
     );
 }
+/// The peer this session's DB caches, when it is a peer cache: the only
+/// peer it may mirror.
+pub(crate) fn cached_peer(cx: &App) -> Option<super::CachedPeer> {
+    match &cx.try_global::<SessionGlobal>()?.storage.as_ref()?.directory {
+        StorageDirectory::Cached(_, peer) => Some(*peer),
+        _ => None,
+    }
+}
 pub(crate) fn take(cx: &mut App) -> Option<SessionStorage> {
     cx.try_global::<SessionGlobal>()?;
     cx.global_mut::<SessionGlobal>().storage.take()
@@ -118,7 +126,7 @@ fn storage_summary(cx: &App) -> SharedString {
             ..
         }) => format!("Recording to {}", path.display()).into(),
         Some(SessionStorage {
-            directory: StorageDirectory::Cached(cached),
+            directory: StorageDirectory::Cached(cached, _),
             ..
         }) => format!("Peer cache {}", cached.path().display()).into(),
         Some(_) => "Temporary session".into(),
