@@ -199,7 +199,7 @@ fn write_target(
     let target = &config.targets[index];
     write_title(out, target, index, theme)?;
     let systems = target.coordinator.systems.iter();
-    let rows = systems.map(|system| vec![system.id.clone(), system.ty.clone(), inputs(system)]);
+    let rows = systems.map(|system| vec![system.id.clone(), kind(system), inputs(system)]);
     table::write(out, &SYSTEM_COLUMNS, rows, theme, width, "    ")
 }
 
@@ -280,6 +280,19 @@ const SYSTEM_COLUMNS: [(&str, Align); 3] = [
 const PARAM_COLUMNS: [(&str, Align); 2] = [("PARAM", Align::Left), ("VALUE", Align::Left)];
 const INPUT_COLUMNS: [(&str, Align); 2] = [("INPUT", Align::Left), ("FROM", Align::Left)];
 const GRANT_COLUMNS: [(&str, Align); 2] = [("GRANT", Align::Left), ("RESOURCE", Align::Left)];
+
+/// `fsw.db (deleted on exit)` for a db whose database goes when the run
+/// stops, otherwise the system's type.
+fn kind(system: &SystemConfig) -> String {
+    #[cfg(feature = "db")]
+    if system.ty == crate::link::DB_TYPE
+        && serde_json::from_value::<crate::link::DbParams>(system.params.clone())
+            .is_ok_and(|params| params.on_exit() == crate::link::OnExit::Delete)
+    {
+        return format!("{} (deleted on exit)", system.ty);
+    }
+    system.ty.clone()
+}
 
 /// `sensors ← plant.sensors, plant.gps`: an input named after its source,
 /// as a link's are, shows the source alone.
@@ -400,6 +413,23 @@ mod tests {
             select(&config, Some("nav")).is_err(),
             "bare ids need one target"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn test_kind_notes_a_db_deleted_on_exit() {
+        let db = |params: serde_json::Value| SystemConfig {
+            params,
+            ..SystemConfig::new("db", crate::link::DB_TYPE)
+        };
+        let listen = "127.0.0.1:2250";
+        let temporary = db(serde_json::json!({"listen": listen, "path": null}));
+        let at_path = db(serde_json::json!({"listen": listen, "path": "/data/db"}));
+        let kept = db(serde_json::json!({"listen": listen, "on_exit": "keep"}));
+        assert_eq!(kind(&temporary), "fsw.db (deleted on exit)");
+        assert_eq!(kind(&at_path), "fsw.db");
+        assert_eq!(kind(&kept), "fsw.db");
+        assert_eq!(kind(&SystemConfig::new("nav", "adcs.Nav")), "adcs.Nav");
     }
 
     #[test]

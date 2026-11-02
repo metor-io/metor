@@ -231,6 +231,16 @@ class DeploymentTest(ConfigTest):
         self.assertEqual([i["port"] for i in entry["inputs"]], ["plant.imu", "plant.log", "plant.status"])
         self.assertEqual(plant.imu.record, Imu)
 
+    def test_db_keep_sets_on_exit(self) -> None:
+        gw, db = gateway("gw", peers=[], listen="0.0.0.0:2250", keep=True)
+        tmp = Target(cycle_rate=10.0, namespace="tmp")
+        tmp.add("db", Db(listen="0.0.0.0:2251", path="/data/db", keep=False))
+        config = Deployment(targets=[gw, tmp]).to_config()
+        gw_params = config["targets"][0]["coordinator"]["systems"][0]["params"]
+        tmp_params = config["targets"][1]["coordinator"]["systems"][0]["params"]
+        self.assertEqual(gw_params["on_exit"], "keep")
+        self.assertEqual(tmp_params["on_exit"], "delete")
+
     def test_db_collects_subscriber_commands(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         plant = a.add("plant", Plant())
