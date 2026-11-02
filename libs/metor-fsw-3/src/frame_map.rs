@@ -425,6 +425,7 @@ mod tests {
     )]
     #[repr(C)]
     struct Nic {
+        #[fsw(unit = "B", metadata(gradient = "auto", note = "x"))]
         rx_bytes: u64,
         ethtool: FrameMap<String, u64>,
     }
@@ -744,5 +745,9 @@ mod tests {
                 ("nics.nics".into(), "sys.stats.nics.nics.en0".into()),
             ]
         );
+        // Field attributes travel as plain metadata keys.
+        assert_eq!(member.metadata["unit"], "B");
+        assert_eq!(member.metadata["gradient"], "auto");
+        assert_eq!(member.metadata["note"], "x");
     }
 }
