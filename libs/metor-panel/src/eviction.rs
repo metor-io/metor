@@ -1,4 +1,4 @@
-//! Working-set eviction for the panel's session DB.
+//! Eviction for the panel's session DB.
 //!
 //! A mirror is a cache, not an archive: what a peer can serve again is kept
 //! only while someone reads it. Every per-frame read path marks the history
@@ -10,13 +10,18 @@
 //! LoD level, stops touching the raw nodes, and they go a few seconds
 //! later; zooming back fetches them again.
 //!
+//! Under [`Eviction::Budget`] the same task instead keeps the most recently
+//! touched history up to a byte budget, for a peer cache reopened day after
+//! day, where what was read yesterday is worth the disk it takes.
+//!
 //! What may go is [`metor_db::evict`]'s rule: acked spans (hydrated from a
 //! peer) and mirrored spans the peer's seals cover, never the live head or
 //! locally produced data. On top of that this module adds the panel's
 //! policy:
 //!
-//! - **Only a temporary session evicts.** A recording, or a database the
-//!   embedding application owns, exists to keep what arrived.
+//! - **Only a temporary session or a peer cache evicts.** A recording, or
+//!   a database the embedding application owns, exists to keep what
+//!   arrived.
 //! - **Paused unless every connection is up, and at least one can serve
 //!   history.** A peer that dropped may hold the only other copy, or none:
 //!   an ephemeral gateway deletes its DB when it stops. Spans aren't
@@ -56,37 +61,32 @@ const TICK: Duration = Duration::from_secs(1);
 const SETTLE: Duration = Duration::from_millis(250);
 
 /// Start the evictor for `db` under `eviction`. Runs until the app quits.
-/// Only the working set is driven here so far; a byte budget keeps
-/// everything, like [`Eviction::Off`].
 pub(crate) fn spawn(db: Arc<DB>, eviction: Eviction, cx: &mut App) {
-    let Eviction::WorkingSet { grace } = eviction else {
-        return;
-    };
-    if !evict::SUPPORTED {
+    if eviction == Eviction::Off || !evict::SUPPORTED {
         return;
     }
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(TICK).await;
-            tick(&db, grace, cx).await;
+            tick(&db, eviction, cx).await;
         }
     })
     .detach();
 }
 
-/// One pass: find idle history, let every view on screen claim what it
-/// shows, then purge what is still idle.
-async fn tick(db: &Arc<DB>, grace: Duration, cx: &mut AsyncApp) {
+/// One pass: see whether anything would go, let every view on screen claim
+/// what it shows, then purge.
+async fn tick(db: &Arc<DB>, eviction: Eviction, cx: &mut AsyncApp) {
     if !cx.update(|cx| peers_reachable(cx)) {
         return;
     }
-    let any_idle = {
+    let due = {
         let db = db.clone();
         cx.background_executor()
-            .spawn(async move { any_idle(&db, Instant::now(), grace) })
+            .spawn(async move { due(&db, eviction, Instant::now()) })
             .await
     };
-    if !any_idle {
+    if !due {
         return;
     }
     cx.update(|cx| {
@@ -100,7 +100,7 @@ async fn tick(db: &Arc<DB>, grace: Duration, cx: &mut AsyncApp) {
     let db = db.clone();
     let evicted = cx
         .background_executor()
-        .spawn(async move { sweep(&db, Instant::now(), grace) })
+        .spawn(async move { purge(&db, eviction, Instant::now()) })
         .await;
     if evicted.spans > 0 {
         tracing::debug!(
@@ -109,6 +109,39 @@ async fn tick(db: &Arc<DB>, grace: Duration, cx: &mut AsyncApp) {
             "evicted idle history"
         );
     }
+}
+
+/// Whether a pass under `eviction` would find anything to purge.
+fn due(db: &DB, eviction: Eviction, now: Instant) -> bool {
+    match eviction {
+        Eviction::WorkingSet { grace } => any_idle(db, now, grace),
+        Eviction::Budget { max_bytes } => over_budget(db, max_bytes),
+        Eviction::Off => false,
+    }
+}
+
+fn purge(db: &DB, eviction: Eviction, now: Instant) -> Evicted {
+    match eviction {
+        Eviction::WorkingSet { grace } => sweep(db, now, grace),
+        Eviction::Budget { max_bytes } => trim(db, now, max_bytes),
+        Eviction::Off => Evicted::default(),
+    }
+}
+
+/// Whether [`trim`] would purge anything.
+fn over_budget(db: &DB, max_bytes: u64) -> bool {
+    let kept = coarsest_lod_levels(db);
+    evict::over_budget(db, max_bytes, |id, _| !kept.contains(&id))
+}
+
+/// Purge the least recently read history until the rest fits `max_bytes`.
+/// What was read within the default grace period stays, and each source's
+/// coarsest LoD level neither goes nor counts toward the budget.
+fn trim(db: &DB, now: Instant, max_bytes: u64) -> Evicted {
+    let kept = coarsest_lod_levels(db);
+    evict::budget(db, now, max_bytes, evict::DEFAULT_GRACE, |id, _| {
+        !kept.contains(&id)
+    })
 }
 
 /// Whether [`sweep`] would find anything to purge.
