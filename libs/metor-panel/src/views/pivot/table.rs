@@ -30,6 +30,7 @@ use crate::inspect;
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{theme, ui_px};
+use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
 use crate::views::component_browser::component_tree::{
     ComponentNode, build_full_tree, natural_cmp,
 };
@@ -37,6 +38,7 @@ use crate::views::component_browser::strip_cell_count;
 use crate::views::lazy_pool::VisibleEntityCache;
 use crate::views::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use crate::views::value_strip::ComponentValueStrip;
+use smallvec::SmallVec;
 
 /// Live strips kept alive; well above any visible cell count.
 const CACHE_CAP: usize = 512;
@@ -320,8 +322,19 @@ pub struct PivotDelegate {
     /// The sorted column by name, as the table tracks it, so the sort
     /// follows its column when captures come and go.
     sort: Option<(SharedString, ColumnSort)>,
+    /// The sorted field's current value per grid instance, while a field
+    /// column is sorted; `None` where an instance lacks it or it doesn't
+    /// read as numbers.
+    sort_values: Vec<Option<SortValue>>,
+    /// One stream per instance feeding `sort_values`; dropped to stop.
+    sort_streams: Vec<gpui::Task<()>>,
+    /// A sort value changed since the order was last settled.
+    resort: bool,
     strips: VisibleEntityCache<ComponentValueStrip>,
 }
+
+/// A field's elements as numbers, compared element by element.
+type SortValue = SmallVec<[f64; 4]>;
 
 impl PivotDelegate {
     fn new(db: Arc<DB>, arrangement: Arrangement) -> Self {
@@ -333,6 +346,9 @@ impl PivotDelegate {
             grid: Arc::new(Grid::new(SharedString::default(), Vec::new(), None, &|_| 1)),
             order: Vec::new(),
             sort: None,
+            sort_values: Vec::new(),
+            sort_streams: Vec::new(),
+            resort: false,
             strips: VisibleEntityCache::new(CACHE_CAP),
         }
     }
@@ -356,17 +372,90 @@ impl PivotDelegate {
             Some(&self.arrangement),
             &|id| strip_cell_count(&db, id),
         ));
+        self.watch_sort(cx);
         self.apply_sort();
         cx.notify();
     }
 
-    /// Instance and key columns sort naturally; unsorted is path order.
+    /// The grid index of the sorted field, when a field column is sorted.
+    fn sorted_field(&self) -> Option<usize> {
+        let (name, sort) = self.sort.as_ref()?;
+        if *sort == ColumnSort::Default {
+            return None;
+        }
+        self.grid.fields.iter().position(|f| f == name)
+    }
+
+    /// Follow the sorted field's value on every instance, so the order
+    /// tracks live data; a sort on anything else streams nothing.
+    fn watch_sort(&mut self, cx: &mut Context<Table<Self>>) {
+        self.sort_streams.clear();
+        self.sort_values = vec![None; self.grid.instances.len()];
+        let Some(field_ix) = self.sorted_field() else {
+            return;
+        };
+        for (ix, instance) in self.grid.instances.iter().enumerate() {
+            let Some(id) = instance.ids[field_ix] else {
+                continue;
+            };
+            self.sort_streams.push(spawn_seeded_stream(
+                self.db.clone(),
+                id,
+                cx,
+                |_, _| {
+                    ((), |view: metor_proto::types::ComponentView<'_>| {
+                        Some(view.iter().map(|v| v.as_f64()).collect::<SortValue>())
+                    })
+                },
+                move |table: &mut Table<Self>, update, cx| {
+                    let value = match update {
+                        StreamUpdate::Value(value) => Some(value),
+                        StreamUpdate::Unavailable => None,
+                        _ => return,
+                    };
+                    let delegate = table.delegate_mut();
+                    if let Some(slot) = delegate.sort_values.get_mut(ix)
+                        && *slot != value
+                    {
+                        *slot = value;
+                        delegate.resort = true;
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+    }
+
+    /// Instance and key columns sort naturally, fields by their live value
+    /// with instances lacking one last either way; unsorted is path order.
     fn apply_sort(&mut self) {
+        self.resort = false;
         let grid = &self.grid;
         let mut order: Vec<usize> = (0..grid.instances.len()).collect();
-        if let Some((name, sort)) = &self.sort
-            && *sort != ColumnSort::Default
-        {
+        let Some((name, sort)) = self
+            .sort
+            .as_ref()
+            .filter(|(_, s)| *s != ColumnSort::Default)
+        else {
+            self.order = order;
+            return;
+        };
+        let directed = |o: std::cmp::Ordering| {
+            if *sort == ColumnSort::Descending {
+                o.reverse()
+            } else {
+                o
+            }
+        };
+        if self.sorted_field().is_some() {
+            let values = &self.sort_values;
+            order.sort_by(|&a, &b| match (&values[a], &values[b]) {
+                (Some(a), Some(b)) => directed(compare_values(a, b)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            });
+        } else {
             let key = if name.as_ref() == INSTANCE_COLUMN {
                 Some(None)
             } else {
@@ -383,10 +472,7 @@ impl PivotDelegate {
                         Some(k) => inst.captures.get(k).map_or("", |s| s.as_ref()),
                     }
                 };
-                order.sort_by(|&a, &b| natural_cmp(text(a), text(b)));
-                if *sort == ColumnSort::Descending {
-                    order.reverse();
-                }
+                order.sort_by(|&a, &b| directed(natural_cmp(text(a), text(b))));
             }
         }
         self.order = order;
@@ -440,7 +526,11 @@ impl TableDelegate for PivotDelegate {
                 .fields
                 .iter()
                 .zip(&self.grid.cells)
-                .map(|(field, &n)| Column::new(field.clone(), cell_width(n, field)).movable()),
+                .map(|(field, &n)| {
+                    Column::new(field.clone(), cell_width(n, field))
+                        .movable()
+                        .sortable()
+                }),
         );
         cols
     }
@@ -451,6 +541,12 @@ impl TableDelegate for PivotDelegate {
 
     fn row_height(&self) -> Pixels {
         px(ROW_HEIGHT)
+    }
+
+    fn before_render(&mut self, _cx: &mut Context<Table<Self>>) {
+        if self.resort {
+            self.apply_sort();
+        }
     }
 
     fn frame_rendered(&mut self) {
@@ -502,6 +598,7 @@ impl TableDelegate for PivotDelegate {
             return;
         };
         self.sort = Some((column.name, sort));
+        self.watch_sort(cx);
         self.apply_sort();
         cx.notify();
     }
@@ -571,6 +668,16 @@ fn count_label(n: usize, singular: &str) -> String {
     } else {
         format!("{n} {singular}s")
     }
+}
+
+/// Element by element; NaN sorts after every number.
+fn compare_values(a: &[f64], b: &[f64]) -> std::cmp::Ordering {
+    let key = |v: f64| if v.is_nan() { f64::INFINITY } else { v };
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| key(*a).total_cmp(&key(*b)))
+        .find(|o| o.is_ne())
+        .unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 
 #[cfg(test)]
@@ -762,5 +869,70 @@ mod tests {
         // `{dut}` returns as the second key, and the sort reads it again.
         set_pattern("/(?<x>dut)(?<dut>\\d)\\.psu/", cx);
         assert_eq!(labels(&view, cx), ["dut3.psu", "dut2.psu", "dut1.psu"]);
+    }
+
+    #[gpui::test]
+    fn a_field_sort_follows_live_values(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        let cx = cx.add_empty_window();
+        let view = open(
+            &db,
+            PivotTableConfig {
+                pattern: "dut{dut}.psu".into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        let deliver = |values: [Option<f64>; 3], cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.table.update(cx, |table, cx| {
+                        let delegate = table.delegate_mut();
+                        delegate.sort_values = values
+                            .iter()
+                            .map(|v| v.map(|v| SortValue::from_slice(&[v])))
+                            .collect();
+                        delegate.resort = true;
+                        delegate.before_render(cx);
+                    });
+                })
+            })
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, cx| {
+                    // Instance, {dut}, current, voltage: sort by current.
+                    table
+                        .delegate_mut()
+                        .sort_column(2, ColumnSort::Ascending, cx);
+                    // Each dut has a current, so each streams one.
+                    assert_eq!(table.delegate().sort_streams.len(), 3);
+                });
+            })
+        });
+        deliver([Some(2.0), Some(1.0), None], cx);
+        assert_eq!(labels(&view, cx), ["dut2.psu", "dut1.psu", "dut3.psu"]);
+        deliver([Some(0.5), Some(1.0), None], cx);
+        assert_eq!(labels(&view, cx), ["dut1.psu", "dut2.psu", "dut3.psu"]);
+        // Descending flips the values; one not read yet stays last.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, cx| {
+                    table
+                        .delegate_mut()
+                        .sort_column(2, ColumnSort::Descending, cx);
+                });
+            })
+        });
+        deliver([Some(0.5), Some(1.0), None], cx);
+        assert_eq!(labels(&view, cx), ["dut2.psu", "dut1.psu", "dut3.psu"]);
+    }
+
+    #[test]
+    fn values_compare_element_by_element_with_nan_last() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_values(&[1.0, 5.0], &[1.0, 2.0]), Greater);
+        assert_eq!(compare_values(&[f64::NAN], &[1e300]), Greater);
+        assert_eq!(compare_values(&[1.0], &[1.0, 0.0]), Less);
     }
 }

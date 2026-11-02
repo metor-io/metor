@@ -148,6 +148,10 @@ pub trait TableDelegate: Sized + 'static {
         _cx: &mut Context<Table<Self>>,
     ) {
     }
+    /// Called at the start of each render, before columns and rows are
+    /// read. A delegate whose order follows live data settles it here, once
+    /// per frame, however many samples arrived since the last one.
+    fn before_render(&mut self, _cx: &mut Context<Table<Self>>) {}
     /// Called once after the visible row range has been painted each frame.
     /// Delegates that materialize rows lazily use it to release entities that
     /// scrolled out of view.
@@ -501,6 +505,7 @@ impl<D: TableDelegate> Table<D> {
 
 impl<D: TableDelegate> Render for Table<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.delegate.before_render(cx);
         self.sync_col_states();
         let theme = theme(cx);
         let columns = self.delegate.columns();
