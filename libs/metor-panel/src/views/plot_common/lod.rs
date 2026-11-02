@@ -10,6 +10,7 @@
 use std::ops::Range;
 
 use gpui::{Div, Hsla, Styled, div, relative};
+use metor_db::remote::HydratePriority;
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 use smallvec::SmallVec;
@@ -33,6 +34,10 @@ pub(crate) struct LodTracking {
     /// Index into `levels` while over budget; `None` when no level has been
     /// published yet (the plot shows gap bands instead).
     selected: Option<usize>,
+    /// True while computing the window's missing expression output would
+    /// read more inputs than the budget; the plot then shows what's
+    /// uncomputed instead of fetching the inputs to compute it.
+    replay_over_budget: bool,
 }
 
 impl LodTracking {
@@ -45,6 +50,10 @@ impl LodTracking {
         self.over_budget
     }
 
+    pub fn replay_over_budget(&self) -> bool {
+        self.replay_over_budget
+    }
+
     /// Decide raw versus LoD for `range`. A raw sample costs
     /// `elements_per_sample` against `budget`; an LoD sample carries both
     /// halves of its bucket, so it costs twice that.
@@ -53,17 +62,22 @@ impl LodTracking {
     /// budget; over budget the finest level that fits wins, falling back to
     /// the coarsest. A level with no data at all (still backfilling, or its
     /// first bucket hasn't completed) can't render and is skipped.
+    ///
+    /// An expression's replay is weighed separately, by its inputs: output
+    /// it never computed counts as nothing, so the output's own cost says
+    /// nothing about what computing it would pull. Each input sample is
+    /// charged as one raw output sample — an unclocked system emits at most
+    /// one frame per input sample read.
     pub fn select(
         &mut self,
         db: &DB,
         source: ComponentId,
         component: &Component,
+        plan: Option<&ReplayPlan>,
         range: Range<Timestamp>,
         budget: u64,
         elements_per_sample: u64,
     ) {
-        let enter = budget + budget / 4;
-        let exit = budget * 4 / 5;
         let vtable_gen = db.vtable_gen.latest();
         if self.resolved_gen != Some(vtable_gen) {
             self.levels = resolve_lod_levels(db, source);
@@ -73,11 +87,12 @@ impl LodTracking {
             .time_series
             .estimate_samples(range.clone())
             .saturating_mul(elements_per_sample);
-        self.over_budget = if self.over_budget {
-            cost >= exit
-        } else {
-            cost > enter
-        };
+        self.over_budget = exceeds(self.over_budget, cost, budget);
+        let replay_cost = plan.map_or(0, |plan| {
+            plan.estimate_samples(range.clone())
+                .saturating_mul(elements_per_sample)
+        });
+        self.replay_over_budget = exceeds(self.replay_over_budget, replay_cost, budget);
         if !self.over_budget {
             self.selected = None;
             return;
@@ -100,6 +115,17 @@ impl LodTracking {
             }
         }
         self.selected = selected;
+    }
+}
+
+/// Whether `cost` is over `budget`, with hysteresis so panning near the
+/// boundary doesn't flap: crossing up takes 25% over, crossing back 20%
+/// under.
+fn exceeds(was: bool, cost: u64, budget: u64) -> bool {
+    if was {
+        cost >= budget * 4 / 5
+    } else {
+        cost > budget + budget / 4
     }
 }
 
@@ -164,19 +190,25 @@ impl GapCollector {
                 && gap.state == metor_db::manifest::SpanState::RemoteOnly
                 && let Some(hydrator) = &self.hydrator
             {
-                hydrator.request(hydrate_id, gap.range.clone());
+                hydrator.request(hydrate_id, gap.range.clone(), HydratePriority::Visible, cx);
             }
             band(&gap.range);
         }
         // What an expression has never computed is a gap of the other kind:
         // nothing to fetch, something to compute. Always against the raw
-        // series — a LoD level is derived from it afterwards.
+        // series — a LoD level is derived from it afterwards. Too wide to
+        // replay, it is only shown: zooming in brings it under budget.
         let history = crate::data_binding::BoundHistory {
             component: component.clone(),
             plan: plan.clone(),
         };
-        for range in history.request_replay(self.visible.clone(), cx) {
-            band(&range);
+        let uncomputed = if lod.replay_over_budget() {
+            history.uncomputed(self.visible.clone())
+        } else {
+            history.request_replay(self.visible.clone(), cx)
+        };
+        for range in &uncomputed {
+            band(range);
         }
     }
 

@@ -16,8 +16,8 @@ mod offload;
 
 pub use db::{MirrorEvent, RemoteDb};
 pub use fsw::fsw_stream;
-pub use hydrate::Hydrator;
 pub use hydrate::hydrate_span;
+pub use hydrate::{HydratePriority, Hydrator, REQUEST_TTL};
 pub use metor_proto_stellar::{Peer, identify};
 pub use offload::offload_span;
 

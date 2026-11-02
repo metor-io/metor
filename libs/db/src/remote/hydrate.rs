@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     ops::Range,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,9 +16,16 @@ use crate::{
     time_series::TimeSeries,
 };
 
-/// Most recent gap requests we keep; render loops re-request visible gaps
-/// every frame, so dropped entries are re-discovered immediately.
+/// Most requests waiting at once; past this the least important, oldest one
+/// is dropped. Render loops re-request visible gaps every frame, so dropped
+/// entries are re-discovered immediately.
 const QUEUE_CAP: usize = 64;
+
+/// How long a waiting request lives without being asked for again. Views
+/// re-request what they still need every frame, so a request that has gone
+/// quiet this long is for a position the user has left — serving it would
+/// only delay the one they moved to.
+pub const REQUEST_TTL: Duration = Duration::from_secs(1);
 
 /// First retry delay after a span fails to hydrate; doubles per attempt.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -86,8 +93,99 @@ pub async fn hydrate_span(
     }
 }
 
+/// How urgently a view needs a range, highest first. The worker always
+/// serves the most urgent waiting request, so a scrubbed value never queues
+/// behind a plot window or read-ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HydratePriority {
+    /// Read-ahead for playback: wanted soon, not shown yet.
+    Prefetch,
+    /// A window on screen: plot ranges and their gap bands.
+    Visible,
+    /// The instant a value view shows right now.
+    Selected,
+}
+
+struct Request {
+    component_id: ComponentId,
+    range: Range<Timestamp>,
+    priority: HydratePriority,
+    /// Order of the latest ask; newer wins within a priority.
+    seq: u64,
+    asked: Instant,
+}
+
+/// The waiting requests: the most urgent, most recently asked first, and
+/// anything not re-asked within [`REQUEST_TTL`] forgotten. Kept apart from
+/// the worker so the ordering is testable without a store.
+#[derive(Default)]
+struct Queue {
+    waiting: Vec<Request>,
+    seq: u64,
+}
+
+impl Queue {
+    /// Add or refresh a request. A repeat keeps one entry, taking the newer
+    /// ask and the higher of the two priorities.
+    fn push(
+        &mut self,
+        component_id: ComponentId,
+        range: Range<Timestamp>,
+        priority: HydratePriority,
+        now: Instant,
+    ) {
+        self.seq += 1;
+        let seq = self.seq;
+        if let Some(existing) = self
+            .waiting
+            .iter_mut()
+            .find(|r| r.component_id == component_id && r.range == range)
+        {
+            existing.priority = existing.priority.max(priority);
+            existing.seq = seq;
+            existing.asked = now;
+            return;
+        }
+        if self.waiting.len() >= QUEUE_CAP
+            && let Some(least) = self.least_important()
+        {
+            self.waiting.swap_remove(least);
+        }
+        self.waiting.push(Request {
+            component_id,
+            range,
+            priority,
+            seq,
+            asked: now,
+        });
+    }
+
+    /// Take the request to serve next, dropping any that expired.
+    fn pop(&mut self, now: Instant) -> Option<(ComponentId, Range<Timestamp>)> {
+        self.waiting
+            .retain(|r| now.saturating_duration_since(r.asked) < REQUEST_TTL);
+        let next = self
+            .waiting
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, r)| (r.priority, r.seq))
+            .map(|(i, _)| i)?;
+        let request = self.waiting.swap_remove(next);
+        Some((request.component_id, request.range))
+    }
+
+    fn least_important(&self) -> Option<usize> {
+        self.waiting
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, r)| (r.priority, r.seq))
+            .map(|(i, _)| i)
+    }
+}
+
 /// Demand-driven fetcher for remote-only history. Frame loops call
-/// [`Self::request`] — non-blocking, lossy, newest-wins — and the
+/// [`Self::request`] — non-blocking, lossy, most urgent and newest first,
+/// forgetting what stops being asked for — and the
 /// [`Self::run`] task downloads, verifies, and installs nodes, waking the
 /// component's data waker so views repaint as spans land.
 #[derive(Clone)]
@@ -102,7 +200,7 @@ impl Default for Hydrator {
 }
 
 struct HydratorInner {
-    queue: std::sync::Mutex<VecDeque<(ComponentId, Range<Timestamp>)>>,
+    queue: std::sync::Mutex<Queue>,
     backoff: std::sync::Mutex<HashMap<(ComponentId, Timestamp), Backoff>>,
     waker: WaitQueue,
 }
@@ -111,7 +209,7 @@ impl Hydrator {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(HydratorInner {
-                queue: std::sync::Mutex::new(VecDeque::new()),
+                queue: std::sync::Mutex::new(Queue::default()),
                 backoff: std::sync::Mutex::new(HashMap::new()),
                 waker: WaitQueue::new(),
             }),
@@ -153,32 +251,37 @@ impl Hydrator {
     }
 
     /// Ask for `range` of `component_id` to become resident. Never blocks
-    /// and never allocates beyond the bounded queue; when the queue is
-    /// full the oldest request is dropped — the newest view wins.
-    pub fn request(&self, component_id: ComponentId, range: Range<Timestamp>) {
-        let mut queue = self.inner.queue.lock().unwrap();
-        if queue
-            .iter()
-            .any(|(id, r)| *id == component_id && *r == range)
-        {
-            return;
-        }
-        if queue.len() >= QUEUE_CAP {
-            queue.pop_front();
-        }
-        queue.push_back((component_id, range));
-        drop(queue);
+    /// and never allocates beyond the bounded queue. A request lives for
+    /// [`REQUEST_TTL`] unless asked again, so callers repeat it for as long
+    /// as they still need it.
+    pub fn request(
+        &self,
+        component_id: ComponentId,
+        range: Range<Timestamp>,
+        priority: HydratePriority,
+    ) {
+        self.inner
+            .queue
+            .lock()
+            .unwrap()
+            .push(component_id, range, priority, Instant::now());
         // wake() stores a wakeup if it lands while run() is between its
         // queue pop and wait(); one stored wakeup suffices because the
         // single consumer drains the whole queue before re-waiting.
         self.inner.waker.wake();
     }
 
+    /// Whether requests are waiting behind the one being served — the
+    /// signal for callers that only re-request when they repaint to repaint.
+    pub fn backlogged(&self) -> bool {
+        !self.inner.queue.lock().unwrap().waiting.is_empty()
+    }
+
     /// Serve requests until the runtime shuts down. Spawn once per DB
     /// with the store hydration should pull from.
     pub async fn run(self, db: Arc<DB>, store: Arc<dyn NodeStore>) {
         loop {
-            let next = self.inner.queue.lock().unwrap().pop_front();
+            let next = self.inner.queue.lock().unwrap().pop(Instant::now());
             let Some((component_id, range)) = next else {
                 let _ = self.inner.waker.wait().await;
                 continue;
@@ -247,5 +350,86 @@ impl Hydrator {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(start: i64) -> Range<Timestamp> {
+        Timestamp(start)..Timestamp(start + 10)
+    }
+
+    fn drain(queue: &mut Queue, now: Instant) -> Vec<(ComponentId, Range<Timestamp>)> {
+        std::iter::from_fn(|| queue.pop(now)).collect()
+    }
+
+    #[test]
+    fn serves_most_urgent_then_newest() {
+        let mut queue = Queue::default();
+        let now = Instant::now();
+        let id = ComponentId(1);
+        queue.push(id, range(0), HydratePriority::Prefetch, now);
+        queue.push(id, range(10), HydratePriority::Visible, now);
+        queue.push(id, range(20), HydratePriority::Selected, now);
+        queue.push(id, range(30), HydratePriority::Visible, now);
+        queue.push(id, range(40), HydratePriority::Selected, now);
+        let order: Vec<_> = drain(&mut queue, now)
+            .into_iter()
+            .map(|(_, r)| r.start.0)
+            .collect();
+        assert_eq!(order, [40, 20, 30, 10, 0]);
+    }
+
+    #[test]
+    fn repeat_refreshes_and_raises() {
+        let mut queue = Queue::default();
+        let now = Instant::now();
+        let id = ComponentId(1);
+        queue.push(id, range(0), HydratePriority::Visible, now);
+        queue.push(id, range(10), HydratePriority::Visible, now);
+        // Asked again: newest within its priority, and never lowered.
+        queue.push(id, range(0), HydratePriority::Visible, now);
+        assert_eq!(queue.waiting.len(), 2);
+        assert_eq!(queue.pop(now).map(|(_, r)| r.start.0), Some(0));
+        queue.push(id, range(20), HydratePriority::Selected, now);
+        queue.push(id, range(20), HydratePriority::Prefetch, now);
+        queue.push(id, range(30), HydratePriority::Visible, now);
+        assert_eq!(queue.pop(now).map(|(_, r)| r.start.0), Some(20));
+    }
+
+    #[test]
+    fn unrepeated_requests_expire() {
+        let mut queue = Queue::default();
+        let start = Instant::now();
+        let id = ComponentId(1);
+        queue.push(id, range(0), HydratePriority::Selected, start);
+        queue.push(id, range(10), HydratePriority::Visible, start);
+        let later = start + REQUEST_TTL / 2;
+        queue.push(id, range(10), HydratePriority::Visible, later);
+        // range(0) went quiet a full TTL ago; range(10) was asked again.
+        let expired = start + REQUEST_TTL;
+        assert_eq!(
+            drain(&mut queue, expired),
+            [(id, range(10))],
+            "only the refreshed request survives"
+        );
+    }
+
+    #[test]
+    fn full_queue_drops_least_important() {
+        let mut queue = Queue::default();
+        let now = Instant::now();
+        let id = ComponentId(1);
+        queue.push(id, range(-10), HydratePriority::Prefetch, now);
+        for i in 0..QUEUE_CAP as i64 - 1 {
+            queue.push(id, range(i * 10), HydratePriority::Visible, now);
+        }
+        queue.push(id, range(10_000), HydratePriority::Selected, now);
+        assert_eq!(queue.waiting.len(), QUEUE_CAP);
+        let served = drain(&mut queue, now);
+        assert_eq!(served.first().map(|(_, r)| r.start.0), Some(10_000));
+        assert!(served.iter().all(|(_, r)| r.start.0 != -10));
     }
 }

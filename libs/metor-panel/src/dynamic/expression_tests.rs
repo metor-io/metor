@@ -1327,6 +1327,97 @@ fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::Te
     assert_eq!(reloaded.ports[0].component_id, source);
 }
 
+/// A plot too wide to replay must not pull its expression's inputs: the
+/// output it never computed costs nothing by its own estimate, so the gate
+/// weighs the inputs. Over budget the window only shows what's uncomputed;
+/// zoomed in under budget, the same window is computed.
+#[gpui::test]
+fn a_window_too_wide_to_replay_shows_its_gap_without_computing(cx: &mut gpui::TestAppContext) {
+    use crate::backfill::Backfiller;
+    use crate::data_binding::BoundHistory;
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::views::plot_common::lod::{GapCollector, LodTracking};
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = ComponentId::new("rpm");
+    let input = db.with_state(|s| s.get_component(source).cloned()).unwrap();
+    let recorded: Vec<(Timestamp, [u8; 8])> = (1..=50i64)
+        .map(|ts| (Timestamp(ts), (ts as f64).to_le_bytes()))
+        .collect();
+    input
+        .time_series
+        .install_samples(
+            8,
+            recorded.iter().map(|(ts, bytes)| (*ts, bytes.as_slice())),
+            metor_db::manifest::SpanSource::LocalIngest,
+        )
+        .unwrap();
+
+    let published = expression_target(&db, "rpm * 2.0", source);
+    let (_bound, plan) = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        Backfiller::init(db.clone(), cx);
+        let bound = expressions::bind("=rpm * 2.0", &db, cx).expect("the expression compiles");
+        let plan =
+            expressions::replay_plan(published, &db, cx).expect("a running expression has a plan");
+        (bound, plan)
+    });
+    let output = db
+        .with_state(|s| s.get_component(published).cloned())
+        .unwrap();
+    wait_for_latest(&output, 50);
+    let window = Timestamp(1)..Timestamp(51);
+    let history = BoundHistory {
+        component: output.clone(),
+        plan: Some(plan.clone()),
+    };
+    assert_eq!(history.replay_cost(window.clone()), 50);
+    let computed = || {
+        output
+            .time_series
+            .estimate_samples(Timestamp(1)..Timestamp(50))
+    };
+
+    let mut lod = LodTracking::default();
+    let gap_bands = |lod: &LodTracking, cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let mut gaps = GapCollector::new(1.0, 51.0, cx);
+            gaps.add(&output, published, lod, &Some(plan.clone()), cx);
+            gaps.bands()
+        })
+    };
+
+    lod.select(&db, published, &output, Some(&plan), window.clone(), 10, 1);
+    assert!(!lod.over_budget(), "the output alone looks cheap");
+    assert!(lod.replay_over_budget(), "its inputs don't");
+    let bands = gap_bands(&lod, cx);
+    assert_eq!(bands.len(), 1, "the uncomputed stretch still shows");
+    assert_eq!(bands[0].0, 0.0);
+    assert!((bands[0].1 - 49.0 / 50.0).abs() < 1e-6, "{bands:?}");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(computed(), 0, "nothing was asked to compute it");
+
+    lod.select(&db, published, &output, Some(&plan), window, 1_000, 1);
+    assert!(!lod.replay_over_budget());
+    gap_bands(&lod, cx);
+    for _ in 0..400 {
+        if computed() == 49 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(computed(), 49, "under budget the window is computed");
+
+    let backfiller = cx.update(|cx| crate::backfill::backfiller(cx)).unwrap();
+    backfiller.stop();
+    backfiller.join().unwrap();
+}
+
 /// Wait for the persist task to land `component`'s sample at `at`.
 fn wait_for_latest(component: &metor_db::Component, at: i64) {
     use metor_proto::types::Timestamp;

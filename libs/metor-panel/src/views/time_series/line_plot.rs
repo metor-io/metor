@@ -340,6 +340,7 @@ impl LinePlot {
                 &self.db,
                 cfg.source.id(),
                 component,
+                tracking.plan.as_ref(),
                 range.clone(),
                 RAW_SAMPLE_BUDGET,
                 1,
