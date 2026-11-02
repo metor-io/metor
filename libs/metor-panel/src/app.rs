@@ -1257,6 +1257,7 @@ pub struct PanelApp {
     themes: Vec<crate::theme::Theme>,
     default_theme: Option<SharedString>,
     splash_logo: Option<crate::connections::logo::SplashLogoBuilder>,
+    eviction: crate::eviction::Eviction,
 }
 
 impl PanelApp {
@@ -1290,6 +1291,7 @@ impl PanelApp {
             themes: Vec::new(),
             default_theme: None,
             splash_logo: None,
+            eviction: crate::eviction::Eviction::default(),
         }
     }
 
@@ -1495,6 +1497,16 @@ impl PanelApp {
         self
     }
 
+    /// What a temporary session does with mirrored history nobody is
+    /// reading: by default, keep the working set and evict the rest a few
+    /// seconds after views stop reading it, since the peer can serve it
+    /// again (see [`crate::eviction`]). A recording, or a database passed
+    /// to [`new`](PanelApp::new), never evicts.
+    pub fn eviction(mut self, eviction: crate::eviction::Eviction) -> Self {
+        self.eviction = eviction;
+        self
+    }
+
     /// Show `logo` on the startup screen in place of the metor logo. It is
     /// built again every frame, like any element, and fills the top of the
     /// screen's sidebar.
@@ -1623,6 +1635,7 @@ impl PanelApp {
             themes: _,
             default_theme: _,
             splash_logo: _,
+            eviction,
         } = self;
 
         let db = db.expect("session selected before DB services start");
@@ -1650,6 +1663,7 @@ impl PanelApp {
         edits::init(cx);
         crate::temporal::TemporalController::init(db.clone(), cx);
         ItemRegistry::init(cx);
+        let temporary = session.as_ref().is_some_and(|s| s.is_temporary());
         crate::session::init(session, db.clone(), open_handler, cx);
         crate::temporal::picker::register(cx);
         crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
@@ -1725,6 +1739,9 @@ impl PanelApp {
             }
             register_connection_commands(cx);
             register_inspector_command(cx);
+            if temporary {
+                crate::eviction::spawn(db.clone(), eviction, cx);
+            }
         }
 
         // Inspector requests route to the window they were made in:

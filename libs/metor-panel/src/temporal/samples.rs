@@ -85,6 +85,19 @@ pub(crate) struct SelectedReader {
     _query: gpui::Task<()>,
 }
 
+/// Have every live reader mark the history it shows as read. Readers touch
+/// as they refresh, but a paused clock doesn't refresh them; the evictor
+/// calls this before purging so a value view's instant survives however
+/// long it sits still.
+pub(crate) fn touch_selected(now: Instant, cx: &App) {
+    let Some(readers) = cx.try_global::<Readers>() else {
+        return;
+    };
+    for reader in readers.0.values().filter_map(|r| r.upgrade()) {
+        reader.read(cx).touch(now, cx);
+    }
+}
+
 pub(crate) fn acquire(db: Arc<DB>, id: ComponentId, cx: &mut App) -> Entity<SelectedReader> {
     let key = (Arc::as_ptr(&db) as usize, id);
     if let Some(existing) = cx
@@ -200,6 +213,21 @@ pub(crate) fn acquire(db: Arc<DB>, id: ComponentId, cx: &mut App) -> Entity<Sele
 }
 
 impl SelectedReader {
+    /// Mark what this reader reads as in use: the span holding the selected
+    /// instant's predecessor, and while playing, the read-ahead window the
+    /// prefetch below fills.
+    fn touch(&self, now: Instant, cx: &App) {
+        let (Some(component), Some(t)) = (&self.component, super::view_time(cx)) else {
+            return;
+        };
+        let series = &component.time_series;
+        if super::snapshot(cx).is_some_and(|s| s.playing) {
+            series.touch(t..read_ahead(t, cx), now);
+        } else {
+            series.touch(t..Timestamp(t.0.saturating_add(1)), now);
+        }
+    }
+
     fn publish(
         &mut self,
         sample: Option<SelectedSample>,
@@ -272,13 +300,13 @@ impl SelectedReader {
                 .as_ref()
                 .is_some_and(|(key, _)| key.tree == tree);
         let manifest = component.time_series.manifest().generation;
+        self.touch(Instant::now(), cx);
         // Prefetch at most the next sealed span in one second of forward play.
         // The hydrator owns deduplication and its bounded request queue.
         if super::snapshot(cx).is_some_and(|s| s.playing)
             && let Some(hydrator) = crate::hydration::hydrator(cx)
         {
-            let horizon =
-                t.0.saturating_add((super::config(cx).rate * 1_000_000.0) as i64);
+            let horizon = read_ahead(t, cx).0;
             if let Some(span) = component.time_series.manifest().spans.iter().find(|s| {
                 s.state == SpanState::RemoteOnly
                     && s.cover_start.0 > t.0
@@ -491,6 +519,11 @@ impl SelectedReader {
             .as_ref()
             .and_then(|(_, text)| text.as_deref())
     }
+}
+
+/// The end of playback's read-ahead from `t`: one second of forward play.
+fn read_ahead(t: Timestamp, cx: &App) -> Timestamp {
+    Timestamp(t.0.saturating_add((super::config(cx).rate * 1_000_000.0) as i64))
 }
 
 /// How long a failed query waits before it is asked again.

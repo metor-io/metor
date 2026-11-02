@@ -412,12 +412,18 @@ impl BoundHistory {
     }
 }
 
+/// Ask the connected peers for `range`'s remote-only stretches, and mark the
+/// range read: what a view keeps asking for stays out of
+/// [`eviction`](crate::eviction).
 pub(crate) fn hydrate(
     component: &metor_db::Component,
     range: std::ops::Range<metor_proto::types::Timestamp>,
     priority: HydratePriority,
     cx: &App,
 ) {
+    component
+        .time_series
+        .touch(range.clone(), std::time::Instant::now());
     if let Some(hydrator) = crate::hydration::hydrator(cx) {
         let mut gaps = metor_db::manifest::GapVec::new();
         component.time_series.coverage(range, &mut gaps);
