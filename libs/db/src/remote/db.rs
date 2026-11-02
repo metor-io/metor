@@ -346,6 +346,208 @@ mod tests {
         }
         assert_eq!(source(&server_db), Some(false));
     }
+
+    /// Polls `check` every 20 ms until it holds, failing after ten seconds.
+    async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if check() {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("never saw {what}");
+    }
+
+    /// One mirror session into `id`'s peer cache, on a runtime of its own
+    /// so cancelling it ends the session: its tasks stop, and the cache's
+    /// lock is released. Hands back the db, whether the cache was fresh,
+    /// and the session's hydrator.
+    fn cached_session(
+        cache: crate::peer_cache::PeerCache,
+        id: metor_proto_wkt::InstanceId,
+        addr: SocketAddr,
+        cancel: stellarator::util::CancelToken,
+    ) -> (
+        std::sync::mpsc::Receiver<(Arc<DB>, bool, Hydrator)>,
+        stellarator::struc_con::Thread<Option<()>>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = stellarator::struc_con::ThreadBuilder::default()
+            .cancel_token(cancel)
+            .stellar(move || async move {
+                let mut cached = cache.open(id).unwrap().expect("cache is free");
+                let db = Arc::new(cached.open_db().unwrap());
+                let remote = RemoteDb::new(addr);
+                // Handed out before the mirror starts, so the caller sees
+                // the db as the session opened it.
+                tx.send((db.clone(), cached.fresh, remote.hydrator()))
+                    .unwrap();
+                remote.spawn(db);
+                let _held = cached;
+                std::future::pending::<()>().await
+            });
+        (rx, thread)
+    }
+
+    async fn recv<T>(rx: &std::sync::mpsc::Receiver<T>) -> T {
+        loop {
+            match rx.try_recv() {
+                Ok(value) => return value,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    stellarator::sleep(Duration::from_millis(10)).await
+                }
+                Err(err) => panic!("session thread ended: {err}"),
+            }
+        }
+    }
+
+    /// A mirror kept in the peer cache picks up where it left off: what the
+    /// first session held and the manifests it seeded are there the moment
+    /// the second opens, its live data lands in new nodes, and what the
+    /// peer wrote between the sessions hydrates from the peer.
+    #[stellarator::test]
+    async fn a_reopened_peer_cache_resumes_and_fetches_the_gap() {
+        use crate::manifest::SpanState;
+        use metor_proto::types::PrimType;
+        use metor_proto::vtable::builder::{
+            component, raw_field, raw_table, schema, timestamp, vtable,
+        };
+        use stellarator::struc_con::Joinable as _;
+
+        const ID: metor_proto::types::PacketId = [9, 3];
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
+        peer.insert_vtable(metor_proto_wkt::VTableMsg {
+            id: ID,
+            vtable: vtable([raw_field(
+                8,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
+            )]),
+        })
+        .unwrap();
+        let write = |ts: i64| {
+            let mut table = ts.to_le_bytes().to_vec();
+            table.extend_from_slice(&(ts as f64).to_le_bytes());
+            peer.ingest_table(ID, &table).unwrap();
+        };
+        let a = ComponentId::new("a");
+        let series = |db: &DB| db.with_state(|s| s.get_component(a).map(|c| c.time_series.clone()));
+        let latest =
+            |db: &DB| series(db).and_then(|ts| ts.latest().map(|sample| sample.timestamp().0));
+        // Small peer nodes, so history seals (and so can be seeded and
+        // fetched) a hundred samples at a time.
+        write(0);
+        series(&peer)
+            .unwrap()
+            .set_max_node_age(Duration::from_micros(100));
+        for ts in 1..250 {
+            write(ts);
+            if ts % 50 == 0 {
+                stellarator::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let sealed = |db: &DB| series(db).map_or(0, |ts| ts.manifest().spans.len());
+        eventually("the peer sealing its history", || sealed(&peer) >= 2).await;
+
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::Server {
+            listener,
+            db: peer.clone(),
+        };
+        let _server = stellarator::struc_con::stellar(move || server.run());
+        let cache = crate::peer_cache::PeerCache::new(dir.path().join("peers"));
+        let id = peer.instance_id();
+
+        // Session one: seed the peer's manifests and watch live data.
+        let cancel = stellarator::util::CancelToken::new();
+        let (rx, session) = cached_session(cache.clone(), id, addr, cancel.clone());
+        let (mirror, fresh, _) = recv(&rx).await;
+        assert!(fresh);
+        let mut ts = 250;
+        eventually("the mirror seeding manifests and ingesting live", || {
+            write(ts);
+            ts += 1;
+            latest(&mirror).is_some_and(|l| l >= 250) && sealed(&mirror) >= 2
+        })
+        .await;
+        let seeded = sealed(&mirror);
+        cancel.cancel();
+        let _ = session.join().await;
+        mirror.flush().unwrap();
+        let held = latest(&mirror).unwrap();
+        drop(mirror);
+
+        // Between sessions the peer keeps writing.
+        let gap_start = ts;
+        for t in gap_start..gap_start + 700 {
+            write(t);
+            if t % 50 == 0 {
+                stellarator::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let resume = gap_start + 700;
+        eventually("the peer sealing the gap", || {
+            series(&peer)
+                .unwrap()
+                .manifest()
+                .spans
+                .iter()
+                .any(|s| s.seal.start_ts.0 > gap_start + 100 && s.seal.end_ts.0 < resume - 100)
+        })
+        .await;
+        let gap = *series(&peer)
+            .unwrap()
+            .manifest()
+            .spans
+            .iter()
+            .find(|s| s.seal.start_ts.0 > gap_start + 100 && s.seal.end_ts.0 < resume - 100)
+            .unwrap();
+
+        // Session two: the same directory, with everything already there.
+        let cancel = stellarator::util::CancelToken::new();
+        let (rx, session) = cached_session(cache.clone(), id, addr, cancel.clone());
+        let (mirror, fresh, hydrator) = recv(&rx).await;
+        assert!(!fresh, "the cache is reopened");
+        assert_eq!(latest(&mirror), Some(held), "what session one held");
+        assert!(sealed(&mirror) >= seeded, "and the manifests it seeded");
+
+        let mut ts = resume;
+        eventually("live data in a new node", || {
+            write(ts);
+            ts += 1;
+            series(&mirror)
+                .and_then(|s| {
+                    s.list
+                        .iter()
+                        .next()
+                        .and_then(|n| n.timestamps().first().copied())
+                })
+                .is_some_and(|head| head.0 > held)
+        })
+        .await;
+
+        let gap_state = || {
+            series(&mirror).and_then(|s| s.manifest().span(gap.cover_start).map(|span| span.state))
+        };
+        eventually("the gap seeded as remote-only", || {
+            gap_state() == Some(SpanState::RemoteOnly)
+        })
+        .await;
+        let range = gap.seal.start_ts..Timestamp(gap.seal.end_ts.0 + 1);
+        eventually("the gap hydrating from the peer", || {
+            hydrator.request(a, range.clone(), super::super::HydratePriority::Visible);
+            series(&mirror).is_some_and(|s| {
+                s.manifest()
+                    .span(gap.cover_start)
+                    .is_some_and(|span| span.state == SpanState::Resident)
+            })
+        })
+        .await;
+        cancel.cancel();
+        let _ = session.join().await;
+    }
 }
 
 /// Import the peer's sealed-node manifest for every component it knows,
