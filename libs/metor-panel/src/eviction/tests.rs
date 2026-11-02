@@ -161,3 +161,39 @@ fn a_plot_keeps_what_it_draws(cx: &mut gpui::TestAppContext) {
     assert!(resident(&coarse, 0));
     assert!(!any_idle(&db, Instant::now(), GRACE));
 }
+
+/// Over a budget the least recently read goes first, until the rest fits;
+/// the coarsest level neither goes nor counts.
+#[test]
+fn a_budget_keeps_the_most_recently_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = DB::create(temp.path().join("db")).unwrap();
+    let rpm = component(&db, "rpm", &[], &[]);
+    hydrate(&rpm, 0..1000);
+    hydrate(&rpm, 1000..2000);
+    let fine = level(&db, &rpm, 64);
+    let coarse = level(&db, &rpm, 1024);
+    let span = rpm
+        .time_series
+        .manifest()
+        .span(Timestamp(0))
+        .unwrap()
+        .bytes();
+    // Read after everything was created, but long enough ago that the
+    // grace period no longer shields it.
+    let later = Instant::now() + evict::DEFAULT_GRACE * 4;
+    rpm.time_series.touch(
+        Timestamp(1000)..Timestamp(2000),
+        later - evict::DEFAULT_GRACE * 2,
+    );
+
+    assert!(!over_budget(&db, u64::MAX));
+    assert!(over_budget(&db, span));
+    let evicted = trim(&db, later, span);
+    assert_eq!(evicted.spans, 2, "the unread raw span and the fine level");
+    assert!(!resident(&rpm, 0));
+    assert!(!resident(&fine, 0));
+    assert!(resident(&rpm, 1000), "the most recently read fits");
+    assert!(resident(&coarse, 0), "the coarsest level stays");
+    assert!(!over_budget(&db, span));
+}

@@ -240,6 +240,32 @@ pub fn sweep(
     total
 }
 
+/// Whether the bytes [`budget`] counts exceed `max_bytes`, so a driver can
+/// ask readers to touch what they show before a pass, as with [`any_idle`],
+/// only when one would purge.
+pub fn over_budget(
+    db: &DB,
+    max_bytes: u64,
+    mut evictable: impl FnMut(ComponentId, &NodeSpan) -> bool,
+) -> bool {
+    if !SUPPORTED {
+        return false;
+    }
+    let mut total = 0u64;
+    for component in components(db) {
+        let id = component.component_id;
+        evictable_spans(
+            &component.time_series,
+            &mut |span| evictable(id, span),
+            |_, span| total += span.bytes(),
+        );
+        if total > max_bytes {
+            return true;
+        }
+    }
+    false
+}
+
 /// Purge `db`'s least recently touched evictable spans until the evictable
 /// bytes left fit in `max_bytes`.
 ///
@@ -581,6 +607,8 @@ mod tests {
         let now = later(GRACE * 4);
         // The span at 0 is exempt, so only the other counts: it fits.
         let not_first = |_: ComponentId, span: &NodeSpan| span.cover_start != Timestamp(0);
+        assert!(!over_budget(&db, span, not_first));
+        assert!(over_budget(&db, span, |_, _| true));
         assert_eq!(budget(&db, now, span, GRACE, not_first).spans, 0);
         assert_eq!(budget(&db, now, 0, GRACE, not_first).spans, 1);
         assert_eq!(state(&series, 0), Some(SpanState::Resident));
