@@ -55,6 +55,7 @@ mod arc_ring;
 mod arrow;
 pub mod disruptor;
 mod error;
+pub mod evict;
 pub mod lod;
 pub mod manifest;
 pub mod msg_log;

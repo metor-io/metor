@@ -276,10 +276,7 @@ impl NodeStaging {
     }
 
     fn node(&self) -> TimeSeriesNode {
-        TimeSeriesNode {
-            index: self.index.clone(),
-            data: self.data.clone(),
-        }
+        TimeSeriesNode::from_logs(self.index.clone(), self.data.clone())
     }
 
     /// Verify the staged bytes against `seal` and promote the directory
