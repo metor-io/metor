@@ -689,8 +689,8 @@ impl TimeSeries {
     /// still records around every one of its samples. The live head
     /// belongs to the writer and never qualifies.
     ///
-    /// An acked span flips to remote-only under its own seal. A mirrored
-    /// span leaves the manifest, and the remote seals over its range are
+    /// An acked span flips to remote-only under its own seal. An unacked
+    /// mirrored span leaves the manifest, and the remote seals over its range are
     /// re-derived to cover it, so it reads as fetchable at once.
     ///
     /// Ordering is crash-safe: the manifest changes durably first, then
@@ -714,7 +714,7 @@ impl TimeSeries {
         else {
             return Ok(false);
         };
-        let mirrored = span.source == SpanSource::Mirrored;
+        let mirrored = !span.acked && span.source == SpanSource::Mirrored;
         if !span.acked && !(mirrored && remote_holds(&manifest, node.timestamps())) {
             return Ok(false);
         }
