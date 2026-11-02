@@ -47,34 +47,17 @@ use metor_proto::types::ComponentId;
 
 use crate::connections::ConnectionStatus;
 
-/// How long history may go unread before it is evicted.
-pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+pub use metor_db::evict::Eviction;
+
 /// How often the evictor looks for idle history.
 const TICK: Duration = Duration::from_secs(1);
 /// How long the pre-purge repaint gets to land, so views that are on screen
 /// but idle have touched what they show.
 const SETTLE: Duration = Duration::from_millis(250);
 
-/// What the panel does with history it holds but nobody is reading. Set with
-/// [`PanelApp::eviction`](crate::PanelApp::eviction).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Eviction {
-    /// Keep only what views have read within `grace`, as long as a peer
-    /// can serve the rest again.
-    WorkingSet { grace: Duration },
-    /// Keep everything that arrives for the life of the session.
-    Off,
-}
-
-impl Default for Eviction {
-    fn default() -> Self {
-        Self::WorkingSet {
-            grace: DEFAULT_GRACE,
-        }
-    }
-}
-
 /// Start the evictor for `db` under `eviction`. Runs until the app quits.
+/// Only the working set is driven here so far; a byte budget keeps
+/// everything, like [`Eviction::Off`].
 pub(crate) fn spawn(db: Arc<DB>, eviction: Eviction, cx: &mut App) {
     let Eviction::WorkingSet { grace } = eviction else {
         return;
