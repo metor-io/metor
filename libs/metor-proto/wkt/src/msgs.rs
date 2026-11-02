@@ -1057,6 +1057,64 @@ pub struct DbInfoResp {
     /// alone can't say: they end at the last seal, possibly long ago.
     /// Added in version 5.
     pub last_updated: Option<Timestamp>,
+    /// Which database answered, stable across the server's restarts. A
+    /// mirror keys its on-disk cache of this peer by it. `None` from a
+    /// server that predates it. Added in version 5.
+    pub instance_id: Option<InstanceId>,
+    /// The server deletes its database when it stops, so its id is new
+    /// every run and its history goes with it: a mirror shouldn't keep a
+    /// cache it will never reopen, and shouldn't evict history only the
+    /// peer could give back once the peer is gone. Added in version 5.
+    pub ephemeral: bool,
+}
+
+/// A database's identity: random, made when the database is created, and
+/// kept with it for its lifetime.
+///
+/// It says which cached copy of a peer to reopen, not that the copy is
+/// still right: a copied database directory keeps its id, so whoever reuses
+/// a cache still checks sealed spans against the peer's.
+#[derive(
+    Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+pub struct InstanceId(pub [u8; 16]);
+
+impl std::fmt::Display for InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Why a string isn't an [`InstanceId`]: anything but 32 hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidInstanceId;
+
+impl std::fmt::Display for InvalidInstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an instance id is 32 hex digits")
+    }
+}
+
+impl std::error::Error for InvalidInstanceId {}
+
+impl std::str::FromStr for InstanceId {
+    type Err = InvalidInstanceId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.as_bytes();
+        if s.len() != 32 {
+            return Err(InvalidInstanceId);
+        }
+        let mut id = [0u8; 16];
+        let nibble = |c: u8| (c as char).to_digit(16).ok_or(InvalidInstanceId);
+        for (byte, pair) in id.iter_mut().zip(s.chunks_exact(2)) {
+            *byte = (nibble(pair[0])? << 4 | nibble(pair[1])?) as u8;
+        }
+        Ok(InstanceId(id))
+    }
 }
 
 impl<'de> Deserialize<'de> for DbInfoResp {
@@ -1081,6 +1139,8 @@ impl<'de> Deserialize<'de> for DbInfoResp {
                     namespace: fields.since(3)?,
                     commands: fields.since(4)?,
                     last_updated: fields.since(5)?,
+                    instance_id: fields.since(5)?,
+                    ephemeral: fields.since(5)?,
                 })
             }
         }
@@ -1091,6 +1151,8 @@ impl<'de> Deserialize<'de> for DbInfoResp {
             "namespace",
             "commands",
             "last_updated",
+            "instance_id",
+            "ephemeral",
         ];
         deserializer.deserialize_struct("DbInfoResp", FIELDS, Visitor)
     }
@@ -2041,6 +2103,8 @@ mod db_info_tests {
             namespace: Some("sat".into()),
             commands: Vec::new(),
             last_updated: Some(Timestamp(42)),
+            instance_id: Some(InstanceId([7; 16])),
+            ephemeral: true,
         };
         let bytes = postcard::to_allocvec(&v3).expect("encode");
         let v2: DbInfoRespV2 = postcard::from_bytes(&bytes).expect("decode v3 as v2");
@@ -2084,6 +2148,8 @@ mod db_info_tests {
                 namespace: Some("sat".into()),
                 commands: Vec::new(),
                 last_updated: None,
+                instance_id: None,
+                ephemeral: false,
             }
         );
     }
@@ -2094,5 +2160,19 @@ mod db_info_tests {
         let info = postcard::from_bytes::<DbInfoResp>(&bytes).expect("decode v2");
         assert_eq!(info.features, FEATURE_MSG_SYNC);
         assert!(info.command_ids.is_empty() && info.namespace.is_none());
+        assert!(info.instance_id.is_none() && !info.ephemeral);
+    }
+
+    #[test]
+    fn instance_id_round_trips_through_hex() {
+        let id = InstanceId(std::array::from_fn(|i| (i * 17) as u8));
+        let text = id.to_string();
+        assert_eq!(text.len(), 32);
+        assert_eq!(text.parse::<InstanceId>(), Ok(id));
+        assert_eq!(text.to_uppercase().parse::<InstanceId>(), Ok(id));
+        assert!("abc".parse::<InstanceId>().is_err());
+        assert!("zz".repeat(16).parse::<InstanceId>().is_err());
+        assert!("+f".repeat(16).parse::<InstanceId>().is_err());
+        assert!("é".repeat(16).parse::<InstanceId>().is_err());
     }
 }

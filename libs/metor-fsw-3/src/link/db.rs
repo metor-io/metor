@@ -164,6 +164,7 @@ impl Db {
             path: path.display().to_string(),
             message: error.to_string(),
         })?;
+        db.set_ephemeral(params.on_exit() == OnExit::Delete);
         Ok(Self {
             listener: Some(listener),
             db: Arc::new(db),
@@ -673,6 +674,7 @@ mod tests {
         let mut db = Db::new(params(None, None)).expect("a free port");
         let path = db.db.path.clone();
         assert!(path.starts_with(std::env::temp_dir()) && path.is_dir());
+        assert!(db.db.ephemeral(), "advertised as deleted on exit");
         scratch::sweep(SCRATCH_PREFIX);
         assert!(path.is_dir(), "a running db's dir survives a sweep");
         db.finish(&mut Log);
@@ -685,6 +687,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut at_path =
             Db::new(params(Some(dir.path().join("store")), None)).expect("a free port");
+        assert!(!temporary.db.ephemeral() && !at_path.db.ephemeral());
         temporary.finish(&mut Log);
         at_path.finish(&mut Log);
         let kept = temporary.db.path.clone();
