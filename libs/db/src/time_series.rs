@@ -1199,8 +1199,11 @@ impl TimeSeries {
     /// [`Self::merge_remote_spans`] for a peer's complete listing: seals
     /// recorded from the peer earlier that it no longer lists (its own
     /// tiering dropped them) are forgotten, so nothing counts on the peer
-    /// for data it can no longer serve. Seals with a fetch in flight are
-    /// left to that fetch. Returns the number of seals recorded.
+    /// for data it can no longer serve. A node hydrated from a seal the
+    /// listing omits stays resident but loses its ack until the peer lists
+    /// it again, so it is not purged as though the peer could give it back.
+    /// Seals with a fetch in flight are left to that fetch. Returns the
+    /// number of seals recorded.
     pub fn sync_remote_spans(&self, listing: Vec<SealRecord>) -> Result<usize, Error> {
         self.update_remote_spans(listing, true)
     }
@@ -1268,8 +1271,25 @@ impl TimeSeries {
                     })
                     .is_err()
             });
+        // A hydrated node's ack says the peer can give it back. A complete
+        // listing without its seal withdraws that, and listing it again
+        // restores it, so eviction never purges what only this side holds.
+        let reacked: Vec<Timestamp> = manifest
+            .spans
+            .iter()
+            .filter(|s| s.state == SpanState::Resident && s.source == SpanSource::RemoteFetch)
+            .filter(|s| {
+                let held = listed(&s.seal);
+                if s.acked {
+                    complete && !held
+                } else {
+                    held
+                }
+            })
+            .map(|s| s.cover_start)
+            .collect();
         let added: Vec<SealRecord> = seals.iter().filter(|seal| !known(seal)).copied().collect();
-        if added.is_empty() && stale.is_empty() && !stale_settled {
+        if added.is_empty() && stale.is_empty() && !stale_settled && reacked.is_empty() {
             return Ok(0);
         }
         let count = added.len();
@@ -1281,6 +1301,11 @@ impl TimeSeries {
         self.publish_manifest(true, |draft| {
             for seal in &stale {
                 draft.forget(seal);
+            }
+            for span in draft.spans.iter_mut() {
+                if reacked.binary_search(&span.cover_start).is_ok() {
+                    span.acked = !span.acked;
+                }
             }
             if complete {
                 draft.settled.retain(|s| {
