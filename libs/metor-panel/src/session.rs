@@ -2,11 +2,11 @@
 //! only explicitly selected recording directories survive as live DB storage.
 use gpui::App;
 use metor_db::DB;
+use metor_db::scratch::{self, ScratchDir};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
-use tempfile::TempDir;
 
 mod archive;
 mod commands;
@@ -23,8 +23,22 @@ pub(crate) struct SessionStorage {
     directory: StorageDirectory,
     source: Option<PathBuf>,
 }
+/// The temp-dir prefix of a session's own database.
+const SESSION_PREFIX: &str = "metor-panel-";
+/// The temp-dir prefix of an opened recording's working copy.
+const IMPORT_PREFIX: &str = "metor-open-";
+
+/// Removes the temporary session directories that crashed or killed panels
+/// left behind, on a background thread so startup doesn't wait for it.
+pub(crate) fn sweep_stale() {
+    std::thread::spawn(|| {
+        scratch::sweep(SESSION_PREFIX);
+        scratch::sweep(IMPORT_PREFIX);
+    });
+}
+
 enum StorageDirectory {
-    Temporary(TempDir),
+    Temporary(ScratchDir),
     Recording { path: PathBuf, _lock: File },
 }
 impl StorageDirectory {
@@ -51,7 +65,7 @@ struct RecordingManifest {
 }
 impl SessionStorage {
     pub(crate) fn create() -> Result<(Self, Arc<DB>), metor_db::Error> {
-        let directory = tempfile::Builder::new().prefix("metor-panel-").tempdir()?;
+        let directory = ScratchDir::create(SESSION_PREFIX)?;
         let db = Arc::new(DB::create(directory.path().to_owned())?);
         Ok((
             Self {
@@ -121,10 +135,13 @@ impl SessionStorage {
         path: PathBuf,
         cancel: &AtomicBool,
     ) -> io::Result<(Self, Arc<DB>, archive::Imported)> {
-        let directory = tempfile::Builder::new().prefix("metor-open-").tempdir()?;
-        let imported = archive::import(&path, directory.path(), cancel)?;
+        let directory = ScratchDir::create(IMPORT_PREFIX)?;
+        // The import fills an empty directory; the scratch root holds its lock.
+        let bundle = directory.path().join("bundle");
+        fs::create_dir(&bundle)?;
+        let imported = archive::import(&path, &bundle, cancel)?;
         let runtime = ImportRuntime(Default::default());
-        let db_path = directory.path().join("db");
+        let db_path = bundle.join("db");
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         runtime
             .0
@@ -169,13 +186,16 @@ impl SessionStorage {
         );
         match self.directory {
             StorageDirectory::Temporary(directory) => {
-                let path = directory.keep();
-                shutdown
-                    .and_then(|()| fs::remove_dir_all(&path))
-                    .map_err(|error| FinishError {
-                        recovery: path,
-                        error,
-                    })
+                let path = directory.path().to_owned();
+                let removed = match shutdown {
+                    Ok(()) => directory.remove(),
+                    // Kept for recovery: a sweep must not take it either.
+                    Err(error) => directory.keep().and(Err(error)),
+                };
+                removed.map_err(|error| FinishError {
+                    recovery: path,
+                    error,
+                })
             }
             StorageDirectory::Recording { path, _lock } => shutdown
                 .and_then(|()| {

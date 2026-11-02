@@ -80,6 +80,20 @@ fn temporary_sessions_are_isolated_and_removed() {
 }
 
 #[test]
+fn live_and_recovered_temporary_sessions_survive_a_sweep() {
+    let (session, db) = SessionStorage::create().unwrap();
+    let (failed, failed_db) = SessionStorage::create().unwrap();
+    failed
+        .finish(&failed_db, Err(io::Error::other("worker failed")))
+        .unwrap_err();
+    scratch::sweep(SESSION_PREFIX);
+    assert!(db.path.join("db_state").exists());
+    assert!(failed_db.path.join("db_state").exists());
+    session.finish(&db, Ok(())).unwrap();
+    fs::remove_dir_all(&failed_db.path).unwrap();
+}
+
+#[test]
 fn persistent_recording_retains_tail_and_import_never_changes_source() {
     let target = tempfile::tempdir().unwrap();
     let path = target.path().join("recording.metor");
