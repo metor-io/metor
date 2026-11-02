@@ -506,9 +506,11 @@ mod tests {
         assert!(series.get(Timestamp(1100)).is_none());
         let manifest = series.manifest();
         assert!(manifest.shadowed.is_empty());
+        // The late seal's tail was settled by its fetch, so only the
+        // purged stretch comes back.
         assert_eq!(
             gaps(&series, 900..1500),
-            [(1000..1121, 1000), (1130..1210, 1130)]
+            [(1000..1121, 1000), (1130..1201, 1130)]
         );
         let early_span = manifest.span(Timestamp(1000)).unwrap();
         assert!(early_span.is_whole());

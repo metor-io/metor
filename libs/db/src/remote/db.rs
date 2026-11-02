@@ -297,7 +297,6 @@ mod tests {
     /// peer's own ingest of the same component stays local.
     #[stellarator::test]
     async fn mirrored_components_ingest_as_mirrored() {
-        use crate::manifest::SpanSource;
         use metor_proto::types::PrimType;
         use metor_proto::vtable::builder::{
             component, raw_field, raw_table, schema, timestamp, vtable,
@@ -328,19 +327,19 @@ mod tests {
 
         let id = ComponentId::new("a");
         let source = |db: &crate::DB| {
-            db.with_state(|s| s.get_component(id).map(|c| c.time_series.ingest_source()))
+            db.with_state(|s| s.get_component(id).map(|c| c.time_series.is_mirrored()))
         };
         for ts in 1i64.. {
             let mut table = ts.to_le_bytes().to_vec();
             table.extend_from_slice(&1.5f64.to_le_bytes());
             server_db.ingest_table(ID, &table).unwrap();
-            if source(&mirror_db) == Some(SpanSource::Mirrored) {
+            if source(&mirror_db) == Some(true) {
                 break;
             }
             assert!(ts < 100, "mirror never ingested the live stream");
             stellarator::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(source(&server_db), Some(SpanSource::LocalIngest));
+        assert_eq!(source(&server_db), Some(false));
     }
 }
 
@@ -373,7 +372,15 @@ async fn seed_manifests(
                 continue;
             }
         };
+        // An empty listing still matters to a component seeded before: the
+        // peer dropped every seal it had.
+        let existing = db.with_state(|state| state.components.get(&component_id).cloned());
         if seals.is_empty() {
+            if let Some(component) = existing
+                && let Err(err) = component.time_series.sync_remote_spans(seals)
+            {
+                warn!(?err, ?component_id, "failed to sync remote spans");
+            }
             continue;
         }
         let inserted = db.with_state_mut(|state| {
@@ -393,7 +400,7 @@ async fn seed_manifests(
                 Some((min, max)) => Some((min.min(seal.start_ts.0), max.max(seal.end_ts.0))),
                 None => Some((seal.start_ts.0, seal.end_ts.0)),
             });
-        match component.time_series.merge_remote_spans(seals) {
+        match component.time_series.sync_remote_spans(seals) {
             Ok(0) => {}
             Ok(added) => {
                 if let Some((min, max)) = bounds {
