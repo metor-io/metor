@@ -182,7 +182,8 @@ pub(crate) struct Imported {
     pub gaps: Vec<HistoryGap>,
 }
 /// `target` must be a fresh managed temporary directory. Callers remove it on
-/// every failure by retaining their TempDir guard until validation succeeds.
+/// every failure by retaining their scratch directory guard until validation
+/// succeeds.
 pub(super) fn import(source: &Path, target: &Path, cancel: &AtomicBool) -> io::Result<Imported> {
     if fs::read_dir(target)?.next().is_some() {
         return Err(invalid("Import target must be empty"));
@@ -403,7 +404,9 @@ fn copy_directory(
             }
             copy_directory(&entry.path(), &path, target, cancel, count)?;
         } else if kind.is_file() {
-            if name.ends_with(".tmp") {
+            // Staged writes and dot-file sidecars (a scratch DB's owner lock
+            // or keep marker) are not data.
+            if name.starts_with('.') || name.ends_with(".tmp") {
                 continue;
             }
             let kind = classify(&path)

@@ -1570,6 +1570,7 @@ impl PanelApp {
     /// app outlives its last window: closing them all leaves the process in
     /// the dock, and a reopen (dock click) spawns a fresh window.
     pub fn run(mut self) {
+        crate::session::sweep_stale();
         let app = gpui_platform::application().with_assets(crate::icons::IconAssets);
         app.on_reopen(|cx| {
             if crate::workspace::panel_windows(cx).is_empty()
