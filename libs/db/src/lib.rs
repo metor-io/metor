@@ -84,6 +84,41 @@ pub struct DB {
     /// Earliest timestamp known to this instance. Moves backwards when
     /// older history is hydrated from a store.
     pub earliest_timestamp: AtomicCell<Timestamp>,
+    /// This database's identity, advertised in [`DbInfoResp`].
+    instance_id: InstanceId,
+    /// Whether the owner deletes this database when it stops; advertised in
+    /// [`DbInfoResp`] so mirrors don't cache it. See [`DB::set_ephemeral`].
+    ephemeral: AtomicBool,
+}
+
+/// The file in a database directory holding its [`InstanceId`] as hex. It
+/// sits beside `db_state` rather than in it because [`DbConfig`] is a wire
+/// type a client can overwrite with `SetDbConfig`, and identity isn't
+/// something a client gets to set.
+const INSTANCE_ID_FILE: &str = "instance_id";
+
+/// Read `dir`'s instance id, or make and save one for a database that
+/// predates them (or whose file is unreadable).
+fn load_instance_id(dir: &Path) -> Result<InstanceId, Error> {
+    let path = dir.join(INSTANCE_ID_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match text.trim().parse() {
+            Ok(id) => return Ok(id),
+            Err(_) => warn!(?path, "replacing an unreadable instance id"),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    save_new_instance_id(dir)
+}
+
+fn save_new_instance_id(dir: &Path) -> Result<InstanceId, Error> {
+    let id = InstanceId(fastrand::u128(..).to_le_bytes());
+    let path = dir.join(INSTANCE_ID_FILE);
+    let staged = dir.join(format!("{INSTANCE_ID_FILE}.tmp"));
+    std::fs::write(&staged, format!("{id}\n"))?;
+    std::fs::rename(&staged, &path)?;
+    Ok(id)
 }
 
 #[derive(Default)]
@@ -132,6 +167,7 @@ impl DB {
         info!(?path, "created db");
 
         std::fs::create_dir_all(&path)?;
+        let instance_id = save_new_instance_id(&path)?;
         let default_stream_time_step = AtomicU64::new(time_step.as_nanos() as u64);
         let state = State {
             db_config: DbConfig {
@@ -149,6 +185,8 @@ impl DB {
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: AtomicCell::new(Timestamp::now()),
+            instance_id,
+            ephemeral: AtomicBool::new(false),
         };
         db.save_db_state()?;
         Ok(db)
@@ -271,6 +309,7 @@ impl DB {
 
         info!(db.path = ?path, "opened db");
         let db_state = DbConfig::read(path.join("db_state"))?;
+        let instance_id = load_instance_id(&path)?;
         let state = State {
             db_config: db_state.clone(),
             components,
@@ -294,7 +333,27 @@ impl DB {
             ),
             last_updated: AtomicCell::new(Timestamp(last_updated)),
             earliest_timestamp: AtomicCell::new(earliest_timestamp),
+            instance_id,
+            ephemeral: AtomicBool::new(false),
         })
+    }
+
+    /// This database's identity: made by [`DB::create`], kept on disk, and
+    /// the same after every [`DB::open`].
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    /// Whether this database is advertised as deleted when its owner stops.
+    pub fn ephemeral(&self) -> bool {
+        self.ephemeral.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Declare that the owner deletes this database when it stops. The DB
+    /// doesn't delete anything itself; this only tells clients, through
+    /// [`DbInfoResp::ephemeral`], not to treat it as a lasting peer.
+    pub fn set_ephemeral(&self, ephemeral: bool) {
+        self.ephemeral.store(ephemeral, atomic::Ordering::Relaxed);
     }
 
     /// Register an announced vtable under its id. A re-announce of the same
@@ -2041,6 +2100,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 namespace,
                 commands,
                 last_updated: Some(db.last_updated.latest()).filter(|t| t.0 != i64::MIN),
+                instance_id: Some(db.instance_id()),
+                ephemeral: db.ephemeral(),
             })
             .await?;
         }
@@ -3362,6 +3423,8 @@ mod msg_sync_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
         db.set_identity(Some("sat".into()), vec![CMD]);
+        let db_id = db.instance_id();
+        let ephemeral = db.clone();
         let addr = serve(db);
         let mut client = Client::connect(addr).await.unwrap();
         let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
@@ -3371,6 +3434,31 @@ mod msg_sync_tests {
         assert_eq!(info.namespace.as_deref(), Some("sat"));
         assert!(info.commands.is_empty(), "nothing described the command");
         assert_eq!(info.last_updated, None, "an empty db has no head");
+        assert_eq!(info.instance_id, Some(db_id));
+        assert!(!info.ephemeral);
+
+        ephemeral.set_ephemeral(true);
+        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
+        assert!(info.ephemeral);
+    }
+
+    /// The id survives a reopen, and a database that predates ids gets one
+    /// on open and keeps it from then on.
+    #[test]
+    fn instance_id_is_kept_across_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let created = DB::create(path.clone()).unwrap();
+        let id = created.instance_id();
+        let other = DB::create(dir.path().join("other")).unwrap();
+        assert_ne!(other.instance_id(), id);
+        drop(created);
+        assert_eq!(DB::open(path.clone()).unwrap().instance_id(), id);
+
+        std::fs::remove_file(path.join(INSTANCE_ID_FILE)).unwrap();
+        let minted = DB::open(path.clone()).unwrap().instance_id();
+        assert_ne!(minted, id);
+        assert_eq!(DB::open(path).unwrap().instance_id(), minted);
     }
 
     fn msg_command(id: PacketId, name: &str) -> CommandInfo {
