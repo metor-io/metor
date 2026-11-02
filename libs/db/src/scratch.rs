@@ -262,7 +262,10 @@ mod tests {
         File::open(&legacy)
             .and_then(|dir| dir.set_modified(old))
             .expect("sets mtime");
-        assert_eq!(sweep_in(parent.path(), PREFIX), std::slice::from_ref(&legacy));
+        assert_eq!(
+            sweep_in(parent.path(), PREFIX),
+            std::slice::from_ref(&legacy)
+        );
         assert!(!legacy.exists());
     }
 

@@ -72,17 +72,19 @@ def gateway(
     listen: str,
     cycle_rate: float = 10.0,
     path: str | None = None,
+    keep: bool | None = None,
 ) -> tuple[Target, SystemHandle]:
     """Creates a gateway target that records telemetry from other targets.
 
     The gateway subscribes to each link in ``peers`` and records everything
-    it receives in a `Db`, which clients reach on ``listen``. Returns the
-    gateway target and the db's handle.
+    it receives in a `Db`, which clients reach on ``listen``. ``keep`` says
+    whether the db survives the run stopping; by default it is deleted
+    unless ``path`` is given. Returns the gateway target and the db's handle.
     """
     gw = Target(cycle_rate=cycle_rate, namespace=namespace)
     for peer in peers:
         gw.add(_namespace(peer), Subscribe(transport=Peer(peer)))
-    db = gw.add("db", Db(listen=listen, path=path, all=True), thread="db")
+    db = gw.add("db", Db(listen=listen, path=path, all=True, keep=keep), thread="db")
     return gw, db
 
 

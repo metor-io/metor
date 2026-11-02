@@ -36,7 +36,7 @@ use crate::{Frame, SeqError};
 use conns::{Conns, ConnsConfig, Event, Stats, Turn};
 
 #[cfg(feature = "db")]
-pub use db::{Db, DbParams, DbStatus};
+pub use db::{Db, DbParams, DbStatus, OnExit};
 pub use publish::Publish;
 pub use subscribe::Subscribe;
 

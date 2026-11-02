@@ -200,8 +200,10 @@ class Db(_Sink, _generated.Db):
 
     It stores every record from the ports in `items`, and serves the database
     to clients on `listen`. `path` is the database directory. When unset, a
-    fresh temporary directory is used. With `all`, it records every system
-    added before this one.
+    fresh temporary directory is used. `keep` says whether the database
+    survives the run stopping; by default a temporary database is deleted
+    and one at a `path` is kept. With `all`, it records every system added
+    before this one.
 
     Its commands are the records of every `Subscribe` whose `peer` is this
     db. A frame is a command for the one subscriber port that takes it. They
@@ -214,19 +216,24 @@ class Db(_Sink, _generated.Db):
         path: str | None = None,
         items: Sequence[Item] = (),
         all: bool = False,
+        keep: bool | None = None,
     ) -> None:
         super().__init__({}, {}, items=items)
         self._sink(items, all)
         self._listen = listen
         self._path = path
+        self._keep = keep
 
     def _params_for(self, target: Any, index: int) -> Any:
-        return {
+        params = {
             "listen": self._listen,
             "path": self._path,
             "namespace": target.namespace,
             "commands": self._commands(),
         }
+        if self._keep is not None:
+            params["on_exit"] = "keep" if self._keep else "delete"
+        return params
 
     def _commands(self) -> list[Any]:
         """Returns the commands that subscribers of this db take: each message
