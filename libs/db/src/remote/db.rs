@@ -128,7 +128,11 @@ impl RemoteDb {
                 emit(MirrorEvent::Connecting);
                 match mirror(&db, addr, expected, &emit).await {
                     Ok(event) => {
-                        warn!(?addr, ?event, "a different database answered; mirror stopped");
+                        warn!(
+                            ?addr,
+                            ?event,
+                            "a different database answered; mirror stopped"
+                        );
                         emit(event);
                         return;
                     }

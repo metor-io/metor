@@ -1280,11 +1280,7 @@ impl TimeSeries {
             .filter(|s| s.state == SpanState::Resident && s.source == SpanSource::RemoteFetch)
             .filter(|s| {
                 let held = listed(&s.seal);
-                if s.acked {
-                    complete && !held
-                } else {
-                    held
-                }
+                if s.acked { complete && !held } else { held }
             })
             .map(|s| s.cover_start)
             .collect();

@@ -19,7 +19,13 @@ pub(crate) struct SessionStartup {
     pub(crate) error: Option<SharedString>,
     opening: Option<Opening>,
     /// The peer being asked who it is before its session DB is chosen.
-    probing: Option<std::net::SocketAddr>,
+    probing: Option<Probing>,
+}
+
+struct Probing {
+    addr: std::net::SocketAddr,
+    /// Set by Escape: the probe's result, whenever it lands, is dropped.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 type OpenResult = std::io::Result<(
@@ -120,11 +126,19 @@ impl SessionStartup {
                 // Which DB depends on who answers, so ask first, off the UI
                 // thread; the screen shows the wait as busy.
                 let config = self.app.as_ref().unwrap().storage_config().clone();
-                let selected = super::select_for_peer(addr, config);
-                self.probing = Some(addr);
+                let cancel = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+                let selected = super::select_for_peer(addr, config, cancel.clone());
+                self.probing = Some(Probing {
+                    addr,
+                    cancel: cancel.clone(),
+                });
                 self.error = None;
                 cx.spawn_in(window, async move |this, cx| {
                     let selected = selected.await;
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        discard(selected);
+                        return;
+                    }
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.probing = None;
                         this.begin(selected, target, window, cx);
@@ -341,8 +355,8 @@ impl SessionStartup {
     pub(crate) fn summary(&self) -> Option<SharedString> {
         if self.opening.is_some() {
             Some("Opening recording… Press Escape to cancel.".into())
-        } else if let Some(addr) = self.probing {
-            Some(format!("Connecting to {addr}…").into())
+        } else if let Some(probing) = &self.probing {
+            Some(format!("Connecting to {}… Press Escape to cancel.", probing.addr).into())
         } else if self.selecting {
             None
         } else {
@@ -352,12 +366,33 @@ impl SessionStartup {
         }
     }
 
-    pub(crate) fn cancel_open(&self) {
+    /// Escape while busy: stop opening a recording, or stop waiting for a
+    /// peer to answer and return to the idle screen.
+    pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(opening) = &self.opening {
             opening
                 .cancel
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(probing) = self.probing.take() {
+            probing
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+}
+
+/// Release storage chosen for a connect that was cancelled meanwhile: a
+/// temporary DB is deleted, a peer cache flushed and unlocked. Off the UI
+/// thread, since that can mean stopping a DB's executor.
+fn discard(selected: super::peer::Selected) {
+    if let Ok((storage, db)) = selected {
+        std::thread::spawn(move || {
+            if let Err(error) = storage.finish(&db, Ok(())) {
+                tracing::warn!(error = %error.error, "could not release a cancelled session's db");
+            }
+        });
     }
 }
 
@@ -407,6 +442,46 @@ mod tests {
         });
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
     }
+    #[gpui::test]
+    fn escape_while_probing_a_peer_returns_to_idle(cx: &mut gpui::TestAppContext) {
+        // Accepts the connection and never answers, so the probe waits out
+        // its timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = crate::connections::ConnectionTarget::tcp("Silent", addr);
+        let visual = cx.add_empty_window();
+        let startup = visual.new(|_| SessionStartup {
+            app: Some(PanelApp::choose_session()),
+            selecting: false,
+            path: None,
+            error: None,
+            opening: None,
+            probing: None,
+        });
+        visual.update(|window, cx| {
+            startup.update(cx, |startup, cx| startup.connect(target, window, cx))
+        });
+        visual.update(|_, cx| {
+            let startup = startup.read(cx);
+            assert!(startup.busy());
+            assert!(startup.summary().unwrap().contains("Escape"));
+        });
+        visual.update(|_, cx| startup.update(cx, |startup, cx| startup.cancel(cx)));
+        visual.update(|_, cx| assert!(!startup.read(cx).busy()));
+
+        // The probe ends after cancelling; nothing starts from it.
+        std::thread::sleep(
+            super::super::peer::PROBE_TIMEOUT + std::time::Duration::from_millis(500),
+        );
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let startup = startup.read(cx);
+            assert!(startup.app.is_some() && !startup.busy());
+            assert!(startup.error.is_none());
+            assert!(crate::connections::try_global(cx).is_none());
+        });
+    }
+
     #[gpui::test]
     fn choosing_storage_does_not_start_a_session_and_temporary_resets_it(
         cx: &mut gpui::TestAppContext,
