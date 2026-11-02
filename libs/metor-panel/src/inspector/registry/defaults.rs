@@ -97,6 +97,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::Gauge>();
         self.register_inspectable::<crate::views::SequenceControl>();
         self.register_inspectable::<crate::views::Map>();
+        self.register_inspectable::<crate::views::PivotTable>();
         self.register_entity_list::<crate::views::SamplesTable, crate::views::SampleSource>(
             |t| &t.components,
             |t| &mut t.components,

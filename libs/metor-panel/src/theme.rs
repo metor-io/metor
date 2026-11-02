@@ -5,6 +5,7 @@ use gpui::{App, Global, Hsla, Rems, SharedString, Window, px, rems};
 use metor_proto_wkt::SequenceChannelState;
 
 use crate::config::{self, FontConfig, PanelConfig};
+use crate::views::gradient::Palette;
 
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
@@ -276,6 +277,37 @@ impl Theme {
             a: 0.10,
             ..self.alarm_color(severity_index)
         }
+    }
+
+    /// A box fill for a gradient position `t` in -1..=1: the plain box at
+    /// 0, moving toward the palette's colour, never so far that the value
+    /// text stops reading.
+    pub fn gradient_fill(&self, palette: Palette, t: f32) -> Hsla {
+        const MAX_TINT: f32 = 0.6;
+        let m = t.abs().min(1.0);
+        let hue = match palette {
+            _ if t < 0.0 && palette != Palette::Heat => self.error_accent,
+            Palette::Status => self.control_active,
+            Palette::Series(i) => self.line_colors[usize::from(i) % self.line_colors.len()],
+            Palette::Heat => {
+                // The intensity ramp carries its own lightness, so walk it
+                // instead of fading one hue.
+                let at = m * (self.density_stops.len() - 1) as f32;
+                let i = (at as usize).min(self.density_stops.len() - 2);
+                let ramp = lerp_color(
+                    self.density_stops[i],
+                    self.density_stops[i + 1],
+                    at - i as f32,
+                );
+                return lerp_color(self.bg_secondary, ramp, (m * 1.5).min(1.0) * MAX_TINT);
+            }
+        };
+        lerp_color(self.bg_secondary, hue, m * MAX_TINT)
+    }
+
+    /// A few fills along a palette, for a menu to show what it looks like.
+    pub fn gradient_preview(&self, palette: Palette) -> [Hsla; 4] {
+        [0.25, 0.5, 0.75, 1.0].map(|t| self.gradient_fill(palette, t))
     }
 
     /// A theme token at reduced alpha, for tints and dimmed borders derived

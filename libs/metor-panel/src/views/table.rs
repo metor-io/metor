@@ -9,7 +9,14 @@ use gpui::{
 use super::Scrollbar;
 
 use crate::icons::Icon;
+use crate::inspector::rows::measure;
 use crate::theme::{theme, ui_px, ui_scale};
+
+/// Text size and horizontal padding of a header label, and the room a
+/// sortable header keeps for its chevron and the gap before it.
+const HEADER_TEXT: f32 = 12.0;
+const HEADER_PAD: f32 = 12.0;
+const SORT_ICON_ROOM: f32 = 16.0;
 
 /// Height of the column header, shared with the chip headers of the log,
 /// sequence and alarm panels so a row of tabs lines up across panes.
@@ -141,6 +148,10 @@ pub trait TableDelegate: Sized + 'static {
         _cx: &mut Context<Table<Self>>,
     ) {
     }
+    /// Called at the start of each render, before columns and rows are
+    /// read. A delegate whose order follows live data settles it here, once
+    /// per frame, however many samples arrived since the last one.
+    fn before_render(&mut self, _cx: &mut Context<Table<Self>>) {}
     /// Called once after the visible row range has been painted each frame.
     /// Delegates that materialize rows lazily use it to release entities that
     /// scrolled out of view.
@@ -152,6 +163,9 @@ struct ColState {
     width: Pixels,
     sort: ColumnSort,
     bounds: Bounds<Pixels>,
+    /// Whether the width has been widened to fit the header label; that
+    /// takes the window's font, so it waits for the first render.
+    fitted: bool,
 }
 
 impl ColState {
@@ -161,6 +175,7 @@ impl ColState {
             width: col.width,
             sort: ColumnSort::Default,
             bounds: Bounds::default(),
+            fitted: false,
         }
     }
 }
@@ -230,6 +245,9 @@ pub struct Table<D: TableDelegate> {
     /// multiplied by this; a resize drag, which runs outside any dashboard
     /// zoom, divides it back out.
     scale: f32,
+    /// On-screen width of the table at the last paint. Columns that don't
+    /// fill it leave the last column to take up the rest.
+    viewport: Pixels,
 }
 
 impl<D: TableDelegate> Table<D> {
@@ -241,6 +259,7 @@ impl<D: TableDelegate> Table<D> {
             scroll_handle: UniformListScrollHandle::new(),
             hscroll: ScrollHandle::new(),
             scale: 1.0,
+            viewport: px(0.0),
         }
     }
 
@@ -321,6 +340,24 @@ impl<D: TableDelegate> Table<D> {
             .collect();
     }
 
+    /// Widen each newly seen fixed column so its whole label fits; a column
+    /// the user has since narrowed keeps their width.
+    fn fit_headers(&mut self, columns: &[Column], window: &Window) {
+        for (state, col) in self.col_states.iter_mut().zip(columns) {
+            if state.fitted {
+                continue;
+            }
+            state.fitted = true;
+            if col.flex {
+                continue;
+            }
+            let icon = if col.sortable { SORT_ICON_ROOM } else { 0.0 };
+            let label = f32::from(measure(&col.name, px(HEADER_TEXT), window));
+            let need = px((label + 2.0 * HEADER_PAD + icon + 1.0).ceil());
+            state.width = state.width.max(need).min(col.max_width);
+        }
+    }
+
     fn apply_sort(&mut self, col_ix: usize, cx: &mut Context<Self>) {
         let new_sort = self.col_states[col_ix].sort.cycle();
         for (ix, state) in self.col_states.iter_mut().enumerate() {
@@ -351,8 +388,8 @@ impl<D: TableDelegate> Table<D> {
             .items_center()
             .size_full()
             .gap(ui_px(4.0))
-            .px(ui_px(12.0))
-            .text_size(ui_px(12.0))
+            .px(ui_px(HEADER_PAD))
+            .text_size(ui_px(HEADER_TEXT))
             .text_color(theme.text_tertiary)
             .child(col.name.clone());
 
@@ -468,12 +505,29 @@ impl<D: TableDelegate> Table<D> {
 
 impl<D: TableDelegate> Render for Table<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.delegate.before_render(cx);
         self.sync_col_states();
         let theme = theme(cx);
         let columns = self.delegate.columns();
         let row_count = self.delegate.rows_count();
         let scale = ui_scale(window);
         self.scale = scale;
+        self.fit_headers(&columns, window);
+        let any_flex = columns.iter().any(|c| c.flex);
+        let total_width: f32 = self
+            .col_states
+            .iter()
+            .zip(columns.iter())
+            .filter(|(_, c)| !c.flex)
+            .map(|(s, _)| f32::from(s.width))
+            .sum();
+        // Fixed columns narrower than the table leave the slack to the last
+        // one, so the grid reaches the edge instead of stopping short.
+        let slack = if any_flex {
+            px(0.0)
+        } else {
+            (self.viewport - px(total_width * scale)).max(px(0.0))
+        };
         let row_height = self.delegate.row_height() * scale;
 
         let mut header = div()
@@ -489,7 +543,10 @@ impl<D: TableDelegate> Render for Table<D> {
         let view = cx.entity().clone();
         let last_col = columns.len().saturating_sub(1);
         for (ix, col) in columns.iter().enumerate() {
-            let width = self.col_states[ix].width * scale;
+            let mut width = self.col_states[ix].width * scale;
+            if ix == last_col {
+                width += slack;
+            }
             let is_flex = col.flex;
             let is_resizable = col.resizable;
 
@@ -535,15 +592,6 @@ impl<D: TableDelegate> Render for Table<D> {
         let col_count = columns.len();
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
         let col_resizable: Vec<bool> = columns.iter().map(|c| c.resizable).collect();
-        let any_flex = col_flex.iter().any(|f| *f);
-
-        let total_width: f32 = self
-            .col_states
-            .iter()
-            .zip(columns.iter())
-            .filter(|(_, c)| !c.flex)
-            .map(|(s, _)| f32::from(s.width))
-            .sum();
 
         let border_color = theme.border_primary;
         let scroll_handle = self.scroll_handle.clone();
@@ -588,9 +636,11 @@ impl<D: TableDelegate> Render for Table<D> {
                                 // collapses below its column width and
                                 // the strip's flex_wrap breaks element
                                 // boxes onto a new line.
-                                cell_div = cell_div
-                                    .w(this.col_states[col_ix].width * scale)
-                                    .h(row_height);
+                                let mut width = this.col_states[col_ix].width * scale;
+                                if col_ix + 1 == col_count {
+                                    width += slack;
+                                }
+                                cell_div = cell_div.w(width).h(row_height);
                                 cell_div.style().flex_shrink = Some(0.0);
                             }
 
@@ -622,7 +672,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .child(header)
             .child(body);
         if !any_flex {
-            inner = inner.w(px(total_width * scale));
+            inner = inner.w(px(total_width * scale) + slack);
         }
 
         let mut scroll_wrap = div().id("table-hscroll").size_full().child(inner);
@@ -677,6 +727,21 @@ impl<D: TableDelegate> Render for Table<D> {
             }
         };
 
+        let view = cx.entity().clone();
+        let viewport_canvas = gpui::canvas(
+            move |bounds, _window, cx| {
+                view.update(cx, |table, cx| {
+                    if table.viewport != bounds.size.width {
+                        table.viewport = bounds.size.width;
+                        cx.notify();
+                    }
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .size_full()
+        .absolute();
+
         let mut outer = div()
             .flex()
             .flex_col()
@@ -685,6 +750,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .bg(theme.bg_primary)
             .on_drag_move(cx.listener(Self::resize_column))
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(viewport_canvas)
             .child(scroll_wrap)
             .child(vertical_scrollbar);
         if let Some(h) = horizontal_scrollbar {

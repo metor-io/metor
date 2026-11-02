@@ -16,8 +16,8 @@ use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{OutlinePanelConfig, PlotPanelConfig, TraceConfig};
 use crate::tiles::{
-    OpenImageAction, OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup,
-    TileGroupEvent,
+    OpenImageAction, OpenOutlineAction, OpenPivotTableAction, PlotComponentAction,
+    PreviewPlotAction, TileGroup, TileGroupEvent,
 };
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
@@ -443,6 +443,18 @@ impl AppRoot {
         crate::tiles::panels::add_registered_panel(&pane, "component_outline", &cfg, cx);
     }
 
+    fn handle_open_pivot_table_action(
+        &mut self,
+        action: &OpenPivotTableAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
+        crate::tiles::panels::add_registered_panel(&pane, "pivot_table", &action.config, cx);
+    }
+
     fn handle_preview_plot_action(
         &mut self,
         action: &PreviewPlotAction,
@@ -661,6 +673,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
             .on_action(cx.listener(Self::handle_open_outline_action))
+            .on_action(cx.listener(Self::handle_open_pivot_table_action))
             .on_action(cx.listener(Self::handle_open_image_action))
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))

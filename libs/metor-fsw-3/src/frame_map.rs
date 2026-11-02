@@ -425,6 +425,7 @@ mod tests {
     )]
     #[repr(C)]
     struct Nic {
+        #[fsw(unit = "B", metadata(gradient = "auto", note = "x"))]
         rx_bytes: u64,
         ethtool: FrameMap<String, u64>,
     }
@@ -716,5 +717,37 @@ mod tests {
     fn test_max_len_sets_record_bound() {
         assert_eq!(Nics::MAX_LEN, 512);
         const { assert!(<Nics as AsVTable>::DYNAMIC) };
+    }
+
+    /// The ground reads a map entry as an instance of its own frame type
+    /// from the tags each member inherits from its template.
+    #[test]
+    fn map_members_name_their_entries() {
+        let crate::record::RecordSchema::Frame { metadata, .. } =
+            crate::record::RecordSchema::frame::<Nics>("sys.stats.nics")
+        else {
+            panic!("a frame announces a frame schema");
+        };
+        let template = metadata
+            .iter()
+            .find(|m| m.name == "sys.stats.nics.nics.rx_bytes")
+            .expect("member template");
+        // What the db hands the keyed member `en0`.
+        let member = metor_proto_wkt::ComponentMetadata {
+            component_id: ComponentId::new("sys.stats.nics.nics.en0.rx_bytes"),
+            name: "sys.stats.nics.nics.en0.rx_bytes".into(),
+            metadata: template.metadata.clone(),
+        };
+        assert_eq!(
+            member.frame_instances(),
+            [
+                ("nics".into(), "sys.stats.nics".into()),
+                ("nics.nics".into(), "sys.stats.nics.nics.en0".into()),
+            ]
+        );
+        // Field attributes travel as plain metadata keys.
+        assert_eq!(member.metadata["unit"], "B");
+        assert_eq!(member.metadata["gradient"], "auto");
+        assert_eq!(member.metadata["note"], "x");
     }
 }

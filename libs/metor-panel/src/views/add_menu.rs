@@ -16,7 +16,7 @@ use crate::views::dashboard::{ImageWidgetConfig, WidgetKind};
 use crate::views::instrument::{ScaleSeed, scale_seeds_for_traces};
 use crate::views::{
     AttitudeConfig, GaugeConfig, ListPlotPanelConfig, ListTraceConfig, MapConfig, MeterConfig,
-    MonitorConfig, PlotPanelConfig, SamplesTableConfig, SequenceControlConfig,
+    MonitorConfig, PivotTableConfig, PlotPanelConfig, SamplesTableConfig, SequenceControlConfig,
     SpectrogramPanelConfig, SpectrogramTraceConfig, StateChipConfig, TraceConfig,
     TrafficLightConfig, XyPlotPanelConfig, XyTraceConfig,
 };
@@ -191,6 +191,7 @@ impl AddMenu {
             ),
             (None, self.sequence_control()),
             (None, self.command("Outline", WidgetKind::table())),
+            (None, self.pivot_table()),
             (
                 Some(Pane),
                 self.command("Component Browser", WidgetKind::new("component_browser")),
@@ -390,6 +391,44 @@ impl AddMenu {
                         menu.add(&WidgetKind::annunciator(), &cfg, cx);
                     },
                 ))]
+            }),
+        ))
+    }
+
+    /// Every tagged frame type as a ready-made table, or a row pattern for
+    /// frames nothing tags.
+    fn pivot_table(&self) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(NavRow::new(
+            "Pivot Table",
+            "",
+            Box::new(move |_| {
+                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+                for frame in crate::views::pivot::source::FrameIndex::from_db(&menu.db).types() {
+                    let menu = menu.clone();
+                    rows.push(Box::new(CommandRow::new(
+                        frame.clone(),
+                        Arc::new(move |_, cx| {
+                            let cfg = PivotTableConfig {
+                                frame: frame.to_string(),
+                                ..Default::default()
+                            };
+                            menu.add(&WidgetKind::pivot_table(), &cfg, cx);
+                        }),
+                    )));
+                }
+                let menu = menu.clone();
+                rows.push(Box::new(DefaultActionRow::new(
+                    "Row pattern, e.g. dut{dut}.psu",
+                    Arc::new(move |input, _window, cx| {
+                        let cfg = PivotTableConfig {
+                            pattern: input,
+                            ..Default::default()
+                        };
+                        menu.add(&WidgetKind::pivot_table(), &cfg, cx);
+                    }),
+                )));
+                rows
             }),
         ))
     }

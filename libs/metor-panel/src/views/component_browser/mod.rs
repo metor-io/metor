@@ -27,7 +27,9 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{Theme, theme};
 use crate::tiles::{OpenImageAction, PlotComponentAction};
-use component_tree::{Children, ComponentNode, build_tree, compress_subtree, resolve_path};
+use component_tree::{
+    Children, ComponentNode, build_tree, component_count, compress_subtree, resolve_path,
+};
 
 /// [`ColumnBrowser`] specialized for the DB component namespace.
 pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
@@ -1079,11 +1081,6 @@ fn collect_component_nodes(node: &Arc<ComponentNode>, out: &mut Vec<Arc<Componen
     for child in node.children.values() {
         collect_component_nodes(child, out);
     }
-}
-
-fn component_count(node: &Arc<ComponentNode>) -> usize {
-    usize::from(node.component_id.is_some())
-        + node.children.values().map(component_count).sum::<usize>()
 }
 
 /// Build the synthetic filter root: a pruned real tree run through

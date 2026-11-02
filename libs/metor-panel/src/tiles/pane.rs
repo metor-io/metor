@@ -42,6 +42,14 @@ pub struct OpenOutlineAction {
     pub root: SharedString,
 }
 
+/// Dispatched by the outline to open a pivot table tab in the same pane,
+/// gathering whatever the right-clicked branch stood for.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct OpenPivotTableAction {
+    pub config: crate::views::PivotTableConfig,
+}
+
 /// Dispatched while shift is held over a component name to open a transient
 /// plot preview anchored at the cursor. An empty `indices` means all
 /// elements; surfaces with per-element granularity (value strips) pass a

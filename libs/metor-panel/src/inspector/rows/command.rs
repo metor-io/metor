@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, SharedString, Window};
+use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
+use smallvec::SmallVec;
 
 use super::{InspectorRow, RowAction, render_label_row};
 use crate::theme::theme;
@@ -20,6 +21,8 @@ pub struct CommandRow {
     /// A tag read on every render, for one that follows shared state.
     live_tag: Option<Arc<dyn Fn(&App) -> Option<SharedString>>>,
     consumes_search: bool,
+    /// Colours shown after the label, for a row that picks a look.
+    swatches: SmallVec<[Hsla; 4]>,
 }
 
 impl CommandRow {
@@ -36,6 +39,7 @@ impl CommandRow {
             tag: None,
             live_tag: None,
             consumes_search: false,
+            swatches: SmallVec::new(),
         }
     }
 
@@ -49,6 +53,7 @@ impl CommandRow {
             tag: None,
             live_tag: None,
             consumes_search: false,
+            swatches: SmallVec::new(),
         }
     }
 
@@ -67,6 +72,12 @@ impl CommandRow {
     /// Show the tag `tag` answers, read on every render.
     pub fn with_live_tag(mut self, tag: Arc<dyn Fn(&App) -> Option<SharedString>>) -> Self {
         self.live_tag = Some(tag);
+        self
+    }
+
+    /// Show `colors` as a strip after the label: a palette, say.
+    pub fn with_swatches(mut self, colors: impl IntoIterator<Item = Hsla>) -> Self {
+        self.swatches = colors.into_iter().collect();
         self
     }
 }
@@ -96,7 +107,21 @@ impl InspectorRow for CommandRow {
             Some(live) => live(cx),
             None => self.tag.clone(),
         };
-        render_label_row(row_ix, selected, self.label.clone(), tag, color, window, cx)
+        let row = render_label_row(row_ix, selected, self.label.clone(), tag, color, window, cx);
+        if self.swatches.is_empty() {
+            return row;
+        }
+        let strip = self.swatches.iter().fold(
+            div().flex().flex_row().flex_none().ml_auto(),
+            |strip, color| strip.child(div().w(px(12.0)).h(px(12.0)).bg(*color)),
+        );
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(div().flex_1().min_w_0().child(row))
+            .child(strip.mr(px(10.0)).rounded(px(3.0)).overflow_hidden())
+            .into_any_element()
     }
 
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {

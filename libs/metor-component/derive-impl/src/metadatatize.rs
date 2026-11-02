@@ -55,17 +55,25 @@ pub fn struct_metadatatize_impl(input: &StructInput, crate_name: &TokenStream2) 
         .map(|field| {
             let ty = &field.ty;
             let name = field.qualified_component_name(parent.as_deref());
-            let unit = field.unit.as_ref().map(|unit| {
+            let entries: Vec<(&str, &str)> = field
+                .unit
+                .iter()
+                .map(|unit| ("unit", unit.as_str()))
+                .chain(field.metadata.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .collect();
+            let set = (!entries.is_empty()).then(|| {
+                let keys = entries.iter().map(|(k, _)| k);
+                let values = entries.iter().map(|(_, v)| v);
                 quote! {
                     .map(|mut m| {
                         use #impeller_wkt::MetadataExt as _;
-                        m.set("unit", #unit);
+                        #(m.set(#keys, #values);)*
                         m
                     })
                 }
             });
             quote! {
-                .chain(<#ty>::metadata(prefix.clone().chain(#name)) #unit)
+                .chain(<#ty>::metadata(prefix.clone().chain(#name)) #set)
             }
         });
     // No group entry at an empty root prefix, since the empty name

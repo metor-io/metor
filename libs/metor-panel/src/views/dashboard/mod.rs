@@ -95,6 +95,9 @@ impl WidgetKind {
     pub fn viewer3d() -> Self {
         Self(SharedString::new_static("viewer3d"))
     }
+    pub fn pivot_table() -> Self {
+        Self(SharedString::new_static("pivot_table"))
+    }
     pub fn traffic_light() -> Self {
         Self(SharedString::new_static("traffic_light"))
     }

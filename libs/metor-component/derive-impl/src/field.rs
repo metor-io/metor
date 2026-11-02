@@ -31,6 +31,10 @@ pub struct Field {
     /// the panel shows beside its value.
     #[darling(default)]
     pub unit: Option<String>,
+    /// `#[fsw(metadata(gradient = "0..100", ...))]` sets arbitrary metadata
+    /// keys on every component of the field, for the ground to interpret.
+    #[darling(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl Field {

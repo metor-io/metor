@@ -26,9 +26,9 @@ use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
     ComponentOutline, Gauge, GaugeConfig, ListPlot, Map, MapConfig, Meter, MeterConfig, Monitor,
-    MonitorConfig, SamplesTable, SamplesTableConfig, SequenceControl, SequenceControlConfig,
-    SequenceGrid, Spectrogram, StateChip, StateChipConfig, TimeSeriesPlot, Timeline, TrafficLight,
-    TrafficLightConfig, XyPlot,
+    MonitorConfig, PivotTable, SamplesTable, SamplesTableConfig, SequenceControl,
+    SequenceControlConfig, SequenceGrid, Spectrogram, StateChip, StateChipConfig, TimeSeriesPlot,
+    Timeline, TrafficLight, TrafficLightConfig, XyPlot,
 };
 use crate::views::{Label, LabelConfig, StateImage, StateImageConfig};
 
@@ -477,6 +477,17 @@ impl WidgetRegistry {
             .with_live_tile_title(|table: &SamplesTable, _| table.title().clone()),
         );
         self.register(
+            WidgetKind::pivot_table(),
+            WidgetSpec::typed(
+                (560.0, 320.0),
+                |w| numbered("Pivot", w),
+                PivotTable::from_config,
+                PivotTable::to_config,
+            )
+            .with_tile("pivot_table", |_| "Pivot".into())
+            .with_live_tile_title(|table: &PivotTable, _| table.tab_title()),
+        );
+        self.register(
             WidgetKind::image_view(),
             WidgetSpec::typed(
                 (320.0, 320.0),
@@ -771,6 +782,7 @@ mod tests {
             "sequence_control",
             "map",
             "samples_table",
+            "pivot_table",
             "attitude",
             "component_browser",
             "alarm",

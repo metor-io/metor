@@ -125,7 +125,8 @@ impl<K, V> Decomponentize for FrameMap<K, V> {
 /// (`procs.4211.name`) inherits.
 impl<K, V: Metadatatize> Metadatatize for FrameMap<K, V> {
     fn metadata(prefix: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
-        V::metadata(prefix)
+        let map = prefix.to_name();
+        V::metadata(prefix).map(move |m| m.with_frame_map(&map))
     }
 }
 
@@ -253,6 +254,20 @@ mod tests {
         assert_eq!(FrameMap::<String, u64>::STRIDE, 16);
         assert_eq!(FrameMap::<String, u8>::STRIDE, 16);
         assert_eq!(FrameMap::<String, [u64; 3]>::STRIDE, 32);
+    }
+
+    #[test]
+    fn member_templates_name_their_map() {
+        let meta: Vec<_> =
+            <FrameMap<String, u64> as Metadatatize>::metadata("sys.nics.ethtool").collect();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(
+            meta[0]
+                .metadata
+                .get(metor_proto_wkt::FRAME_MAPS_KEY)
+                .map(String::as_str),
+            Some("sys.nics.ethtool")
+        );
     }
 
     #[test]

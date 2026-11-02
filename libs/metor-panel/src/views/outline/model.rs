@@ -20,7 +20,7 @@
 //! how four reaction wheels read as a grid instead of four folded subtrees.
 //! Alike siblings are detected structurally, so nothing in the FSW has to
 //! opt in; siblings missing a field simply get an empty cell. A
-//! [`PivotLayout`] records how the user arranged a grid — field order,
+//! [`Arrangement`] records how the user arranged a grid — field order,
 //! hidden fields, instance order — apart from the grid itself, so it
 //! survives fields and instances coming and going.
 //!
@@ -30,7 +30,7 @@
 //! labelled by full path. Types show as synthetic branches above the tree,
 //! and the outline can focus on one to show nothing else.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::SharedString;
@@ -38,9 +38,10 @@ use metor_proto::types::ComponentId;
 
 use crate::query::Query;
 use crate::views::component_browser::component_tree::{
-    ComponentNode, chain_to, natural_cmp, under,
+    ComponentNode, chain_to, component_count, under,
 };
 use crate::views::component_browser::prune_to_matches;
+use crate::views::pivot::{Arrangement, Frame, Grid, alike, children};
 
 /// Depth below which branches start open: the top-level namespaces are
 /// disclosed and everything beneath them is folded.
@@ -65,9 +66,9 @@ pub(crate) enum RowKind {
     Node,
     /// A pivoted branch; `node` is the branch. Its row carries the grid's
     /// field labels, so the instances sit directly beneath it.
-    PivotBranch(Arc<Pivot>),
+    PivotBranch(Arc<Grid>),
     /// One instance of a pivot; `node` is the instance's own subtree root.
-    PivotInstance { pivot: Arc<Pivot>, ix: usize },
+    PivotInstance { pivot: Arc<Grid>, ix: usize },
 }
 
 impl OutlineRow {
@@ -77,45 +78,6 @@ impl OutlineRow {
 
     pub fn is_pivoted(&self) -> bool {
         matches!(self.kind, RowKind::PivotBranch(_))
-    }
-}
-
-/// A branch, or a frame type, rotated into instances × fields.
-pub(crate) struct Pivot {
-    /// What the grid belongs to — the branch path or the type key — so
-    /// its rows can share per-grid state such as the scroll offset.
-    pub key: SharedString,
-    /// Leaf paths relative to an instance, in display order.
-    pub fields: Vec<SharedString>,
-    /// Widest strip each field needs, in element cells.
-    pub cells: Vec<usize>,
-    pub instances: Vec<PivotInstance>,
-    /// Fields the layout hides, so the header menu can offer them back.
-    pub hidden: Vec<SharedString>,
-}
-
-pub(crate) struct PivotInstance {
-    pub node: Arc<ComponentNode>,
-    /// Row label: the segment under a branch, the full path in a type.
-    pub label: SharedString,
-    /// One slot per field; `None` where this instance lacks it.
-    pub ids: Vec<Option<ComponentId>>,
-}
-
-/// How the user arranged one pivot grid. Names that no longer exist are
-/// kept, not pruned, so a field that comes back keeps its slot.
-#[derive(Default, Clone, PartialEq, Eq)]
-pub(crate) struct PivotLayout {
-    /// Fields first, in this order; the rest follow in natural order.
-    pub order: Vec<SharedString>,
-    pub hidden: HashSet<SharedString>,
-    /// Instance labels first, in this order; the rest keep their sort.
-    pub rows: Vec<SharedString>,
-}
-
-impl PivotLayout {
-    pub fn is_empty(&self) -> bool {
-        self.order.is_empty() && self.hidden.is_empty() && self.rows.is_empty()
     }
 }
 
@@ -132,196 +94,17 @@ pub(crate) fn type_key(label: &str) -> SharedString {
     SharedString::from(format!("type:{label}"))
 }
 
-/// The name a set of alike frames share: the longest trailing run of
-/// segments common to every path, so `dut1.psu` and `dut2.bay.psu` are
-/// "psu" and `cube_sat.nav.health` and `cube_sat.ctrl.health` are
-/// "health". Empty when nothing is shared.
-pub(crate) fn common_suffix<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
-    let mut names = names.into_iter();
-    let Some(first) = names.next() else {
-        return String::new();
-    };
-    let mut shared: Vec<&str> = first.split('.').collect();
-    for name in names {
-        let segments: Vec<&str> = name.split('.').collect();
-        let common = shared
-            .iter()
-            .rev()
-            .zip(segments.iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        shared.drain(..shared.len() - common);
-    }
-    shared.join(".")
-}
-
-/// The shape of `node`: its leaf paths relative to itself, sorted.
-pub(crate) fn signature(node: &Arc<ComponentNode>) -> Vec<SharedString> {
-    let mut leaves = BTreeMap::new();
-    collect_leaves(node, node.full_name.len() + 1, &mut leaves);
-    leaves.into_keys().collect()
-}
-
-/// Every subtree under `root` whose shape is exactly `fields`, in name
-/// order. A match's own subtree is never searched: anything inside it has
-/// fewer leaves, so it can't match too.
-pub(crate) fn alike(root: &Arc<ComponentNode>, fields: &[SharedString]) -> Vec<Arc<ComponentNode>> {
-    let mut out = Vec::new();
-    for child in root.children.values() {
-        collect_alike(child, fields, &mut out);
-    }
-    out
-}
-
-fn collect_alike(
-    node: &Arc<ComponentNode>,
-    fields: &[SharedString],
-    out: &mut Vec<Arc<ComponentNode>>,
-) {
-    if node.children.is_empty() {
-        return;
-    }
-    // Leaf count is a cheap pre-check before building the full signature.
-    if component_count(node) - usize::from(node.component_id.is_some()) == fields.len()
-        && signature(node) == fields
-    {
-        out.push(node.clone());
-        return;
-    }
-    for child in node.children.values() {
-        collect_alike(child, fields, out);
-    }
-}
-
 /// Rotate `branch`: every child that is itself a branch becomes an instance.
 /// `None` when nothing qualifies, so a pivot on a flat branch is a no-op
 /// rather than an empty grid.
-pub(crate) fn build_pivot(branch: &ComponentNode, layout: &Layout) -> Option<Pivot> {
-    let candidates: Vec<(Arc<ComponentNode>, SharedString)> = ordered(branch, layout.descending)
-        .filter(|c| !c.children.is_empty())
-        .map(|c| (c.clone(), c.segment.clone()))
-        .collect();
-    if candidates.is_empty() {
+pub(crate) fn build_pivot(branch: &ComponentNode, layout: &Layout) -> Option<Grid> {
+    let instances = children(branch, layout.descending);
+    if instances.is_empty() {
         return None;
     }
-    Some(pivot_from(branch.full_name.clone(), candidates, layout))
-}
-
-/// Lay `instances` out on the union of their fields, arranged by the
-/// grid's [`PivotLayout`] when it has one.
-fn pivot_from(
-    key: SharedString,
-    candidates: Vec<(Arc<ComponentNode>, SharedString)>,
-    layout: &Layout,
-) -> Pivot {
+    let key = branch.full_name.clone();
     let arrangement = layout.layouts.get(&key);
-    let candidates = match arrangement {
-        Some(a) => lead_by(candidates, &a.rows, |(_, label)| label),
-        None => candidates,
-    };
-    let per_instance: Vec<BTreeMap<SharedString, ComponentId>> = candidates
-        .iter()
-        .map(|(inst, _)| {
-            let mut leaves = BTreeMap::new();
-            collect_leaves(inst, inst.full_name.len() + 1, &mut leaves);
-            leaves
-        })
-        .collect();
-    let mut fields: Vec<SharedString> = per_instance
-        .iter()
-        .flat_map(|m| m.keys().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    fields.sort_by(|a, b| natural_cmp(a, b));
-    let mut hidden = Vec::new();
-    if let Some(a) = arrangement {
-        fields = lead_by(fields, &a.order, |f| f);
-        (hidden, fields) = fields.into_iter().partition(|f| a.hidden.contains(f));
-    }
-    let instances: Vec<PivotInstance> = candidates
-        .into_iter()
-        .zip(&per_instance)
-        .map(|((node, label), leaves)| PivotInstance {
-            node,
-            label,
-            ids: fields.iter().map(|f| leaves.get(f).copied()).collect(),
-        })
-        .collect();
-    let cells = (0..fields.len())
-        .map(|f| {
-            instances
-                .iter()
-                .filter_map(|i| i.ids[f])
-                .map(layout.cell_count)
-                .max()
-                .unwrap_or(1)
-                .max(1)
-        })
-        .collect();
-    Pivot {
-        key,
-        fields,
-        cells,
-        instances,
-        hidden,
-    }
-}
-
-/// `items` with those named in `lead` moved to the front in that order;
-/// names in `lead` that match nothing are skipped.
-fn lead_by<T>(
-    mut items: Vec<T>,
-    lead: &[SharedString],
-    name: impl Fn(&T) -> &SharedString,
-) -> Vec<T> {
-    let mut out = Vec::with_capacity(items.len());
-    for want in lead {
-        if let Some(ix) = items.iter().position(|i| name(i) == want) {
-            out.push(items.remove(ix));
-        }
-    }
-    out.extend(items);
-    out
-}
-
-/// `items` with `from` moved into the slot `to` occupies, the way a
-/// dragged column takes the place of the one it was dropped on. Unknown
-/// names leave the order unchanged.
-pub(crate) fn take_slot(
-    items: &[SharedString],
-    from: &SharedString,
-    to: &SharedString,
-) -> Vec<SharedString> {
-    let mut out = items.to_vec();
-    let (Some(from_ix), Some(to_ix)) = (
-        items.iter().position(|i| i == from),
-        items.iter().position(|i| i == to),
-    ) else {
-        return out;
-    };
-    let item = out.remove(from_ix);
-    out.insert(to_ix, item);
-    out
-}
-
-/// Every component under `node` keyed by its name past `prefix_len`.
-fn collect_leaves(
-    node: &Arc<ComponentNode>,
-    prefix_len: usize,
-    out: &mut BTreeMap<SharedString, ComponentId>,
-) {
-    if let Some(id) = node.component_id
-        && node.full_name.len() > prefix_len
-    {
-        out.insert(
-            SharedString::from(node.full_name[prefix_len..].to_string()),
-            id,
-        );
-    }
-    for child in node.children.values() {
-        collect_leaves(child, prefix_len, out);
-    }
+    Some(Grid::new(key, instances, arrangement, layout.cell_count))
 }
 
 /// Which branches are open, as the paths flipped away from the depth
@@ -401,22 +184,12 @@ fn sorted_paths(set: &HashSet<SharedString>) -> Vec<String> {
     out
 }
 
-/// Components at or below `node`, the node itself included.
-pub(crate) fn component_count(node: &ComponentNode) -> usize {
-    usize::from(node.component_id.is_some())
-        + node
-            .children
-            .values()
-            .map(|c| component_count(c))
-            .sum::<usize>()
-}
-
 /// Everything that shapes the flattened rows besides the tree itself.
 pub(crate) struct Layout<'a> {
     pub disclosure: &'a Disclosure,
     pub pivoted: &'a HashSet<SharedString>,
     /// Arrangements keyed by pivot key: a branch path or a type key.
-    pub layouts: &'a HashMap<SharedString, PivotLayout>,
+    pub layouts: &'a HashMap<SharedString, Arrangement>,
     /// Frame types shown as synthetic branches above the tree.
     pub types: &'a [FrameType],
     /// A type label to show alone, hiding the tree and the other types.
@@ -535,7 +308,7 @@ fn push_rows(
 }
 
 /// The instance rows of an open pivot.
-fn push_grid_rows(depth: usize, pivot: &Arc<Pivot>, rows: &mut Vec<OutlineRow>) {
+fn push_grid_rows(depth: usize, pivot: &Arc<Grid>, rows: &mut Vec<OutlineRow>) {
     for (ix, instance) in pivot.instances.iter().enumerate() {
         rows.push(OutlineRow {
             node: instance.node.clone(),
@@ -563,13 +336,13 @@ fn push_type_rows(
     rows: &mut Vec<OutlineRow>,
 ) {
     let filtering = !layout.query.is_empty();
-    let mut instances: Vec<(Arc<ComponentNode>, SharedString)> = alike(tree, &t.fields)
+    let mut instances: Vec<Frame> = alike(tree, &t.fields)
         .into_iter()
         .filter(|n| !filtering || layout.query.matches_name(&n.full_name))
         .filter(|n| under(layout.root, &n.full_name))
         .map(|n| {
             let label = n.full_name.clone();
-            (n, label)
+            Frame::labelled(n, label)
         })
         .collect();
     if layout.descending {
@@ -583,10 +356,11 @@ fn push_type_rows(
         segment: t.label.clone(),
         full_name: key.clone(),
         component_id: None,
-        children: instances.iter().map(|(n, _)| n.clone()).collect(),
+        children: instances.iter().map(|f| f.node.clone()).collect(),
     });
     let expanded = focused || filtering || layout.disclosure.is_expanded(&key, 0);
-    let pivot = Arc::new(pivot_from(key, instances, layout));
+    let arrangement = layout.layouts.get(&key);
+    let pivot = Arc::new(Grid::new(key, instances, arrangement, layout.cell_count));
     rows.push(OutlineRow {
         node: node.clone(),
         depth: 0,
@@ -602,25 +376,7 @@ fn push_type_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::component_browser::component_tree::Children;
-
-    fn leaf(name: &str) -> Arc<ComponentNode> {
-        Arc::new(ComponentNode {
-            segment: SharedString::from(name.rsplit('.').next().unwrap().to_string()),
-            full_name: SharedString::from(name.to_string()),
-            component_id: Some(metor_proto::types::ComponentId::new(name)),
-            children: Children::default(),
-        })
-    }
-
-    fn branch(name: &str, children: Vec<Arc<ComponentNode>>) -> Arc<ComponentNode> {
-        Arc::new(ComponentNode {
-            segment: SharedString::from(name.rsplit('.').next().unwrap().to_string()),
-            full_name: SharedString::from(name.to_string()),
-            component_id: None,
-            children: children.into_iter().collect(),
-        })
-    }
+    use crate::views::pivot::model::tests::{branch, duts, leaf, psu_fields};
 
     /// `sat` → `imu` → {`temp`, `gyro`}; `sat` → `mode`.
     fn tree() -> Arc<ComponentNode> {
@@ -646,7 +402,7 @@ mod tests {
     struct Knobs<'a> {
         disclosure: Disclosure,
         pivoted: HashSet<SharedString>,
-        layouts: HashMap<SharedString, PivotLayout>,
+        layouts: HashMap<SharedString, Arrangement>,
         types: Vec<FrameType>,
         focus: Option<SharedString>,
         root: &'a str,
@@ -863,7 +619,7 @@ mod tests {
         assert!(!rows[0].is_pivoted());
     }
 
-    fn wheel_pivot(knobs: &Knobs) -> Arc<Pivot> {
+    fn wheel_pivot(knobs: &Knobs) -> Arc<Grid> {
         let rows = knobs.rows(&wheels());
         let RowKind::PivotBranch(pivot) = &rows[0].kind else {
             panic!("expected the pivoted branch");
@@ -879,7 +635,7 @@ mod tests {
         };
         knobs.layouts.insert(
             "wheels".into(),
-            PivotLayout {
+            Arrangement {
                 order: vec!["speed".into(), "gone".into()],
                 ..Default::default()
             },
@@ -898,7 +654,7 @@ mod tests {
         };
         knobs.layouts.insert(
             "wheels".into(),
-            PivotLayout {
+            Arrangement {
                 hidden: ["motor.temp".into()].into_iter().collect(),
                 ..Default::default()
             },
@@ -917,7 +673,7 @@ mod tests {
         };
         knobs.layouts.insert(
             "wheels".into(),
-            PivotLayout {
+            Arrangement {
                 rows: vec!["1".into()],
                 ..Default::default()
             },
@@ -929,54 +685,11 @@ mod tests {
         );
     }
 
-    /// Two PSUs under different DUTs, plus a decoy with one field fewer.
-    fn duts() -> Arc<ComponentNode> {
-        let psu = |prefix: &str| {
-            branch(
-                &format!("{prefix}.psu"),
-                vec![
-                    leaf(&format!("{prefix}.psu.current")),
-                    leaf(&format!("{prefix}.psu.voltage")),
-                ],
-            )
-        };
-        branch(
-            "",
-            vec![
-                branch("dut1", vec![psu("dut1"), leaf("dut1.serial")]),
-                branch("dut2", vec![branch("dut2.bay", vec![psu("dut2.bay")])]),
-                branch(
-                    "dut3",
-                    vec![branch("dut3.psu", vec![leaf("dut3.psu.current")])],
-                ),
-            ],
-        )
-    }
-
     fn psu_type(tree: &Arc<ComponentNode>) -> FrameType {
-        let exemplar = tree
-            .children
-            .get("dut1")
-            .unwrap()
-            .children
-            .get("psu")
-            .unwrap();
         FrameType {
             label: "psu".into(),
-            fields: signature(exemplar),
+            fields: psu_fields(tree),
         }
-    }
-
-    #[test]
-    fn alike_finds_the_shape_at_any_depth_and_nothing_else() {
-        let tree = duts();
-        let t = psu_type(&tree);
-        assert_eq!(t.fields, ["current", "voltage"]);
-        let found: Vec<String> = alike(&tree, &t.fields)
-            .iter()
-            .map(|n| n.full_name.to_string())
-            .collect();
-        assert_eq!(found, ["dut1.psu", "dut2.bay.psu"]);
     }
 
     #[test]
@@ -1034,36 +747,5 @@ mod tests {
             names(&rows),
             ["type:psu", "dut2.bay.psu", "dut2.bay", "dut2.bay.psu"]
         );
-    }
-
-    #[test]
-    fn take_slot_moves_an_item_onto_another_in_either_direction() {
-        let items: Vec<SharedString> = ["a", "b", "c", "d"].map(SharedString::from).to_vec();
-        let names =
-            |v: Vec<SharedString>| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        assert_eq!(
-            names(take_slot(&items, &"a".into(), &"c".into())),
-            ["b", "c", "a", "d"]
-        );
-        assert_eq!(
-            names(take_slot(&items, &"d".into(), &"b".into())),
-            ["a", "d", "b", "c"]
-        );
-        assert_eq!(
-            names(take_slot(&items, &"x".into(), &"b".into())),
-            ["a", "b", "c", "d"]
-        );
-    }
-
-    #[test]
-    fn common_suffix_is_the_shared_trailing_segments() {
-        assert_eq!(common_suffix(["dut1.psu", "dut2.bay.psu"]), "psu");
-        assert_eq!(
-            common_suffix(["cube_sat.nav.health", "cube_sat.ctrl.health"]),
-            "health"
-        );
-        assert_eq!(common_suffix(["a.b.c", "x.b.c"]), "b.c");
-        assert_eq!(common_suffix(["a.b", "c.d"]), "");
-        assert_eq!(common_suffix(["only.one"]), "only.one");
     }
 }
