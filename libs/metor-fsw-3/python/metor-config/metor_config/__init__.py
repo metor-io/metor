@@ -12,6 +12,7 @@ from ._builtins import (
     Db,
     DlSlot,
     Listen,
+    Mux,
     Peer,
     Publish,
     Subscribe,
@@ -19,6 +20,7 @@ from ._builtins import (
 )
 from ._config import ConfigError
 from ._deployment import Deployment, emit, gateway
+from ._fields import Field
 from ._generated import (
     CONFIG_VERSION,
     ChannelMessage,
@@ -90,9 +92,11 @@ __all__ = [
     "ConfigError",
     "Connect",
     "Deployment",
+    "Field",
     "Item",
     "Listen",
     "Loop",
+    "Mux",
     "OutPort",
     "Pack",
     "Peer",

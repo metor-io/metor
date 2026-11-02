@@ -128,6 +128,7 @@ mod tests {
             &Registry::new,
             Params(&params),
             &mut crate::io::IoInit::empty("registry"),
+            &crate::fn_system::Bound::empty(),
         )
     }
 

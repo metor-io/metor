@@ -220,7 +220,8 @@ raw_field(0, 8, map(&prefix, V::element_fields(String::new()), stride, value_off
 `AsVTable` gains one defaulted item, `const DYNAMIC: bool = false`.
 `FrameMap` sets it to `true`, and the struct derive ORs its fields. The
 `Frame` derive then rejects a frame that holds a map but has no `max_len`,
-which would otherwise fail on its first non-empty write.
+which would otherwise fail on its first non-empty write, and a fixed frame
+that has one, whose length is then always its size.
 
 ## Changes
 

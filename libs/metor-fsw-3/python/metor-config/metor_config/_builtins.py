@@ -17,10 +17,10 @@ the transport a resource named ``{name}_ep`` and grants it to the link's
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Sequence, TypeVar
 
 from . import _generated
-from ._config import ConfigError
+from ._config import NANOS_PER_SEC, ConfigError
 from ._generated import IO_RECORDS, SequenceRegistry
 from ._io import Kind, PeerDial, TcpDial, TcpListen
 from ._model import (
@@ -37,7 +37,7 @@ from ._model import (
 )
 from ._target import SystemHandle, Target, _targets
 
-T = TypeVar("T", bound=Record)
+P = TypeVar("P", bound=OutPort[Any])
 
 MAX_CONNECTIONS = 8
 CONN_CAP = 1 << 20
@@ -288,12 +288,12 @@ class Subscribe(Link, _generated.Subscribe):
         ]
         return copies + self._dyn_outputs
 
-    def port(self, source: OutPort[T]) -> OutPort[T]:
+    def port(self, source: P) -> P:
         """Returns this subscriber's copy of ``source``, a port of its peer's
         target."""
         return self._port(source, self._name, self._target)
 
-    def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
+    def _port(self, source: P, name: str, target: Any) -> P:
         for copy in self._peer_copies():
             if copy.target is not source.target:
                 continue
@@ -304,7 +304,7 @@ class Subscribe(Link, _generated.Subscribe):
                 and copy.record._name == source.record._name
             )
             if same_port or same_msg:
-                return OutPort(name, copy.port, copy.record, target)
+                return type(source)(name, copy.port, copy.record, target)
         raise ConfigError(f"`{name}` does not copy `{source.name}`")
 
     def _peer_copies(self) -> list[Copy]:
@@ -454,3 +454,101 @@ class ChannelRegistry(_generated.ChannelRegistry):
         return {"channels": channels, "period": max(1, round(target.cycle_rate))}
 
     registry: OutPort[SequenceRegistry]
+
+
+TRIGGERS = ("any", "all", "cycle")
+"""The `on=` rules that name no port."""
+
+
+class Mux(_generated.Mux):
+    """Builds new frames from fields of existing frames.
+
+    Each keyword names an output port and gives a record instance whose
+    fields map to port fields, as ``Body(q=nav.est.q)``. ``on`` is the
+    input whose records trigger an emit, or ``"any"``, ``"all"``, or
+    ``"cycle"``; a mux with one input defaults to it. ``timestamp`` is the
+    input whose latest stamp stamps each output, or ``"now"`` for the cycle
+    time. ``max_age`` withholds an output while any input it maps is older
+    than that many seconds, by this target's clock.
+    """
+
+    def __init__(
+        self,
+        *,
+        on: OutPort[Any] | Literal["any", "all", "cycle"] | None = None,
+        timestamp: OutPort[Any] | Literal["now"] | None = None,
+        max_age: float | None = None,
+        **outputs: Record,
+    ) -> None:
+        for key, record in outputs.items():
+            if not isinstance(record, Record) or record._kind != "frame":
+                raise ConfigError(f"mux output `{key}` takes a frame record instance, got {record!r}")
+        ports = _mux_inputs(outputs, on, timestamp)
+        common = {"on": _trigger(on, ports), "stamp": _stamp(timestamp, on, ports)}
+        if max_age is not None:
+            common["max_age"] = _duration(max_age)
+        params = {
+            "inputs": [p.name for p in ports],
+            "outputs": [{"port": k, **common, "fields": _fields(r)} for k, r in outputs.items()],
+        }
+        dyn = [{"port": key, "record": record._name} for key, record in outputs.items()]
+        super().__init__({}, params, outputs=dyn, items=ports)
+        self._ports = {**{k: type(r) for k, r in outputs.items()}, **type(self)._ports}
+        records = [p.record for p in ports] + [type(r) for r in outputs.values()]
+        self._record_packs = tuple(r._pack for r in records if r is not None and r._pack is not None)
+        self._mux_inputs = ports
+
+    def _bind(self, target: Target, name: str) -> None:
+        for port in self._mux_inputs:
+            if port.target is not None and port.target is not target:
+                raise ConfigError(f"mux `{name}` reads `{port.name}`, a port on another target")
+
+    if TYPE_CHECKING:
+
+        def __getattr__(self, port: str) -> Any: ...
+
+
+def _mux_inputs(outputs: dict[str, Record], on: Any, timestamp: Any) -> list[OutPort[Any]]:
+    """The distinct frame ports the mappings, ``on``, and ``timestamp`` read, in order."""
+    ports: list[OutPort[Any]] = []
+    sources = [f.port for r in outputs.values() for f in r._mapping.values()]
+    for port in sources + [on, timestamp]:
+        if isinstance(port, OutPort) and all(port.name != p.name for p in ports):
+            if port.record is None or port.record._kind != "frame":
+                raise ConfigError(f"a mux reads frames; `{port.name}` carries a message")
+            ports.append(port)
+    return ports
+
+
+def _trigger(on: Any, ports: list[OutPort[Any]]) -> Any:
+    if on is None:
+        if len(ports) != 1:
+            raise ConfigError(f"a mux reading {len(ports)} ports needs `on=`")
+        return {"input": ports[0].name}
+    if isinstance(on, OutPort):
+        return {"input": on.name}
+    if on not in TRIGGERS:
+        raise ConfigError(f"`on=` takes a port or one of {TRIGGERS}, got {on!r}")
+    return on
+
+
+def _stamp(timestamp: Any, on: Any, ports: list[OutPort[Any]]) -> Any:
+    """The stamp source: ``timestamp``, else the trigger port, else the cycle time."""
+    if isinstance(timestamp, OutPort):
+        return {"input": timestamp.name}
+    if timestamp not in (None, "now"):
+        raise ConfigError(f"`timestamp=` takes a port or \"now\", got {timestamp!r}")
+    if timestamp is None and on not in TRIGGERS:
+        return _trigger(on, ports)
+    return "now"
+
+
+def _duration(seconds: float) -> dict[str, int]:
+    if seconds <= 0:
+        raise ConfigError(f"`max_age=` must be positive, got {seconds}")
+    nanos = round(seconds * NANOS_PER_SEC)
+    return {"secs": nanos // NANOS_PER_SEC, "nanos": nanos % NANOS_PER_SEC}
+
+
+def _fields(record: Record) -> list[dict[str, str]]:
+    return [{"dst": dst, "input": f.port.name, "src": f.path} for dst, f in record._mapping.items()]

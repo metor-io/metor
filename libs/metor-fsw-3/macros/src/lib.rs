@@ -17,6 +17,8 @@ mod system_attr;
 /// Mark one field `#[frame(timestamp)]`.
 /// `#[frame(name = "..")]` sets the record name, which defaults to the struct
 /// name in snake_case. `#[frame(depth = N)]` sets `Record::DEPTH`.
+/// `#[frame(max_len = N)]` bounds a frame holding a `FrameMap`; a fixed
+/// frame's length is its size, and the attribute fails its build.
 #[proc_macro_derive(Frame, attributes(frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)

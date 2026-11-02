@@ -18,6 +18,10 @@ const GOLDEN: &str = include_str!("golden/echo_pack.py");
 #[test]
 fn test_golden_module_type_checks() {
     let Some(pyright) = pyright() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "neither `pyright` nor `uvx` is on PATH"
+        );
         println!("skipped: neither `pyright` nor `uvx` is on PATH");
         return;
     };

@@ -1,0 +1,13 @@
+error[E0080]: evaluation panicked: #[frame(max_len)] is only for a frame holding a FrameMap
+ --> tests/ui/fixed_frame_with_max_len.rs:4:10
+  |
+4 | #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+  |          ^^^^^ evaluation of `<Padded as metor_fsw_3::Record>::MAX_LEN` failed here
+
+note: erroneous constant encountered
+ --> tests/ui/fixed_frame_with_max_len.rs:4:10
+  |
+4 | #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+  |          ^^^^^
+  |
+  = note: this note originates in the derive macro `Frame` (in Nightly builds, run with -Z macro-backtrace for more info)

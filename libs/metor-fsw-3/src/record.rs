@@ -6,7 +6,7 @@
 use core::borrow::Borrow;
 
 use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id, table_id};
-use metor_proto::vtable::VTable;
+use metor_proto::vtable::{Op, OpRef, VTable};
 use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,25 @@ impl RecordSchema {
         }
     }
 
+    /// Moves a frame's components from `{from}.*` to `{to}.*`.
+    ///
+    /// Each component's id becomes the hash of its new name. A message is
+    /// returned unchanged.
+    pub fn reroot(&self, from: &str, to: &str) -> Result<Self, RerootError> {
+        let Self::Frame { vtable, metadata } = self else {
+            return Ok(self.clone());
+        };
+        let moved: Vec<ComponentMetadata> = metadata.iter().map(|m| renamed(m, from, to)).collect();
+        let mut vtable = vtable.clone();
+        for (range, id) in reroot_ids(&vtable, metadata, &moved)? {
+            vtable.data[range].copy_from_slice(&id.0.to_le_bytes());
+        }
+        Ok(Self::Frame {
+            vtable,
+            metadata: moved,
+        })
+    }
+
     /// Returns the packet type this record is sent as.
     ///
     /// A frame is sent as a table, and a message as a message.
@@ -165,6 +184,78 @@ impl RecordSchema {
             Self::Frame { .. } => PacketTy::Table,
             Self::Msg { .. } => PacketTy::Msg,
         }
+    }
+}
+
+/// Why a frame cannot be re-rooted.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum RerootError {
+    #[error("the frame holds a dynamic field")]
+    Dynamic,
+    #[error("component {0:?} has no metadata")]
+    Unnamed(ComponentId),
+    #[error("the frame's vtable is malformed")]
+    Malformed,
+}
+
+/// `meta` with its name moved from under `from` to under `to`.
+fn renamed(meta: &ComponentMetadata, from: &str, to: &str) -> ComponentMetadata {
+    let Some(rest) = meta.name.strip_prefix(from) else {
+        return meta.clone();
+    };
+    if !(rest.is_empty() || rest.starts_with('.')) {
+        return meta.clone();
+    }
+    let name = format!("{to}{rest}");
+    ComponentMetadata {
+        component_id: ComponentId::new(&name),
+        name,
+        metadata: meta.metadata.clone(),
+    }
+}
+
+/// The data range of each component id in `vtable`, with its new id.
+///
+/// `old` holds the metadata before renaming and `new` after, in the same
+/// order.
+fn reroot_ids(
+    vtable: &VTable,
+    old: &[ComponentMetadata],
+    new: &[ComponentMetadata],
+) -> Result<Vec<(core::ops::Range<usize>, ComponentId)>, RerootError> {
+    let mut moves = Vec::new();
+    for op in &vtable.ops {
+        let target = match op {
+            Op::List { .. } | Op::Map { .. } => return Err(RerootError::Dynamic),
+            Op::Component { component_id } => *component_id,
+            _ => continue,
+        };
+        let range = data_range(vtable, target).ok_or(RerootError::Malformed)?;
+        if moves.iter().any(|(known, _)| *known == range) {
+            continue;
+        }
+        let bytes: [u8; 8] = vtable.data[range.clone()]
+            .try_into()
+            .map_err(|_| RerootError::Malformed)?;
+        let id = ComponentId(u64::from_le_bytes(bytes));
+        let index = old
+            .iter()
+            .position(|m| m.component_id == id)
+            .ok_or(RerootError::Unnamed(id))?;
+        moves.push((range, new[index].component_id));
+    }
+    Ok(moves)
+}
+
+/// The data bytes the `Data` op at `op` holds.
+fn data_range(vtable: &VTable, op: OpRef) -> Option<core::ops::Range<usize>> {
+    match vtable.ops.get(op.to_index())? {
+        Op::Data { offset, len } => {
+            let start = offset.to_index();
+            let range = start..start.checked_add(*len as usize)?;
+            (range.end <= vtable.data.len()).then_some(range)
+        }
+        _ => None,
     }
 }
 
@@ -338,7 +429,7 @@ mod tests {
 
     use super::*;
     use crate::MaxSize;
-    use crate::tests::utils::{BareName, Fixed, Imu, Note};
+    use crate::tests::utils::{BareName, Fixed, Imu, Nested, Note};
 
     /// A message whose codec is JSON, written by hand as a pack author would.
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -385,6 +476,59 @@ mod tests {
         assert_eq!(metadata[0].component_id, leaf);
         assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
         assert_ne!(schema.packet_id(), Imu::schema().packet_id());
+    }
+
+    #[derive(
+        crate::Frame,
+        zerocopy::IntoBytes,
+        zerocopy::Immutable,
+        zerocopy::KnownLayout,
+        zerocopy::FromBytes,
+    )]
+    #[frame(name = "procs", max_len = 128)]
+    #[repr(C)]
+    struct Procs {
+        #[frame(timestamp)]
+        timestamp: Timestamp,
+        procs: metor_component::FrameMap<u32, u64>,
+    }
+
+    #[test]
+    fn test_reroot_matches_schema_with_root() {
+        let moved = Imu::schema()
+            .reroot("imu", "ns.mux.imu")
+            .expect("a fixed frame");
+        assert_eq!(moved, Imu::schema_with_root("ns.mux.imu"));
+        let nested = Nested::schema()
+            .reroot("nested", "a.b")
+            .expect("a fixed frame");
+        assert_eq!(nested, Nested::schema_with_root("a.b"));
+        assert_ne!(moved.packet_id(), Imu::schema().packet_id());
+    }
+
+    #[test]
+    fn test_reroot_in_place_and_message() {
+        assert_eq!(Imu::schema().reroot("imu", "imu"), Ok(Imu::schema()));
+        assert_eq!(Note::schema().reroot("note", "x.note"), Ok(Note::schema()));
+    }
+
+    #[test]
+    fn test_reroot_refusals() {
+        assert_eq!(
+            Procs::schema().reroot("procs", "x"),
+            Err(RerootError::Dynamic)
+        );
+        let RecordSchema::Frame { vtable, .. } = Imu::schema() else {
+            panic!("a frame announces a vtable")
+        };
+        let bare = RecordSchema::Frame {
+            vtable,
+            metadata: Vec::new(),
+        };
+        assert!(matches!(
+            bare.reroot("imu", "x"),
+            Err(RerootError::Unnamed(id)) if id == ComponentId::new("imu.sample")
+        ));
     }
 
     #[test]

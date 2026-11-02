@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from ._model import Pack, Record, System
+from typing import Literal
+
+from ._fields import Field, _given
+from ._model import OutPort, Pack, Record, System
 
 ABI_VERSION = 15
 """The host ABI version the built-in systems are compiled against."""
@@ -32,24 +35,116 @@ class ChannelMessage(Record):
     _name = "channel_message"
     _kind = "frame"
     _pack = PACK
+    _fields = {"text": "u8[128]"}
+
+    def __init__(self, *, text: Field[Literal["u8[128]"]] | None = None) -> None:
+        super().__init__(**_given({"text": text}))
+
+
+class ChannelMessagePort(OutPort[ChannelMessage]):
+    @property
+    def text(self) -> Field[Literal["u8[128]"]]:
+        return self.field("text")
+
+
+ChannelMessage._port = ChannelMessagePort
 
 
 class ChannelStatus(Record):
     _name = "channel_status"
     _kind = "frame"
     _pack = PACK
+    _fields = {"state": "u32", "loaded": "u32", "artifact": "u8[64]", "hash": "u8[32]", "elapsed": "f64", "abort_elapsed": "f64", "accepts": "u32"}
+
+    def __init__(self, *, state: Field[Literal["u32"]] | None = None, loaded: Field[Literal["u32"]] | None = None, artifact: Field[Literal["u8[64]"]] | None = None, hash: Field[Literal["u8[32]"]] | None = None, elapsed: Field[Literal["f64"]] | None = None, abort_elapsed: Field[Literal["f64"]] | None = None, accepts: Field[Literal["u32"]] | None = None) -> None:
+        super().__init__(**_given({"state": state, "loaded": loaded, "artifact": artifact, "hash": hash, "elapsed": elapsed, "abort_elapsed": abort_elapsed, "accepts": accepts}))
+
+
+class ChannelStatusPort(OutPort[ChannelStatus]):
+    @property
+    def state(self) -> Field[Literal["u32"]]:
+        return self.field("state")
+
+    @property
+    def loaded(self) -> Field[Literal["u32"]]:
+        return self.field("loaded")
+
+    @property
+    def artifact(self) -> Field[Literal["u8[64]"]]:
+        return self.field("artifact")
+
+    @property
+    def hash(self) -> Field[Literal["u8[32]"]]:
+        return self.field("hash")
+
+    @property
+    def elapsed(self) -> Field[Literal["f64"]]:
+        return self.field("elapsed")
+
+    @property
+    def abort_elapsed(self) -> Field[Literal["f64"]]:
+        return self.field("abort_elapsed")
+
+    @property
+    def accepts(self) -> Field[Literal["u32"]]:
+        return self.field("accepts")
+
+
+ChannelStatus._port = ChannelStatusPort
 
 
 class DbStatus(Record):
     _name = "db_status"
     _kind = "frame"
     _pack = PACK
+    _fields = {"records": "u64", "refused": "u64"}
+
+    def __init__(self, *, records: Field[Literal["u64"]] | None = None, refused: Field[Literal["u64"]] | None = None) -> None:
+        super().__init__(**_given({"records": records, "refused": refused}))
+
+
+class DbStatusPort(OutPort[DbStatus]):
+    @property
+    def records(self) -> Field[Literal["u64"]]:
+        return self.field("records")
+
+    @property
+    def refused(self) -> Field[Literal["u64"]]:
+        return self.field("refused")
+
+
+DbStatus._port = DbStatusPort
 
 
 class LinkStatus(Record):
     _name = "link_status"
     _kind = "frame"
     _pack = PACK
+    _fields = {"connections": "u32", "bytes_out": "u64", "batches_dropped": "u64", "inbound_dropped": "u64"}
+
+    def __init__(self, *, connections: Field[Literal["u32"]] | None = None, bytes_out: Field[Literal["u64"]] | None = None, batches_dropped: Field[Literal["u64"]] | None = None, inbound_dropped: Field[Literal["u64"]] | None = None) -> None:
+        super().__init__(**_given({"connections": connections, "bytes_out": bytes_out, "batches_dropped": batches_dropped, "inbound_dropped": inbound_dropped}))
+
+
+class LinkStatusPort(OutPort[LinkStatus]):
+    @property
+    def connections(self) -> Field[Literal["u32"]]:
+        return self.field("connections")
+
+    @property
+    def bytes_out(self) -> Field[Literal["u64"]]:
+        return self.field("bytes_out")
+
+    @property
+    def batches_dropped(self) -> Field[Literal["u64"]]:
+        return self.field("batches_dropped")
+
+    @property
+    def inbound_dropped(self) -> Field[Literal["u64"]]:
+        return self.field("inbound_dropped")
+
+
+LinkStatus._port = LinkStatusPort
 
 
 class LogEvent(Record):
@@ -62,6 +157,47 @@ class ResourceStatus(Record):
     _name = "io_status"
     _kind = "frame"
     _pack = PACK
+    _fields = {"resource": "u8[64]", "submitted": "u64", "completed": "u64", "failed": "u64", "bytes_in": "u64", "bytes_out": "u64", "dropped": "u64", "rejected": "u64"}
+
+    def __init__(self, *, resource: Field[Literal["u8[64]"]] | None = None, submitted: Field[Literal["u64"]] | None = None, completed: Field[Literal["u64"]] | None = None, failed: Field[Literal["u64"]] | None = None, bytes_in: Field[Literal["u64"]] | None = None, bytes_out: Field[Literal["u64"]] | None = None, dropped: Field[Literal["u64"]] | None = None, rejected: Field[Literal["u64"]] | None = None) -> None:
+        super().__init__(**_given({"resource": resource, "submitted": submitted, "completed": completed, "failed": failed, "bytes_in": bytes_in, "bytes_out": bytes_out, "dropped": dropped, "rejected": rejected}))
+
+
+class ResourceStatusPort(OutPort[ResourceStatus]):
+    @property
+    def resource(self) -> Field[Literal["u8[64]"]]:
+        return self.field("resource")
+
+    @property
+    def submitted(self) -> Field[Literal["u64"]]:
+        return self.field("submitted")
+
+    @property
+    def completed(self) -> Field[Literal["u64"]]:
+        return self.field("completed")
+
+    @property
+    def failed(self) -> Field[Literal["u64"]]:
+        return self.field("failed")
+
+    @property
+    def bytes_in(self) -> Field[Literal["u64"]]:
+        return self.field("bytes_in")
+
+    @property
+    def bytes_out(self) -> Field[Literal["u64"]]:
+        return self.field("bytes_out")
+
+    @property
+    def dropped(self) -> Field[Literal["u64"]]:
+        return self.field("dropped")
+
+    @property
+    def rejected(self) -> Field[Literal["u64"]]:
+        return self.field("rejected")
+
+
+ResourceStatus._port = ResourceStatusPort
 
 
 class SequenceCommand(Record):
@@ -80,6 +216,23 @@ class SystemStatus(Record):
     _name = "status"
     _kind = "frame"
     _pack = PACK
+    _fields = {"exec_time_ns": "u64", "exec_offset_ns": "u64"}
+
+    def __init__(self, *, exec_time_ns: Field[Literal["u64"]] | None = None, exec_offset_ns: Field[Literal["u64"]] | None = None) -> None:
+        super().__init__(**_given({"exec_time_ns": exec_time_ns, "exec_offset_ns": exec_offset_ns}))
+
+
+class SystemStatusPort(OutPort[SystemStatus]):
+    @property
+    def exec_time_ns(self) -> Field[Literal["u64"]]:
+        return self.field("exec_time_ns")
+
+    @property
+    def exec_offset_ns(self) -> Field[Literal["u64"]]:
+        return self.field("exec_offset_ns")
+
+
+SystemStatus._port = SystemStatusPort
 
 
 FRAMEWORK_PORTS: dict[str, type[Record]] = {"log": LogEvent, "status": SystemStatus}
@@ -113,6 +266,14 @@ class Db(System):
     _ty = "db"
     _takes_inputs = True
     _ports = {"db_status": DbStatus, "log": LogEvent, "status": SystemStatus}
+
+
+class Mux(System):
+    _pack = PACK
+    _ty = "mux"
+    _takes_inputs = True
+    _takes_outputs = True
+    _ports = {"log": LogEvent, "status": SystemStatus}
 
 
 class ChannelRegistry(System):

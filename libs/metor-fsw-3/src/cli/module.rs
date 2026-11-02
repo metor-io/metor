@@ -13,18 +13,23 @@ use serde_json::Value;
 use metor_proto_wkt::{LogEvent, SequenceCommand};
 
 use super::pack_dev::PackDevError;
+use super::port_class::Accessors;
 use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelMessage, ChannelStatus};
 use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
+use crate::def::DefCx;
 use crate::dl::{PackKind, PackRef};
 use crate::fn_system::LOG_PORT;
+use crate::frame_fields::FieldTable;
 use crate::io::{Cqe, IO_CQ, IO_SQ, ResourceStatus, Sqe};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::{PackDef, PackSystemDef};
+use crate::port::Output;
 use crate::record::{Record, RecordSchema};
 use crate::system::PortDef;
 
 const TEMPLATE: &str = include_str!("module.py.jinja");
 const BUILTINS_TEMPLATE: &str = include_str!("builtins.py.jinja");
+const RECORD_TEMPLATE: &str = include_str!("record.py.jinja");
 
 /// The prefix of every built-in system type.
 const BUILTIN_PACK: &str = "fsw";
@@ -84,23 +89,56 @@ struct Module {
 /// A record class in the generated module.
 ///
 /// `name` is the record's name on the host, `class` is the Python class name,
-/// and `kind` is `"frame"` or `"msg"`.
+/// and `kind` is `"frame"` or `"msg"`. A frame also carries its leaves'
+/// `(path, signature)` pairs in vtable order.
 #[derive(Clone, Serialize)]
 struct RecordClass {
     name: String,
     class: String,
     kind: &'static str,
+    fields: Vec<(String, String)>,
+    /// A frame's `__init__` keywords and port classes.
+    accessors: Accessors,
+    /// The frame's port class name.
+    port: String,
 }
 
 impl RecordClass {
     /// The class for record `R`, named after its Rust type.
     fn of<R: Record>() -> Self {
+        let def = Output::<R>::def(&DefCx::empty(), R::NAME);
+        Self::from_def(&def, type_name::<R>().to_string())
+    }
+
+    /// The class for the record `def` carries, with schema rooted at `def.name`.
+    fn from_def(def: &PortDef, class: String) -> Self {
+        let frame = is_frame(def);
+        let fields = if frame {
+            leaf_signatures(def)
+        } else {
+            Vec::new()
+        };
         Self {
-            name: R::NAME.to_string(),
-            class: type_name::<R>().to_string(),
-            kind: kind(matches!(R::schema(), RecordSchema::Frame { .. })),
+            name: def.record.to_string(),
+            accessors: Accessors::of(&class, &fields),
+            port: annotation(&class, true),
+            class,
+            kind: kind(frame),
+            fields,
         }
     }
+}
+
+/// Each leaf's path and signature. A frame no `FieldTable` reads has none.
+fn leaf_signatures(def: &PortDef) -> Vec<(String, String)> {
+    let Ok(table) = FieldTable::of(def) else {
+        return Vec::new();
+    };
+    table
+        .leaves
+        .iter()
+        .map(|leaf| (leaf.path.clone(), FieldTable::signature(leaf)))
+        .collect()
 }
 
 /// The data the built-in module's template renders.
@@ -174,15 +212,40 @@ struct Entry {
 struct Port {
     name: String,
     record: String,
+    /// The type of the port on a handle: the frame's port class, or
+    /// `OutPort[...]` for a message.
+    annotation: String,
 }
 
 impl Port {
     fn of((name, record): (&str, RecordClass)) -> Self {
         Self {
             name: name.to_string(),
+            annotation: annotation(&record.class, record.kind == "frame"),
             record: record.class,
         }
     }
+
+    fn from_def(port: &PortDef) -> Self {
+        let record = class_of(&port.record);
+        Self {
+            name: port.name.to_string(),
+            annotation: annotation(&record, is_frame(port)),
+            record,
+        }
+    }
+}
+
+fn annotation(class: &str, frame: bool) -> String {
+    if frame {
+        format!("{class}Port")
+    } else {
+        format!("OutPort[{class}]")
+    }
+}
+
+fn is_frame(port: &PortDef) -> bool {
+    matches!(port.schema, RecordSchema::Frame { .. })
 }
 
 /// Renders `metor_config/_generated.py` from the built-in systems in `table`.
@@ -190,6 +253,7 @@ pub fn render_builtins(table: &SystemTable) -> Result<String, PackDevError> {
     let def = PackDef::from_table(table);
     let mut env = minijinja::Environment::new();
     env.add_filter("python_string", python_string);
+    env.add_template("record", RECORD_TEMPLATE)?;
     env.add_template("builtins", BUILTINS_TEMPLATE)?;
     Ok(env.get_template("builtins")?.render(builtin_view(&def))?)
 }
@@ -237,6 +301,7 @@ pub fn render(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<String,
     let mut env = minijinja::Environment::new();
     env.add_filter("python_string", python_string);
     env.add_filter("docstring", docstring);
+    env.add_template("record", RECORD_TEMPLATE)?;
     env.add_template("module", TEMPLATE)?;
     Ok(env.get_template("module")?.render(module)?)
 }
@@ -282,11 +347,7 @@ fn records(def: &PackDef) -> Vec<RecordClass> {
         .collect();
     for port in def.systems.iter().flat_map(ports) {
         if !records.iter().any(|record| record.name == port.record) {
-            records.push(RecordClass {
-                name: port.record.to_string(),
-                class: class_of(&port.record),
-                kind: kind(matches!(port.schema, RecordSchema::Frame { .. })),
-            });
+            records.push(RecordClass::from_def(port, class_of(&port.record)));
         }
     }
     records.sort_unstable_by(|a, b| a.class.cmp(&b.class));
@@ -346,13 +407,9 @@ fn class_of(record: &str) -> String {
 /// Every output port of `system` with its record class. The framework's
 /// ports come last.
 fn output_ports(system: &PackSystemDef) -> Vec<Port> {
-    let port = |port: &PortDef| Port {
-        name: port.name.to_string(),
-        record: class_of(&port.record),
-    };
     let declared = exposed_outputs(system).filter(|p| !is_framework(&p.name));
     let framework = framework_ports().into_iter().map(Port::of);
-    declared.map(port).chain(framework).collect()
+    declared.map(Port::from_def).chain(framework).collect()
 }
 
 /// The last path segment of `T`'s name.
@@ -448,10 +505,6 @@ fn entry(
             name: name.clone(),
         });
     }
-    let port = |port: &PortDef| Port {
-        name: port.name.to_string(),
-        record: class_of(&port.record),
-    };
     Ok(Entry {
         name: pascal(&system.ty),
         ty: system.ty.to_string(),
@@ -459,7 +512,7 @@ fn entry(
         args_doc: args_doc(&params),
         takes_inputs: system.takes_inputs,
         takes_outputs: system.takes_outputs,
-        inputs: wired_inputs(system).map(port).collect(),
+        inputs: wired_inputs(system).map(Port::from_def).collect(),
         params,
         caps,
         ports: output_ports(system),
@@ -789,7 +842,7 @@ mod tests {
             "no params, no docstring: {text}"
         );
         assert!(text.contains("_ports = {\"log\": LogEvent, \"status\": SystemStatus}"));
-        assert!(text.contains("    log: OutPort[LogEvent]\n    status: OutPort[SystemStatus]\n"));
+        assert!(text.contains("    log: OutPort[LogEvent]\n    status: SystemStatusPort\n"));
     }
 
     #[test]

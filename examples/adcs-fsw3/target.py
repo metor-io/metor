@@ -1,19 +1,34 @@
 """Runs the plant, the flight software, and a gateway as three targets.
 
-`plant` simulates the spacecraft, `fsw` runs nav, ctrl, and the `commission`
-sequence on its measurements, and the gateway's db records both. `commission`
-runs as a wasm module and takes its commands through the gateway.
+`plant` simulates the spacecraft, `fsw` runs nav, ctrl, sensor health, and
+the `commission` sequence on its measurements, and the gateway's db records
+both. `commission` runs as a wasm module and takes its commands through the
+gateway.
 `METOR_DEPLOY_PORTS` sets the three listen ports so tests can pick free ones.
 """
 import math
 import os
 
 import adcs_seqs
-from adcs_pack import Ctrl, MtqCmd, Nav, Plant, TorqueCmd
+from adcs_pack import (
+    Beacon,
+    Body,
+    Ctrl,
+    Health,
+    Housekeeping,
+    Magnetometer,
+    MtqCmd,
+    Nav,
+    Plant,
+    SunSensors,
+    TorqueCmd,
+)
 from adcs_seqs import Commission
 from metor_config import (
+    ChannelRegistry,
     Deployment,
     Listen,
+    Mux,
     Peer,
     Publish,
     SequenceCommand,
@@ -91,6 +106,48 @@ ctrl = fsw.add(
         k_detumble=0.00005,
     ),
 )
+# The body state as the flight software knows it: nav's attitude and the GPS
+# fix, emitted with each estimate while the fix is under half a second old.
+gps = mirror.port(sim.gps)
+est_body = fsw.add(
+    "est_body",
+    Mux(
+        body=Body(
+            q_b_eci=nav.attitude_estimate.q_hat_b_eci,
+            omega_b=nav.attitude_estimate.omega_b,
+            pos_eci=gps.pos_eci,
+            vel_eci=gps.vel_eci,
+        ),
+        on=nav.attitude_estimate,
+        max_age=0.5,
+    ),
+)
+# One frame per sensor, each emitted with the sample it came from.
+sensors = mirror.port(sim.sensors)
+split = fsw.add(
+    "sensor_split",
+    Mux(
+        css=SunSensors(css=sensors.css),
+        mag=Magnetometer(mag_b=sensors.mag_b),
+    ),
+)
+fsw.add("health", Health(css=split.css, mag=split.mag, gps=gps))
+# Housekeeping every cycle, holding each source's newest value.
+hk = fsw.add(
+    "hk",
+    Mux(
+        hk=Housekeeping(
+            omega_b=nav.attitude_estimate.omega_b,
+            b_hat_b=nav.attitude_estimate.b_hat_b,
+            torque_b=ctrl.torque_cmd.torque_b,
+            dipole_b=ctrl.mtq_cmd.dipole_b,
+        ),
+        on="cycle",
+    ),
+)
+fsw.add("beacon", Beacon(hk=hk.hk, period_s=10.0))
+# Tells the panel which channels the target has.
+fsw.add("channels", ChannelRegistry())
 fsw_pub = fsw.add("pub", Publish(transport=Listen(f"[::]:{p_fsw}"), all=True))
 
 # The plant applies the controller's commands one cycle late.

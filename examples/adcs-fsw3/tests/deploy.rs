@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use metor_proto::types::Msg;
+use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_stellar::Client;
-use metor_proto_wkt::{DumpMetadata, GetDbInfo, SequenceCommand};
+use metor_proto_wkt::{DumpMetadata, GetDbInfo, GetTimeSeries, SequenceCommand};
 
 /// How long the test waits for the deployment.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -108,8 +108,8 @@ async fn connect(addr: SocketAddr) -> Client {
     }
 }
 
-/// The gateway records the plant's gyro and the flight software's estimate,
-/// each under its own target's namespace.
+/// The gateway records the plant's gyro, the flight software's estimate, and
+/// the frames its muxes build, each under its own target's namespace.
 #[stellarator::test]
 async fn test_gateway_records_both_members() {
     let ports = free_ports();
@@ -119,6 +119,11 @@ async fn test_gateway_records_both_members() {
     let wanted = [
         "plant.plant.sensors.gyro_b",
         "fsw.nav.attitude_estimate.omega_b",
+        "fsw.est_body.body.q_b_eci",
+        "fsw.sensor_split.css.css.0",
+        "fsw.sensor_split.mag.mag_b",
+        "fsw.hk.hk.omega_b",
+        "fsw.hk.hk.dipole_b",
     ];
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -145,4 +150,45 @@ async fn test_gateway_advertises_sequence_command() {
     let mut client = connect(SocketAddr::from(([127, 0, 0, 1], ports[2]))).await;
     let info = client.request(&GetDbInfo).await.expect("the db answers");
     assert_eq!(info.command_ids, vec![<SequenceCommand as Msg>::ID]);
+}
+
+/// Rows of the per-cycle housekeeping mux and of the sensor split reach the
+/// gateway's db, with the split's field values copied from the plant.
+#[stellarator::test]
+async fn test_gateway_receives_mux_rows() {
+    let ports = free_ports();
+    let _running = run(&ports);
+    let mut client = connect(SocketAddr::from(([127, 0, 0, 1], ports[2]))).await;
+    let omega = first_sample(&mut client, "fsw.hk.hk.omega_b").await;
+    assert_eq!(omega.len(), 3 * 8, "three f64");
+    let mag = first_sample(&mut client, "fsw.sensor_split.mag.mag_b").await;
+    let b: Vec<f64> = mag
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|v| f64::from_le_bytes(*v))
+        .collect();
+    let norm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!((15e-6..70e-6).contains(&norm), "|B| {norm} T at 400 km");
+}
+
+/// Polls the db until `component` has a sample, and returns the oldest one.
+async fn first_sample(client: &mut Client, component: &str) -> Vec<u8> {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let query = GetTimeSeries {
+            id: [0, 0],
+            range: Timestamp(i64::MIN)..Timestamp(i64::MAX),
+            component_id: ComponentId::new(component),
+            limit: Some(1),
+        };
+        if let Ok(series) = client.request(&query).await
+            && let Ok(data) = series.data()
+            && !data.is_empty()
+        {
+            return data.to_vec();
+        }
+        assert!(Instant::now() < deadline, "no `{component}` sample");
+        stellarator::sleep(Duration::from_millis(50)).await;
+    }
 }

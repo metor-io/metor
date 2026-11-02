@@ -1146,3 +1146,89 @@ fn test_def_records_its_queue_ports() {
     assert_eq!(def.outputs[io.sq].name, crate::io::IO_SQ);
     assert_eq!(def_of(counting()).io, None, "no Cap, no queue pair");
 }
+
+mod bound {
+    use super::*;
+    use crate::coordinator::{InputConfig, MakeError, ParamError};
+    use crate::fn_system::Bound;
+    use crate::port::DynInputs;
+    use crate::tests::utils::{Recorder, table};
+
+    /// What a `WithDef` ctor saw of its instance.
+    #[derive(Default)]
+    struct Seen {
+        inputs: Vec<(String, Option<u64>)>,
+        knows_imu: bool,
+    }
+
+    /// Reads any inputs its config lists.
+    #[crate::system]
+    fn dyn_sink(inputs: &mut DynInputs) {
+        let _ = inputs;
+    }
+
+    fn record(seen: &Rc<RefCell<Seen>>, bound: &Bound<'_>) {
+        let inputs = bound.def.inputs.iter();
+        seen.borrow_mut().inputs = inputs.map(|p| (p.name.to_string(), p.layout)).collect();
+        seen.borrow_mut().knows_imu = bound.records.get(Imu::NAME).is_some();
+    }
+
+    fn recording_table(seen: &Rc<RefCell<Seen>>) -> SystemTable {
+        let mut table = table(&Recorder::default());
+        let a = seen.clone();
+        let dyn_ctor = move |_: NoParams, bound: &Bound<'_>| -> Result<(), MakeError> {
+            record(&a, bound);
+            Ok(())
+        };
+        let refuse = |_: NoParams, _: &Bound<'_>| -> Result<(), MakeError> {
+            Err(ParamError::Decode("refused".into()).into())
+        };
+        table
+            .register("dyn_sink", dyn_sink(), dyn_ctor)
+            .expect("registers");
+        table
+            .register("refuse", dyn_sink(), refuse)
+            .expect("registers");
+        table
+    }
+
+    fn config(ty: &str, inputs: Vec<InputConfig>) -> CoordinatorConfig {
+        CoordinatorConfig {
+            systems: vec![
+                SystemConfig::new("imu", "imu"),
+                SystemConfig {
+                    inputs,
+                    ..SystemConfig::new("sink", ty)
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_with_def_sees_config_ports() {
+        let seen = Rc::new(RefCell::new(Seen::default()));
+        let inputs = vec![InputConfig::new("imu.imu", "imu", "imu")];
+        config("dyn_sink", inputs)
+            .build(&recording_table(&seen))
+            .expect("builds");
+        let seen = seen.borrow();
+        assert_eq!(seen.inputs, [("imu.imu".to_string(), Imu::layout())]);
+        assert!(seen.knows_imu);
+    }
+
+    #[test]
+    fn test_with_def_error_fails_build() {
+        let seen = Rc::new(RefCell::new(Seen::default()));
+        let err = config("refuse", Vec::new())
+            .build(&recording_table(&seen))
+            .err();
+        assert_eq!(
+            err,
+            Some(BuildError::Make {
+                id: "sink".into(),
+                source: ParamError::Decode("refused".into()).into(),
+            })
+        );
+    }
+}

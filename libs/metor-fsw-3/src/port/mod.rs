@@ -348,6 +348,11 @@ impl<W: InputWake> DynInputs<W> {
         self.ports.iter_mut().map(|(def, input)| (&*def, input))
     }
 
+    /// Returns port `index`'s definition and input.
+    pub fn get_mut(&mut self, index: usize) -> Option<(&PortDef, &mut Input<Bytes, W>)> {
+        self.ports.get_mut(index).map(|(def, input)| (&*def, input))
+    }
+
     /// Returns each port's index, definition, and input, from port `start`
     /// to the last and then from the first.
     #[cfg(feature = "host")]
@@ -410,6 +415,13 @@ impl<W: WakeSource> DynOutputs<W> {
     /// Returns each port's definition alongside its output.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, output)| (&*def, output))
+    }
+
+    /// Returns port `index`'s definition and output.
+    pub fn get_mut(&mut self, index: usize) -> Option<(&PortDef, &mut Output<Bytes, W>)> {
+        self.ports
+            .get_mut(index)
+            .map(|(def, output)| (&*def, output))
     }
 }
 

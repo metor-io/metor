@@ -72,6 +72,35 @@ pub fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
     });
 }
 
+/// A stamped frame with a scalar and a shaped leaf.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[frame(name = "pair")]
+#[repr(C)]
+pub struct Pair {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub a: f64,
+    pub b: metor_fsw_3::FrameArray<f64, 3>,
+}
+
+/// Publishes a `Pair` every cycle, and an `Imu` every fifth millisecond.
+#[system]
+pub fn pair_source(now: Timestamp, pair: &mut Output<Pair>, imu: &mut Output<Imu>) {
+    let t = now.0 as f64;
+    let b = metor_fsw_3::FrameArray([t, t + 1.0, t + 2.0]);
+    let _ = pair.write(&Pair {
+        timestamp: now,
+        a: t,
+        b,
+    });
+    if now.0 % 5000 == 0 {
+        let _ = imu.write(&Imu {
+            timestamp: now,
+            sample: -t,
+        });
+    }
+}
+
 /// A camera's 1024² 12-bit image.
 pub type Pixels = FrameImage<Mono16<12>, 1024, 1024>;
 
