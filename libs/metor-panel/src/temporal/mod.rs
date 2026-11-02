@@ -10,13 +10,19 @@ pub use display::TimeDisplay;
 use gpui::{App, AppContext, Context, Entity, Global};
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
-pub use model::{Anchor, TimeContext, TimeExpr, TimeRangeSpec};
+pub use model::{Anchor, DEFAULT_SESSION_LOOKBACK, TimeContext, TimeExpr, TimeRangeSpec};
 use serde::{Deserialize, Serialize};
 use std::{
     ops::Range,
     sync::Arc,
     time::{Duration, Instant},
 };
+
+/// The [`TemporalConfig::version`] this build writes. Version 1 layouts
+/// predate [`Anchor::Session`], and their full range was almost always the
+/// old default rather than a choice, so restoring one moves it to the new
+/// default.
+const TEMPORAL_VERSION: u32 = 2;
 
 /// Persisted temporal intent; playback always restores paused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,9 +43,9 @@ pub struct TemporalConfig {
 impl Default for TemporalConfig {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: TEMPORAL_VERSION,
             view: TimeExpr::LIVE,
-            range: TimeRangeSpec::FULL,
+            range: TimeRangeSpec::SESSION,
             timezone: "UTC".into(),
             display: TimeDisplay::Timestamp,
             t0: None,
@@ -122,7 +128,7 @@ impl TemporalController {
                     context: TimeContext {
                         live: Some(now),
                         view: Some(now),
-                        extent: None,
+                        ..TimeContext::default()
                     },
                     range: None,
                     live: true,
@@ -189,6 +195,7 @@ impl TemporalController {
                     this.bounds_busy = false;
                     if this.config.scope_prefix == prefix {
                         this.components = components;
+                        this.capture_session(extent.as_ref());
                         this.snapshot.context.extent = extent;
                     } else {
                         this.last_bounds = Instant::now() - Duration::from_secs(1);
@@ -374,6 +381,7 @@ impl TemporalController {
             TimeAction::Scope(prefix) => {
                 self.config.scope_prefix = prefix;
                 self.snapshot.context.extent = None;
+                self.snapshot.context.session = None;
                 self.pause_if_playing();
                 self.last_bounds = Instant::now() - Duration::from_secs(1);
             }
@@ -398,6 +406,27 @@ impl TemporalController {
         self.tick(Instant::now(), cx);
         Ok(())
     }
+    /// Latches where this session's data began from the first non-empty
+    /// extent. A mirror can see the peer's sealed history before its first
+    /// live sample, and a seal can be long ago, so the db's head (which the
+    /// peer's handshake raises to its own) bounds it from below.
+    fn capture_session(&mut self, extent: Option<&Range<Timestamp>>) {
+        if self.snapshot.context.session.is_some() {
+            return;
+        }
+        let Some(extent) = extent else {
+            return;
+        };
+        let head = self.db.last_updated.latest();
+        self.snapshot.context.session = Some(extent.end.max(head));
+    }
+
+    /// How far before the data end the default range reaches at least.
+    pub fn set_session_lookback(&mut self, lookback: Duration, cx: &mut Context<Self>) {
+        self.snapshot.context.lookback = lookback.as_micros().min(i64::MAX as u128) as i64;
+        self.tick(Instant::now(), cx);
+    }
+
     fn pause_if_playing(&mut self) {
         if self.playback.take().is_some()
             && let Some(t) = self.snapshot.context.view
@@ -448,7 +477,13 @@ impl TemporalController {
         self.playback = None;
         self.resume_live = false;
         self.config = config;
-        if self.config.version != 1 || self.config.view.anchor == Anchor::View {
+        if self.config.version == 1 {
+            self.config.version = TEMPORAL_VERSION;
+            if self.config.range == TimeRangeSpec::FULL {
+                self.config.range = TimeRangeSpec::SESSION;
+            }
+        }
+        if self.config.version != TEMPORAL_VERSION || self.config.view.anchor == Anchor::View {
             self.config = TemporalConfig::default();
         }
         if !self.config.rate.is_finite() || self.config.rate <= 0.0 || self.config.rate > 100.0 {
@@ -544,7 +579,7 @@ pub(crate) fn save_layout(cx: &App) -> metor_proto_wkt::TemporalLayout {
         .map(|c| c.read(cx).saved())
         .unwrap_or_default();
     metor_proto_wkt::TemporalLayout {
-        version: 1,
+        version: c.version,
         view_time: c.view.to_string(),
         range_start: c.range.start.to_string(),
         range_end: c.range.end.to_string(),
@@ -561,7 +596,7 @@ pub(crate) fn save_layout(cx: &App) -> metor_proto_wkt::TemporalLayout {
 
 pub(crate) fn restore_layout(saved: &metor_proto_wkt::TemporalLayout, cx: &mut App) {
     let parse = || -> Result<TemporalConfig, String> {
-        if saved.version != 1 {
+        if !(1..=TEMPORAL_VERSION).contains(&saved.version) {
             return Err("Unsupported temporal version".into());
         }
         let context =

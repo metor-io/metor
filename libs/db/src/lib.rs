@@ -2040,6 +2040,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 command_ids,
                 namespace,
                 commands,
+                last_updated: Some(db.last_updated.latest()).filter(|t| t.0 != i64::MIN),
             })
             .await?;
         }
@@ -3369,6 +3370,7 @@ mod msg_sync_tests {
         assert_eq!(info.command_ids, vec![CMD]);
         assert_eq!(info.namespace.as_deref(), Some("sat"));
         assert!(info.commands.is_empty(), "nothing described the command");
+        assert_eq!(info.last_updated, None, "an empty db has no head");
     }
 
     fn msg_command(id: PacketId, name: &str) -> CommandInfo {

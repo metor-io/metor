@@ -1245,6 +1245,7 @@ pub struct PanelApp {
     default_theme: Option<SharedString>,
     splash_logo: Option<crate::connections::logo::SplashLogoBuilder>,
     eviction: crate::eviction::Eviction,
+    session_lookback: std::time::Duration,
 }
 
 impl PanelApp {
@@ -1279,6 +1280,9 @@ impl PanelApp {
             default_theme: None,
             splash_logo: None,
             eviction: crate::eviction::Eviction::default(),
+            session_lookback: std::time::Duration::from_micros(
+                crate::temporal::DEFAULT_SESSION_LOOKBACK as u64,
+            ),
         }
     }
 
@@ -1494,6 +1498,16 @@ impl PanelApp {
         self
     }
 
+    /// How much recent data the default time range shows at least. It
+    /// covers everything since the session started, reaching back at least
+    /// this far before the newest sample, so a session that just connected
+    /// (or a recording with no live data) opens on its latest stretch
+    /// rather than an empty range. One hour by default.
+    pub fn session_lookback(mut self, lookback: std::time::Duration) -> Self {
+        self.session_lookback = lookback;
+        self
+    }
+
     /// Show `logo` on the startup screen in place of the metor logo. It is
     /// built again every frame, like any element, and fills the top of the
     /// screen's sidebar.
@@ -1623,6 +1637,7 @@ impl PanelApp {
             default_theme: _,
             splash_logo: _,
             eviction,
+            session_lookback,
         } = self;
 
         let db = db.expect("session selected before DB services start");
@@ -1648,7 +1663,8 @@ impl PanelApp {
             .leader
             .clone();
         edits::init(cx);
-        crate::temporal::TemporalController::init(db.clone(), cx);
+        crate::temporal::TemporalController::init(db.clone(), cx)
+            .update(cx, |c, cx| c.set_session_lookback(session_lookback, cx));
         ItemRegistry::init(cx);
         let temporary = session.as_ref().is_some_and(|s| s.is_temporary());
         crate::session::init(session, db.clone(), open_handler, cx);

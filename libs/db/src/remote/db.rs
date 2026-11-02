@@ -155,6 +155,11 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> 
     // peer through the forwarder below.
     db.add_command_ids(&info.command_ids);
     db.add_commands(&info.commands);
+    // Before the first live sample, the peer's head is the only sign of
+    // where its data ends; seeded manifests stop at its last seal.
+    if let Some(head) = info.last_updated {
+        db.last_updated.update_max(head);
+    }
     emit(MirrorEvent::Connected);
 
     let metadata: DumpMetadataResp = handshake_request(client.request(&DumpMetadata)).await?;

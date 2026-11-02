@@ -855,6 +855,7 @@ fn complete(
     let before = &query[..cursor];
     let presets: &[&str] = match target {
         Target::Range => &[
+            "since session start",
             "full range",
             "last 5m",
             "last 15m",
@@ -950,6 +951,7 @@ fn complete(
         for anchor in [
             "data start",
             "data end",
+            "session start",
             "live",
             "view time",
             "T0",
