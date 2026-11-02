@@ -18,6 +18,8 @@ pub(crate) struct SessionStartup {
     path: Option<PathBuf>,
     pub(crate) error: Option<SharedString>,
     opening: Option<Opening>,
+    /// The peer being asked who it is before its session DB is chosen.
+    probing: Option<std::net::SocketAddr>,
 }
 
 type OpenResult = std::io::Result<(
@@ -78,6 +80,7 @@ pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
             path: None,
             error: None,
             opening: None,
+            probing: None,
         });
         let picker = cx.new(|cx| {
             crate::connections::ConnectionPicker::for_startup(store, startup.clone(), cx)
@@ -111,13 +114,43 @@ impl SessionStartup {
         if self.app.is_none() || self.busy() {
             return;
         }
-        let result = match self.path.clone() {
-            Some(path) => SessionStorage::record_to(path),
-            None => SessionStorage::create(),
+        let result = match (self.path.clone(), target.peer) {
+            (Some(path), _) => SessionStorage::record_to(path),
+            (None, Some(addr)) => {
+                // Which DB depends on who answers, so ask first, off the UI
+                // thread; the screen shows the wait as busy.
+                let config = self.app.as_ref().unwrap().storage_config().clone();
+                let selected = super::select_for_peer(addr, config);
+                self.probing = Some(addr);
+                self.error = None;
+                cx.spawn_in(window, async move |this, cx| {
+                    let selected = selected.await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.probing = None;
+                        this.begin(selected, target, window, cx);
+                    });
+                })
+                .detach();
+                cx.notify();
+                return;
+            }
+            (None, None) => SessionStorage::create(),
         };
+        self.begin(result, target, window, cx);
+    }
+
+    /// Start the session on the storage `connect` chose, or show why there
+    /// is none.
+    fn begin(
+        &mut self,
+        result: super::peer::Selected,
+        target: crate::connections::ConnectionTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok((storage, db)) => {
-                if !storage.is_temporary() {
+                if storage.is_recording() {
                     let parent = storage
                         .directory
                         .path()
@@ -147,7 +180,7 @@ impl SessionStartup {
     }
 
     pub(crate) fn choose_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selecting || self.opening.is_some() {
+        if self.busy() {
             return;
         }
         self.selecting = true;
@@ -172,7 +205,7 @@ impl SessionStartup {
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.opening.is_some() || self.app.is_none() {
+        if self.busy() || self.app.is_none() {
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -233,7 +266,7 @@ impl SessionStartup {
     }
 
     pub(crate) fn record_to(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selecting || self.opening.is_some() || self.app.is_none() {
+        if self.busy() || self.app.is_none() {
             return;
         }
         self.selecting = true;
@@ -282,7 +315,7 @@ impl SessionStartup {
 
 impl SessionStartup {
     pub(crate) fn busy(&self) -> bool {
-        self.selecting || self.opening.is_some()
+        self.selecting || self.opening.is_some() || self.probing.is_some()
     }
 
     pub(crate) fn temporary(&mut self, cx: &mut Context<Self>) {
@@ -308,6 +341,8 @@ impl SessionStartup {
     pub(crate) fn summary(&self) -> Option<SharedString> {
         if self.opening.is_some() {
             Some("Opening recording… Press Escape to cancel.".into())
+        } else if let Some(addr) = self.probing {
+            Some(format!("Connecting to {addr}…").into())
         } else if self.selecting {
             None
         } else {
@@ -339,6 +374,7 @@ mod tests {
             path: None,
             error: None,
             opening: None,
+            probing: None,
         });
         cx.update(|window, cx| picker.update(cx, |picker, cx| picker.record_to(window, cx)));
         assert!(cx.did_prompt_for_new_path());
@@ -384,6 +420,7 @@ mod tests {
             path: None,
             error: None,
             opening: None,
+            probing: None,
         });
         visual.update(|window, cx| startup.update(cx, |startup, cx| startup.record_to(window, cx)));
         visual.simulate_new_path_selection(|_| Some(path.clone()));
@@ -437,6 +474,7 @@ mod tests {
             path: Some(path.clone()),
             error: None,
             opening: None,
+            probing: None,
         });
         visual.update(|window, cx| {
             startup.update(cx, |startup, cx| startup.connect(target, window, cx))
