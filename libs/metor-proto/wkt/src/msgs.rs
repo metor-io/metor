@@ -1016,7 +1016,7 @@ pub struct LogEvent {
 /// telemetry, so probing with anything else pollutes the remote DB.
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
-pub const NODE_PROTOCOL_VERSION: u32 = 5;
+pub const NODE_PROTOCOL_VERSION: u32 = 6;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
@@ -1059,12 +1059,12 @@ pub struct DbInfoResp {
     pub last_updated: Option<Timestamp>,
     /// Which database answered, stable across the server's restarts. A
     /// mirror keys its on-disk cache of this peer by it. `None` from a
-    /// server that predates it. Added in version 5.
+    /// server that predates it. Added in version 6.
     pub instance_id: Option<InstanceId>,
     /// The server deletes its database when it stops, so its id is new
     /// every run and its history goes with it: a mirror shouldn't keep a
     /// cache it will never reopen, and shouldn't evict history only the
-    /// peer could give back once the peer is gone. Added in version 5.
+    /// peer could give back once the peer is gone. Added in version 6.
     pub ephemeral: bool,
 }
 
@@ -1141,8 +1141,8 @@ impl<'de> Deserialize<'de> for DbInfoResp {
                     namespace: fields.since(3)?,
                     commands: fields.since(4)?,
                     last_updated: fields.since(5)?,
-                    instance_id: fields.since(5)?,
-                    ephemeral: fields.since(5)?,
+                    instance_id: fields.since(6)?,
+                    ephemeral: fields.since(6)?,
                 })
             }
         }
@@ -2154,6 +2154,33 @@ mod db_info_tests {
                 ephemeral: false,
             }
         );
+    }
+
+    /// A version-5 server's reply ends at `last_updated`; the identity
+    /// fields came in version 6.
+    #[test]
+    fn db_info_v5_bytes_decode_as_current() {
+        #[derive(Serialize)]
+        struct DbInfoRespV5 {
+            protocol_version: u32,
+            features: u64,
+            command_ids: Vec<PacketId>,
+            namespace: Option<String>,
+            commands: Vec<CommandInfo>,
+            last_updated: Option<Timestamp>,
+        }
+        let bytes = postcard::to_allocvec(&DbInfoRespV5 {
+            protocol_version: 5,
+            features: FEATURE_MSG_SYNC,
+            command_ids: Vec::new(),
+            namespace: None,
+            commands: Vec::new(),
+            last_updated: Some(Timestamp(42)),
+        })
+        .expect("encode");
+        let info = postcard::from_bytes::<DbInfoResp>(&bytes).expect("decode v5");
+        assert_eq!(info.last_updated, Some(Timestamp(42)));
+        assert!(info.instance_id.is_none() && !info.ephemeral);
     }
 
     #[test]
