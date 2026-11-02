@@ -59,6 +59,7 @@ pub mod lod;
 pub mod manifest;
 pub mod msg_log;
 pub mod remote;
+pub mod scratch;
 pub mod seal;
 pub mod store;
 pub mod tiering;
