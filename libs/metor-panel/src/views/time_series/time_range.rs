@@ -96,6 +96,7 @@ impl TimeRangeBehavior {
                     extent: Some(earliest..latest),
                     live: Some(Timestamp::now()),
                     view: None,
+                    ..Default::default()
                 })
                 .unwrap_or(earliest),
         };
@@ -108,6 +109,7 @@ impl TimeRangeBehavior {
                     extent: Some(earliest..latest),
                     live: Some(Timestamp::now()),
                     view: None,
+                    ..Default::default()
                 })
                 .unwrap_or(latest),
         };

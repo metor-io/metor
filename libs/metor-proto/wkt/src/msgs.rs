@@ -1016,7 +1016,7 @@ pub struct LogEvent {
 /// telemetry, so probing with anything else pollutes the remote DB.
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
-pub const NODE_PROTOCOL_VERSION: u32 = 4;
+pub const NODE_PROTOCOL_VERSION: u32 = 5;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
@@ -1051,6 +1051,12 @@ pub struct DbInfoResp {
     /// command this server takes, messages and frames alike. Added in
     /// version 4.
     pub commands: Vec<CommandInfo>,
+    /// The newest sample time the server held when it answered, or `None`
+    /// for an empty db. A mirror learns from it where "now" is in the
+    /// peer's data before the first live sample arrives, which manifests
+    /// alone can't say: they end at the last seal, possibly long ago.
+    /// Added in version 5.
+    pub last_updated: Option<Timestamp>,
 }
 
 impl<'de> Deserialize<'de> for DbInfoResp {
@@ -1074,6 +1080,7 @@ impl<'de> Deserialize<'de> for DbInfoResp {
                     command_ids: fields.since(3)?,
                     namespace: fields.since(3)?,
                     commands: fields.since(4)?,
+                    last_updated: fields.since(5)?,
                 })
             }
         }
@@ -1083,6 +1090,7 @@ impl<'de> Deserialize<'de> for DbInfoResp {
             "command_ids",
             "namespace",
             "commands",
+            "last_updated",
         ];
         deserializer.deserialize_struct("DbInfoResp", FIELDS, Visitor)
     }
@@ -2032,6 +2040,7 @@ mod db_info_tests {
             command_ids: vec![AlarmAck::ID],
             namespace: Some("sat".into()),
             commands: Vec::new(),
+            last_updated: Some(Timestamp(42)),
         };
         let bytes = postcard::to_allocvec(&v3).expect("encode");
         let v2: DbInfoRespV2 = postcard::from_bytes(&bytes).expect("decode v3 as v2");
@@ -2074,6 +2083,7 @@ mod db_info_tests {
                 command_ids: vec![AlarmAck::ID],
                 namespace: Some("sat".into()),
                 commands: Vec::new(),
+                last_updated: None,
             }
         );
     }

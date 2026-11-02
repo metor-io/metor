@@ -11,6 +11,11 @@ pub enum Anchor {
     DataEnd,
     Live,
     View,
+    /// Where this session's data began: the data end when the session first
+    /// saw data, pulled back to at least [`TimeContext::lookback`] before the
+    /// current data end and clamped to the data start. Saved layouts keep it
+    /// symbolic, so it means "since this session started" on every launch.
+    Session,
     Timestamp(i64),
 }
 
@@ -35,6 +40,7 @@ impl TimeExpr {
             Anchor::DataEnd => context.extent.as_ref().map(|e| e.end.0),
             Anchor::Live => context.live.map(|t| t.0),
             Anchor::View => context.view.map(|t| t.0),
+            Anchor::Session => context.session_start().map(|t| t.0),
             Anchor::Timestamp(t) => Some(t),
         }
         .ok_or_else(|| "Waiting for the selected clock or data bounds".to_string())?;
@@ -53,7 +59,7 @@ pub struct TimeRangeSpec {
 
 impl Default for TimeRangeSpec {
     fn default() -> Self {
-        Self::FULL
+        Self::SESSION
     }
 }
 impl TimeRangeSpec {
@@ -61,13 +67,33 @@ impl TimeRangeSpec {
         start: TimeExpr::new(Anchor::DataStart, 0),
         end: TimeExpr::new(Anchor::DataEnd, 0),
     };
+    /// The default: everything since this session started, through live.
+    /// Unlike [`FULL`](Self::FULL), connecting to a month-old db opens on
+    /// recent data rather than a month with live data as a sliver.
+    pub const SESSION: Self = Self {
+        start: TimeExpr::new(Anchor::Session, 0),
+        end: TimeExpr::LIVE,
+    };
     pub fn resolve(self, context: &TimeContext) -> Result<Range<Timestamp>, String> {
-        let start = self.start.resolve(context)?;
+        let mut start = self.start.resolve(context)?;
         let mut end = self.end.resolve(context)?;
-        if start > end || (start == end && self != Self::FULL) {
+        // A window reaching back from the data end shows what was recorded,
+        // so "last 1h of data" on a 20 minute recording isn't mostly empty.
+        if self.start.anchor == Anchor::DataEnd
+            && let Some(extent) = &context.extent
+            && extent.start < end
+        {
+            start = start.max(extent.start);
+        }
+        // Data holding a single instant still has a range to show.
+        let instant_ok = self == Self::FULL || self.start.anchor == Anchor::Session;
+        if start > end || (start == end && !instant_ok) {
             return Err("Start must be before end".into());
         }
-        if self.end.anchor == Anchor::DataEnd && self.end.offset == 0 {
+        // Like the data end, the session range includes the newest sample.
+        let inclusive =
+            (self.end.anchor == Anchor::DataEnd && self.end.offset == 0) || self == Self::SESSION;
+        if inclusive || start == end {
             end = Timestamp(end.0.checked_add(1).ok_or("Timestamp overflow")?);
         }
         Ok(start..end)
@@ -80,12 +106,45 @@ impl TimeRangeSpec {
     }
 }
 
+/// How far before the data end [`Anchor::Session`] reaches at least, unless
+/// the application sets its own.
+pub const DEFAULT_SESSION_LOOKBACK: i64 = 3_600_000_000;
+
 /// One clock snapshot for all endpoint resolution.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimeContext {
     pub extent: Option<Range<Timestamp>>,
     pub live: Option<Timestamp>,
     pub view: Option<Timestamp>,
+    /// The data end when this session first saw data.
+    pub session: Option<Timestamp>,
+    /// Microseconds before the data end that [`Anchor::Session`] reaches at
+    /// least. Without it a session that just started would show nothing,
+    /// and a stale db would stay empty forever.
+    pub lookback: i64,
+}
+
+impl Default for TimeContext {
+    fn default() -> Self {
+        Self {
+            extent: None,
+            live: None,
+            view: None,
+            session: None,
+            lookback: DEFAULT_SESSION_LOOKBACK,
+        }
+    }
+}
+
+impl TimeContext {
+    /// `max(data start, min(session, data end - lookback))`. Before the
+    /// session has been captured, the lookback alone decides.
+    fn session_start(&self) -> Option<Timestamp> {
+        let extent = self.extent.as_ref()?;
+        let recent = extent.end.0.saturating_sub(self.lookback.max(0));
+        let start = self.session.map_or(recent, |s| s.0.min(recent));
+        Some(Timestamp(start.max(extent.start.0)))
+    }
 }
 
 /// Editing context freezes shorthand dates while Live previews continue moving.
@@ -211,6 +270,7 @@ impl fmt::Display for TimeExpr {
             Anchor::DataEnd => f.write_str("data end")?,
             Anchor::Live => f.write_str("live")?,
             Anchor::View => f.write_str("view time")?,
+            Anchor::Session => f.write_str("session start")?,
             Anchor::Timestamp(t) => f.write_str(&timestamp_text(Timestamp(t), "UTC"))?,
         }
         if self.offset != 0 {
@@ -229,6 +289,9 @@ impl fmt::Display for TimeRangeSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if *self == Self::FULL {
             return f.write_str("full range");
+        }
+        if *self == Self::SESSION {
+            return f.write_str("since session start");
         }
         if self.start.anchor == Anchor::DataStart
             && self.start.offset == 0
@@ -261,6 +324,7 @@ pub fn parse_instant(
         ("data start", Anchor::DataStart),
         ("data end", Anchor::DataEnd),
         ("view time", Anchor::View),
+        ("session start", Anchor::Session),
         ("live", Anchor::Live),
     ] {
         if let Some(rest) = lower.strip_prefix(name) {
@@ -381,6 +445,9 @@ pub fn parse_range(text: &str, context: &ParseContext) -> Result<TimeRangeSpec, 
     let lower = lower.strip_prefix("the ").unwrap_or(&lower);
     if matches!(lower, "full" | "full range") {
         return Ok(TimeRangeSpec::FULL);
+    }
+    if matches!(lower, "session" | "since session start") {
+        return Ok(TimeRangeSpec::SESSION);
     }
     let window = |anchor, start, end| TimeRangeSpec {
         start: TimeExpr::new(anchor, start),
