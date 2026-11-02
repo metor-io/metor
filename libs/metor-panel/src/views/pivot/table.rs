@@ -28,7 +28,7 @@ use super::model::{Arrangement, Frame, Grid};
 use super::source::{FrameIndex, RowPattern, Sources};
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{theme, ui_px};
@@ -37,7 +37,7 @@ use crate::views::component_browser::component_tree::{
     ComponentNode, build_full_tree, natural_cmp,
 };
 use crate::views::component_browser::strip_cell_count;
-use crate::views::gradient::{Gradient, Scale};
+use crate::views::gradient::{Gradient, Palette, Scale, Span};
 use crate::views::lazy_pool::VisibleEntityCache;
 use crate::views::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use crate::views::value_strip::{ComponentValueStrip, StripStyle};
@@ -479,7 +479,7 @@ impl PivotDelegate {
             .column_gradients
             .iter()
             .enumerate()
-            .filter(|(_, g)| **g == Some(Gradient::Auto))
+            .filter(|(_, g)| g.and_then(|g| g.span()) == Some(Span::Auto))
             .map(|(ix, _)| ix);
         let mut fields: Vec<usize> = self.sorted_field().into_iter().chain(fitted).collect();
         fields.sort_unstable();
@@ -604,64 +604,16 @@ impl PivotDelegate {
         self.relayout(cx);
     }
 
-    /// Colour a field by value, on a range fitted to the column or one
-    /// typed in; stop; or go back to what its metadata says.
-    fn gradient_rows(
-        &self,
-        field: &SharedString,
-        cx: &mut Context<Table<Self>>,
-    ) -> Vec<Box<dyn InspectorRow>> {
-        let current = self
-            .grid
-            .fields
-            .iter()
-            .position(|f| f == field)
-            .and_then(|ix| self.column_gradients.get(ix).copied().flatten());
-        let table = cx.entity();
-        let set = move |gradient: Option<Gradient>| {
-            let (table, field) = (table.clone(), field.clone());
-            move |cx: &mut App| {
-                table.update(cx, |table, cx| {
-                    table.delegate_mut().set_gradient(&field, gradient, cx);
-                })
-            }
+    /// A field's gradient as it stands, and the range an `auto` span is
+    /// fitted to right now.
+    fn coloring(&self, field: &SharedString) -> (Option<Gradient>, Option<Scale>) {
+        let Some(ix) = self.grid.fields.iter().position(|f| f == field) else {
+            return (None, None);
         };
-        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-        if current != Some(Gradient::Auto) {
-            let apply = set(Some(Gradient::Auto));
-            rows.push(Box::new(CommandRow::new(
-                "Color by value",
-                Arc::new(move |_, cx| apply(cx)),
-            )));
-        }
-        let (table, field_name) = (cx.entity(), field.clone());
-        rows.push(Box::new(DefaultActionRow::new(
-            "Color range, e.g. 0..100",
-            Arc::new(move |input, _, cx| {
-                if let Ok(Some(gradient)) = Gradient::parse(&input) {
-                    table.update(cx, |table, cx| {
-                        table
-                            .delegate_mut()
-                            .set_gradient(&field_name, Some(gradient), cx);
-                    });
-                }
-            }),
-        )));
-        if current.is_some_and(|g| g != Gradient::Off) {
-            let apply = set(Some(Gradient::Off));
-            rows.push(Box::new(CommandRow::new(
-                "Stop coloring",
-                Arc::new(move |_, cx| apply(cx)),
-            )));
-        }
-        if self.gradients.contains_key(field) {
-            let apply = set(None);
-            rows.push(Box::new(CommandRow::new(
-                "Color as its metadata says",
-                Arc::new(move |_, cx| apply(cx)),
-            )));
-        }
-        rows
+        (
+            self.column_gradients.get(ix).copied().flatten(),
+            self.watched.get(&ix).and_then(|w| w.fitted),
+        )
     }
 
     fn render_text(&self, text: SharedString, primary: bool, cx: &App) -> AnyElement {
@@ -813,9 +765,10 @@ impl TableDelegate for PivotDelegate {
             return;
         }
         let table = cx.entity();
-        let mut rows = field
-            .map(|field| self.gradient_rows(field, cx))
-            .unwrap_or_default();
+        let mut rows: Vec<Box<dyn InspectorRow>> = field
+            .map(|field| Box::new(coloring_row(cx.entity(), field.clone())) as _)
+            .into_iter()
+            .collect();
         rows.extend(field_menu_rows(
             &self.grid,
             field,
@@ -833,6 +786,119 @@ impl TableDelegate for PivotDelegate {
             window,
             cx,
         );
+    }
+}
+
+/// The "Coloring" page of a field's header menu. Its pages are rebuilt on
+/// entry, so each one shows the setting as it is then.
+fn coloring_row(table: Entity<Table<PivotDelegate>>, field: SharedString) -> NavRow {
+    let summary = {
+        let (table, field) = (table.clone(), field.clone());
+        Box::new(move |cx: &App| {
+            let (current, _) = table.read(cx).delegate().coloring(&field);
+            match current {
+                None | Some(Gradient::Off) => SharedString::new_static("Off"),
+                Some(g) => g.text().into(),
+            }
+        })
+    };
+    NavRow::with_dynamic_summary(
+        "Coloring",
+        summary,
+        Box::new(move |cx| {
+            let delegate = table.read(cx).delegate();
+            let (current, fitted) = delegate.coloring(&field);
+            let overridden = delegate.gradients.contains_key(&field);
+            let base = current.unwrap_or(Gradient::Off);
+            let set = |gradient: Option<Gradient>| {
+                let (table, field) = (table.clone(), field.clone());
+                Arc::new(move |_: &mut Window, cx: &mut App| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().set_gradient(&field, gradient, cx);
+                    })
+                })
+            };
+            let theme = theme(cx);
+            let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+            let fitting = base.span() == Some(Span::Auto);
+            let mut fit = CommandRow::new("Fit to column", set(Some(base.with_span(Span::Auto))));
+            if fitting {
+                fit = fit.with_tag("current");
+            }
+            rows.push(Box::new(fit));
+            rows.push(Box::new(range_row(
+                table.clone(),
+                field.clone(),
+                base,
+                fitted,
+            )));
+
+            for palette in Palette::all() {
+                let mut row =
+                    CommandRow::new(palette.title(), set(Some(base.with_palette(palette))))
+                        .with_swatches(theme.gradient_preview(palette));
+                if base.palette() == Some(palette) {
+                    row = row.with_tag("current");
+                }
+                rows.push(Box::new(row));
+            }
+
+            if base != Gradient::Off {
+                rows.push(Box::new(CommandRow::new("Off", set(Some(Gradient::Off)))));
+            }
+            if overridden {
+                rows.push(Box::new(CommandRow::new("Use field metadata", set(None))));
+            }
+            rows
+        }),
+    )
+}
+
+/// Type a fixed range. The page opens with the range in use typed out, a
+/// fitted one included, so it can be nudged rather than retyped.
+fn range_row(
+    table: Entity<Table<PivotDelegate>>,
+    field: SharedString,
+    base: Gradient,
+    fitted: Option<Scale>,
+) -> NavRow {
+    let current = match base.span() {
+        Some(Span::Fixed(..)) => base.span().map(|s| s.text()),
+        Some(Span::Auto) => fitted.map(|s| s.text()),
+        None => None,
+    };
+    let summary = match base.span() {
+        Some(Span::Auto) => match &current {
+            Some(range) => format!("fitted {range}"),
+            None => "fitted".into(),
+        },
+        _ => current.clone().unwrap_or_default(),
+    };
+    let row = NavRow::new(
+        "Range",
+        summary,
+        Box::new(move |_| {
+            let (table, field) = (table.clone(), field.clone());
+            vec![Box::new(DefaultActionRow::new(
+                "Set range lo..hi",
+                Arc::new(move |input, _, cx| {
+                    if let Ok(span) = Span::parse(&input) {
+                        table.update(cx, |table, cx| {
+                            table.delegate_mut().set_gradient(
+                                &field,
+                                Some(base.with_span(span)),
+                                cx,
+                            );
+                        });
+                    }
+                }),
+            )) as Box<dyn InspectorRow>]
+        }),
+    );
+    match current {
+        Some(range) => row.with_query(range),
+        None => row,
     }
 }
 
@@ -1127,7 +1193,7 @@ mod tests {
             &db,
             PivotTableConfig {
                 frame: "psu".into(),
-                gradients: [("current".to_string(), "auto".to_string())].into(),
+                gradients: [("current".to_string(), "auto heat".to_string())].into(),
                 ..Default::default()
             },
             cx,
@@ -1139,7 +1205,10 @@ mod tests {
                     // Fields are current, voltage.
                     assert_eq!(
                         delegate.column_gradients,
-                        [Some(Gradient::Auto), Some(Gradient::Range(0.0, 5.0))]
+                        [
+                            Gradient::parse("auto heat").unwrap(),
+                            Gradient::parse("0..5").unwrap()
+                        ]
                     );
                     // Only the auto column streams, to fit its range.
                     assert_eq!(delegate.watched.keys().collect::<Vec<_>>(), [&0]);
@@ -1163,6 +1232,38 @@ mod tests {
                 config.gradients,
                 BTreeMap::from([("voltage".to_string(), "off".to_string())])
             );
+        });
+    }
+
+    #[gpui::test]
+    fn the_coloring_page_offers_presets_and_the_way_back(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = psu_db();
+        let cx = cx.add_empty_window();
+        let view = open(
+            &db,
+            PivotTableConfig {
+                frame: "psu".into(),
+                gradients: [("current".to_string(), "auto heat".to_string())].into(),
+                ..Default::default()
+            },
+            cx,
+        );
+        cx.update(|_, cx| {
+            let table = view.read(cx).table.clone();
+            let labels = |field: &str, cx: &App| -> Vec<String> {
+                let row = coloring_row(table.clone(), field.into());
+                (row.build_children)(cx)
+                    .iter()
+                    .map(|r| r.label().to_string())
+                    .collect()
+            };
+            let current = labels("current", cx);
+            assert_eq!(current[..2], ["Fit to column", "Range"]);
+            assert_eq!(current[2..12].len(), Palette::all().count());
+            assert_eq!(current[12..], ["Off", "Use field metadata"]);
+            // An uncoloured field offers neither stopping nor going back.
+            let voltage = labels("voltage", cx);
+            assert_eq!(voltage.last().map(String::as_str), Some("Series 8"));
         });
     }
 

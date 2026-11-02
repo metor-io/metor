@@ -711,7 +711,9 @@ impl Render for ComponentValueStrip {
             let tint = scale
                 .filter(|_| state.is_none())
                 .zip(raw_values.get(idx))
-                .map(|(scale, v)| theme.gradient_fill(scale.position(v.as_f64())));
+                .map(|((scale, palette), v)| {
+                    theme.gradient_fill(palette, scale.position(v.as_f64()))
+                });
             let (display_cell, accent) = match state {
                 Some((text, accent)) => (
                     StripCell {
