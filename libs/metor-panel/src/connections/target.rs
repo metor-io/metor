@@ -210,6 +210,10 @@ pub struct ConnectionTarget {
     /// [`with_address`](Self::with_address) for resolver-produced kinds;
     /// discovery-only targets leave it unset and don't persist.
     pub(crate) address: Option<SharedString>,
+    /// The metor-db a built-in kind may mirror, which a session that
+    /// connects only this target probes to pick its peer cache. `None` for
+    /// the fsw mode and custom backends, which never mirror a metor-db.
+    pub(crate) peer: Option<SocketAddr>,
     /// Knobs this target's backend reads at connect time. Empty for the
     /// built-in kinds and for anything a discoverer produces — those fall
     /// back to the panel-wide set installed on the store.
@@ -231,6 +235,7 @@ impl ConnectionTarget {
             detail: SharedString::from(addr.to_string()),
             backend: Arc::new(DiscoverBackend { addr }),
             address: Some(SharedString::from(addr.to_string())),
+            peer: Some(addr),
             options: OptionSpec::default(),
         }
     }
@@ -244,6 +249,7 @@ impl ConnectionTarget {
             detail: SharedString::from(format!("{addr} · metor-db")),
             backend: Arc::new(TcpBackend { addr }),
             address: Some(SharedString::from(format!("db://{addr}"))),
+            peer: Some(addr),
             options: OptionSpec::default(),
         }
     }
@@ -257,6 +263,7 @@ impl ConnectionTarget {
             detail: SharedString::from(format!("{addr} · fsw")),
             backend: Arc::new(FswBackend { addr }),
             address: Some(SharedString::from(format!("fsw://{addr}"))),
+            peer: None,
             options: OptionSpec::default(),
         }
     }
@@ -273,6 +280,7 @@ impl ConnectionTarget {
             detail: detail.into(),
             backend: Arc::new(backend),
             address: None,
+            peer: None,
             options: OptionSpec::default(),
         }
     }

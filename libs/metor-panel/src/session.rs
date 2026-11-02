@@ -1,5 +1,6 @@
 //! Session ownership and shutdown. Saved snapshots are independent artifacts;
-//! only explicitly selected recording directories survive as live DB storage.
+//! only explicitly selected recording directories survive as live DB storage,
+//! plus the per-peer cache a single-peer mirror reopens next time.
 use gpui::App;
 use metor_db::DB;
 use metor_db::scratch::{self, ScratchDir};
@@ -10,6 +11,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 mod archive;
 mod commands;
+mod peer;
+pub(crate) use peer::select_for_peer;
 pub(crate) mod startup;
 pub(crate) use commands::{
     OpenHandler, OpenRecording, QuitPanel, SaveSnapshot, SaveSnapshotAs, finish_export, init,
@@ -18,8 +21,9 @@ pub(crate) use commands::{
 
 pub(crate) struct SessionStorage {
     // Field order ensures an abandoned import stops its executor before its
-    // temporary directory is removed, even if the panel was never run.
-    runtime: Option<ImportRuntime>,
+    // temporary directory is removed, even if the panel was never run, and
+    // a peer cache's executor stops before its lock is released.
+    runtime: Option<DbRuntime>,
     directory: StorageDirectory,
     source: Option<PathBuf>,
 }
@@ -39,21 +43,35 @@ pub(crate) fn sweep_stale() {
 
 enum StorageDirectory {
     Temporary(ScratchDir),
-    Recording { path: PathBuf, _lock: File },
+    Recording {
+        path: PathBuf,
+        _lock: File,
+    },
+    /// One peer's mirror, kept between sessions in the peer cache and
+    /// locked while this session runs. A cache, not a record: flushed and
+    /// kept on quit so the next session reopens it, never swept as stale,
+    /// evicted while running like a temporary session, and removed only by
+    /// the cache's own pruning once unused. Snapshots save from it like
+    /// from any session.
+    Cached(metor_db::peer_cache::CachedDb),
 }
 impl StorageDirectory {
     fn path(&self) -> &Path {
         match self {
             Self::Temporary(d) => d.path(),
             Self::Recording { path, .. } => path,
+            Self::Cached(cached) => cached.path(),
         }
     }
 }
-struct ImportRuntime(crate::background_tasks::BackgroundTasks);
-impl Drop for ImportRuntime {
+/// The executor for the tasks [`DB::open`] spawns for an existing database
+/// (an imported recording's working copy, a reopened peer cache), which
+/// must outlive every reader of it.
+struct DbRuntime(crate::background_tasks::BackgroundTasks);
+impl Drop for DbRuntime {
     fn drop(&mut self) {
         if let Err(error) = self.0.shutdown() {
-            tracing::error!(%error, "import executor shutdown failed");
+            tracing::error!(%error, "session db executor shutdown failed");
         }
     }
 }
@@ -127,8 +145,22 @@ impl SessionStorage {
         result
     }
 
+    #[cfg(test)]
     pub(crate) fn is_temporary(&self) -> bool {
         matches!(self.directory, StorageDirectory::Temporary(_))
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        matches!(self.directory, StorageDirectory::Recording { .. })
+    }
+
+    /// Whether what the session holds may be dropped once a peer can give
+    /// it back: a temporary session or a peer cache, never a recording.
+    pub(crate) fn is_cache(&self) -> bool {
+        matches!(
+            self.directory,
+            StorageDirectory::Temporary(_) | StorageDirectory::Cached(_)
+        )
     }
 
     pub(crate) fn import(
@@ -140,7 +172,7 @@ impl SessionStorage {
         let bundle = directory.path().join("bundle");
         fs::create_dir(&bundle)?;
         let imported = archive::import(&path, &bundle, cancel)?;
-        let runtime = ImportRuntime(Default::default());
+        let runtime = DbRuntime(Default::default());
         let db_path = bundle.join("db");
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         runtime
@@ -204,6 +236,14 @@ impl SessionStorage {
                 })
                 .map_err(|error| FinishError {
                     recovery: path,
+                    error,
+                }),
+            // No fsync: a cache torn by a crash is replaced when it next
+            // fails to open, and its history fetched again.
+            StorageDirectory::Cached(cached) => shutdown
+                .and_then(|()| db.flush().map_err(io::Error::other))
+                .map_err(|error| FinishError {
+                    recovery: cached.path().to_owned(),
                     error,
                 }),
         }

@@ -5,7 +5,8 @@ pub(crate) enum Startup {
     Temporary,
     RecordTo(std::path::PathBuf),
     Open(std::path::PathBuf),
-    /// A temporary session that mirrors the db at `host:port` at once.
+    /// Mirror the db at `host:port` at once, into its peer cache or, when
+    /// it can't be cached, a temporary session.
     Connect(String),
     Help,
 }

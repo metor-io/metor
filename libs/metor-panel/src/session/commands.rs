@@ -105,6 +105,10 @@ fn storage_summary(cx: &App) -> SharedString {
             directory: StorageDirectory::Recording { path, .. },
             ..
         }) => format!("Recording to {}", path.display()).into(),
+        Some(SessionStorage {
+            directory: StorageDirectory::Cached(cached),
+            ..
+        }) => format!("Peer cache {}", cached.path().display()).into(),
         Some(_) => "Temporary session".into(),
         None => "Caller-owned database".into(),
     }
