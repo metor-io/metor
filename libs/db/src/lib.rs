@@ -88,7 +88,7 @@ pub struct DB {
     pub earliest_timestamp: AtomicCell<Timestamp>,
     /// This database's identity, advertised in [`DbInfoResp`].
     instance_id: InstanceId,
-    /// Whether the owner deletes this database when it stops; advertised in
+    /// Whether this database lasts only its owner's run; advertised in
     /// [`DbInfoResp`] so mirrors don't cache it. See [`DB::set_ephemeral`].
     ephemeral: AtomicBool,
 }
@@ -346,12 +346,13 @@ impl DB {
         self.instance_id
     }
 
-    /// Whether this database is advertised as deleted when its owner stops.
+    /// Whether this database is advertised as lasting only its owner's run.
     pub fn ephemeral(&self) -> bool {
         self.ephemeral.load(atomic::Ordering::Relaxed)
     }
 
-    /// Declare that the owner deletes this database when it stops. The DB
+    /// Declare that this database lasts only its owner's run: deleted when
+    /// it stops, or in a scratch directory no later run reopens. The DB
     /// doesn't delete anything itself; this only tells clients, through
     /// [`DbInfoResp::ephemeral`], not to treat it as a lasting peer.
     pub fn set_ephemeral(&self, ephemeral: bool) {

@@ -1061,8 +1061,9 @@ pub struct DbInfoResp {
     /// mirror keys its on-disk cache of this peer by it. `None` from a
     /// server that predates it. Added in version 6.
     pub instance_id: Option<InstanceId>,
-    /// The server deletes its database when it stops, so its id is new
-    /// every run and its history goes with it: a mirror shouldn't keep a
+    /// The server's database lasts only this run: it is deleted when the
+    /// server stops, or lives in a scratch directory the next run won't
+    /// reuse, so its id is never seen again. A mirror shouldn't keep a
     /// cache it will never reopen, and shouldn't evict history only the
     /// peer could give back once the peer is gone. Added in version 6.
     pub ephemeral: bool,
