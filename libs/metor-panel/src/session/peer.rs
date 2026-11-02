@@ -226,6 +226,7 @@ mod tests {
         for (case, info) in cases {
             let (storage, db) = SessionStorage::for_peer(ADDR, info.as_ref(), &config).unwrap();
             assert!(storage.is_temporary(), "{case}");
+            assert!(db.ephemeral(), "{case}: deleted on quit, so never cached");
             storage.finish(&db, Ok(())).unwrap();
         }
     }

@@ -164,7 +164,9 @@ impl Db {
             path: path.display().to_string(),
             message: error.to_string(),
         })?;
-        db.set_ephemeral(params.on_exit() == OnExit::Delete);
+        // A scratch directory is new every run, so even one kept on exit
+        // is never served again under this id.
+        db.set_ephemeral(params.path.is_none() || params.on_exit() == OnExit::Delete);
         Ok(Self {
             listener: Some(listener),
             db: Arc::new(db),
@@ -687,7 +689,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut at_path =
             Db::new(params(Some(dir.path().join("store")), None)).expect("a free port");
-        assert!(!temporary.db.ephemeral() && !at_path.db.ephemeral());
+        assert!(
+            temporary.db.ephemeral(),
+            "a kept scratch db is never served under its id again"
+        );
+        assert!(!at_path.db.ephemeral());
         temporary.finish(&mut Log);
         at_path.finish(&mut Log);
         let kept = temporary.db.path.clone();

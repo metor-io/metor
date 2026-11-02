@@ -86,6 +86,9 @@ impl SessionStorage {
     pub(crate) fn create() -> Result<(Self, Arc<DB>), metor_db::Error> {
         let directory = ScratchDir::create(SESSION_PREFIX)?;
         let db = Arc::new(DB::create(directory.path().to_owned())?);
+        // Deleted on quit, so a mirror of it when it is served must not
+        // cache it or count on it for history.
+        db.set_ephemeral(true);
         Ok((
             Self {
                 directory: StorageDirectory::Temporary(directory),
