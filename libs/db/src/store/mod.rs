@@ -282,7 +282,37 @@ impl NodeStaging {
     /// Verify the staged bytes against `seal` and promote the directory
     /// into place. Returns the final node directory and the (already
     /// mapped) node.
-    pub fn commit(mut self, seal: &SealRecord) -> Result<(PathBuf, TimeSeriesNode), Error> {
+    pub fn commit(self, seal: &SealRecord) -> Result<(PathBuf, TimeSeriesNode), Error> {
+        let final_dir = self.dir.with_file_name(seal.start_ts.0.to_string());
+        self.commit_to(seal, final_dir)
+    }
+
+    /// [`Self::commit`] for a range-fetch fragment, into a directory named
+    /// apart from sealed nodes (`<start_ts>.<n>.fragment`): its first sample
+    /// may be where a whole node will later land, and opening the component
+    /// deletes it rather than loading it.
+    pub(crate) fn commit_fragment(
+        self,
+        seal: &SealRecord,
+    ) -> Result<(PathBuf, TimeSeriesNode), Error> {
+        let name = self
+            .dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".fetching"))
+            .ok_or_else(|| StoreError::Other("staging dir has no name".to_string()))?
+            .to_string();
+        let final_dir = self.dir.with_file_name(format!("{name}.fragment"));
+        let (dir, mut node) = self.commit_to(seal, final_dir)?;
+        node.fragment = true;
+        Ok((dir, node))
+    }
+
+    fn commit_to(
+        mut self,
+        seal: &SealRecord,
+        final_dir: PathBuf,
+    ) -> Result<(PathBuf, TimeSeriesNode), Error> {
         let node = self.node();
         if !seal.verify(&node) {
             return Err(StoreError::ChecksumMismatch.into());
@@ -290,7 +320,6 @@ impl NodeStaging {
         node.index.flush()?;
         node.data.flush()?;
         seal.write(&self.dir)?;
-        let final_dir = self.dir.with_file_name(seal.start_ts.0.to_string());
         if final_dir.exists() {
             return Err(StoreError::Other(format!(
                 "node {} was committed by a concurrent fetch",

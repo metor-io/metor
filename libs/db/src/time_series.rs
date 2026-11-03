@@ -29,13 +29,13 @@ use crate::{
     disruptor::ArcAtomic,
     evict::LastAccess,
     manifest::{
-        ComponentManifest, Coverage, GapVec, ManifestCell, NodeSpan, RangeVec, SpanSource,
-        SpanState,
+        ComponentManifest, Coverage, Fragment, GapVec, ManifestCell, NodeSpan, RangeVec,
+        SpanSource, SpanState,
     },
     seal::{SealRecord, SealRecordExt, seal_node},
 };
 
-use coverage::{Draft, RemoteSeal, extents, remote_holds};
+use coverage::{Draft, Extent, RemoteSeal, extents, remote_holds};
 
 #[derive(Clone)]
 pub struct TimeSeries {
@@ -85,6 +85,9 @@ pub struct TimeSeriesNode {
     /// shells a splice rebuilds, so a touch lands whichever one a reader
     /// holds. See [`TimeSeries::touch`].
     pub(crate) last_access: Arc<LastAccess>,
+    /// The node holds a range-fetch [`Fragment`]'s samples: sealed, never
+    /// appended to, and claiming no time of its own in coverage.
+    pub(crate) fragment: bool,
 }
 
 impl Debug for TimeSeriesNode {
@@ -133,6 +136,7 @@ impl TimeSeriesNode {
             index,
             data,
             last_access: Arc::new(LastAccess::now()),
+            fragment: false,
         }
     }
 
@@ -151,6 +155,71 @@ impl TimeSeriesNode {
     pub fn element_size(&self) -> usize {
         *self.data.extra() as usize
     }
+}
+
+/// Fragments an install replaces: their claims leave the manifest and
+/// their nodes the list, together with what replaces them.
+#[derive(Default)]
+struct Superseded {
+    claims: SmallVec<[Timestamp; 4]>,
+    dirs: SmallVec<[Arc<Path>; 4]>,
+    nodes: Vec<Arc<AtomicNode<TimeSeriesNode>>>,
+}
+
+impl Superseded {
+    fn forget(&self, draft: &mut Draft) {
+        if !self.claims.is_empty() {
+            draft.fragments.retain(|f| !self.claims.contains(&f.start));
+        }
+    }
+
+    /// Delete the replaced nodes' files, once nothing links them. Readers
+    /// still holding slices keep the unlinked mappings alive.
+    fn delete(&self) {
+        for dir in &self.dirs {
+            if let Err(err) = std::fs::remove_dir_all(dir) {
+                warn!(?dir, ?err, "failed to delete a replaced fragment");
+            }
+        }
+    }
+}
+
+/// `start..=end` in stretches that never cross a resident node: a node
+/// inside it splits it, the stretch before the node ending on the node's
+/// first timestamp and the one after starting on its last.
+fn around_nodes(start: i64, end: i64, resident: &[Extent]) -> SmallVec<[(i64, i64); 2]> {
+    let mut out = SmallVec::new();
+    let mut cursor = start;
+    let first = resident.partition_point(|e| e.end < start);
+    for e in &resident[first..] {
+        if e.start > end {
+            break;
+        }
+        if cursor <= e.start {
+            out.push((cursor, e.start));
+        }
+        let after = match e.end > e.start {
+            true => e.end,
+            false => e.end.saturating_add(1),
+        };
+        cursor = cursor.max(after);
+        if cursor > end {
+            return out;
+        }
+    }
+    out.push((cursor, end));
+    out
+}
+
+/// Whether `node` is closed to appends: a sealed span, or a fragment. The
+/// one node that is neither is the head a writer appends to.
+fn is_sealed(manifest: &ComponentManifest, node: &TimeSeriesNode) -> bool {
+    node.fragment
+        || node.timestamps().first().is_some_and(|start| {
+            manifest
+                .span(*start)
+                .is_some_and(|span| span.state == SpanState::Resident)
+        })
 }
 
 /// Marks a node directory as holding [`SpanSource::Mirrored`] data. Written
@@ -189,6 +258,7 @@ fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> Compon
         spans: Vec::new(),
         shadowed: persisted.shadowed.to_vec(),
         settled: persisted.settled.to_vec(),
+        fragments: Vec::new(),
     };
     for node in list.iter() {
         let Some(start_ts) = node.timestamps().first().copied() else {
@@ -278,7 +348,8 @@ pub(crate) fn node_dirs_oldest_first(path: &Path) -> Result<Vec<PathBuf>, Error>
 }
 
 /// Delete staging directories left behind by fetches that never
-/// committed. Runs at open, before any fetch task exists, so every
+/// committed, and the nodes of range-fetch fragments, which are a cache
+/// that lasts one run. Runs at open, before any fetch task exists, so every
 /// `.fetching` directory is guaranteed orphaned.
 fn remove_stale_staging_dirs(path: &Path) {
     let Ok(entries) = std::fs::read_dir(path) else {
@@ -287,7 +358,9 @@ fn remove_stale_staging_dirs(path: &Path) {
     for entry in entries.flatten() {
         let dir = entry.path();
         if dir.is_dir()
-            && dir.extension().is_some_and(|ext| ext == "fetching")
+            && dir
+                .extension()
+                .is_some_and(|ext| ext == "fetching" || ext == "fragment")
             && let Err(e) = std::fs::remove_dir_all(&dir)
         {
             warn!(?dir, ?e, "failed to remove stale staging directory");
@@ -484,11 +557,15 @@ impl TimeSeries {
 
     /// Pin a coherent local node set and its coverage metadata. Ingestion
     /// does not take the structural lock and continues while these are copied.
+    /// Fragments are left out: a snapshot holds what this side keeps.
     pub(crate) fn snapshot_nodes(
         &self,
     ) -> (Arc<ComponentManifest>, Vec<Arc<AtomicNode<TimeSeriesNode>>>) {
         let _guard = self.structural.lock().unwrap();
-        (self.manifest.load(), self.list.iter().collect())
+        (
+            self.manifest.load(),
+            self.list.iter().filter(|node| !node.fragment).collect(),
+        )
     }
 
     /// The current sealed-span snapshot.
@@ -593,6 +670,11 @@ impl TimeSeries {
                 break;
             }
         }
+        // A fragment that held no samples has no node to touch.
+        let manifest = self.manifest.load();
+        for fragment in manifest.fragments_in(range.start.0, end) {
+            fragment.access.touch(stamp);
+        }
     }
 
     /// Mark this component as written by `run`'s mirror. Called by the
@@ -624,6 +706,9 @@ impl TimeSeries {
         // Newest-first; the first node is the live head and must not be
         // sealed — the writer may still be appending to it.
         for node in self.list.iter().skip(1) {
+            if node.fragment {
+                continue;
+            }
             let Some(start_ts) = node.timestamps().first().copied() else {
                 continue;
             };
@@ -745,11 +830,7 @@ impl TimeSeries {
     fn install_ceiling(&self) -> Option<Timestamp> {
         let head = self.list.head()?;
         let start = *head.timestamps().first()?;
-        let sealed = self
-            .manifest
-            .load()
-            .span(start)
-            .is_some_and(|s| s.state == SpanState::Resident);
+        let sealed = is_sealed(&self.manifest.load(), &head);
         (!sealed || self.has_writer.load(Ordering::Acquire)).then_some(start)
     }
 
@@ -809,19 +890,31 @@ impl TimeSeries {
     /// here the node goes first, so a crash in between finds a resident
     /// entry with no node, which reopening drops. Readers holding slices
     /// keep the unmapped bytes alive until they finish.
+    ///
+    /// A fragment, keyed by its claim's start or its node's, is just
+    /// dropped (see [`Self::purge_fragment`]). Fragments touching a purged
+    /// node's range go with it: one may claim the node's edge timestamps,
+    /// which only the node held samples for.
     pub fn purge_span(&self, start_ts: Timestamp) -> Result<bool, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
-        let Some(span) = manifest.span(start_ts).copied() else {
-            return Ok(false);
+        let Some(span) = manifest
+            .span(start_ts)
+            .copied()
+            .filter(|span| span.state == SpanState::Resident)
+        else {
+            let fragment = manifest.fragments.iter().find(|f| {
+                f.start == start_ts || f.node.is_some_and(|seal| seal.start_ts == start_ts)
+            });
+            return match fragment {
+                Some(fragment) => self.purge_fragment_locked(&manifest, fragment.start),
+                None => Ok(false),
+            };
         };
-        if span.state != SpanState::Resident {
-            return Ok(false);
-        }
         let Some(node) = self
             .list
             .iter()
-            .find(|n| n.timestamps().first() == Some(&start_ts))
+            .find(|n| !n.fragment && n.timestamps().first() == Some(&start_ts))
         else {
             return Ok(false);
         };
@@ -837,12 +930,15 @@ impl TimeSeries {
             return Ok(false);
         }
         let (start, end) = (span.seal.start_ts.0, span.seal.end_ts.0);
+        let mut gone = self.fragments_over(&manifest, &[(start, end)]);
+        gone.nodes.push(node);
 
         if mirrored {
-            let resident = extents(self.list.iter(), Some(&node));
-            self.unlink_node(&node, start_ts)?;
+            let resident = extents(self.list.iter(), gone.nodes.last());
+            self.unlink_nodes(&gone, start_ts)?;
             self.publish_manifest(true, |draft| {
                 draft.spans.retain(|s| s.cover_start != start_ts);
+                gone.forget(draft);
                 draft.unsettle(start, end);
                 draft.derive(&resident, Some(start..=end), []);
             })?;
@@ -853,22 +949,170 @@ impl TimeSeries {
                         span.state = SpanState::RemoteOnly;
                     }
                 }
+                gone.forget(draft);
                 draft.unsettle(start, end);
             })?;
-            self.unlink_node(&node, start_ts)?;
+            self.unlink_nodes(&gone, start_ts)?;
         }
         Ok(true)
     }
 
-    fn unlink_node(
-        &self,
-        node: &Arc<AtomicNode<TimeSeriesNode>>,
-        start_ts: Timestamp,
-    ) -> Result<(), Error> {
-        self.list.unlink(node);
+    /// Unlink the nodes in `gone` in one swap and delete their files: the
+    /// node keyed `start_ts` and any fragments going with it.
+    fn unlink_nodes(&self, gone: &Superseded, start_ts: Timestamp) -> Result<(), Error> {
+        self.link(Vec::new(), &gone.nodes)?;
+        gone.delete();
         std::fs::remove_dir_all(self.path.join(start_ts.0.to_string()))?;
         std::fs::File::open(&self.path)?.sync_all()?;
         Ok(())
+    }
+
+    /// Drop the [`Fragment`] keyed `start` (its claim's start) with its
+    /// node, when the remote spans it lies in can give its samples back
+    /// right now: eviction never takes data only this side holds, such as
+    /// a fragment of a seal the peer has since dropped. A fragment that
+    /// held no samples always qualifies.
+    ///
+    /// The claim leaves the manifest before the node leaves the list, so a
+    /// reader never sees the stretch reported held with its samples gone.
+    pub fn purge_fragment(&self, start: Timestamp) -> Result<bool, Error> {
+        let _guard = self.structural.lock().unwrap();
+        self.purge_fragment_locked(&self.manifest.load(), start)
+    }
+
+    fn purge_fragment_locked(
+        &self,
+        manifest: &ComponentManifest,
+        start: Timestamp,
+    ) -> Result<bool, Error> {
+        let gone = self.fragments_over(manifest, &[(start.0, start.0)]);
+        if let Some(node) = gone.nodes.first()
+            && !remote_holds(manifest, node.timestamps())
+        {
+            return Ok(false);
+        }
+        if gone.claims.is_empty() {
+            return Ok(false);
+        }
+        self.publish_manifest(false, |draft| gone.forget(draft))?;
+        self.link(Vec::new(), &gone.nodes)?;
+        gone.delete();
+        Ok(true)
+    }
+
+    /// Install the reply to a range fetch: `timestamps` and `data` (samples
+    /// of `element_size` bytes) are every sample the peer holds within
+    /// `covered`, which is half-open.
+    ///
+    /// Only the parts of `covered` still remote-only here are claimed, each
+    /// stretch as a [`Fragment`] with the reply's samples in it (or none),
+    /// so whatever is resident, mid-fetch, already claimed by a fragment,
+    /// or above an unsealed head is left alone. A stretch is never claimed
+    /// across a resident node; at a timestamp a resident node starts or
+    /// ends on, the node's samples answer and the reply's are dropped, as
+    /// a peer node tying with its neighbour leaves that timestamp to it.
+    /// Every fragment lands in one swap of the node list and one publish.
+    /// Returns the stretches claimed, oldest first.
+    pub fn install_fragment(
+        &self,
+        covered: Range<Timestamp>,
+        element_size: usize,
+        timestamps: &[Timestamp],
+        data: &[u8],
+    ) -> Result<SmallVec<[Range<Timestamp>; 2]>, Error> {
+        if data.len() != timestamps.len() * element_size || element_size == 0 {
+            return Err(Error::SchemaMismatch);
+        }
+        if timestamps.windows(2).any(|w| w[1].0 < w[0].0) {
+            return Err(Error::TimeTravel);
+        }
+        if timestamps
+            .iter()
+            .any(|t| t.0 < covered.start.0 || t.0 >= covered.end.0)
+        {
+            return Err(Error::TimeRangeOutOfBounds);
+        }
+        let mut claimed = SmallVec::new();
+        if covered.end.0 <= covered.start.0 {
+            return Ok(claimed);
+        }
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        let mut gaps = GapVec::new();
+        manifest.gaps(&covered, &mut gaps);
+        let mut runs: Vec<(i64, i64)> = gaps
+            .iter()
+            .filter(|g| g.state == SpanState::RemoteOnly)
+            .map(|g| (g.range.start.0, g.range.end.0 - 1))
+            .collect();
+        runs.sort_unstable();
+        let ceiling = self.install_ceiling().map(|c| c.0);
+        let resident = extents(self.list.iter(), None);
+        let mut stretches: Vec<(i64, i64)> = Vec::new();
+        for (start, end) in runs {
+            let end = ceiling.map_or(end, |c| end.min(c - 1));
+            if end < start {
+                continue;
+            }
+            match stretches.last_mut() {
+                Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+                _ => stretches.push((start, end)),
+            }
+        }
+        let held = |t: i64| {
+            let at = resident.partition_point(|e| e.end < t);
+            resident.get(at).is_some_and(|e| e.start <= t)
+        };
+        let mut fragments = Vec::new();
+        let mut nodes = Vec::new();
+        for (start, end) in stretches {
+            for (start, end) in around_nodes(start, end, &resident) {
+                let lo = timestamps.partition_point(|t| t.0 < start);
+                let hi = timestamps.partition_point(|t| t.0 <= end);
+                let samples: Vec<usize> = (lo..hi).filter(|i| !held(timestamps[*i].0)).collect();
+                let mut fragment = Fragment {
+                    start: Timestamp(start),
+                    end: Timestamp(end),
+                    node: None,
+                    dir: None,
+                    access: Arc::new(LastAccess::now()),
+                };
+                if let Some(first) = samples.first() {
+                    let staging = crate::store::NodeStaging::with_capacity(
+                        &self.path,
+                        timestamps[*first],
+                        element_size as u64,
+                        samples.len(),
+                    )?;
+                    for i in &samples {
+                        staging.push(
+                            timestamps[*i],
+                            &data[i * element_size..(i + 1) * element_size],
+                        )?;
+                    }
+                    let seal = staging.seal().expect("staged at least one sample");
+                    let (dir, node) = staging.commit_fragment(&seal)?;
+                    fragment.node = Some(seal);
+                    fragment.dir = Some(Arc::from(dir));
+                    fragment.access = node.last_access.clone();
+                    nodes.push(node);
+                }
+                claimed.push(fragment.claim());
+                fragments.push(fragment);
+            }
+        }
+        if fragments.is_empty() {
+            return Ok(claimed);
+        }
+        if let Err(err) = self.link(nodes, &[]) {
+            for dir in fragments.iter().filter_map(|f| f.dir.as_ref()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(err);
+        }
+        self.publish_manifest(false, |draft| draft.fragments.extend(fragments))?;
+        self.data_waker.wake_all();
+        Ok(claimed)
     }
 
     /// Re-derive the coverage of every idle remote seal meeting `range`
@@ -920,7 +1164,11 @@ impl TimeSeries {
     }
 
     /// [`Self::install_node`] with the structural mutex already held; `tie`
-    /// as for [`Self::splice_node`].
+    /// as for [`Self::check_splice`].
+    ///
+    /// Fragments overlapping the seal's range give way to the node in the
+    /// same swap of the node list and the same manifest publish, so readers
+    /// never see both, or neither.
     fn install_node_locked(
         &self,
         staging: crate::store::NodeStaging,
@@ -938,7 +1186,10 @@ impl TimeSeries {
                 Err(crate::store::StoreError::ChecksumMismatch.into())
             };
         }
-        self.splice_node(staging, seal, tie)?;
+        let superseded = self.fragments_over(&manifest, &[(seal.start_ts.0, seal.end_ts.0)]);
+        self.check_splice(seal, tie, &superseded.nodes)?;
+        let (_node_dir, node) = staging.commit(seal)?;
+        self.link(vec![node], &superseded.nodes)?;
         let resident = extents(self.list.iter(), None);
         self.publish_manifest(true, |draft| {
             // A whole remote span this node fulfils gives way to it.
@@ -962,6 +1213,7 @@ impl TimeSeries {
                     span.state = SpanState::RemoteOnly;
                 }
             }
+            superseded.forget(draft);
             // Whatever store this came from holds a copy by definition.
             let acked = matches!(source, SpanSource::RemoteFetch);
             draft
@@ -969,6 +1221,7 @@ impl TimeSeries {
                 .push(NodeSpan::whole(*seal, SpanState::Resident, source, acked));
             draft.derive(&resident, Some(seal.start_ts.0..=seal.end_ts.0), []);
         })?;
+        superseded.delete();
         self.data_waker.wake_all();
         // A span that arrives whole is as final as one the lifecycle task
         // seals, and the LoD engine sleeps on this queue.
@@ -976,13 +1229,14 @@ impl TimeSeries {
         Ok(())
     }
 
-    /// Verify `staging` against `seal`, promote it into place and splice
-    /// the node into the list, without touching the manifest. Caller holds
-    /// the structural mutex.
+    /// Check that a node sealed by `seal` can be spliced into the list,
+    /// with `replaced` unlinked in the same swap. Caller holds the
+    /// structural mutex.
     ///
     /// The node must fill a hole: overlap with resident data is refused,
     /// except, with `tie`, a shared edge timestamp — a peer node whose
-    /// first samples tie with its predecessor's last.
+    /// first samples tie with its predecessor's last. Fragments are not
+    /// resident data here: whoever installs over one replaces it.
     ///
     /// A node above the head is rejected whenever the head is *unsealed* —
     /// the working node a writer is appending to, which sealing always
@@ -995,59 +1249,112 @@ impl TimeSeries {
     /// `install_node`, which publishes a Resident span), so pushes above it
     /// legitimately land. A live writer over an empty-timestamp head still
     /// rejects, keyed off `has_writer`.
-    fn splice_node(
+    fn check_splice(
         &self,
-        staging: crate::store::NodeStaging,
         seal: &SealRecord,
         tie: bool,
+        replaced: &[Arc<AtomicNode<TimeSeriesNode>>],
     ) -> Result<(), Error> {
         use crate::store::StoreError;
         let manifest = self.manifest.load();
-        let mut succ: Option<Arc<AtomicNode<TimeSeriesNode>>> = None;
+        let mut newer = false;
         for node in self.list.iter() {
+            if replaced.iter().any(|r| Arc::ptr_eq(r, &node)) {
+                continue;
+            }
             let timestamps = node.timestamps();
             let (Some(start), Some(end)) = (timestamps.first(), timestamps.last()) else {
                 continue;
             };
             let overlaps = seal.start_ts.0 <= end.0 && start.0 <= seal.end_ts.0;
             let edge = seal.start_ts == *end || seal.end_ts == *start;
-            if overlaps && !(tie && edge) {
+            if overlaps && !(tie && edge) && !node.fragment {
                 return Err(StoreError::Other("span overlaps resident data".to_string()).into());
             }
-            if start.0 > seal.start_ts.0 {
-                // Iteration is newest-first, so the last node we see that
-                // is newer than the install is its direct successor.
-                succ = Some(node);
-            }
+            newer |= start.0 > seal.start_ts.0;
         }
-        if succ.is_none()
-            && let Some(head) = self.list.head()
-        {
-            // The head is the live writer's working node iff it has no
-            // manifest span; an archive's head is always sealed. Reject
-            // above an unsealed head (the window after reopen, before the
-            // first live sample, that a `has_writer`-only guard misses) or
-            // whenever a writer is live (covers an empty-timestamp head).
-            let head_unsealed = head
-                .timestamps()
-                .first()
-                .is_some_and(|start| manifest.span(*start).is_none());
+        if !newer && let Some(head) = self.list.head() {
+            // The head is the live writer's working node iff it is
+            // unsealed; an archive's head is always sealed. Reject above an
+            // unsealed head (the window after reopen, before the first live
+            // sample, that a `has_writer`-only guard misses) or whenever a
+            // writer is live (covers an empty-timestamp head).
+            let head_unsealed = !head.timestamps().is_empty() && !is_sealed(&manifest, &head);
             if head_unsealed || self.has_writer.load(Ordering::Acquire) {
                 return Err(
                     StoreError::Other("span is newer than the live head".to_string()).into(),
                 );
             }
         }
-        let (_node_dir, node) = staging.commit(seal)?;
-        match succ {
-            Some(succ) => {
-                if !self.list.insert_older(&succ, node) {
-                    return Err(StoreError::Other("insert lost its anchor".to_string()).into());
-                }
-            }
-            None => self.list.push(node),
-        }
         Ok(())
+    }
+
+    /// Link committed `nodes` into the list at their timestamp-ordered
+    /// positions and unlink `replaced`, in one swap. Caller holds the
+    /// structural mutex and checked each node with [`Self::check_splice`].
+    fn link(
+        &self,
+        nodes: Vec<TimeSeriesNode>,
+        replaced: &[Arc<AtomicNode<TimeSeriesNode>>],
+    ) -> Result<(), Error> {
+        if nodes.is_empty() && replaced.is_empty() {
+            return Ok(());
+        }
+        // Newest first by first sample; an empty node can only be the
+        // writer's fresh head, newer than anything installed.
+        let key = |node: &TimeSeriesNode| node.timestamps().first().map_or(i64::MAX, |t| t.0);
+        if self.list.replace(replaced, nodes, |a, b| key(a) > key(b)) {
+            Ok(())
+        } else {
+            Err(
+                crate::store::StoreError::Other("splice lost a node it replaces".to_string())
+                    .into(),
+            )
+        }
+    }
+
+    /// The fragments whose claims meet any of the inclusive `ranges`, with
+    /// their nodes, for an install over them to replace.
+    fn fragments_over(&self, manifest: &ComponentManifest, ranges: &[(i64, i64)]) -> Superseded {
+        let mut superseded = Superseded::default();
+        if manifest.fragments.is_empty() {
+            return superseded;
+        }
+        for fragment in manifest.fragments.iter() {
+            if ranges.iter().any(|(a, b)| fragment.overlaps(*a, *b)) {
+                superseded.claims.push(fragment.start);
+                superseded.dirs.extend(fragment.dir.clone());
+            }
+        }
+        superseded.nodes = self.fragment_nodes(manifest, &superseded.claims);
+        superseded
+    }
+
+    /// The list nodes of the fragments keyed by `claims`.
+    fn fragment_nodes(
+        &self,
+        manifest: &ComponentManifest,
+        claims: &[Timestamp],
+    ) -> Vec<Arc<AtomicNode<TimeSeriesNode>>> {
+        let starts: SmallVec<[Timestamp; 4]> = manifest
+            .fragments
+            .iter()
+            .filter(|f| claims.contains(&f.start))
+            .filter_map(|f| f.node.map(|seal| seal.start_ts))
+            .collect();
+        if starts.is_empty() {
+            return Vec::new();
+        }
+        self.list
+            .iter()
+            .filter(|node| {
+                node.fragment
+                    && node
+                        .timestamps()
+                        .first()
+                        .is_some_and(|first| starts.contains(first))
+            })
+            .collect()
     }
 
     /// Install a node fetched for a claimed remote seal (see
@@ -1057,10 +1364,11 @@ impl TimeSeries {
     /// marked [`SpanSource::Mirrored`]: those nodes do not match any node
     /// the peer serves.
     ///
-    /// Every piece lands in one publish, together with the stretches the
-    /// download settled (including pieces that held no samples), and the
-    /// seal is re-derived against what is resident by then, so it ends up
-    /// shadowed unless local data moved during the fetch.
+    /// Every piece lands in one swap of the node list and one publish,
+    /// together with the stretches the download settled (including pieces
+    /// that held no samples), and the seal is re-derived against what is
+    /// resident by then, so it ends up shadowed unless local data moved
+    /// during the fetch. Fragments over a landed piece give way to it.
     pub fn install_fetched(
         &self,
         staging: crate::store::NodeStaging,
@@ -1085,14 +1393,21 @@ impl TimeSeries {
             }
             _ => {}
         }
+        let covers: SmallVec<[(i64, i64); 2]> = pieces
+            .iter()
+            .map(|p| (p.cover_start.0, p.cover_end.0))
+            .collect();
+        let replaced = self.fragments_over(&manifest, &covers);
         let mut landed: SmallVec<[(NodeSpan, Option<SealRecord>); 2]> = SmallVec::new();
+        let mut nodes = Vec::new();
         let mut installed: Result<(), Error> = Ok(());
         for piece in &pieces {
             let cut = staging.cut(piece.cover_start..=piece.cover_end);
             installed = cut.and_then(|cut| match cut {
                 Some((node, piece_seal)) => {
                     tag_mirrored(node.dir())?;
-                    self.splice_node(node, &piece_seal, true)?;
+                    self.check_splice(&piece_seal, true, &replaced.nodes)?;
+                    nodes.push(node.commit(&piece_seal)?.1);
                     landed.push((*piece, Some(piece_seal)));
                     Ok(())
                 }
@@ -1104,6 +1419,22 @@ impl TimeSeries {
             if installed.is_err() {
                 break;
             }
+        }
+        // Only fragments over what landed give way; the rest still answer
+        // for pieces a failed install left remote.
+        let landed_covers: SmallVec<[(i64, i64); 2]> = landed
+            .iter()
+            .map(|(p, _)| (p.cover_start.0, p.cover_end.0))
+            .collect();
+        let superseded = self.fragments_over(&manifest, &landed_covers);
+        if let Err(err) = self.link(nodes, &superseded.nodes) {
+            for (_, piece_seal) in &landed {
+                if let Some(piece_seal) = piece_seal {
+                    let dir = self.path.join(piece_seal.start_ts.0.to_string());
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+            return Err(err);
         }
         let resident = extents(self.list.iter(), None);
         let remote = RemoteSeal::of(&pieces[0]);
@@ -1123,8 +1454,10 @@ impl TimeSeries {
                 }
                 draft.settle(seal, piece.cover_start, piece.cover_end);
             }
+            superseded.forget(draft);
             draft.derive(&resident, None, [remote]);
         })?;
+        superseded.delete();
         if landed.iter().any(|(_, piece_seal)| piece_seal.is_some()) {
             self.data_waker.wake_all();
             self.seal_waker.wake_all();
@@ -1330,13 +1663,12 @@ impl TimeSeries {
         // nodes invisible, skewing the panel's raw/LoD switchover.
         for node in self.list.iter() {
             let timestamps = node.timestamps();
-            let Some(start) = timestamps.first() else {
+            if timestamps.is_empty() {
                 continue;
-            };
-            if manifest
-                .span(*start)
-                .is_some_and(|s| s.state == SpanState::Resident)
-            {
+            }
+            // A fragment's samples are already counted by the remote span
+            // it lies in.
+            if is_sealed(&manifest, &node) {
                 continue;
             }
             let lo = timestamps.partition_point(|t| t.0 < range.start.0);
@@ -1655,14 +1987,7 @@ impl TimerSeriesWriter {
     }
 
     fn head_is_sealed(&self, head: &Arc<AtomicNode<TimeSeriesNode>>) -> bool {
-        let Some(start_ts) = head.timestamps().first().copied() else {
-            return false;
-        };
-        self.time_series
-            .manifest
-            .load()
-            .span(start_ts)
-            .is_some_and(|span| span.state == SpanState::Resident)
+        is_sealed(&self.time_series.manifest.load(), head)
     }
 }
 
