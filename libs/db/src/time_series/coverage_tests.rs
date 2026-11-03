@@ -366,3 +366,329 @@ fn a_full_listing_forgets_seals_the_peer_dropped() {
     assert!(!series.purge_span(Timestamp(100)).unwrap());
     assert_eq!(gaps(&series, 0, 400).1, [(300, 311)]);
 }
+
+/// The reply to a range fetch of `covered`: the samples of `peer` stamped
+/// inside it, valued as their timestamps like [`peer_node`]'s.
+fn fetch(series: &TimeSeries, peer: &[i64], covered: std::ops::Range<i64>) -> Vec<(i64, i64)> {
+    let stamps: Vec<Timestamp> = peer
+        .iter()
+        .filter(|t| covered.contains(t))
+        .map(|t| Timestamp(*t))
+        .collect();
+    let data: Vec<u8> = stamps
+        .iter()
+        .flat_map(|t| (t.0 as u64).to_le_bytes())
+        .collect();
+    let covered = Timestamp(covered.start)..Timestamp(covered.end);
+    series
+        .install_fragment(covered, 8, &stamps, &data)
+        .unwrap()
+        .iter()
+        .map(|r| (r.start.0, r.end.0))
+        .collect()
+}
+
+fn fragment_dirs(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "fragment"))
+        .count()
+}
+
+/// A remote-only peer seal over 0..=140, sampled every 10.
+fn remote(dir: &Path) -> (TimeSeries, TimeSeriesNode, SealRecord) {
+    let cdir = dir.join("c");
+    std::fs::create_dir_all(&cdir).unwrap();
+    let series = TimeSeries::create(&cdir).unwrap();
+    let src = peer_node(&dir.join("peer"), &every_10(140));
+    let peer = SealRecord::compute(&src).unwrap();
+    series.merge_remote_spans([peer]).unwrap();
+    (series, src, peer)
+}
+
+#[test]
+fn a_fragment_claims_what_the_peer_vouched_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    // Vouched for 15..61: its edges hold no samples, but are answered.
+    assert_eq!(fetch(&series, &every_10(140), 15..61), [(15, 61)]);
+    assert_eq!(gaps(&series, 0, 141).1, [(0, 15), (61, 141)]);
+    assert_eq!(gaps(&series, 15, 61).0, Coverage::Complete);
+    assert_eq!(stamps(&series, 0, 141), [20, 30, 40, 50, 60]);
+    assert_eq!(
+        series.get(Timestamp(30)).unwrap().data(),
+        30u64.to_le_bytes()
+    );
+    // The span itself stays remote-only; only coverage stops asking.
+    assert_eq!(
+        series.manifest().span(Timestamp(0)).unwrap().state,
+        SpanState::RemoteOnly
+    );
+    // Asking again claims only what is still missing.
+    assert_eq!(fetch(&series, &every_10(140), 0..100), [(0, 15), (61, 100)]);
+    assert_eq!(gaps(&series, 0, 141).1, [(100, 141)]);
+    assert_eq!(stamps(&series, 0, 141), every_10(90));
+}
+
+#[test]
+fn a_stretch_checked_and_empty_counts_as_covered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    assert_eq!(fetch(&series, &[], 41..50), [(41, 50)]);
+    assert_eq!(gaps(&series, 41, 50).0, Coverage::Complete);
+    assert_eq!(fragment_dirs(&dir.path().join("c")), 0);
+    let manifest = series.manifest();
+    assert!(manifest.fragments[0].node.is_none());
+}
+
+/// A point read's reply holds the sample before the instant and vouches
+/// back to just past the one before that, so a reader at any instant in
+/// between finds its predecessor held.
+#[test]
+fn point_reads_see_fragment_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 51..76);
+    let before = |t: i64| {
+        let slice = series.get_range(Timestamp(i64::MIN)..Timestamp(t))?;
+        let node = slice.as_iter().next()?;
+        node.timestamps().last().map(|t| t.0)
+    };
+    assert_eq!(before(75), Some(70));
+    assert_eq!(before(60), Some(60));
+    assert_eq!(gaps(&series, 51, 76).0, Coverage::Complete);
+    assert_eq!(
+        series.get(Timestamp(70)).unwrap().data(),
+        70u64.to_le_bytes()
+    );
+}
+
+#[test]
+fn a_whole_node_supersedes_its_fragments() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let (series, src, peer) = remote(dir.path());
+    fetch(&series, &every_10(140), 15..61);
+    fetch(&series, &[], 100..111);
+    assert_eq!(fragment_dirs(&cdir), 1);
+    // The fragments don't hide the span from a whole-node fetch.
+    let claim = series.begin_fetch(Timestamp(0)).unwrap();
+    assert!(claim.is_whole());
+    series
+        .install_fetched(stage(&cdir, &src, &peer), &peer)
+        .unwrap();
+    let manifest = series.manifest();
+    assert!(manifest.fragments.is_empty());
+    assert_eq!(
+        manifest.span(Timestamp(0)).unwrap().state,
+        SpanState::Resident
+    );
+    assert_eq!(stamps(&series, 0, 141), every_10(140));
+    assert_eq!(series.list.iter().count(), 1);
+    assert_eq!(fragment_dirs(&cdir), 0);
+}
+
+/// Fragments over a split seal give way to the pieces that land, and the
+/// mirrored node between them is untouched.
+#[test]
+fn a_split_install_supersedes_fragments_over_its_pieces() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let (series, src, peer) = split(dir.path());
+    assert_eq!(fetch(&series, &every_10(140), 15..61), [(15, 61)]);
+    // Never claimed across the mirrored node.
+    assert_eq!(
+        fetch(&series, &every_10(140), 95..131),
+        [(95, 100), (102, 131)]
+    );
+    assert_eq!(stamps(&series, 90, 135), [100, 101, 110, 120, 130]);
+    series.begin_fetch(Timestamp(0)).unwrap();
+    series
+        .install_fetched(stage(&cdir, &src, &peer), &peer)
+        .unwrap();
+    assert!(series.manifest().fragments.is_empty());
+    let mut expected = every_10(140);
+    expected.insert(expected.binary_search(&100).unwrap() + 1, 101);
+    expected.push(500);
+    assert_eq!(stamps(&series, 0, 501), expected);
+    assert_eq!(fragment_dirs(&cdir), 0);
+}
+
+/// A range fetch landing while a whole node is mid-fetch leaves the span
+/// to that fetch.
+#[test]
+fn fragments_leave_a_fetch_in_flight_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let (series, src, peer) = remote(dir.path());
+    series.begin_fetch(Timestamp(0)).unwrap();
+    assert_eq!(fetch(&series, &every_10(140), 15..61), []);
+    assert!(series.manifest().fragments.is_empty());
+    series
+        .install_fetched(stage(&cdir, &src, &peer), &peer)
+        .unwrap();
+    assert_eq!(stamps(&series, 0, 141), every_10(140));
+}
+
+/// A fetch that fails after fragments landed under its claim leaves them,
+/// and the span can be claimed again.
+#[test]
+fn an_aborted_fetch_keeps_fragments_that_landed_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 15..61);
+    series.begin_fetch(Timestamp(0)).unwrap();
+    series.abort_fetch(Timestamp(0));
+    assert_eq!(gaps(&series, 0, 141).1, [(0, 15), (61, 141)]);
+    assert!(series.begin_fetch(Timestamp(0)).is_some());
+}
+
+#[test]
+fn evicting_a_fragment_gives_its_range_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 15..61);
+    fetch(&series, &[], 100..111);
+    let now = std::time::Instant::now();
+    let grace = std::time::Duration::from_secs(5);
+    // Freshly read: kept.
+    let kept = crate::evict::evict(&series, now, grace, |_| true).unwrap();
+    assert_eq!(kept.spans, 0);
+    // Touched later, only the empty one goes idle.
+    let later = now + grace * 2;
+    series.touch(Timestamp(30)..Timestamp(31), later);
+    let evicted = crate::evict::evict(&series, later, grace, |_| true).unwrap();
+    assert_eq!(evicted.spans, 1);
+    assert_eq!(evicted.bytes, 0);
+    assert_eq!(gaps(&series, 0, 141).1, [(0, 15), (61, 141)]);
+    let evicted = crate::evict::evict(&series, later + grace * 2, grace, |_| true).unwrap();
+    assert_eq!(evicted.spans, 1);
+    assert!(evicted.bytes > 0);
+    assert_eq!(gaps(&series, 0, 141).1, [(0, 141)]);
+    assert!(stamps(&series, 0, 141).is_empty());
+    assert_eq!(fragment_dirs(&cdir), 0);
+}
+
+#[test]
+fn purge_span_on_a_fragment_drops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 15..61);
+    // Keyed by its node's first sample, as a list walk would find it.
+    assert!(series.purge_span(Timestamp(20)).unwrap());
+    assert!(series.manifest().fragments.is_empty());
+    assert!(stamps(&series, 0, 141).is_empty());
+    assert!(!series.purge_span(Timestamp(15)).unwrap());
+}
+
+/// Once the peer stops listing the seal, nothing can give a fragment's
+/// samples back, so eviction leaves it.
+#[test]
+fn a_fragment_of_a_seal_the_peer_dropped_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 15..61);
+    series.sync_remote_spans(vec![]).unwrap();
+    assert!(!series.purge_fragment(Timestamp(15)).unwrap());
+    assert_eq!(stamps(&series, 0, 141), [20, 30, 40, 50, 60]);
+}
+
+#[test]
+fn fragments_last_one_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 15..61);
+    drop(series);
+    let series = TimeSeries::open(&cdir).unwrap();
+    assert_eq!(fragment_dirs(&cdir), 0);
+    assert!(stamps(&series, 0, 141).is_empty());
+    assert_eq!(gaps(&series, 0, 141).1, [(0, 141)]);
+}
+
+/// Above an unsealed head nothing may land, fragments included.
+#[test]
+fn fragments_stay_below_an_unsealed_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    let mut writer = series.writer().unwrap();
+    series.enter_mirror_run(MirrorRun::next());
+    writer
+        .push_buf(Timestamp(100), &100u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(fetch(&series, &every_10(140), 0..141), [(0, 100)]);
+    assert_eq!(stamps(&series, 0, 141), every_10(100));
+    // The writer keeps appending to its head, not to the fragment.
+    writer
+        .push_buf(Timestamp(105), &105u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(series.list.iter().count(), 2);
+}
+
+/// In an archive without a writer, a fragment can become the newest node;
+/// a writer arriving later rolls a node above it rather than appending,
+/// and sealing never takes it for local data.
+#[test]
+fn a_fragment_at_the_head_is_never_written_or_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (series, _, _) = remote(dir.path());
+    fetch(&series, &every_10(140), 125..141);
+    let mut writer = series.writer().unwrap();
+    writer
+        .push_buf(Timestamp(200), &200u64.to_le_bytes())
+        .unwrap();
+    writer
+        .push_buf(Timestamp(300), &300u64.to_le_bytes())
+        .unwrap();
+    drop(writer);
+    series.seal_rolled_nodes().unwrap();
+    let manifest = series.manifest();
+    assert!(manifest.span(Timestamp(130)).is_none());
+    assert_eq!(manifest.fragments.len(), 1);
+    assert_eq!(stamps(&series, 0, 400), [130, 140, 200, 300]);
+    // Nor are its samples counted twice in estimates.
+    assert_eq!(
+        series.estimate_samples(Timestamp(125)..Timestamp(141)),
+        series
+            .manifest()
+            .count_in(&(Timestamp(125)..Timestamp(141)))
+    );
+}
+
+/// Where a whole peer node ends on a timestamp its neighbour's seal also
+/// holds, a range fetch over the neighbour claims the shared timestamp
+/// but leaves its samples to the node; purging the node takes such a
+/// fragment with it, so the shared timestamp is offered again.
+#[test]
+fn a_fragment_on_a_nodes_edge_goes_with_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    std::fs::create_dir_all(&cdir).unwrap();
+    let series = TimeSeries::create(&cdir).unwrap();
+    let a = peer_node(&dir.path().join("pa"), &[10, 20]);
+    let b = peer_node(&dir.path().join("pb"), &[20, 30]);
+    let (sa, sb) = (
+        SealRecord::compute(&a).unwrap(),
+        SealRecord::compute(&b).unwrap(),
+    );
+    series.merge_remote_spans([sa, sb]).unwrap();
+    series.begin_fetch(Timestamp(10)).unwrap();
+    series.install_fetched(stage(&cdir, &a, &sa), &sa).unwrap();
+    assert_eq!(gaps(&series, 0, 100).1, [(20, 31)]);
+    // The peer replies with both 20s; only b's 30 is new here.
+    let reply = [Timestamp(20), Timestamp(20), Timestamp(30)];
+    let data: Vec<u8> = [20u64, 20, 30]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    series
+        .install_fragment(Timestamp(20)..Timestamp(31), 8, &reply, &data)
+        .unwrap();
+    assert_eq!(gaps(&series, 0, 100).0, Coverage::Complete);
+    assert_eq!(stamps(&series, 0, 100), [10, 20, 30]);
+    assert!(series.purge_span(Timestamp(10)).unwrap());
+    assert!(series.manifest().fragments.is_empty());
+    assert_eq!(gaps(&series, 0, 100).1, [(10, 21), (20, 31)]);
+}

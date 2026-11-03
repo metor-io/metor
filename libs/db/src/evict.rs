@@ -116,18 +116,49 @@ impl LastAccess {
     }
 }
 
-type Victims = SmallVec<[(Timestamp, u64); 8]>;
+/// What eviction can take: a sealed span, keyed by its start, or a
+/// range-fetch fragment, keyed by its claim's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Victim {
+    start: Timestamp,
+    bytes: u64,
+    fragment: bool,
+}
+
+impl Victim {
+    fn of(span: &NodeSpan, fragment: bool) -> Self {
+        Self {
+            start: span.cover_start,
+            bytes: span.bytes(),
+            fragment,
+        }
+    }
+
+    fn purge(&self, series: &TimeSeries) -> Result<bool, Error> {
+        match self.fragment {
+            true => series.purge_fragment(self.start),
+            false => series.purge_span(self.start),
+        }
+    }
+}
+
+type Victims = SmallVec<[Victim; 8]>;
 
 /// Call `found` with each span of `series` eviction may take, and its
 /// node's last access: resident, sealed, not locally produced, and accepted
-/// by `evictable`. Whether `purge_span` agrees is only known when it runs.
+/// by `evictable`. Range-fetch fragments come as the spans they stand for
+/// ([`crate::manifest::Fragment::as_span`]). Whether a purge agrees is only
+/// known when it runs.
 fn evictable_spans(
     series: &TimeSeries,
     evictable: &mut impl FnMut(&NodeSpan) -> bool,
-    mut found: impl FnMut(u64, &NodeSpan),
+    mut found: impl FnMut(u64, Victim),
 ) {
     let manifest = series.manifest();
     for node in series.list.iter() {
+        if node.fragment {
+            continue;
+        }
         let Some(start) = node.timestamps().first().copied() else {
             continue;
         };
@@ -140,7 +171,13 @@ fn evictable_spans(
             && span.source != SpanSource::LocalIngest
             && evictable(span)
         {
-            found(node.last_access.last(), span);
+            found(node.last_access.last(), Victim::of(span, false));
+        }
+    }
+    for fragment in manifest.fragments.iter() {
+        let span = fragment.as_span();
+        if evictable(&span) {
+            found(fragment.access.last(), Victim::of(&span, true));
         }
     }
 }
@@ -160,9 +197,9 @@ fn idle_spans(
     out: &mut Victims,
 ) {
     let cutoff = idle_cutoff(now, grace);
-    evictable_spans(series, evictable, |last, span| {
+    evictable_spans(series, evictable, |last, victim| {
         if last < cutoff {
-            out.push((span.cover_start, span.bytes()));
+            out.push(victim);
         }
     });
 }
@@ -181,10 +218,10 @@ pub fn evict(
     }
     let mut victims = Victims::new();
     idle_spans(series, now, grace, &mut evictable, &mut victims);
-    for (start, bytes) in victims {
-        if series.purge_span(start)? {
+    for victim in victims {
+        if victim.purge(series)? {
             evicted.spans += 1;
-            evicted.bytes += bytes;
+            evicted.bytes += victim.bytes;
         }
     }
     Ok(evicted)
@@ -257,7 +294,7 @@ pub fn over_budget(
         evictable_spans(
             &component.time_series,
             &mut |span| evictable(id, span),
-            |_, span| total += span.bytes(),
+            |_, victim| total += victim.bytes,
         );
         if total > max_bytes {
             return true;
@@ -294,9 +331,9 @@ pub fn budget(
         evictable_spans(
             &component.time_series,
             &mut |span| evictable(id, span),
-            |last, span| {
-                total += span.bytes();
-                candidates.push((last, index, span.cover_start, span.bytes()));
+            |last, victim| {
+                total += victim.bytes;
+                candidates.push((last, index, victim));
             },
         );
     }
@@ -305,16 +342,16 @@ pub fn budget(
     }
     let cutoff = idle_cutoff(now, grace);
     candidates.sort_unstable_by_key(|(last, ..)| *last);
-    for (last, index, start, bytes) in candidates {
+    for (last, index, victim) in candidates {
         if total <= max_bytes || last >= cutoff {
             break;
         }
         let component = &components[index];
-        match component.time_series.purge_span(start) {
+        match victim.purge(&component.time_series) {
             Ok(true) => {
-                total -= bytes;
+                total -= victim.bytes;
                 evicted.spans += 1;
-                evicted.bytes += bytes;
+                evicted.bytes += victim.bytes;
             }
             Ok(false) => {}
             Err(err) => warn!(?err, id = ?component.component_id, "eviction failed"),

@@ -129,6 +129,100 @@ impl<T: Clone> AtomicStack<T> {
         self.splice(succ, SpliceKind::InsertOlder(value))
     }
 
+    /// Remove every node in `victims` and insert `values`, in one swap of
+    /// the head, so a reader sees the stack either before the edit or
+    /// after it. This is how cached data gives way to whatever supersedes
+    /// it without a moment where neither is linked. Returns false, changing
+    /// nothing, if any victim is no longer reachable from the head.
+    ///
+    /// Each value lands directly older than the last node `newer` says is
+    /// newer than it, or at the bottom when none is. Shells above the
+    /// deepest edit are rebuilt, as for [`Self::unlink`].
+    pub fn replace(
+        &self,
+        victims: &[Arc<AtomicNode<T>>],
+        mut values: Vec<T>,
+        newer: impl Fn(&T, &T) -> bool,
+    ) -> bool {
+        // Newest first, the order the walk places them in.
+        values.sort_by(|a, b| match (newer(a, b), newer(b, a)) {
+            (true, _) => std::cmp::Ordering::Less,
+            (_, true) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        });
+        let _guard = self.lock.write().unwrap();
+        loop {
+            let head_ptr = self.head.ptr.load(Ordering::Acquire);
+
+            // Walk until every victim is passed and every value placed.
+            // Under the write lock the only concurrent mutator is `push`,
+            // which never decrements, so every pointer stays valid.
+            enum Kept<T> {
+                Old(Arc<AtomicNode<T>>),
+                New(usize),
+            }
+            let mut kept: Vec<Kept<T>> = Vec::new();
+            let mut remaining = victims.len();
+            let mut next = 0;
+            let mut cursor_ptr = head_ptr;
+            while !cursor_ptr.is_null() && (remaining > 0 || next < values.len()) {
+                let cursor = unsafe {
+                    Arc::increment_strong_count(cursor_ptr);
+                    Arc::from_raw(cursor_ptr)
+                };
+                while next < values.len() && !newer(&cursor.value, &values[next]) {
+                    kept.push(Kept::New(next));
+                    next += 1;
+                }
+                cursor_ptr = cursor.prev.0.ptr.load(Ordering::Acquire);
+                if victims.iter().any(|v| Arc::ptr_eq(v, &cursor)) {
+                    remaining -= 1;
+                } else {
+                    kept.push(Kept::Old(cursor));
+                }
+            }
+            if remaining > 0 {
+                return false;
+            }
+            kept.extend((next..values.len()).map(Kept::New));
+
+            let mut below: Option<Arc<AtomicNode<T>>> = (!cursor_ptr.is_null()).then(|| unsafe {
+                Arc::increment_strong_count(cursor_ptr);
+                Arc::from_raw(cursor_ptr)
+            });
+            for entry in kept.iter().rev() {
+                let value = match entry {
+                    Kept::Old(node) => node.value.clone(),
+                    Kept::New(i) => values[*i].clone(),
+                };
+                below = Some(Arc::new(AtomicNode {
+                    value,
+                    prev: PrevLink(below.map(ArcAtomic::from).unwrap_or_else(ArcAtomic::null)),
+                }));
+            }
+
+            let new_head_ptr = below.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null());
+            if self
+                .head
+                .ptr
+                .compare_exchange(
+                    head_ptr,
+                    new_head_ptr as *mut _,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                std::mem::forget(below);
+                if !head_ptr.is_null() {
+                    drop(unsafe { Arc::from_raw(head_ptr) });
+                }
+                return true;
+            }
+            // A concurrent push won the head; rebuild including its nodes.
+        }
+    }
+
     fn splice(&self, boundary: &Arc<AtomicNode<T>>, kind: SpliceKind<T>) -> bool {
         let _guard = self.lock.write().unwrap();
         let boundary_ptr = Arc::as_ptr(boundary);
@@ -344,6 +438,39 @@ mod tests {
             expected.insert(pos + 1, 100);
             assert_eq!(contents(&stack), expected);
         }
+    }
+
+    /// Values are kept in order, as the timestamped nodes they stand for.
+    #[test]
+    fn replace_removes_and_inserts_in_order() {
+        let newer = |a: &i32, b: &i32| a > b;
+        let fill = || {
+            let stack = AtomicStack::new();
+            for i in [0, 20, 40, 60] {
+                stack.push(i);
+            }
+            stack
+        };
+        let stack = fill();
+        let victims = [node_at(&stack, 20), node_at(&stack, 40)];
+        assert!(stack.replace(&victims, vec![30, 70, -10, 25], newer));
+        assert_eq!(contents(&stack), vec![70, 60, 30, 25, 0, -10]);
+        // A victim already gone leaves the stack untouched.
+        assert!(!stack.replace(&victims[..1], vec![5], newer));
+        assert_eq!(contents(&stack), vec![70, 60, 30, 25, 0, -10]);
+
+        let stack = fill();
+        assert!(stack.replace(&[], vec![], newer));
+        assert_eq!(contents(&stack), vec![60, 40, 20, 0]);
+        let all: Vec<_> = [0, 20, 40, 60].map(|v| node_at(&stack, v)).into();
+        let weak = Arc::downgrade(&all[1]);
+        assert!(stack.replace(&all, vec![], newer));
+        assert_eq!(contents(&stack), Vec::<i32>::new());
+        drop(all);
+        assert!(weak.upgrade().is_none(), "replaced node still referenced");
+        let empty = AtomicStack::new();
+        assert!(empty.replace(&[], vec![1, 3, 2], newer));
+        assert_eq!(contents(&empty), vec![3, 2, 1]);
     }
 
     #[test]

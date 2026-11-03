@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::evict::LastAccess;
+
 use metor_proto::types::Timestamp;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -135,6 +137,73 @@ pub struct ComponentManifest {
     /// all, such as the gap between two mirrored nodes), so derivation
     /// stops offering them until local data inside is dropped.
     pub settled: Box<[Settled]>,
+    /// Stretches of remote-only spans held as fragments, sorted by start
+    /// and disjoint. In memory only.
+    pub fragments: Box<[Fragment]>,
+}
+
+/// A stretch of remote-only history this side read with a range fetch
+/// (`GetTimeSeries`), rather than as a whole sealed node.
+///
+/// It claims exactly the range the peer vouched for, `start..=end`, which
+/// can hold fewer samples than its edges suggest or none at all: a stretch
+/// checked and found empty is as answered as one full of samples. The
+/// samples it does hold live in a node of their own, linked into the
+/// component's node list like any other, so every read path sees them.
+///
+/// Fragments are a cache. They are never sealed into the manifest's spans,
+/// never acked, offloaded or persisted (their node directories are deleted
+/// on open), and the remote spans under them stay remote-only: coverage
+/// just stops reporting the claimed stretch as a gap. Eviction drops them
+/// like any other hydrated data, and a whole node installed over one
+/// replaces it.
+#[derive(Debug, Clone)]
+pub struct Fragment {
+    /// Inclusive start of the claimed stretch.
+    pub start: Timestamp,
+    /// Inclusive end of the claimed stretch.
+    pub end: Timestamp,
+    /// The seal of the fragment's node, or `None` when the stretch held
+    /// no samples.
+    pub node: Option<SealRecord>,
+    /// Where the node lives, so dropping the fragment can delete it.
+    pub(crate) dir: Option<Arc<Path>>,
+    /// Shared with the node when there is one, so a read that touches the
+    /// node keeps the fragment, and an empty fragment can still go idle.
+    pub(crate) access: Arc<LastAccess>,
+}
+
+impl Fragment {
+    pub fn claim(&self) -> Range<Timestamp> {
+        self.start..Timestamp(self.end.0.saturating_add(1))
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.node.map_or(0, |seal| seal.index_len + seal.data_len)
+    }
+
+    pub(crate) fn overlaps(&self, start: i64, end: i64) -> bool {
+        self.start.0 <= end && start <= self.end.0
+    }
+
+    /// The fragment as eviction sees it: a resident, unacked span of
+    /// fetched data covering its claim.
+    pub fn as_span(&self) -> NodeSpan {
+        let seal = self.node.unwrap_or(SealRecord {
+            start_ts: self.start,
+            end_ts: self.end,
+            count: 0,
+            index_len: 0,
+            data_len: 0,
+            checksum: 0,
+            element_size: 0,
+        });
+        NodeSpan {
+            cover_start: self.start,
+            cover_end: self.end,
+            ..NodeSpan::whole(seal, SpanState::Resident, SpanSource::RemoteFetch, false)
+        }
+    }
 }
 
 /// A stretch of a remote seal that needs no fetch: everything the seal
@@ -169,22 +238,43 @@ impl ComponentManifest {
     /// first overlapping span and stops past the range — components with
     /// years of sealed spans pay O(log n + overlapped), not O(n), and this
     /// runs per trace per frame.
+    ///
+    /// Stretches [`Self::fragments`] hold are not gaps, so a span partly
+    /// read by range fetches can report several.
     pub fn gaps(&self, range: &Range<Timestamp>, out: &mut GapVec) {
         for span in self.overlapping(range) {
             if span.state == SpanState::Resident {
                 continue;
             }
-            let start = Timestamp(range.start.0.max(span.cover_start.0));
-            let end = Timestamp(range.end.0.min(span.cover_end.0.saturating_add(1)));
-            if end.0 > start.0 {
+            let start = range.start.0.max(span.cover_start.0);
+            let end = range.end.0.min(span.cover_end.0.saturating_add(1));
+            let mut push = |start: i64, end: i64| {
                 out.push(Gap {
-                    range: start..end,
+                    range: Timestamp(start)..Timestamp(end),
                     state: span.state,
                     start_ts: span.cover_start,
                     seal_start: span.seal.start_ts,
-                });
+                })
+            };
+            let mut cursor = start;
+            for fragment in self.fragments_in(start, end) {
+                if fragment.start.0 > cursor {
+                    push(cursor, fragment.start.0);
+                }
+                cursor = cursor.max(fragment.end.0.saturating_add(1));
+            }
+            if end > cursor {
+                push(cursor, end);
             }
         }
+    }
+
+    /// The fragments overlapping `start..end`, in order.
+    pub(crate) fn fragments_in(&self, start: i64, end: i64) -> impl Iterator<Item = &Fragment> {
+        let lo = self.fragments.partition_point(|f| f.end.0 < start);
+        self.fragments[lo..]
+            .iter()
+            .take_while(move |f| f.start.0 < end)
     }
 
     /// Estimate how many samples the sealed spans hold inside `range`,
@@ -255,6 +345,7 @@ impl ComponentManifest {
             spans: spans.into_boxed_slice(),
             shadowed: shadowed.into_boxed_slice(),
             settled: settled.into_boxed_slice(),
+            fragments: Box::default(),
         }))
     }
 

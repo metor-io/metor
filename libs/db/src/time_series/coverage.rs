@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 
 use crate::{
     arc_ring::AtomicNode,
-    manifest::{ComponentManifest, NodeSpan, Settled, SpanSource, SpanState},
+    manifest::{ComponentManifest, Fragment, NodeSpan, Settled, SpanSource, SpanState},
     seal::SealRecord,
 };
 
@@ -40,6 +40,7 @@ pub(super) struct Draft {
     pub spans: Vec<NodeSpan>,
     pub shadowed: Vec<SealRecord>,
     pub settled: Vec<Settled>,
+    pub fragments: Vec<Fragment>,
 }
 
 impl Draft {
@@ -48,6 +49,7 @@ impl Draft {
             spans: manifest.spans.to_vec(),
             shadowed: manifest.shadowed.to_vec(),
             settled: manifest.settled.to_vec(),
+            fragments: manifest.fragments.to_vec(),
         }
     }
 
@@ -66,11 +68,17 @@ impl Draft {
                 .map(|s| (s.cover_start.0, s.state))
                 .collect::<Vec<_>>()
         );
+        self.fragments.sort_unstable_by_key(|f| f.start.0);
+        debug_assert!(
+            self.fragments.windows(2).all(|w| w[0].end < w[1].start),
+            "fragments must be disjoint"
+        );
         ComponentManifest {
             generation: 0,
             spans: self.spans.into_boxed_slice(),
             shadowed: self.shadowed.into_boxed_slice(),
             settled: self.settled.into_boxed_slice(),
+            fragments: self.fragments.into_boxed_slice(),
         }
     }
 
@@ -293,13 +301,15 @@ pub(super) struct Extent {
     pub end: i64,
 }
 
-/// Every non-empty node in `nodes` except `without`, sorted by start.
+/// Every non-empty node in `nodes` except `without` and fragments, sorted
+/// by start. Fragments claim no time of their own: they only answer for
+/// part of a remote span, which keeps deriving as though they weren't there.
 pub(super) fn extents(
     nodes: impl Iterator<Item = Arc<AtomicNode<TimeSeriesNode>>>,
     without: Option<&Arc<AtomicNode<TimeSeriesNode>>>,
 ) -> Vec<Extent> {
     let mut extents: Vec<Extent> = nodes
-        .filter(|node| without.is_none_or(|w| !Arc::ptr_eq(w, node)))
+        .filter(|node| !node.fragment && without.is_none_or(|w| !Arc::ptr_eq(w, node)))
         .filter_map(|node| {
             let timestamps = node.timestamps();
             let (start, end) = (timestamps.first()?.0, timestamps.last()?.0);
