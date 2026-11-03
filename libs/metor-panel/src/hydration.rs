@@ -30,7 +30,10 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use gpui::Global;
-use metor_db::remote::{FetchError, HydratePriority, Hydrator, REQUEST_TTL, RangeQuery};
+use metor_db::manifest::{ComponentManifest, Gap};
+use metor_db::remote::{
+    FetchError, HydratePriority, Hydrator, PAGE_BYTES, REQUEST_TTL, RangeQuery,
+};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::connections::TargetId;
@@ -161,6 +164,22 @@ impl Hydrators {
         .detach();
     }
 
+    /// Ask for a remote-only `gap` a plot shows: as the whole node holding
+    /// it, unless [`range_fetch`] finds the node far bigger than the gap.
+    pub fn request_gap(
+        &self,
+        component_id: ComponentId,
+        manifest: &ComponentManifest,
+        gap: &Gap,
+        priority: HydratePriority,
+        cx: &gpui::App,
+    ) {
+        match range_fetch(manifest, gap) {
+            Some(range) => self.request_range(component_id, RangeQuery::range(range), priority),
+            None => self.request(component_id, gap.range.clone(), priority, cx),
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.0.hydrators.lock().unwrap().is_empty()
     }
@@ -183,6 +202,39 @@ impl Hydrators {
     }
 }
 
+/// How many times a gap's share of its node the node must be before the
+/// gap is range-fetched instead.
+const NODE_TO_GAP: u64 = 8;
+
+/// The range to fetch for `gap` instead of its whole node, if any.
+///
+/// A whole node is the better fetch whenever it is affordable: it lands
+/// checksum-verified against its seal as the span itself, and replaces any
+/// fragments under it, where fragments are a cache that only ever goes
+/// away. A range fetch earns its place when the node is mostly bytes the
+/// plot doesn't show, as when a zoomed-in window sits over a node of up to
+/// 64 MB. So a gap is range-fetched when its share of the node's bytes
+/// (prorated by time, as [`ComponentManifest::count_in`] prorates samples)
+/// fits one page ([`PAGE_BYTES`], one round trip) and is at most an eighth
+/// of the node; anything wider fetches the node.
+///
+/// The gap is first widened to a power-of-two grid within its span, so a
+/// panning plot mostly repeats one ask instead of making a new one per
+/// frame.
+fn range_fetch(manifest: &ComponentManifest, gap: &Gap) -> Option<Range<Timestamp>> {
+    let span = manifest.span(gap.start_ts)?;
+    let cover = span.cover();
+    let len = gap.range.end.0.checked_sub(gap.range.start.0)?.max(1) as u64;
+    let grid = len.checked_next_power_of_two()? as i64;
+    let start = gap.range.start.0.div_euclid(grid) * grid;
+    let end = gap.range.end.0.saturating_add(grid - 1).div_euclid(grid) * grid;
+    let range = Timestamp(start.max(cover.start.0))..Timestamp(end.min(cover.end.0));
+    let seal_len = (span.seal.end_ts.0 - span.seal.start_ts.0) as u128 + 1;
+    let share = (span.bytes() as u128 * (range.end.0 - range.start.0) as u128 / seal_len) as u64;
+    (share <= PAGE_BYTES as u64 && share.saturating_mul(NODE_TO_GAP) <= span.bytes())
+        .then_some(range)
+}
+
 #[derive(Default)]
 pub struct HydratorGlobal(pub Hydrators);
 
@@ -194,4 +246,57 @@ pub fn hydrator(cx: &gpui::App) -> Option<Hydrators> {
     cx.try_global::<HydratorGlobal>()
         .map(|h| h.0.clone())
         .filter(|h| !h.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use metor_db::manifest::{NodeSpan, SpanSource, SpanState};
+    use metor_db::seal::SealRecord;
+
+    use super::*;
+
+    const MB: u64 = 1024 * 1024;
+
+    /// A remote span over 0..=999_999 holding `bytes`, and its gap over
+    /// `range`.
+    fn gap(bytes: u64, range: Range<i64>) -> Option<Range<i64>> {
+        let seal = SealRecord {
+            start_ts: Timestamp(0),
+            end_ts: Timestamp(999_999),
+            count: 1_000_000,
+            index_len: bytes / 2,
+            data_len: bytes / 2,
+            checksum: 1,
+            element_size: 8,
+        };
+        let manifest = ComponentManifest {
+            spans: [NodeSpan::whole(
+                seal,
+                SpanState::RemoteOnly,
+                SpanSource::RemoteFetch,
+                false,
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let gap = Gap {
+            range: Timestamp(range.start)..Timestamp(range.end),
+            state: SpanState::RemoteOnly,
+            start_ts: Timestamp(0),
+            seal_start: Timestamp(0),
+        };
+        range_fetch(&manifest, &gap).map(|r| r.start.0..r.end.0)
+    }
+
+    #[test]
+    fn a_small_gap_in_a_big_node_is_range_fetched() {
+        // A zoomed-in plot over a full node: widened to the grid.
+        assert_eq!(gap(64 * MB, 1000..2000), Some(0..2048));
+        assert_eq!(gap(64 * MB, 5000..6000), Some(4096..6144));
+        // Past one page, or a big share of the node, the node is the fetch.
+        assert_eq!(gap(64 * MB, 0..500_000), None);
+        assert_eq!(gap(MB, 0..200_000), None);
+        // The grid never reaches past the span.
+        assert_eq!(gap(64 * MB, 999_000..999_990), Some(998_400..1_000_000));
+    }
 }

@@ -194,6 +194,7 @@ impl GapCollector {
         }
         self.gaps.clear();
         series.coverage(self.visible.clone(), &mut self.gaps);
+        let manifest = series.manifest();
         let (min_x, span) = (self.min_x, self.span);
         let bands = &mut self.bands;
         let mut band = |range: &Range<Timestamp>| {
@@ -208,7 +209,7 @@ impl GapCollector {
                 && gap.state == metor_db::manifest::SpanState::RemoteOnly
                 && let Some(hydrator) = &self.hydrator
             {
-                hydrator.request(hydrate_id, gap.range.clone(), HydratePriority::Visible, cx);
+                hydrator.request_gap(hydrate_id, &manifest, gap, HydratePriority::Visible, cx);
             }
             band(&gap.range);
         }
