@@ -21,10 +21,6 @@ pub(crate) use commands::{
 };
 
 pub(crate) struct SessionStorage {
-    // Field order ensures an abandoned import stops its executor before its
-    // temporary directory is removed, even if the panel was never run, and
-    // a peer cache's executor stops before its lock is released.
-    runtime: Option<DbRuntime>,
     directory: StorageDirectory,
     source: Option<PathBuf>,
 }
@@ -65,17 +61,6 @@ impl StorageDirectory {
         }
     }
 }
-/// The executor for the tasks [`DB::open`] spawns for an existing database
-/// (an imported recording's working copy, a reopened peer cache), which
-/// must outlive every reader of it.
-struct DbRuntime(crate::background_tasks::BackgroundTasks);
-impl Drop for DbRuntime {
-    fn drop(&mut self) {
-        if let Err(error) = self.0.shutdown() {
-            tracing::error!(%error, "session db executor shutdown failed");
-        }
-    }
-}
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecordingManifest {
     format: String,
@@ -92,7 +77,6 @@ impl SessionStorage {
         Ok((
             Self {
                 directory: StorageDirectory::Temporary(directory),
-                runtime: None,
                 source: None,
             },
             db,
@@ -135,7 +119,6 @@ impl SessionStorage {
                         path: path.clone(),
                         _lock: lock,
                     },
-                    runtime: None,
                     source: None,
                 },
                 db,
@@ -176,22 +159,7 @@ impl SessionStorage {
         let bundle = directory.path().join("bundle");
         fs::create_dir(&bundle)?;
         let imported = archive::import(&path, &bundle, cancel)?;
-        let runtime = DbRuntime(Default::default());
-        let db_path = bundle.join("db");
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        runtime
-            .0
-            .spawn(stellarator::util::CancelToken::new(), move || async move {
-                let result = DB::open(db_path).map(Arc::new);
-                let ok = result.is_ok();
-                if tx.send(result).is_ok() && ok {
-                    std::future::pending::<()>().await;
-                }
-            });
-        let db = rx
-            .recv()
-            .map_err(io::Error::other)?
-            .map_err(io::Error::other)?;
+        let db = Arc::new(DB::open(bundle.join("db")).map_err(io::Error::other)?);
         let mut actual_gaps = db.snapshot_gaps();
         let mut recorded_gaps = imported.gaps.clone();
         actual_gaps.sort_by_key(|g| (g.component, g.start, g.end));
@@ -204,7 +172,6 @@ impl SessionStorage {
         let source = Some(path.canonicalize()?);
         Ok((
             Self {
-                runtime: Some(runtime),
                 directory: StorageDirectory::Temporary(directory),
                 source,
             },
@@ -213,13 +180,10 @@ impl SessionStorage {
         ))
     }
 
-    pub(crate) fn finish(mut self, db: &DB, shutdown: io::Result<()>) -> Result<(), FinishError> {
-        let shutdown = shutdown.and(
-            self.runtime
-                .take()
-                .map(|runtime| runtime.0.shutdown().map_err(io::Error::other))
-                .unwrap_or(Ok(())),
-        );
+    pub(crate) fn finish(self, db: &DB, shutdown: io::Result<()>) -> Result<(), FinishError> {
+        // Nothing may write the directory once it is removed, and the flush
+        // below must see every sample the persistence thread would have.
+        db.stop_persistence();
         match self.directory {
             StorageDirectory::Temporary(directory) => {
                 let path = directory.path().to_owned();

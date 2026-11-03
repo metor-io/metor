@@ -209,7 +209,7 @@ mod tests {
                 .unwrap();
         }
 
-        metor_db::lod::spawn(db.clone());
+        metor_db::lod::enable(&db);
 
         // The engine derives companions from the sealed history and emits
         // the complete buckets behind the sealed frontier.

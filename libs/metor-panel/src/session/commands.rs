@@ -545,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_runtime_stops_before_an_abandoned_working_copy_is_removed() {
+    fn an_abandoned_import_removes_its_working_copy() {
         let root = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(root.path().join("db")).unwrap());
         populate(&db);

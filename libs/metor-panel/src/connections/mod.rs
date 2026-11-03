@@ -403,9 +403,6 @@ pub struct ConnectionsStore {
     active: Vec<ActiveConnection>,
     db: Option<Arc<DB>>,
     _registry_lifetime: Arc<()>,
-    /// The LoD companion task is DB-wide and runs until quit, spawning at
-    /// most once — on the first local-authority connection.
-    lod_spawned: bool,
     tasks: crate::background_tasks::BackgroundTasks,
     /// Last successful layout write per target; skips rewrites while idle. Pane and
     /// item mutations don't notify the tile group, so autosave poll-compares
@@ -540,7 +537,7 @@ impl ConnectionsStore {
                             Hydrators::global(cx).insert(id, hydrator);
                         }
                         if resolved.local_authority {
-                            store.spawn_lod_once();
+                            store.enable_lod();
                         }
                     }
                     for conn in &mut store.active {
@@ -569,7 +566,6 @@ impl ConnectionsStore {
             active: Vec::new(),
             db: None,
             _registry_lifetime: lifetime,
-            lod_spawned: false,
             tasks: Default::default(),
             saved_layouts: Default::default(),
             registry_rx,
@@ -710,7 +706,7 @@ impl ConnectionsStore {
             Hydrators::global(cx).insert(target.id.clone(), hydrator.clone());
         }
         if connected.local_authority {
-            self.spawn_lod_once();
+            self.enable_lod();
         }
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -732,19 +728,12 @@ impl ConnectionsStore {
         cx.notify();
     }
 
-    /// Spawn the DB-wide LoD companion for the first local-authority
-    /// connection. Deliberately outlives the connection: the companion
-    /// serves the whole DB, and its buckets stay valid after a disconnect.
-    fn spawn_lod_once(&mut self) {
-        if self.lod_spawned {
-            return;
-        }
-        self.lod_spawned = true;
-        let db = self.db().clone();
-        self.tasks.spawn(CancelToken::new(), move || async move {
-            metor_db::lod::spawn(db);
-            std::future::pending::<()>().await
-        });
+    /// Enable the DB-wide LoD companion for the first local-authority
+    /// connection. It runs on the DB's persistence thread, so it outlives the
+    /// connection: it serves the whole DB, and its buckets stay valid after a
+    /// disconnect.
+    fn enable_lod(&self) {
+        metor_db::lod::enable(self.db());
     }
 
     /// Cancel `id`'s backend. The stellar executor drops the backend's tasks

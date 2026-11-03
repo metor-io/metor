@@ -20,7 +20,7 @@ use std::{
 };
 use zerocopy::{Immutable, IntoBytes};
 
-use crate::{Component, DB, Error, append_log::AppendLog, time_series::TimeSeriesNode};
+use crate::{Component, DbCore, Error, append_log::AppendLog, time_series::TimeSeriesNode};
 
 mod fft;
 use fft::{FftUDF, FrequencyDomainUDF};
@@ -186,7 +186,7 @@ impl Component {
     }
 }
 
-impl DB {
+impl DbCore {
     pub fn as_session_context(&self) -> Result<SessionContext, datafusion::error::DataFusionError> {
         use datafusion::prelude::*;
         let config = SessionConfig::new().set_bool("datafusion.catalog.information_schema", true);

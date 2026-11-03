@@ -45,6 +45,8 @@ impl Bench {
         ComponentId::new(name)
     }
 
+    /// Pushes a sample and commits it to history, so a seed read right
+    /// after sees it rather than racing the db's persistence thread.
     pub(super) fn push(&self, name: &str, ts: i64, values: &[f64]) {
         let component = self
             .db
@@ -56,6 +58,7 @@ impl Bench {
             crate::dynamic::tensor::write_f64_as(&mut bytes, prim, *v);
         }
         component.push_buf(Timestamp(ts), &bytes).unwrap();
+        self.db.flush().unwrap();
     }
 
     pub(super) fn source(&self, name: &str) -> Arc<Node> {
@@ -474,6 +477,7 @@ async fn a_seeded_expression_accumulates_history() {
     assert_eq!(take(&mut out, 5).await, vec![11.0, 21.0, 31.0, 41.0, 51.0]);
 
     // What a plot actually reads: distinct, advancing entries.
+    bench.db.flush().unwrap();
     let component = bench
         .db
         .with_state(|s| s.get_component(ComponentId::new("scaled")).cloned())

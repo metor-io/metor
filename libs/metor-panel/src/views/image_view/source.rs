@@ -142,6 +142,9 @@ pub(crate) mod tests {
     pub(crate) fn scrub_db(stamps: &[i64]) -> (tempfile::TempDir, Arc<DB>, metor_db::Component) {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        // Its wakes would come from off the gpui test scheduler, which
+        // reports them as nondeterminism; tests commit with `DB::flush`.
+        db.stop_persistence();
         let meta = ComponentMetadata::from(ID).with_image(ImageFormat::Mono16, 12);
         let id = meta.component_id;
         db.with_state_mut(|s| {
@@ -221,10 +224,12 @@ pub(crate) mod tests {
         component.push_buf(Timestamp(50), &frame_bytes(50)).unwrap();
         cx.run_until_parked();
         assert_eq!(read(&source, cx), Some((50, 500)));
-        // Live, a committed append (what the db's WAL committer makes) leads.
+        // Live, a committed append leads.
         cx.update(|cx| dispatch(TimeAction::Live, cx).unwrap());
-        let mut writer = component.time_series.writer().unwrap();
-        writer.push_buf(Timestamp(120), &frame_bytes(120)).unwrap();
+        component
+            .push_buf(Timestamp(120), &frame_bytes(120))
+            .unwrap();
+        db.flush().unwrap();
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(100));
         cx.run_until_parked();

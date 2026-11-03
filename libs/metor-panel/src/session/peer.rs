@@ -23,7 +23,7 @@ use metor_db::storage::StorageConfig;
 use metor_db::{AtomicTimestampExt as _, DB};
 use metor_proto_wkt::{DbInfoResp, InstanceId};
 
-use super::{DbRuntime, SessionStorage, StorageDirectory};
+use super::{SessionStorage, StorageDirectory};
 
 /// How long the startup probe waits for a peer to say who it is. Shorter
 /// than the mirror's own handshake bound: a slow answer costs only the
@@ -122,8 +122,7 @@ impl SessionStorage {
     }
 
     /// Claim and open `id`'s cache, or `None` to fall back to a temporary
-    /// DB. Opening an existing DB spawns its components' persistence and
-    /// lifecycle tasks, so it runs on an executor the session keeps.
+    /// DB.
     fn cached(cache: &PeerCache, peer: CachedPeer) -> Option<(Self, Arc<DB>)> {
         let id = peer.id;
         let mut cached = match cache.open(id) {
@@ -137,29 +136,16 @@ impl SessionStorage {
                 return None;
             }
         };
-        let runtime = DbRuntime(Default::default());
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        runtime
-            .0
-            .spawn(stellarator::util::CancelToken::new(), move || async move {
-                let result = cached.open_db().map(Arc::new);
-                let ok = result.is_ok();
-                if tx.send((cached, result)).is_ok() && ok {
-                    std::future::pending::<()>().await;
-                }
-            });
-        let (cached, db) = match rx.recv() {
-            Ok((cached, Ok(db))) => (cached, db),
-            Ok((_, Err(error))) => {
+        let db = match cached.open_db() {
+            Ok(db) => Arc::new(db),
+            Err(error) => {
                 tracing::warn!(%id, ?error, "could not open cached db; using a temporary db");
                 return None;
             }
-            Err(_) => return None,
         };
         tracing::info!(%id, fresh = cached.fresh, path = %cached.path().display(), "mirroring into peer cache");
         Some((
             Self {
-                runtime: Some(runtime),
                 directory: StorageDirectory::Cached(cached, peer),
                 source: None,
             },

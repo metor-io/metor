@@ -1,7 +1,7 @@
 //! Independent per-series committed-prefix capture. Each stream may end at a
 //! slightly different point; every included record is complete. No writers are
 //! paused and pending WAL data is left for subsequent captures.
-use crate::{DB, Error, append_log::FrozenLog, manifest::SpanState};
+use crate::{DbCore, Error, append_log::FrozenLog, manifest::SpanState};
 use metor_proto::types::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -58,7 +58,7 @@ impl Snapshot {
         &self.files
     }
 }
-impl DB {
+impl DbCore {
     /// Known unavailable history; snapshots include local bytes only.
     pub fn snapshot_gaps(&self) -> Vec<HistoryGap> {
         self.with_state(|state| {

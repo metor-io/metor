@@ -60,6 +60,7 @@ pub mod lod;
 pub mod manifest;
 pub mod msg_log;
 pub mod peer_cache;
+mod persistence;
 pub mod remote;
 pub mod scratch;
 pub mod seal;
@@ -73,10 +74,43 @@ mod vtable_stream;
 pub mod snapshot;
 pub mod storage;
 
+/// A database, and the persistence thread that keeps it on disk.
+///
+/// Everything else about the database lives in [`DbCore`], which this
+/// derefs to. The split exists so the persistence thread can share the core
+/// without keeping the `DB` itself alive: dropping the last `DB` stops and
+/// joins the thread, and with it every task writing to the directory.
 pub struct DB {
+    core: Arc<DbCore>,
+    persistence: std::sync::Mutex<Option<stellarator::struc_con::Thread<Option<()>>>>,
+}
+
+impl std::ops::Deref for DB {
+    type Target = DbCore;
+
+    fn deref(&self) -> &DbCore {
+        &self.core
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        self.stop_persistence();
+    }
+}
+
+/// The state of a [`DB`] that its persistence thread shares.
+pub struct DbCore {
     pub vtable_gen: AtomicCell<u64>,
     /// Invalidates cached display metadata independently of live sample arrival.
     pub metadata_gen: AtomicCell<u64>,
+    /// Bumped whenever a component or message log is added, or the LoD
+    /// engine is enabled: whatever the persistence thread must start
+    /// running. Kept apart from `vtable_gen` because components are added
+    /// through [`State`] directly, without a vtable bump.
+    storage_gen: AtomicCell<u64>,
+    /// Whether the LoD engine runs on this database; see [`lod::enable`].
+    lod: AtomicBool,
     state: RwLock<State>,
     pub recording_cell: PlayingCell,
 
@@ -129,6 +163,8 @@ pub struct State {
     components: HashMap<ComponentId, Component>,
     component_metadata: HashMap<ComponentId, ComponentMetadata>,
     metadata_generation: u64,
+    /// Counts components and message logs added, for [`DbCore::storage_gen`].
+    storage_generation: u64,
 
     msg_logs: HashMap<PacketId, MsgLog>,
 
@@ -162,6 +198,35 @@ pub struct State {
 }
 
 impl DB {
+    /// Starts the persistence thread over `core`.
+    fn start(core: DbCore) -> Self {
+        let core = Arc::new(core);
+        let persisted = core.clone();
+        let thread = stellarator::struc_con::ThreadBuilder::default()
+            .name("metor-db-persist")
+            .stellar(move || persistence::run(persisted));
+        DB {
+            core,
+            persistence: std::sync::Mutex::new(Some(thread)),
+        }
+    }
+
+    /// Stops the persistence thread and waits for it to exit, so nothing
+    /// writes to the directory afterwards; a seal in progress finishes
+    /// first. For an owner about to delete or hand off the directory. The
+    /// database stays readable, and [`DbCore::flush`] still drains what the
+    /// thread left behind. Later calls do nothing.
+    pub fn stop_persistence(&self) {
+        let thread = self
+            .persistence
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            thread.cancel_and_wait();
+        }
+    }
+
     pub fn create(path: PathBuf) -> Result<Self, Error> {
         Self::with_time_step(path, Duration::from_secs_f64(1.0 / 120.0))
     }
@@ -179,12 +244,14 @@ impl DB {
             },
             ..Default::default()
         };
-        let db = DB {
+        let db = DbCore {
             state: RwLock::new(state),
             recording_cell: PlayingCell::new(true),
             path,
             vtable_gen: AtomicCell::new(0),
             metadata_gen: AtomicCell::new(0),
+            storage_gen: AtomicCell::new(0),
+            lod: AtomicBool::new(false),
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: AtomicCell::new(Timestamp::now()),
@@ -192,9 +259,11 @@ impl DB {
             ephemeral: AtomicBool::new(false),
         };
         db.save_db_state()?;
-        Ok(db)
+        Ok(DB::start(db))
     }
+}
 
+impl DbCore {
     pub fn with_state<O, F: FnOnce(&State) -> O>(&self, f: F) -> O {
         let state = self.state.read().unwrap();
         f(&state)
@@ -203,9 +272,13 @@ impl DB {
     pub fn with_state_mut<O, F: FnOnce(&mut State) -> O>(&self, f: F) -> O {
         let mut state = self.state.write().unwrap();
         let generation = state.metadata_generation;
+        let storage = state.storage_generation;
         let result = f(&mut state);
         if generation != state.metadata_generation {
             self.metadata_gen.store(state.metadata_generation);
+        }
+        if storage != state.storage_generation {
+            self.storage_gen.store(state.storage_generation);
         }
         result
     }
@@ -238,7 +311,9 @@ impl DB {
         })?;
         self.save_db_state()
     }
+}
 
+impl DB {
     pub fn open(path: PathBuf) -> Result<Self, Error> {
         let mut component_metadata = HashMap::new();
         let mut components = HashMap::new();
@@ -325,11 +400,13 @@ impl DB {
         } else {
             Timestamp(start_timestamp)
         };
-        Ok(DB {
+        Ok(DB::start(DbCore {
             state: RwLock::new(state),
             path,
             vtable_gen: AtomicCell::new(0),
             metadata_gen: AtomicCell::new(0),
+            storage_gen: AtomicCell::new(0),
+            lod: AtomicBool::new(false),
             recording_cell: PlayingCell::new(db_state.recording),
             default_stream_time_step: AtomicU64::new(
                 db_state.default_stream_time_step.as_nanos() as u64
@@ -338,7 +415,20 @@ impl DB {
             earliest_timestamp: AtomicCell::new(earliest_timestamp),
             instance_id,
             ephemeral: AtomicBool::new(false),
-        })
+        }))
+    }
+}
+
+impl DbCore {
+    /// Asks the persistence thread to run the LoD engine; see [`lod::enable`].
+    fn enable_lod(&self) {
+        if !self.lod.swap(true, atomic::Ordering::SeqCst) {
+            self.storage_gen.fetch_add(1, atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn lod_enabled(&self) -> bool {
+        self.lod.load(atomic::Ordering::SeqCst)
     }
 
     /// This database's identity: made by [`DB::create`], kept on disk, and
@@ -705,6 +795,7 @@ impl State {
             self.set_component_metadata(component_metadata, db_path)?;
         }
         self.components.insert(component_id, component);
+        self.storage_generation = self.storage_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -899,6 +990,7 @@ impl State {
                 // A new log is a metadata change: it is how a `SyncMsgs`
                 // sweep learns there is another log to tail.
                 self.metadata_generation = self.metadata_generation.wrapping_add(1);
+                self.storage_generation = self.storage_generation.wrapping_add(1);
                 entry.insert(msg_log)
             }
         })
@@ -1185,9 +1277,22 @@ struct ComponentPersistence {
     engine_owned: bool,
 }
 
+impl ComponentPersistence {
+    /// Takes the WAL's durable reader at construction, so samples written
+    /// before the persistence task starts wait for it.
+    fn new(wal: &Disruptor, engine_owned: bool) -> Arc<std::sync::Mutex<Option<Self>>> {
+        Arc::new(std::sync::Mutex::new(Some(Self {
+            reader: wal.reader(),
+            writer: None,
+            engine_owned,
+        })))
+    }
+}
+
 impl Component {
-    /// Wrap existing storage for read-only consumers without starting an executor.
-    /// Use `create` or `open` when the component needs live WAL persistence.
+    /// Wrap existing storage for read-only consumers, with nothing to drain
+    /// its WAL. Use `create` or `open` when the component needs live WAL
+    /// persistence.
     pub fn from_time_series(
         component_id: ComponentId,
         schema: ComponentSchema,
@@ -1211,6 +1316,10 @@ impl Component {
     /// `engine_owned` marks a component whose writer belongs to the LoD
     /// engine (it emits buckets directly); its `persist` runs in drain mode
     /// so it never races [`lod`]'s `setup_levels` for the writer claim.
+    ///
+    /// Nothing drains the WAL until someone runs [`Self::persist`] and
+    /// [`TimeSeries::lifecycle`]; a [`DB`]'s persistence thread does that
+    /// for every component in it.
     pub fn create(
         db_path: &Path,
         component_id: ComponentId,
@@ -1227,18 +1336,16 @@ impl Component {
         if let Some(age) = max_node_age_override() {
             time_series.set_max_node_age(age);
         }
-        let this = Component {
-            wal: Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
+        let wal = Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES));
+        Ok(Component {
+            persistence: ComponentPersistence::new(&wal, engine_owned),
+            wal,
             component_id,
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
-            persistence: Default::default(),
             wal_dropped: Default::default(),
-        };
-        stellarator::spawn(this.clone().persist(engine_owned));
-        stellarator::spawn(this.time_series.clone().lifecycle());
-        Ok(this)
+        })
     }
 
     pub fn open(
@@ -1256,31 +1363,22 @@ impl Component {
             .latest()
             .map(|t| t.timestamp())
             .unwrap_or(Timestamp(i64::MIN));
-        let this = Component {
-            wal: Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES)),
+        let wal = Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES));
+        Ok(Component {
+            persistence: ComponentPersistence::new(&wal, engine_owned),
+            wal,
             component_id,
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
-            persistence: Default::default(),
             wal_dropped: Default::default(),
-        };
-        stellarator::spawn(this.persist(engine_owned));
-        stellarator::spawn(this.time_series.clone().lifecycle());
-        Ok(this)
+        })
     }
 
-    pub fn persist(&self, engine_owned: bool) -> impl Future<Output = ()> + 'static {
-        self.persistence
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| ComponentPersistence {
-                reader: self.wal.reader(),
-                writer: None,
-                engine_owned,
-            });
+    /// Drains the WAL into the time series as samples arrive.
+    pub fn persist(&self) -> impl Future<Output = ()> + 'static {
         // This reader only wakes the task. The durable reader and writer stay
-        // with the component when its executor is stopped, for DB::flush.
+        // with the component when the task stops, for DB::flush.
         let mut notify = self.wal.reader();
         let component = self.clone();
         async move {
@@ -2899,7 +2997,7 @@ mod dynamic_ingest_tests {
         });
 
         // values landed in the concrete time series
-        stellarator::sleep(std::time::Duration::from_millis(100)).await;
+        db.flush().unwrap();
         let pid0 = db
             .with_state(|s| {
                 s.get_component(ComponentId::new("processes.0.pid"))
@@ -3112,7 +3210,7 @@ mod dynamic_ingest_tests {
         let t3 = map_table(3000, &[("htop", 5, 0.5), ("init", 6, 0.25)]);
         db.ingest_table(id, &t3).unwrap();
 
-        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush().unwrap();
         assert_eq!(sample_times(&db, "processes.htop.pid"), [1000, 2000, 3000]);
         assert_eq!(
             sample_times(&db, "processes.init.cpu_usage"),
@@ -3137,7 +3235,7 @@ mod dynamic_ingest_tests {
         db.ingest_table(id, &t2).unwrap();
         assert!(db.vtable_gen.latest() > gen_before);
 
-        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush().unwrap();
         assert_eq!(sample_times(&db, "processes.htop.pid"), [1000, 2000]);
         assert_eq!(sample_times(&db, "processes.init.pid"), [2000]);
         let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
@@ -3153,7 +3251,7 @@ mod dynamic_ingest_tests {
         let t2 = map_table(2000, &[("init", 4, 0.25)]);
         db.ingest_table(id, &t2).unwrap();
 
-        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush().unwrap();
         assert_eq!(sample_times(&db, "processes.htop.pid"), [1000]);
         assert_eq!(sample_times(&db, "processes.init.pid"), [1000, 2000]);
         assert_eq!(cached_table(&db, id), t2);
@@ -3806,6 +3904,7 @@ mod wal_tests {
         let dir = tempfile::tempdir().unwrap();
         let id = ComponentId::new("image");
         let component = Component::create(dir.path(), id, image_schema(), false).unwrap();
+        let _persist = stellarator::spawn(component.persist()).drop_guard();
         assert!(component.wal.capacity() <= WAL_BUDGET);
         let mut buf = vec![0u8; IMAGE_SIZE];
         for ts in 0..100 {

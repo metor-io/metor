@@ -236,16 +236,14 @@ impl MsgLog {
         let path = path.as_ref();
         let wal = Disruptor::new(1024 * 1024);
         let pending = Arc::new(Mutex::new(wal.reader()));
-        let this = Self {
+        Ok(Self {
             list: Arc::new(AtomicStack::new()),
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             metadata: None,
             wal,
             pending,
-        };
-        stellarator::spawn(this.clone().persist());
-        Ok(this)
+        })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -271,16 +269,14 @@ impl MsgLog {
 
         let wal = Disruptor::new(1024 * 1024);
         let pending = Arc::new(Mutex::new(wal.reader()));
-        let this = Self {
+        Ok(Self {
             list,
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             metadata,
             wal,
             pending,
-        };
-        stellarator::spawn(this.clone().persist());
-        Ok(this)
+        })
     }
 
     pub fn push(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {
@@ -457,6 +453,8 @@ impl MsgLog {
         self.first_timestamp()
     }
 
+    /// Drains the WAL into the log as messages arrive. A [`crate::DB`]'s
+    /// persistence thread runs one per log.
     pub fn persist(self) -> impl Future<Output = ()> {
         let mut notify = self.wal.reader();
         async move {

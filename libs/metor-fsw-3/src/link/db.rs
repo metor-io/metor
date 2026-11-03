@@ -186,13 +186,18 @@ impl Db {
         })
     }
 
-    /// Deletes the database directory if the params ask for it.
+    /// Stops persisting the database, then deletes its directory if the
+    /// params ask for it, or flushes what is left otherwise.
     ///
-    /// Called once the serve task and the writer have stopped. Clients and
-    /// background tasks may still map its files; unix keeps those mappings
-    /// valid after the directory is gone.
+    /// Called once the serve task and the writer have stopped, so nothing
+    /// writes the directory afterwards. Clients may still map its files;
+    /// unix keeps those mappings valid after the directory is gone.
     fn finish(&mut self, log: &mut Log) {
+        self.db.stop_persistence();
         if self.params.on_exit() == OnExit::Keep {
+            if let Err(error) = self.db.flush() {
+                log.fault("flush_db", format!("{}: {error}", self.db.path.display()));
+            }
             return;
         }
         let path = self.db.path.clone();
@@ -255,7 +260,7 @@ pub async fn db(
         stellarator::spawn(udp).drop_guard()
     });
     let serve_task = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
-    metor_db::lod::spawn(db.clone());
+    metor_db::lod::enable(&db);
 
     let mut status = DbStatus::default();
     let mut reported = status;

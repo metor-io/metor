@@ -26,6 +26,16 @@ where
     ThreadBuilder::default().thread(f)
 }
 
+impl<T> Thread<T> {
+    /// Cancels the thread and blocks until it exits, for an owner tearing it
+    /// down from `Drop`, where there is no executor to await
+    /// [`Joinable::join`] on.
+    pub fn cancel_and_wait(self) {
+        self.cancel_token.cancel();
+        let _ = self.handle.join();
+    }
+}
+
 impl<T: Send + Sync> Joinable<T> for Thread<T> {
     fn join(self) -> impl Future<Output = Result<T, Error>> {
         JoinFuture {
@@ -99,11 +109,18 @@ where
 #[derive(Default)]
 pub struct ThreadBuilder {
     cancel_token: Option<CancelToken>,
+    name: Option<String>,
 }
 
 impl ThreadBuilder {
     pub fn cancel_token(mut self, cancel_token: CancelToken) -> Self {
         self.cancel_token = Some(cancel_token);
+        self
+    }
+
+    /// Names the OS thread, so profilers and panics say which role it plays.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -115,9 +132,15 @@ impl ThreadBuilder {
         let (tx, rx) = oneshot::<T>();
         let cancel_token = self.cancel_token.unwrap_or_default();
         let thread_cancel_token = cancel_token.clone();
-        let handle = std::thread::spawn(move || {
-            tx.send(f(thread_cancel_token));
-        });
+        let mut builder = std::thread::Builder::new();
+        if let Some(name) = self.name {
+            builder = builder.name(name);
+        }
+        let handle = builder
+            .spawn(move || {
+                tx.send(f(thread_cancel_token));
+            })
+            .expect("failed to spawn thread");
         Thread {
             handle,
             rx,

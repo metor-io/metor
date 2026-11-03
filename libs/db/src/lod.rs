@@ -30,7 +30,7 @@ use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Component, ComponentSchema, DB, Error,
+    Component, ComponentSchema, DbCore, Error,
     manifest::{ComponentManifest, RangeVec, SpanSource, SpanState},
     time_series::{TimeSeries, TimeSeriesNodeSlice, TimerSeriesWriter},
 };
@@ -102,14 +102,15 @@ pub fn lod_schema(source: &ComponentSchema) -> ComponentSchema {
     ComponentSchema::new(PrimType::F32, dim)
 }
 
-/// Spawn the engine: watches for new eligible components and runs one
-/// downsampling task per source. Call this only on the DB that ingests
-/// the raw data (the system of record), never on mirrors.
-pub fn spawn(db: Arc<DB>) {
-    stellarator::spawn(run(db));
+/// Run the engine on `db`'s persistence thread: it watches for new eligible
+/// components and runs one downsampling task per source, for as long as the
+/// database lives. Call this only on the DB that ingests the raw data (the
+/// system of record), never on mirrors. Enabling it again does nothing.
+pub fn enable(db: &DbCore) {
+    db.enable_lod();
 }
 
-async fn run(db: Arc<DB>) {
+pub(crate) async fn run(db: Arc<DbCore>) {
     let mut tracked: HashSet<ComponentId> = HashSet::new();
     loop {
         let new: Vec<Component> = db.with_state(|state| {
@@ -146,7 +147,7 @@ fn eligible(meta: &ComponentMetadata) -> bool {
     visible && !meta.is_string() && !is_lod_name(&meta.name) && meta.image_format().is_none()
 }
 
-async fn downsample_source(db: Arc<DB>, src: Component) {
+async fn downsample_source(db: Arc<DbCore>, src: Component) {
     let seal_waiter = src.time_series.seal_waiter();
     // The first sealed history is the rate estimate `bucket_us` derives
     // from; nothing can be emitted before a seal exists anyway.
@@ -229,7 +230,7 @@ fn estimate_period_us(series: &TimeSeries) -> Option<i64> {
 /// running, or not yet set up); callers then keep their pre-LoD behavior.
 /// A level that has emitted nothing reports [`i64::MIN`], pinning the min
 /// so no raw history is purged until summarization has actually started.
-pub fn summarized_frontier(db: &DB, source_id: ComponentId) -> Option<i64> {
+pub fn summarized_frontier(db: &DbCore, source_id: ComponentId) -> Option<i64> {
     let source_key = source_id.0.to_string();
     let mut frontier: Option<i64> = None;
     db.with_state(|state| {
@@ -297,7 +298,7 @@ struct Level {
 /// Resolve or create the LoD companions for `src`. Existing levels are
 /// found by `lod_source_id` so a renamed source keeps its history; new
 /// ones derive their bucket duration from `period_us` and persist it.
-fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -> Vec<Level> {
+fn setup_levels(db: &Arc<DbCore>, src: &Component, src_name: &str, period_us: i64) -> Vec<Level> {
     let mut levels = Vec::new();
     for ratio in LOD_RATIOS {
         let existing = db.with_state(|state| {
@@ -373,7 +374,7 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
 }
 
 fn create_level(
-    db: &Arc<DB>,
+    db: &Arc<DbCore>,
     src: &Component,
     name: String,
     component_id: ComponentId,

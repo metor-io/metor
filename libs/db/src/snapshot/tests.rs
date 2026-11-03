@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ComponentSchema, manifest::SpanSource};
+use crate::{ComponentSchema, DB, manifest::SpanSource};
 use metor_proto::types::{ComponentId, PrimType};
 use std::{
     path::Path,
