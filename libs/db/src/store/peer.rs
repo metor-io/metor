@@ -20,9 +20,17 @@ use super::{
 /// Most range fetches one batch pipelines; also the request ids it uses.
 pub const MAX_BATCH: usize = 64;
 
-/// Bound on one batch's round trip, so a wedged peer fails the batch and
-/// the next one redials instead of parking every waiting read.
-const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest a batch waits on the peer between sends or replies, so a wedged
+/// peer fails the batch and the next one redials instead of parking every
+/// waiting read. Reset per reply rather than spanning the batch: a batch of
+/// full pages on a slow link takes as long as its bytes take, and a bound
+/// on the whole would fail it every time, never converging.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a peer found unable to answer range fetches is believed: past
+/// this the range connection is redialed and the peer asked again, so one
+/// upgraded in place is noticed without restarting.
+const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// This store owns its connection outright, so bulk streams can use a
 /// fixed request id without colliding with anyone.
@@ -70,6 +78,7 @@ pub struct PeerStore {
 struct RangeConn {
     client: Client,
     supported: bool,
+    probed: std::time::Instant,
 }
 
 impl PeerStore {
@@ -136,9 +145,9 @@ impl PeerStore {
     ) -> Result<Vec<Result<SeriesReply, StoreError>>, StoreError> {
         for (i, request) in requests.iter().enumerate() {
             let id = (i + 1) as u8;
-            client
-                .send(request.with_request_id(id))
+            bounded(REPLY_TIMEOUT, client.send(request.with_request_id(id)))
                 .await
+                .map_err(unavailable)?
                 .0
                 .map_err(unavailable)?;
         }
@@ -146,10 +155,9 @@ impl PeerStore {
             (0..requests.len()).map(|_| None).collect();
         let mut pending = requests.len();
         while pending > 0 {
-            let pkt = client
-                .rx
-                .next_grow(vec![0u8; 1024])
+            let pkt = bounded(REPLY_TIMEOUT, client.rx.next_grow(vec![0u8; 1024]))
                 .await
+                .map_err(unavailable)?
                 .map_err(unavailable)?;
             let Some(slot) = (pkt.req_id() as usize)
                 .checked_sub(1)
@@ -209,6 +217,18 @@ impl PeerStore {
         match client.request(&DumpSchema).await {
             Ok(resp) => Ok(resp),
             Err(err) => Err(request_err(&mut guard, err)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PeerStore {
+    /// Make the range connection believe its peer can't answer range
+    /// fetches, as of `ago`.
+    pub(crate) async fn pretend_unsupported(&self, ago: std::time::Duration) {
+        if let Some(conn) = self.ranges.lock().await.as_mut() {
+            conn.supported = false;
+            conn.probed = std::time::Instant::now() - ago;
         }
     }
 }
@@ -347,8 +367,10 @@ impl NodeStore for PeerStore {
 
     /// Pipelined on the range connection, at most [`MAX_BATCH`] at a time:
     /// the server answers a connection's requests in order and each reply
-    /// is small, so a batch costs one round trip. A transport error or a
-    /// timeout fails the batch and drops the connection.
+    /// is small, so a batch costs one round trip. A transport error, or
+    /// [`REPLY_TIMEOUT`] without progress, fails the batch and drops the
+    /// connection. A peer that could not answer range fetches is asked
+    /// again after [`REPROBE_INTERVAL`].
     fn time_series<'a>(
         &'a self,
         requests: &'a [GetTimeSeries],
@@ -360,25 +382,31 @@ impl NodeStore for PeerStore {
                 )));
             }
             let mut guard = self.ranges.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|conn| !conn.supported && conn.probed.elapsed() >= REPROBE_INTERVAL)
+            {
+                *guard = None;
+            }
             if guard.is_none() {
                 let (client, info) = self.dial().await?;
                 let supported =
                     info.protocol_version >= 7 && info.features & FEATURE_RANGE_FETCH != 0;
-                *guard = Some(RangeConn { client, supported });
+                *guard = Some(RangeConn {
+                    client,
+                    supported,
+                    probed: std::time::Instant::now(),
+                });
             }
             let conn = guard.as_mut().expect("just connected");
             if !conn.supported {
                 return Err(StoreError::Unsupported);
             }
-            match bounded(BATCH_TIMEOUT, Self::pipeline(&mut conn.client, requests)).await {
-                Ok(Ok(replies)) => Ok(replies),
-                Ok(Err(err)) => {
-                    *guard = None;
-                    Err(err)
-                }
+            match Self::pipeline(&mut conn.client, requests).await {
+                Ok(replies) => Ok(replies),
                 Err(err) => {
                     *guard = None;
-                    Err(unavailable(err))
+                    Err(err)
                 }
             }
         })
