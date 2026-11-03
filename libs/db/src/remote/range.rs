@@ -200,6 +200,24 @@ impl Hydrator {
         self.request_range(component_id, RangeQuery::instant(t), priority);
     }
 
+    /// [`Self::request_range`] for several reads at once, queued under one
+    /// lock so the worker takes them as one batch: what a scrub asks of
+    /// every reader on screen goes out in one round trip, rather than as
+    /// many as the worker happens to wake between asks.
+    pub fn request_ranges(
+        &self,
+        asks: impl IntoIterator<Item = (ComponentId, RangeQuery)>,
+        priority: HydratePriority,
+    ) {
+        let now = Instant::now();
+        let mut queue = self.inner.ranges.lock().unwrap();
+        for (component_id, query) in asks {
+            queue.push((component_id, Ask::Range(query)), priority, now, false);
+        }
+        drop(queue);
+        self.inner.range_waker.wake();
+    }
+
     /// Fetch `query` of `component_id` and install it as fragments,
     /// returning the range the peer vouched for: local reads answer it from
     /// then on, until eviction or a whole node replaces the fragments. When
