@@ -13,6 +13,7 @@ mod db;
 mod fsw;
 mod hydrate;
 mod offload;
+mod range;
 
 pub use db::{MirrorEvent, RemoteDb};
 pub use fsw::fsw_stream;
@@ -20,6 +21,7 @@ pub use hydrate::hydrate_span;
 pub use hydrate::{HydratePriority, Hydrator, REQUEST_TTL};
 pub use metor_proto_stellar::{Peer, identify};
 pub use offload::offload_span;
+pub use range::{FetchError, PAGE_BYTES, RangeQuery, Strided, answered_here};
 
 use std::sync::Arc;
 
