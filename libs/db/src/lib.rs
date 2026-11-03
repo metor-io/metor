@@ -1134,12 +1134,17 @@ fn push_field(
 ) -> Result<Pushed, Error> {
     // PANIC Safety: the callers walk a table, so every field realizes a view.
     let view = rf.view.as_ref().expect("table provided to for_each_field");
-    let ts = rf.timestamp.unwrap_or(arrival.received);
     if let Some(run) = arrival.mirror {
         component.time_series.enter_mirror_run(run);
     }
     let new_series = component.time_series.is_empty();
-    component.push_buf(ts, view.as_bytes())?;
+    let ts = match rf.timestamp {
+        Some(ts) => {
+            component.push_buf(ts, view.as_bytes())?;
+            ts
+        }
+        None => component.push_buf_received(arrival.received, view.as_bytes()),
+    };
     Ok(Pushed {
         max_ts: Some(ts),
         new_series,
@@ -1338,19 +1343,46 @@ impl Component {
         }
     }
 
+    /// Pushes a sample at `timestamp`, refusing one older than the series.
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
         if timestamp < self.last_timestamp.latest() {
             return Err(Error::TimeTravel);
         }
+        self.write_wal(timestamp, value_buf);
+        Ok(())
+    }
+
+    /// Pushes a sample this db stamped with its own clock when the table
+    /// arrived, returning the timestamp it was written at.
+    ///
+    /// Connections stamp their tables before they contend for the WAL, so
+    /// when two write one component at once the later stamp can land
+    /// first. Neither sample is stale, so rather than refuse the other one
+    /// as time travel, it lands at the latest timestamp: the db's arrival
+    /// clock stays monotonic per component.
+    pub fn push_buf_received(&self, received: Timestamp, value_buf: &[u8]) -> Timestamp {
+        self.write_wal(received, value_buf)
+    }
+
+    /// Writes one sample to the WAL at `timestamp`, or at the series'
+    /// latest timestamp if a concurrent writer has since passed it.
+    ///
+    /// The stamp is settled under the grant's write lock, where
+    /// `last_timestamp` is exact, so the WAL never holds samples out of
+    /// order (its drain refuses those as time travel).
+    fn write_wal(&self, timestamp: Timestamp, value_buf: &[u8]) -> Timestamp {
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             self.warn_wal_drop(timestamp);
-            return Ok(());
+            return timestamp;
         };
+        let timestamp = timestamp.max(self.last_timestamp.latest());
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
-        drop(grant);
+        // Before the grant releases the write lock, so the next writer's
+        // stamp sees this one.
         self.last_timestamp.update_max(timestamp);
-        Ok(())
+        drop(grant);
+        timestamp
     }
 }
 
@@ -1462,16 +1494,27 @@ struct IncomingNode {
     staging: store::NodeStaging,
 }
 
+/// The largest packet a connection accepts.
+const MAX_PACKET_LEN: usize = 1024 * 1024 * 1024;
+
+/// What a connection's receive buffer and response packet start at. Large
+/// enough for any UDP datagram, since a datagram that doesn't fit is cut.
+const CONN_BUF_LEN: usize = 128 * 1024;
+
 async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     mut tx: Arc<Mutex<PacketSink<OwnedWriter<A>>>>,
     mut rx: PacketStream<OwnedReader<A>>,
     db: Arc<DB>,
 ) -> Result<(), Error> {
-    let mut buf = vec![0u8; 1024 * 1024 * 1024];
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024 * 1024);
+    // Both buffers start small and grow to the largest packet the
+    // connection carries. Every connection runs on its own thread, and
+    // reserving the 1 GiB ceiling up front for each one stalled new
+    // connections for most of a second once a few dozen were open.
+    let mut buf = vec![0u8; CONN_BUF_LEN];
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], CONN_BUF_LEN);
     let mut conn = ConnState::default();
     loop {
-        let pkt = rx.next(buf).await?;
+        let pkt = rx.next_grow_max(buf, MAX_PACKET_LEN).await?;
         let req_id = pkt.req_id();
         let mut pkt_tx = PacketTx {
             req_id,

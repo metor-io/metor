@@ -1443,7 +1443,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        let sql = "SELECT * FROM `sensor_1_temp`, `sensor_2_temp` WHERE `sensor_1_temp`.`sensor_1_temp` > 22.0";
+        let sql = "SELECT * FROM `sensor1.temp`, `sensor2.temp` WHERE `sensor1.temp`.`sensor1.temp` > 22.0";
         let mut stream = client.stream(&SQLQuery(sql.to_string())).await.unwrap();
 
         let mut batches = vec![];
@@ -1459,7 +1459,7 @@ mod tests {
             }
         }
 
-        let sql_simple = "SELECT * FROM `sensor_1_temp` UNION ALL SELECT * FROM `sensor_2_temp`";
+        let sql_simple = "SELECT * FROM `sensor1.temp` UNION ALL SELECT * FROM `sensor2.temp`";
         let mut stream_simple = client
             .stream(&SQLQuery(sql_simple.to_string()))
             .await
