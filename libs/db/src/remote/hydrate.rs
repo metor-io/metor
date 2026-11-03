@@ -9,6 +9,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 
+use super::range::{Completion, FetchError, Outcome, RangeKey};
 use crate::{
     AtomicTimestampExt, ComponentSchema, DB, Error,
     manifest::{GapVec, SpanState},
@@ -101,72 +102,125 @@ pub enum HydratePriority {
     Selected,
 }
 
-struct Request {
-    component_id: ComponentId,
-    range: Range<Timestamp>,
+pub(super) struct Request<K> {
+    pub key: K,
     priority: HydratePriority,
     /// Order of the latest ask; newer wins within a priority.
     seq: u64,
     asked: Instant,
+    /// Where the outcome goes, once someone awaits it.
+    pub done: Option<Arc<Completion>>,
+}
+
+impl<K> Request<K> {
+    /// Someone still awaits the outcome, which keeps the request alive
+    /// past [`REQUEST_TTL`]: an await is an ask that never stops.
+    fn awaited(&self) -> bool {
+        self.done.as_ref().is_some_and(|d| Arc::strong_count(d) > 1)
+    }
+
+    pub(super) fn finish(&self, outcome: Result<Outcome, FetchError>) {
+        if let Some(done) = &self.done {
+            done.finish(outcome);
+        }
+    }
 }
 
 /// The waiting requests: the most urgent, most recently asked first, and
-/// anything not re-asked within [`REQUEST_TTL`] forgotten. Kept apart from
-/// the worker so the ordering is testable without a store.
-#[derive(Default)]
-struct Queue {
-    waiting: Vec<Request>,
+/// anything not re-asked within [`REQUEST_TTL`] (nor awaited) forgotten.
+/// Kept apart from the worker so the ordering is testable without a store.
+pub(super) struct Queue<K> {
+    waiting: Vec<Request<K>>,
     seq: u64,
 }
 
-impl Queue {
+impl<K> Default for Queue<K> {
+    fn default() -> Self {
+        Self {
+            waiting: Vec::new(),
+            seq: 0,
+        }
+    }
+}
+
+impl<K: PartialEq> Queue<K> {
     /// Add or refresh a request. A repeat keeps one entry, taking the newer
-    /// ask and the higher of the two priorities.
-    fn push(
+    /// ask and the higher of the two priorities. With `await_it`, returns
+    /// the completion the request's outcome will land in.
+    pub(super) fn push(
         &mut self,
-        component_id: ComponentId,
-        range: Range<Timestamp>,
+        key: K,
         priority: HydratePriority,
         now: Instant,
-    ) {
+        await_it: bool,
+    ) -> Option<Arc<Completion>> {
         self.seq += 1;
         let seq = self.seq;
-        if let Some(existing) = self
-            .waiting
-            .iter_mut()
-            .find(|r| r.component_id == component_id && r.range == range)
-        {
-            existing.priority = existing.priority.max(priority);
-            existing.seq = seq;
-            existing.asked = now;
-            return;
-        }
-        if self.waiting.len() >= QUEUE_CAP
-            && let Some(least) = self.least_important()
-        {
-            self.waiting.swap_remove(least);
-        }
-        self.waiting.push(Request {
-            component_id,
-            range,
-            priority,
-            seq,
-            asked: now,
+        let at = match self.waiting.iter().position(|r| r.key == key) {
+            Some(at) => {
+                let existing = &mut self.waiting[at];
+                existing.priority = existing.priority.max(priority);
+                existing.seq = seq;
+                existing.asked = now;
+                at
+            }
+            None => {
+                if self.waiting.len() >= QUEUE_CAP
+                    && let Some(least) = self.least_important()
+                {
+                    self.waiting
+                        .swap_remove(least)
+                        .finish(Err(FetchError::Expired));
+                }
+                self.waiting.push(Request {
+                    key,
+                    priority,
+                    seq,
+                    asked: now,
+                    done: None,
+                });
+                self.waiting.len() - 1
+            }
+        };
+        await_it.then(|| {
+            self.waiting[at]
+                .done
+                .get_or_insert_with(|| Arc::new(Completion::default()))
+                .clone()
+        })
+    }
+
+    /// Drop what expired: not asked again within [`REQUEST_TTL`] and not
+    /// awaited.
+    fn expire(&mut self, now: Instant) {
+        self.waiting.retain(|r| {
+            let alive = now.saturating_duration_since(r.asked) < REQUEST_TTL || r.awaited();
+            if !alive {
+                r.finish(Err(FetchError::Expired));
+            }
+            alive
         });
     }
 
     /// Take the request to serve next, dropping any that expired.
-    fn pop(&mut self, now: Instant) -> Option<(ComponentId, Range<Timestamp>)> {
-        self.waiting
-            .retain(|r| now.saturating_duration_since(r.asked) < REQUEST_TTL);
+    pub(super) fn pop(&mut self, now: Instant) -> Option<Request<K>> {
+        self.expire(now);
         let next = self
             .waiting
             .iter()
             .enumerate()
             .max_by_key(|(_, r)| (r.priority, r.seq))
             .map(|(i, _)| i)?;
-        let request = self.waiting.swap_remove(next);
-        Some((request.component_id, request.range))
+        Some(self.waiting.swap_remove(next))
+    }
+
+    /// Take up to `max` requests, most urgent first.
+    pub(super) fn pop_batch(&mut self, now: Instant, max: usize) -> Vec<Request<K>> {
+        self.expire(now);
+        self.waiting
+            .sort_unstable_by_key(|r| std::cmp::Reverse((r.priority, r.seq)));
+        let take = self.waiting.len().min(max);
+        self.waiting.drain(..take).collect()
     }
 
     fn least_important(&self) -> Option<usize> {
@@ -185,7 +239,7 @@ impl Queue {
 /// component's data waker so views repaint as spans land.
 #[derive(Clone)]
 pub struct Hydrator {
-    inner: Arc<HydratorInner>,
+    pub(super) inner: Arc<HydratorInner>,
 }
 
 impl Default for Hydrator {
@@ -194,10 +248,14 @@ impl Default for Hydrator {
     }
 }
 
-struct HydratorInner {
-    queue: std::sync::Mutex<Queue>,
+pub(super) struct HydratorInner {
+    queue: std::sync::Mutex<Queue<(ComponentId, Range<Timestamp>)>>,
     backoff: std::sync::Mutex<HashMap<(ComponentId, Timestamp), Backoff>>,
     waker: WaitQueue,
+    /// Range fetches and point reads, served apart from whole nodes so
+    /// neither waits on the other (see [`super::range`]).
+    pub(super) ranges: std::sync::Mutex<Queue<RangeKey>>,
+    pub(super) range_waker: WaitQueue,
 }
 
 impl Hydrator {
@@ -207,12 +265,14 @@ impl Hydrator {
                 queue: std::sync::Mutex::new(Queue::default()),
                 backoff: std::sync::Mutex::new(HashMap::new()),
                 waker: WaitQueue::new(),
+                ranges: std::sync::Mutex::new(Queue::default()),
+                range_waker: WaitQueue::new(),
             }),
         }
     }
 
     /// Whether `key` is still inside its retry backoff window.
-    fn backed_off(&self, key: (ComponentId, Timestamp)) -> bool {
+    pub(super) fn backed_off(&self, key: (ComponentId, Timestamp)) -> bool {
         self.inner
             .backoff
             .lock()
@@ -224,7 +284,7 @@ impl Hydrator {
     /// Record a failed hydration: bump the attempt count and push
     /// `retry_at` out by exponential backoff (capped). Prunes elapsed
     /// entries when the memo grows past [`MEMO_CAP`].
-    fn record_failure(&self, key: (ComponentId, Timestamp)) {
+    pub(super) fn record_failure(&self, key: (ComponentId, Timestamp)) {
         let mut memo = self.inner.backoff.lock().unwrap();
         let now = Instant::now();
         let entry = memo.entry(key).or_insert(Backoff {
@@ -241,7 +301,7 @@ impl Hydrator {
     }
 
     /// Clear a span's backoff once it hydrates (or no longer needs to).
-    fn clear_backoff(&self, key: (ComponentId, Timestamp)) {
+    pub(super) fn clear_backoff(&self, key: (ComponentId, Timestamp)) {
         self.inner.backoff.lock().unwrap().remove(&key);
     }
 
@@ -255,11 +315,12 @@ impl Hydrator {
         range: Range<Timestamp>,
         priority: HydratePriority,
     ) {
-        self.inner
-            .queue
-            .lock()
-            .unwrap()
-            .push(component_id, range, priority, Instant::now());
+        self.inner.queue.lock().unwrap().push(
+            (component_id, range),
+            priority,
+            Instant::now(),
+            false,
+        );
         // wake() stores a wakeup if it lands while run() is between its
         // queue pop and wait(); one stored wakeup suffices because the
         // single consumer drains the whole queue before re-waiting.
@@ -273,21 +334,30 @@ impl Hydrator {
     }
 
     /// Serve requests until the runtime shuts down. Spawn once per DB
-    /// with the store hydration should pull from.
+    /// with the store hydration should pull from. Whole nodes and range
+    /// fetches are served side by side, so a point read never waits for a
+    /// node download to finish.
     pub async fn run(self, db: Arc<DB>, store: Arc<dyn NodeStore>) {
-        loop {
-            let next = self.inner.queue.lock().unwrap().pop(Instant::now());
-            let Some((component_id, range)) = next else {
-                let _ = self.inner.waker.wait().await;
-                continue;
-            };
-            if let Err(err) = self.serve(&db, store.as_ref(), component_id, range).await {
-                warn!(?err, ?component_id, "hydration request failed");
+        let nodes = async {
+            loop {
+                let next = self.inner.queue.lock().unwrap().pop(Instant::now());
+                let Some(Request {
+                    key: (component_id, range),
+                    ..
+                }) = next
+                else {
+                    let _ = self.inner.waker.wait().await;
+                    continue;
+                };
+                if let Err(err) = self.serve(&db, store.as_ref(), component_id, range).await {
+                    warn!(?err, ?component_id, "hydration request failed");
+                }
             }
-        }
+        };
+        futures_lite::future::zip(nodes, self.serve_ranges(&db, store.as_ref())).await;
     }
 
-    async fn serve(
+    pub(super) async fn serve(
         &self,
         db: &Arc<DB>,
         store: &dyn NodeStore,
@@ -359,8 +429,20 @@ mod tests {
         Timestamp(start)..Timestamp(start + 10)
     }
 
-    fn drain(queue: &mut Queue, now: Instant) -> Vec<(ComponentId, Range<Timestamp>)> {
-        std::iter::from_fn(|| queue.pop(now)).collect()
+    type Key = (ComponentId, Range<Timestamp>);
+
+    fn drain(queue: &mut Queue<Key>, now: Instant) -> Vec<Key> {
+        std::iter::from_fn(|| queue.pop(now).map(|r| r.key)).collect()
+    }
+
+    fn push(
+        queue: &mut Queue<Key>,
+        id: ComponentId,
+        range: Range<Timestamp>,
+        p: HydratePriority,
+        now: Instant,
+    ) {
+        queue.push((id, range), p, now, false);
     }
 
     #[test]
@@ -368,11 +450,11 @@ mod tests {
         let mut queue = Queue::default();
         let now = Instant::now();
         let id = ComponentId(1);
-        queue.push(id, range(0), HydratePriority::Prefetch, now);
-        queue.push(id, range(10), HydratePriority::Visible, now);
-        queue.push(id, range(20), HydratePriority::Selected, now);
-        queue.push(id, range(30), HydratePriority::Visible, now);
-        queue.push(id, range(40), HydratePriority::Selected, now);
+        push(&mut queue, id, range(0), HydratePriority::Prefetch, now);
+        push(&mut queue, id, range(10), HydratePriority::Visible, now);
+        push(&mut queue, id, range(20), HydratePriority::Selected, now);
+        push(&mut queue, id, range(30), HydratePriority::Visible, now);
+        push(&mut queue, id, range(40), HydratePriority::Selected, now);
         let order: Vec<_> = drain(&mut queue, now)
             .into_iter()
             .map(|(_, r)| r.start.0)
@@ -385,16 +467,16 @@ mod tests {
         let mut queue = Queue::default();
         let now = Instant::now();
         let id = ComponentId(1);
-        queue.push(id, range(0), HydratePriority::Visible, now);
-        queue.push(id, range(10), HydratePriority::Visible, now);
+        push(&mut queue, id, range(0), HydratePriority::Visible, now);
+        push(&mut queue, id, range(10), HydratePriority::Visible, now);
         // Asked again: newest within its priority, and never lowered.
-        queue.push(id, range(0), HydratePriority::Visible, now);
+        push(&mut queue, id, range(0), HydratePriority::Visible, now);
         assert_eq!(queue.waiting.len(), 2);
-        assert_eq!(queue.pop(now).map(|(_, r)| r.start.0), Some(0));
-        queue.push(id, range(20), HydratePriority::Selected, now);
-        queue.push(id, range(20), HydratePriority::Prefetch, now);
-        queue.push(id, range(30), HydratePriority::Visible, now);
-        assert_eq!(queue.pop(now).map(|(_, r)| r.start.0), Some(20));
+        assert_eq!(queue.pop(now).map(|r| r.key.1.start.0), Some(0));
+        push(&mut queue, id, range(20), HydratePriority::Selected, now);
+        push(&mut queue, id, range(20), HydratePriority::Prefetch, now);
+        push(&mut queue, id, range(30), HydratePriority::Visible, now);
+        assert_eq!(queue.pop(now).map(|r| r.key.1.start.0), Some(20));
     }
 
     #[test]
@@ -402,10 +484,10 @@ mod tests {
         let mut queue = Queue::default();
         let start = Instant::now();
         let id = ComponentId(1);
-        queue.push(id, range(0), HydratePriority::Selected, start);
-        queue.push(id, range(10), HydratePriority::Visible, start);
+        push(&mut queue, id, range(0), HydratePriority::Selected, start);
+        push(&mut queue, id, range(10), HydratePriority::Visible, start);
         let later = start + REQUEST_TTL / 2;
-        queue.push(id, range(10), HydratePriority::Visible, later);
+        push(&mut queue, id, range(10), HydratePriority::Visible, later);
         // range(0) went quiet a full TTL ago; range(10) was asked again.
         let expired = start + REQUEST_TTL;
         assert_eq!(
@@ -420,14 +502,57 @@ mod tests {
         let mut queue = Queue::default();
         let now = Instant::now();
         let id = ComponentId(1);
-        queue.push(id, range(-10), HydratePriority::Prefetch, now);
+        push(&mut queue, id, range(-10), HydratePriority::Prefetch, now);
         for i in 0..QUEUE_CAP as i64 - 1 {
-            queue.push(id, range(i * 10), HydratePriority::Visible, now);
+            push(&mut queue, id, range(i * 10), HydratePriority::Visible, now);
         }
-        queue.push(id, range(10_000), HydratePriority::Selected, now);
+        push(
+            &mut queue,
+            id,
+            range(10_000),
+            HydratePriority::Selected,
+            now,
+        );
         assert_eq!(queue.waiting.len(), QUEUE_CAP);
         let served = drain(&mut queue, now);
         assert_eq!(served.first().map(|(_, r)| r.start.0), Some(10_000));
         assert!(served.iter().all(|(_, r)| r.start.0 != -10));
+    }
+
+    /// An awaited request outlives the TTL for as long as it is awaited,
+    /// and an expired one tells whoever still holds its completion.
+    #[test]
+    fn awaited_requests_live_until_dropped() {
+        let mut queue = Queue::default();
+        let start = Instant::now();
+        let id = ComponentId(1);
+        let held = queue
+            .push((id, range(0)), HydratePriority::Selected, start, true)
+            .unwrap();
+        let dropped = queue
+            .push((id, range(10)), HydratePriority::Selected, start, true)
+            .unwrap();
+        let expired = start + REQUEST_TTL * 2;
+        queue.expire(expired);
+        assert_eq!(queue.waiting.len(), 2, "both still awaited");
+        drop(dropped);
+        queue.expire(expired);
+        assert_eq!(queue.waiting.len(), 1);
+        assert_eq!(drain(&mut queue, expired), [(id, range(0))]);
+        drop(held);
+    }
+
+    #[test]
+    fn a_request_pushed_out_completes_as_expired() {
+        let mut queue = Queue::default();
+        let now = Instant::now();
+        let id = ComponentId(1);
+        let least = queue
+            .push((id, range(-10)), HydratePriority::Prefetch, now, true)
+            .unwrap();
+        for i in 0..QUEUE_CAP as i64 {
+            queue.push((id, range(i * 10)), HydratePriority::Visible, now, false);
+        }
+        assert!(matches!(least.outcome(), Some(Err(FetchError::Expired))));
     }
 }

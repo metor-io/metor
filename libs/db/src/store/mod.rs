@@ -19,11 +19,12 @@ mod peer;
 pub use local_dir::LocalDirStore;
 #[cfg(feature = "store-object")]
 pub use object::ObjectStoreAdapter;
-pub use peer::PeerStore;
+pub use peer::{MAX_BATCH, PeerStore};
 
 use std::{future::Future, path::PathBuf, pin::Pin};
 
 use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto_wkt::GetTimeSeries;
 
 use crate::{
     Error,
@@ -382,4 +383,20 @@ pub trait NodeStore: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>>;
 
     fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Answer range fetches ([`GetTimeSeries`]) instead of whole nodes, one
+    /// reply (or error) per request, in order. Only a live database can:
+    /// the default, for stores of sealed nodes, is [`StoreError::Unsupported`],
+    /// as it is from a peer too old to say what a reply covers. Callers then
+    /// fall back to whole nodes.
+    fn time_series<'a>(
+        &'a self,
+        requests: &'a [GetTimeSeries],
+    ) -> BoxFuture<'a, Result<Vec<Result<SeriesReply, StoreError>>, StoreError>> {
+        let _ = requests;
+        Box::pin(async { Err(StoreError::Unsupported) })
+    }
 }
+
+/// One reply to a range fetch, owning its buffer.
+pub type SeriesReply = metor_proto::types::OwnedTimeSeries<stellarator::buf::Slice<Vec<u8>>>;
