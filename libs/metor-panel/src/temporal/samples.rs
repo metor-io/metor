@@ -1,6 +1,10 @@
 //! Shared asynchronous predecessor reads. Views retain leases; the registry is weak.
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, WeakEntity};
-use metor_db::{Component, DB, manifest::SpanState, remote::HydratePriority};
+use metor_db::{
+    Component, DB,
+    manifest::{ComponentManifest, Gap, GapVec, SpanState},
+    remote::{FetchError, HydratePriority},
+};
 use metor_proto::types::{ComponentId, Timestamp};
 use std::{
     collections::{HashMap, VecDeque},
@@ -79,10 +83,50 @@ pub(crate) struct SelectedReader {
     health_age: Duration,
     health_observed: Instant,
     retry: Option<(Instant, u64)>,
+    point: Option<PointRead>,
     _clock: Subscription,
     _wal: gpui::Task<()>,
     _history: gpui::Task<()>,
     _query: gpui::Task<()>,
+    _point: gpui::Task<()>,
+}
+
+/// The last point read a reader asked for. One isn't asked again for the
+/// same instant until coverage moves, so a read that lands nothing (or
+/// fails) can't turn into a request loop.
+#[derive(Clone, Debug, PartialEq)]
+struct PointRead {
+    id: ComponentId,
+    at: Timestamp,
+    /// The component's manifest generation when asked.
+    generation: Option<u64>,
+    failed: Option<String>,
+}
+
+/// Point reads queued during one effect flush, sent together when it ends:
+/// a scrub refreshes every reader in the same flush, so a dashboard's
+/// reads leave in one batch and cost one round trip.
+#[derive(Default)]
+struct PointBatch(Vec<(ComponentId, Timestamp, WeakEntity<SelectedReader>)>);
+impl Global for PointBatch {}
+
+/// Send the queued point reads, then await each for its reader.
+fn send_points(cx: &mut App) {
+    let reads = std::mem::take(&mut cx.default_global::<PointBatch>().0);
+    let Some(hydrators) = crate::hydration::hydrator(cx) else {
+        return;
+    };
+    let asks: Vec<_> = reads.iter().map(|(id, at, _)| (*id, *at)).collect();
+    hydrators.request_points(&asks, HydratePriority::Selected);
+    for (id, at, reader) in reads {
+        let read = hydrators.point(id, at, HydratePriority::Selected);
+        let landed = reader.clone();
+        let task = cx.spawn(async move |cx| {
+            let outcome = read.await;
+            let _ = landed.update(cx, |reader, cx| reader.point_landed(id, at, outcome, cx));
+        });
+        let _ = reader.update(cx, |reader, _| reader._point = task);
+    }
 }
 
 /// Have every live reader mark the history it shows as read. Readers touch
@@ -200,10 +244,12 @@ pub(crate) fn acquire(db: Arc<DB>, id: ComponentId, cx: &mut App) -> Entity<Sele
             health_age: Duration::ZERO,
             health_observed: Instant::now(),
             retry: None,
+            point: None,
             _clock: subscription,
             _wal: wal,
             _history: history,
             _query: gpui::Task::ready(()),
+            _point: gpui::Task::ready(()),
         }
     });
     let readers = cx.default_global::<Readers>();
@@ -342,6 +388,14 @@ impl SelectedReader {
             self.cache = Some(result);
             return;
         }
+        // The predecessor is behind a remote stretch: ask now, not once the
+        // query below finds out, so every reader this refresh moved asks
+        // in the same batch.
+        if hidden_predecessor(component, t, &self.tail)
+            .is_some_and(|gap| gap.state == SpanState::RemoteOnly)
+        {
+            self.request_point(self.id, t, cx);
+        }
         // A seek never presents the old result as the new selected instant.
         let clock = super::snapshot(cx);
         let seeking = clock.as_ref().is_some_and(|s| !s.live && !s.playing)
@@ -447,20 +501,24 @@ impl SelectedReader {
                     return;
                 }
                 let t = selected.unwrap_or(t);
-                if result.missing.as_ref().is_some_and(|(id, range)| {
-                    *id == this.id
-                        && result
-                            .sample
-                            .as_ref()
-                            .is_some_and(|s| s.timestamp.0 >= range.end.0.saturating_sub(1))
+                if result.missing.as_ref().is_some_and(|missing| {
+                    missing.id == this.id
+                        && !hides(&missing.gap, result.sample.as_ref().map(|s| s.timestamp))
                 }) {
                     result.missing = None;
                 }
-                if let Some((id, range)) = result.missing.clone() {
+                if let Some(missing) = result.missing.clone() {
                     this.retry = Some((Instant::now() + RETRY_BACKOFF, result.manifest));
-                    if let Some(hydrator) = crate::hydration::hydrator(cx) {
-                        hydrator.request(id, range, HydratePriority::Selected, cx);
-                        this.publish(None, SampleStatus::Loading, Some(t), cx);
+                    if crate::hydration::hydrator(cx).is_some() {
+                        // A stretch mid-fetch as a whole node lands by
+                        // itself, waking the history task.
+                        let failed = if missing.remote {
+                            this.request_point(missing.id, missing.at, cx)
+                        } else {
+                            None
+                        };
+                        let status = failed.map_or(SampleStatus::Loading, SampleStatus::Error);
+                        this.publish(None, status, Some(t), cx);
                     } else {
                         this.publish(
                             None,
@@ -492,6 +550,78 @@ impl SelectedReader {
                 this.cache = Some(result);
             });
         });
+    }
+
+    /// Point-read `at` on `id` (this component, or an input a reconstruction
+    /// reads): queued for the flush's batch unless this reader already
+    /// asked for that instant at the current coverage. Returns why that
+    /// earlier read failed, if it did.
+    fn request_point(
+        &mut self,
+        id: ComponentId,
+        at: Timestamp,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let generation = if id == self.id {
+            self.component
+                .as_ref()
+                .map(|c| c.time_series.manifest().generation)
+        } else {
+            self.db.with_state(|state| {
+                state
+                    .get_component(id)
+                    .map(|c| c.time_series.manifest().generation)
+            })
+        };
+        if let Some(point) = &self.point
+            && point.id == id
+            && point.at == at
+            && point.generation == generation
+        {
+            return point.failed.clone();
+        }
+        self.point = Some(PointRead {
+            id,
+            at,
+            generation,
+            failed: None,
+        });
+        let reader = cx.weak_entity();
+        let batch = cx.default_global::<PointBatch>();
+        let first = batch.0.is_empty();
+        batch.0.push((id, at, reader));
+        if first {
+            cx.defer(send_points);
+        }
+        None
+    }
+
+    /// A point read finished. A landed fragment already woke the history
+    /// task; this refresh covers the reads that land nothing new.
+    fn point_landed(
+        &mut self,
+        id: ComponentId,
+        at: Timestamp,
+        outcome: Result<Range<Timestamp>, FetchError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(point) = self
+            .point
+            .as_mut()
+            .filter(|point| point.id == id && point.at == at)
+        else {
+            return;
+        };
+        match outcome {
+            Ok(_) => {}
+            // Pushed out of a full queue unserved: free to ask again.
+            Err(FetchError::Expired) => self.point = None,
+            Err(err) => {
+                point.failed = Some(format!("Fetching history failed: {err}"));
+                self.retry = None;
+            }
+        }
+        self.refresh(cx);
     }
 
     /// The expression recorded on this component, re-read only when metadata
@@ -537,10 +667,23 @@ struct PlanKey {
     tree: (u64, u64),
 }
 
+/// A predecessor this side can't answer: the newest stretch at or before
+/// `at` that isn't held locally, with no local sample after it.
+#[derive(Clone, Debug, PartialEq)]
+struct Missing {
+    id: ComponentId,
+    /// The instant whose predecessor is wanted.
+    at: Timestamp,
+    gap: Range<Timestamp>,
+    /// Whether a point read fetches it. Otherwise the stretch is already
+    /// being fetched as a whole node.
+    remote: bool,
+}
+
 struct QueryResult {
     sample: Option<SelectedSample>,
     next: Option<Timestamp>,
-    missing: Option<(ComponentId, Range<Timestamp>)>,
+    missing: Option<Missing>,
     manifest: u64,
     committed_head: Option<Timestamp>,
     dependencies: Vec<(Component, u64, Option<Timestamp>)>,
@@ -630,18 +773,18 @@ fn latest_at_or_before(
         result.take(sample.clone(), t);
     }
     let predecessor = result.sample.as_ref()?.timestamp;
-    if manifest.spans.iter().rev().any(|span| {
-        span.state != SpanState::Resident && span.cover_start <= t && span.cover_end > predecessor
-    }) {
+    if newest_gap(&manifest, t).is_some_and(|gap| hides(&gap.range, Some(predecessor))) {
         return None;
     }
     let next = manifest.spans.partition_point(|span| span.cover_start <= t);
-    if let Some(span) = manifest.spans.get(next) {
-        result.next = Some(
-            result
-                .next
-                .map_or(span.cover_start, |t| t.min(span.cover_start)),
-        );
+    for bound in manifest
+        .spans
+        .get(next)
+        .map(|span| span.cover_start)
+        .into_iter()
+        .chain(first_gap_after(&manifest, t))
+    {
+        result.next = Some(result.next.map_or(bound, |t| t.min(bound)));
     }
     (component.time_series.manifest().generation == manifest.generation).then_some(result)
 }
@@ -696,26 +839,89 @@ fn at_or_before(component: &Component, t: Timestamp, tail: &[SelectedSample]) ->
         result.take(sample.clone(), t);
     }
     let predecessor = result.sample.as_ref().map(|s| s.timestamp);
-    result.missing = manifest
+    result.missing = newest_gap(&manifest, t)
+        .filter(|gap| hides(&gap.range, predecessor))
+        .map(|gap| Missing {
+            id: component.component_id,
+            at: t,
+            remote: gap.state == SpanState::RemoteOnly,
+            gap: gap.range,
+        });
+    // Past the first stretch held neither as a node nor as a fragment, a
+    // newer predecessor may be hiding.
+    for bound in manifest
         .spans
         .iter()
-        .rev()
-        .find(|span| {
-            span.state != SpanState::Resident
-                && span.cover_start <= t
-                && predecessor.is_none_or(|s| span.cover_end > s)
-        })
-        .map(|span| (component.component_id, span.cover()));
-    for span in &manifest.spans {
-        if span.cover_start > t {
-            result.next = Some(
-                result
-                    .next
-                    .map_or(span.cover_start, |next| next.min(span.cover_start)),
-            );
-        }
+        .filter(|span| span.cover_start > t)
+        .map(|span| span.cover_start)
+        .chain(first_gap_after(&manifest, t))
+    {
+        result.next = Some(result.next.map_or(bound, |next| next.min(bound)));
     }
     result
+}
+
+/// Whether `gap` can hold a newer sample than `predecessor`, the newest
+/// local sample at or before the instant.
+fn hides(gap: &Range<Timestamp>, predecessor: Option<Timestamp>) -> bool {
+    predecessor.is_none_or(|s| gap.end.0.saturating_sub(1) > s.0)
+}
+
+/// The newest stretch at or before `t` this side can't answer: a remote or
+/// mid-fetch span, less what range fetches hold. Walks back from `t` and
+/// stops at the first, so an archive behind it costs nothing.
+fn newest_gap(manifest: &ComponentManifest, t: Timestamp) -> Option<Gap> {
+    let end = manifest.spans.partition_point(|span| span.cover_start <= t);
+    let mut gaps = GapVec::new();
+    for span in manifest.spans[..end].iter().rev() {
+        if span.state == SpanState::Resident {
+            continue;
+        }
+        let through = Timestamp(span.cover_end.0.min(t.0).saturating_add(1));
+        manifest.gaps(&(span.cover_start..through), &mut gaps);
+        if let Some(gap) = gaps.pop() {
+            return Some(gap);
+        }
+    }
+    None
+}
+
+/// Where the first stretch after `t` this side can't answer starts.
+fn first_gap_after(manifest: &ComponentManifest, t: Timestamp) -> Option<Timestamp> {
+    let after = Timestamp(t.0.saturating_add(1));
+    let start = manifest
+        .spans
+        .partition_point(|span| span.cover_end < after);
+    let mut gaps = GapVec::new();
+    for span in &manifest.spans[start..] {
+        if span.state == SpanState::Resident {
+            continue;
+        }
+        let through = Timestamp(span.cover_end.0.saturating_add(1));
+        manifest.gaps(&(span.cover_start.max(after)..through), &mut gaps);
+        if let Some(gap) = gaps.first() {
+            return Some(gap.range.start);
+        }
+    }
+    None
+}
+
+/// The stretch hiding `t`'s predecessor, when one does: [`at_or_before`]'s
+/// `missing`, decided without collecting the sample. Cheap enough for every
+/// refresh: the node walk only runs once a gap is found.
+fn hidden_predecessor(
+    component: &Component,
+    t: Timestamp,
+    tail: &VecDeque<SelectedSample>,
+) -> Option<Gap> {
+    let gap = newest_gap(&component.time_series.manifest(), t)?;
+    let shown = |s: Timestamp| s <= t && !hides(&gap.range, Some(s));
+    let held = component.time_series.iter_node_slices().any(|node| {
+        let times = node.timestamps();
+        let i = times.partition_point(|s| *s <= t);
+        i.checked_sub(1).is_some_and(|i| shown(times[i]))
+    }) || tail.iter().any(|s| shown(s.timestamp));
+    (!held).then_some(gap)
 }
 
 /// Stateless point reconstruction reads only predecessor inputs. Stateful replay
@@ -857,8 +1063,9 @@ pub(crate) fn status_text(db: &Arc<DB>, id: ComponentId, cx: &App) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metor_db::{ComponentSchema, manifest::SpanSource, seal::SealRecord};
+    use metor_db::{ComponentSchema, manifest::SpanSource, seal::SealRecord, store};
     use metor_proto::types::PrimType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn fixture() -> (tempfile::TempDir, Arc<DB>, Component) {
         let temp = tempfile::tempdir().unwrap();
@@ -935,7 +1142,7 @@ mod tests {
         assert!(before.missing.is_none());
         assert!(!before.contains(Timestamp(200)));
         let inside = at_or_before(&c, Timestamp(250), &[]);
-        assert_eq!(inside.missing.unwrap().1, Timestamp(200)..Timestamp(300));
+        assert_eq!(inside.missing.unwrap().gap, Timestamp(200)..Timestamp(251));
         assert!(latest_at_or_before(&c, Timestamp(250), &VecDeque::new()).is_none());
         let fast = latest_at_or_before(&c, Timestamp(150), &VecDeque::new()).unwrap();
         assert_eq!(stamp(&fast), Some(100));
@@ -1284,5 +1491,266 @@ mod tests {
                 assert_eq!(reader.changed.latest(), before.wrapping_add(1));
             })
         });
+    }
+
+    fn remote_seal(start: i64, end: i64) -> SealRecord {
+        SealRecord {
+            start_ts: Timestamp(start),
+            end_ts: Timestamp(end),
+            count: (end - start + 1) as u64,
+            index_len: 800,
+            data_len: 800,
+            checksum: 1,
+            element_size: 8,
+        }
+    }
+
+    #[test]
+    fn fragments_answer_what_they_claim_and_nothing_past_it() {
+        let (_temp, _db, c) = fixture();
+        c.time_series
+            .merge_remote_spans([remote_seal(200, 299)])
+            .unwrap();
+        // A range fetch vouched for 240..=259 and found one sample there.
+        c.time_series
+            .install_fragment(
+                Timestamp(240)..Timestamp(260),
+                8,
+                &[Timestamp(250)],
+                &250f64.to_le_bytes(),
+            )
+            .unwrap();
+        let held = at_or_before(&c, Timestamp(255), &[]);
+        assert_eq!(stamp(&held), Some(250));
+        assert!(held.missing.is_none());
+        assert!(held.contains(Timestamp(259)));
+        assert!(!held.contains(Timestamp(260)));
+        // Past the claim the span is remote again, and so is its start:
+        // the fragment's sample doesn't answer before it.
+        for (at, gap) in [(270, 260..271), (245, 200..240)] {
+            let query = at_or_before(&c, Timestamp(at), &[]);
+            let missing = query.missing.unwrap();
+            assert_eq!(missing.gap, Timestamp(gap.start)..Timestamp(gap.end));
+            assert_eq!((missing.at, missing.remote), (Timestamp(at), true));
+            let hidden = hidden_predecessor(&c, Timestamp(at), &VecDeque::new());
+            assert_eq!(hidden.map(|g| g.range), Some(missing.gap));
+        }
+        assert!(hidden_predecessor(&c, Timestamp(255), &VecDeque::new()).is_none());
+        assert!(hidden_predecessor(&c, Timestamp(150), &VecDeque::new()).is_none());
+    }
+
+    /// A peer store that counts what it is asked for.
+    struct Counting {
+        store: store::PeerStore,
+        batches: std::sync::Mutex<Vec<usize>>,
+        nodes: AtomicUsize,
+    }
+
+    impl store::NodeStore for Counting {
+        fn put<'a>(
+            &'a self,
+            key: store::NodeKey<'a>,
+            node: store::SealedNode<'a>,
+        ) -> store::BoxFuture<'a, Result<(), store::StoreError>> {
+            self.store.put(key, node)
+        }
+
+        fn get<'a>(
+            &'a self,
+            key: store::NodeKey<'a>,
+            dst: &'a store::NodeStaging,
+        ) -> store::BoxFuture<'a, Result<SealRecord, store::StoreError>> {
+            self.nodes.fetch_add(1, Ordering::Relaxed);
+            self.store.get(key, dst)
+        }
+
+        fn list<'a>(
+            &'a self,
+            component_id: ComponentId,
+            component_name: &'a str,
+        ) -> store::BoxFuture<'a, Result<Vec<SealRecord>, store::StoreError>> {
+            self.store.list(component_id, component_name)
+        }
+
+        fn contains<'a>(
+            &'a self,
+            key: store::NodeKey<'a>,
+        ) -> store::BoxFuture<'a, Result<bool, store::StoreError>> {
+            self.store.contains(key)
+        }
+
+        fn time_series<'a>(
+            &'a self,
+            requests: &'a [metor_proto_wkt::GetTimeSeries],
+        ) -> store::BoxFuture<
+            'a,
+            Result<Vec<Result<store::SeriesReply, store::StoreError>>, store::StoreError>,
+        > {
+            self.batches.lock().unwrap().push(requests.len());
+            self.store.time_series(requests)
+        }
+    }
+
+    struct Remote {
+        _temp: tempfile::TempDir,
+        mirror: Arc<DB>,
+        store: Arc<Counting>,
+        ids: Vec<ComponentId>,
+        _threads: Vec<Box<dyn std::any::Any>>,
+    }
+
+    /// A peer holding `count` components, each sampled every 10 over
+    /// 0..2000 in two sealed nodes, and a mirror that knows them only as
+    /// remote spans, hydrating from the peer through the app's hydrators.
+    fn remote(count: usize, cx: &mut gpui::TestAppContext) -> Remote {
+        // The hydrator and the peer run on threads of their own.
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let peer = Arc::new(DB::create(temp.path().join("peer")).unwrap());
+        let mirror = Arc::new(DB::create(temp.path().join("mirror")).unwrap());
+        let ids: Vec<_> = (0..count)
+            .map(|i| ComponentId::new(&format!("sensor{i}")))
+            .collect();
+        for id in &ids {
+            for db in [&peer, &mirror] {
+                db.with_state_mut(|s| {
+                    s.insert_component(*id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
+                })
+                .unwrap();
+            }
+            let component = |db: &DB| db.with_state(|s| s.get_component(*id).cloned()).unwrap();
+            let source = component(&peer);
+            for node in [0i64..1000, 1000..2000] {
+                let stamps: Vec<i64> = node.step_by(10).collect();
+                install(&source, &stamps);
+            }
+            let seals: Vec<SealRecord> = source
+                .time_series
+                .manifest()
+                .spans
+                .iter()
+                .map(|s| s.seal)
+                .collect();
+            component(&mirror)
+                .time_series
+                .merge_remote_spans(seals)
+                .unwrap();
+        }
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = metor_db::Server { listener, db: peer };
+        let server = stellarator::struc_con::stellar(move || server.run());
+        let store = Arc::new(Counting {
+            store: store::PeerStore::new(addr),
+            batches: Default::default(),
+            nodes: Default::default(),
+        });
+        let hydrator = metor_db::remote::Hydrator::new();
+        let (run, run_db, run_store) = (hydrator.clone(), mirror.clone(), store.clone());
+        let worker = stellarator::struc_con::stellar(move || run.run(run_db, run_store));
+        cx.update(|cx| {
+            crate::hydration::Hydrators::global(cx)
+                .insert(crate::connections::TargetId("peer".into()), hydrator);
+        });
+        Remote {
+            _temp: temp,
+            mirror,
+            store,
+            ids,
+            _threads: vec![Box::new(server), Box::new(worker)],
+        }
+    }
+
+    /// Run the app until `done`, letting the hydrator's threads work.
+    fn settle(
+        cx: &mut gpui::TestAppContext,
+        mut done: impl FnMut(&mut gpui::TestAppContext) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn seek(t: i64, cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            super::super::dispatch(
+                super::super::TimeAction::Seek(super::super::TimeExpr::fixed(Timestamp(t))),
+                cx,
+            )
+            .unwrap()
+        });
+    }
+
+    fn shown(reader: &Entity<SelectedReader>, cx: &mut gpui::TestAppContext) -> Option<f64> {
+        cx.update(|cx| {
+            let selection = &reader.read(cx).selection;
+            (selection.status == SampleStatus::Ready).then(|| {
+                let sample = selection.sample.as_ref().unwrap();
+                f64::from_le_bytes(sample.bytes.as_ref().try_into().unwrap())
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn a_scrub_into_remote_history_point_reads_the_instant(cx: &mut gpui::TestAppContext) {
+        let remote = remote(1, cx);
+        let id = remote.ids[0];
+        let reader = cx.update(|cx| {
+            super::super::TemporalController::init(remote.mirror.clone(), cx);
+            acquire(remote.mirror.clone(), id, cx)
+        });
+        seek(1234, cx);
+        settle(cx, |cx| shown(&reader, cx).is_some());
+        assert_eq!(shown(&reader, cx), Some(1230.0));
+        assert_eq!(remote.store.nodes.load(Ordering::Relaxed), 0);
+        let series = remote
+            .mirror
+            .with_state(|s| s.get_component(id).unwrap().time_series.clone());
+        assert_eq!(
+            series.manifest().span(Timestamp(1000)).unwrap().state,
+            SpanState::RemoteOnly
+        );
+        let asked = remote.store.batches.lock().unwrap().clone();
+        assert!(!asked.is_empty());
+        // Inside what the read vouched for, the reader answers itself.
+        seek(1232, cx);
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(shown(&reader, cx), Some(1230.0));
+        assert_eq!(*remote.store.batches.lock().unwrap(), asked);
+        // Before it, it asks again.
+        seek(1225, cx);
+        settle(cx, |cx| shown(&reader, cx) == Some(1220.0));
+        assert_eq!(remote.store.batches.lock().unwrap().len(), asked.len() + 1);
+    }
+
+    #[gpui::test]
+    fn a_scrubbed_dashboard_point_reads_in_one_batch(cx: &mut gpui::TestAppContext) {
+        const READERS: usize = 12;
+        let remote = remote(READERS, cx);
+        let readers: Vec<_> = cx.update(|cx| {
+            super::super::TemporalController::init(remote.mirror.clone(), cx);
+            remote
+                .ids
+                .iter()
+                .map(|id| acquire(remote.mirror.clone(), *id, cx))
+                .collect()
+        });
+        seek(555, cx);
+        settle(cx, |cx| readers.iter().all(|r| shown(r, cx) == Some(550.0)));
+        remote.store.batches.lock().unwrap().clear();
+        seek(1555, cx);
+        settle(cx, |cx| {
+            readers.iter().all(|r| shown(r, cx) == Some(1550.0))
+        });
+        assert_eq!(*remote.store.batches.lock().unwrap(), [READERS]);
+        assert_eq!(remote.store.nodes.load(Ordering::Relaxed), 0);
     }
 }

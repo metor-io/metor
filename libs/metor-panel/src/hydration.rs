@@ -9,6 +9,12 @@
 //! holds. A learned component→peer routing map is the follow-up if that
 //! stops being true.
 //!
+//! Besides whole sealed nodes, a hydrator answers range fetches and point
+//! reads, which land as in-memory fragments of a node rather than the node:
+//! what a value view or a zoomed-in plot needs of a node far bigger than
+//! that. Point reads asked in the same frame go out together, one round
+//! trip for a scrubbed dashboard.
+//!
 //! A hydrator forgets a request nobody repeats within
 //! [`REQUEST_TTL`](metor_db::remote::REQUEST_TTL), so a position the user
 //! scrubbed past never delays the current one. Views repeat their requests
@@ -16,12 +22,15 @@
 //! this repaints the windows inside that lifetime, so every view still on
 //! screen asks again and the ones that closed or moved on don't.
 
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use gpui::Global;
-use metor_db::remote::{HydratePriority, Hydrator, REQUEST_TTL};
+use metor_db::remote::{FetchError, HydratePriority, Hydrator, REQUEST_TTL, RangeQuery};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::connections::TargetId;
@@ -51,6 +60,80 @@ impl Hydrators {
             hydrator.request(component_id, range.clone(), priority);
         }
         self.renew_later(cx);
+    }
+
+    /// Ask every connected peer for `query` as a range fetch: the samples,
+    /// landing as fragments, instead of the nodes holding them.
+    pub fn request_range(
+        &self,
+        component_id: ComponentId,
+        query: RangeQuery,
+        priority: HydratePriority,
+    ) {
+        for (_, hydrator) in self.0.hydrators.lock().unwrap().iter() {
+            hydrator.request_range(component_id, query.clone(), priority);
+        }
+    }
+
+    /// Ask every connected peer for the sample each reader shows at its
+    /// instant, queued at once so each peer serves them in one batch.
+    pub fn request_points(&self, reads: &[(ComponentId, Timestamp)], priority: HydratePriority) {
+        for (_, hydrator) in self.0.hydrators.lock().unwrap().iter() {
+            hydrator.request_ranges(
+                reads.iter().map(|(id, t)| (*id, RangeQuery::instant(*t))),
+                priority,
+            );
+        }
+    }
+
+    /// Await the point read of `t` on every connected peer: the range the
+    /// peer holding the component vouched for, or the reason none answered.
+    /// Awaiting keeps the request alive past the request lifetime; dropping
+    /// the future lets it lapse.
+    pub fn point(
+        &self,
+        component_id: ComponentId,
+        t: Timestamp,
+        priority: HydratePriority,
+    ) -> impl Future<Output = Result<Range<Timestamp>, FetchError>> + 'static {
+        type Read = Pin<Box<dyn Future<Output = Result<Range<Timestamp>, FetchError>>>>;
+        let mut reads: Vec<Read> = self
+            .0
+            .hydrators
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, hydrator)| {
+                let hydrator = hydrator.clone();
+                Box::pin(async move { hydrator.point(component_id, t, priority).await }) as Read
+            })
+            .collect();
+        async move {
+            let mut outcome = Err(FetchError::Expired);
+            std::future::poll_fn(|cx| {
+                reads.retain_mut(|read| match read.as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        // An answer beats a failure, and a failure beats
+                        // the peers that never served the request.
+                        match (&outcome, result) {
+                            (Ok(_), _) => {}
+                            (_, Ok(covered)) => outcome = Ok(covered),
+                            (Err(FetchError::Expired), Err(err)) => outcome = Err(err),
+                            (Err(_), Err(_)) => {}
+                        }
+                        false
+                    }
+                    Poll::Pending => true,
+                });
+                if reads.is_empty() || outcome.is_ok() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            outcome
+        }
     }
 
     /// Repaint once, half a request lifetime from now, if a backlog is still
