@@ -3,7 +3,7 @@ use gpui::{App, AppContext, Context, Entity, Global, Subscription, WeakEntity};
 use metor_db::{
     Component, DB,
     manifest::{ComponentManifest, Gap, GapVec, SpanState},
-    remote::{FetchError, HydratePriority},
+    remote::{FetchError, HydratePriority, RangeQuery},
 };
 use metor_proto::types::{ComponentId, Timestamp};
 use std::{
@@ -347,19 +347,14 @@ impl SelectedReader {
                 .is_some_and(|(key, _)| key.tree == tree);
         let manifest = component.time_series.manifest().generation;
         self.touch(Instant::now(), cx);
-        // Prefetch at most the next sealed span in one second of forward play.
-        // The hydrator owns deduplication and its bounded request queue.
+        // Prefetch the next remote stretch within a second of forward play,
+        // a page at most. The hydrator owns deduplication and its bounded
+        // request queue.
         if super::snapshot(cx).is_some_and(|s| s.playing)
             && let Some(hydrator) = crate::hydration::hydrator(cx)
+            && let Some(range) = prefetch(&component.time_series.manifest(), t, read_ahead(t, cx))
         {
-            let horizon = read_ahead(t, cx).0;
-            if let Some(span) = component.time_series.manifest().spans.iter().find(|s| {
-                s.state == SpanState::RemoteOnly
-                    && s.cover_start.0 > t.0
-                    && s.cover_start.0 <= horizon
-            }) {
-                hydrator.request(self.id, span.cover(), HydratePriority::Prefetch, cx);
-            }
+            hydrator.request_range(self.id, RangeQuery::range(range), HydratePriority::Prefetch);
         }
         if plan_current
             && let Some(cache) = &self.cache
@@ -654,6 +649,28 @@ impl SelectedReader {
 /// The end of playback's read-ahead from `t`: one second of forward play.
 fn read_ahead(t: Timestamp, cx: &App) -> Timestamp {
     Timestamp(t.0.saturating_add((super::config(cx).rate * 1_000_000.0) as i64))
+}
+
+/// The first remote stretch playback from `t` reaches by `horizon`, as one
+/// range fetch.
+///
+/// The window is aligned to the lookahead, not to `t`: a playing reader
+/// asks every frame, and a stretch clipped to `t` would be a new request
+/// each time, each fetching most of the last one's page again. Aligned,
+/// the ask stays the same until a page lands or play crosses a cell.
+fn prefetch(
+    manifest: &ComponentManifest,
+    t: Timestamp,
+    horizon: Timestamp,
+) -> Option<Range<Timestamp>> {
+    let lookahead = horizon.0.checked_sub(t.0).filter(|l| *l > 0)?;
+    let start = t.0.div_euclid(lookahead) * lookahead;
+    let window = Timestamp(start)..Timestamp(start.saturating_add(2 * lookahead));
+    let mut gaps = GapVec::new();
+    manifest.gaps(&window, &mut gaps);
+    gaps.into_iter()
+        .find(|gap| gap.state == SpanState::RemoteOnly && gap.range.end > t)
+        .map(|gap| gap.range)
 }
 
 /// How long a failed query waits before it is asked again.
@@ -1537,6 +1554,21 @@ mod tests {
         }
         assert!(hidden_predecessor(&c, Timestamp(255), &VecDeque::new()).is_none());
         assert!(hidden_predecessor(&c, Timestamp(150), &VecDeque::new()).is_none());
+    }
+
+    #[test]
+    fn playback_prefetches_one_stable_stretch() {
+        let (_temp, _db, c) = fixture();
+        c.time_series
+            .merge_remote_spans([remote_seal(200, 299)])
+            .unwrap();
+        let manifest = c.time_series.manifest();
+        let ask = |t: i64| prefetch(&manifest, Timestamp(t), Timestamp(t + 50));
+        assert_eq!(ask(150), Some(Timestamp(200)..Timestamp(250)));
+        // Frames later, the same ask, so the hydrator serves it once.
+        assert_eq!(ask(170), ask(150));
+        assert_eq!(ask(210), Some(Timestamp(200)..Timestamp(300)));
+        assert_eq!(ask(20), None);
     }
 
     /// A peer store that counts what it is asked for.
