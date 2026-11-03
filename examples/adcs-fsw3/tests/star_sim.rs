@@ -108,9 +108,11 @@ fn preset_components() -> Vec<ComponentId> {
 async fn u64s(client: &mut Client, component: &str) -> Vec<(i64, u64)> {
     let query = GetTimeSeries {
         id: [0, 0],
-        range: Timestamp(0)..Timestamp(i64::MAX),
-        component_id: ComponentId::new(component),
         limit: None,
+        ..GetTimeSeries::range(
+            ComponentId::new(component),
+            Timestamp(0)..Timestamp(i64::MAX),
+        )
     };
     let Ok(series) = client.request(&query).await else {
         return Vec::new(); // no samples yet

@@ -63,6 +63,7 @@ pub mod peer_cache;
 pub mod remote;
 pub mod scratch;
 pub mod seal;
+mod series;
 pub mod store;
 pub mod tiering;
 pub mod time_series;
@@ -1547,162 +1548,6 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
         self.pkt = Some(pkt);
         res.map_err(Error::from)
     }
-
-    pub async fn send_time_series(
-        &mut self,
-        id: PacketId,
-        timestamps: &[Timestamp],
-        data: &[u8],
-    ) -> Result<(), Error> {
-        let req_id = self.req_id;
-        self.send_with_builder(|pkt| {
-            let header = PacketHeader {
-                packet_ty: metor_proto::types::PacketTy::TimeSeries,
-                id,
-                req_id,
-            };
-            pkt.as_mut_packet().header = header;
-            pkt.clear();
-            pkt.extend_from_slice(&(timestamps.len() as u64).to_le_bytes());
-            pkt.extend_from_slice(timestamps.as_bytes());
-            pkt.extend_from_slice(data);
-            Ok(())
-        })
-        .await
-    }
-}
-
-/// Upper bound on a `GetTimeSeries` response, header included.
-const SERIES_BUDGET: usize = 256 * 1024 * 1024;
-/// A time series packet's bytes before its timestamps: header and count.
-const SERIES_HEAD: usize = size_of::<PacketHeader>() + size_of::<u64>();
-
-/// Samples a `GetTimeSeries` response carries: the oldest of `range_len`,
-/// at most `limit`, and no more than fit `SERIES_BUDGET`.
-fn series_len(range_len: usize, limit: usize, size: usize) -> Result<usize, Error> {
-    let entry = size.saturating_add(size_of::<Timestamp>());
-    match (SERIES_BUDGET - SERIES_HEAD) / entry {
-        0 => Err(Error::ComponentTooLarge(size)),
-        fit => Ok(range_len.min(limit).min(fit)),
-    }
-}
-
-/// Writes the oldest `len` samples of `range` into `pkt`, after skipping
-/// its newest `skip`. Slices arrive newest first, so each fills the
-/// destination from the back.
-fn write_series(
-    pkt: &mut LenPacket,
-    range: &time_series::TimeSeriesSlice,
-    mut skip: usize,
-    len: usize,
-    size: usize,
-) -> Result<(), Error> {
-    let stamps_len = len * size_of::<Timestamp>();
-    let body_len = stamps_len + len * size;
-    let pkt_len =
-        u32::try_from(SERIES_HEAD + body_len).map_err(|_| Error::ComponentTooLarge(size))?;
-    pkt.extend_from_slice((len as u64).as_bytes());
-    pkt.inner.resize(pkt.inner.len() + body_len, 0);
-    pkt.inner[..size_of::<u32>()].copy_from_slice(&pkt_len.to_le_bytes());
-    let body = &mut pkt.as_mut_packet().body[size_of::<u64>()..];
-    let (stamps, data) = body.split_at_mut(stamps_len);
-    let mut end = len;
-    for slice in range.as_iter() {
-        if end == 0 {
-            break;
-        }
-        let all = slice.timestamps();
-        let skipped = skip.min(all.len());
-        skip -= skipped;
-        let kept = (all.len() - skipped).min(end);
-        let from = all.len() - skipped - kept;
-        let start = end - kept;
-        let src = slice
-            .data()
-            .get(from * size..(from + kept) * size)
-            .ok_or(Error::SeriesTruncated)?;
-        stamps[start * size_of::<Timestamp>()..end * size_of::<Timestamp>()]
-            .copy_from_slice(all[from..from + kept].as_bytes());
-        data[start * size..end * size].copy_from_slice(src);
-        end = start;
-    }
-    match end {
-        0 => Ok(()),
-        _ => Err(Error::SeriesTruncated),
-    }
-}
-
-/// Moves a page's end of `len` (of `range_len`, oldest first) so that no
-/// timestamp is split across pages, since the next page starts after the
-/// last timestamp. The page shrinks back to the last timestamp change, or,
-/// if it is one tie, grows to hold the whole tie: up to `cap` samples, past
-/// any limit. `None` if that tie exceeds `cap`.
-fn whole_ties(
-    range: &time_series::TimeSeriesSlice,
-    range_len: usize,
-    len: usize,
-    cap: usize,
-) -> Option<usize> {
-    let skip = range_len - len;
-    if skip == 0 || len == 0 {
-        return Some(len);
-    }
-    // Newest first, `skip` excluded samples come before the `len` kept.
-    // Slices wholly excluded are passed by length; `newer` carries the
-    // newest-passed slice's first stamp and how many equal it, so a tie
-    // spanning slices is counted whole.
-    let mut position = 0;
-    let mut newer: Option<(Timestamp, usize)> = None;
-    let mut edge = None;
-    let (mut excluded_tie, mut kept_tie) = (0, 0);
-    for slice in range.as_iter() {
-        let stamps = slice.timestamps();
-        let n = stamps.len();
-        let newer_position = position;
-        position += n;
-        match edge {
-            None if position < skip => {
-                let Some(&first) = stamps.first() else {
-                    continue;
-                };
-                let lead = stamps.partition_point(|t| *t == first);
-                newer = match newer {
-                    Some((stamp, run)) if lead == n && stamp == first => Some((first, n + run)),
-                    _ => Some((first, lead)),
-                };
-            }
-            None => {
-                // The excluded edge, `skip - 1` positions from the newest.
-                let at = n - 1 - (skip - 1 - newer_position);
-                let stamp = stamps[at];
-                excluded_tie = stamps[at..].partition_point(|t| *t == stamp);
-                if let Some((first, run)) = newer
-                    && at + excluded_tie == n
-                    && first == stamp
-                {
-                    excluded_tie += run;
-                }
-                let older = stamps[..at].partition_point(|t| *t < stamp);
-                kept_tie = at - older;
-                edge = Some(stamp);
-                if older > 0 {
-                    break;
-                }
-            }
-            Some(stamp) => {
-                let older = stamps.partition_point(|t| *t < stamp);
-                kept_tie += n - older;
-                if older > 0 {
-                    break;
-                }
-            }
-        }
-    }
-    let kept_tie = kept_tie.min(len);
-    match kept_tie < len {
-        true => Some(len - kept_tie),
-        false => Some(len + excluded_tie).filter(|whole| *whole <= cap),
-    }
 }
 
 async fn handle_packet<A: AsyncWrite + 'static>(
@@ -1772,16 +1617,10 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&SchemaMsg(schema)).await?;
         }
         Packet::Msg(m) if m.id == GetTimeSeries::ID => {
-            let get_time_series = m.parse::<GetTimeSeries>()?;
-            let GetTimeSeries {
-                component_id,
-                range,
-                limit,
-                id,
-            } = get_time_series;
+            let req = m.parse::<GetTimeSeries>()?;
             let component = db.with_state(|state| {
-                let Some(component) = state.components.get(&component_id) else {
-                    return Err(Error::ComponentNotFound(component_id));
+                let Some(component) = state.components.get(&req.component_id) else {
+                    return Err(Error::ComponentNotFound(req.component_id));
                 };
                 Ok(component.clone())
             })?;
@@ -1790,26 +1629,12 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_with_builder(move |pkt| {
                 let header = PacketHeader {
                     packet_ty: metor_proto::types::PacketTy::TimeSeries,
-                    id,
+                    id: req.id,
                     req_id,
                 };
                 pkt.as_mut_packet().header = header;
                 pkt.clear();
-                let size = component.schema.size();
-                let range = component
-                    .time_series
-                    .get_range(range)
-                    .ok_or(Error::TimeRangeOutOfBounds)?;
-                let range_len = range.len();
-                let len = series_len(range_len, limit.unwrap_or(usize::MAX), size)?;
-                let len = whole_ties(
-                    &range,
-                    range_len,
-                    len,
-                    series_len(usize::MAX, usize::MAX, size)?,
-                )
-                .ok_or(Error::ComponentTooLarge(size))?;
-                write_series(pkt, &range, range_len - len, len, size)
+                series::answer(pkt, &component.time_series, &req, component.schema.size())
             })
             .await?;
         }
@@ -2098,7 +1923,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             });
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
-                features: FEATURE_MSG_SYNC,
+                features: FEATURE_MSG_SYNC | FEATURE_RANGE_FETCH,
                 command_ids,
                 namespace,
                 commands,
@@ -3964,14 +3789,13 @@ mod series_tests {
     const PAGE: usize = 127;
 
     #[test]
-    fn series_len_clamps_to_the_budget() {
-        assert_eq!(series_len(300, usize::MAX, IMAGE_SIZE).unwrap(), PAGE);
-        assert_eq!(series_len(300, 10, IMAGE_SIZE).unwrap(), 10);
-        assert_eq!(series_len(1_000_000, usize::MAX, 8).unwrap(), 1_000_000);
-        let largest = SERIES_BUDGET - SERIES_HEAD - size_of::<Timestamp>();
-        assert_eq!(series_len(5, usize::MAX, largest).unwrap(), 1);
+    fn a_reply_fits_the_budget() {
+        assert_eq!(series::fit(IMAGE_SIZE).unwrap(), PAGE);
+        let head = size_of::<PacketHeader>() + metor_proto::types::TimeSeries::HEAD;
+        let largest = series::SERIES_BUDGET - head - size_of::<Timestamp>();
+        assert_eq!(series::fit(largest).unwrap(), 1);
         assert!(matches!(
-            series_len(1, usize::MAX, largest + 1),
+            series::fit(largest + 1),
             Err(Error::ComponentTooLarge(s)) if s == largest + 1
         ));
     }
@@ -4065,9 +3889,11 @@ mod series_tests {
     fn query(start: i64, limit: Option<usize>) -> GetTimeSeries {
         GetTimeSeries {
             id: ID,
-            range: Timestamp(start)..Timestamp(i64::MAX),
-            component_id: ComponentId::new("img"),
             limit,
+            ..GetTimeSeries::range(
+                ComponentId::new("img"),
+                Timestamp(start)..Timestamp(i64::MAX),
+            )
         }
     }
 
@@ -4188,22 +4014,6 @@ mod series_tests {
     }
 
     #[stellarator::test]
-    async fn a_tie_past_the_cap_is_refused() {
-        let (_dir, db) = image_db();
-        ingest_stamps(&db, &[1, 1, 1, 2]).await;
-        let range = db.with_state(|s| {
-            let f = s.get_component(ComponentId::new("f")).unwrap();
-            f.time_series
-                .get_range(Timestamp(0)..Timestamp(i64::MAX))
-                .unwrap()
-        });
-        assert_eq!(whole_ties(&range, 4, 1, 3), Some(3));
-        assert_eq!(whole_ties(&range, 4, 1, 2), None);
-        assert_eq!(whole_ties(&range, 4, 4, 2), Some(4));
-        assert_eq!(whole_ties(&range, 4, 0, 2), Some(0));
-    }
-
-    #[stellarator::test]
     async fn get_time_series_limits_and_single_samples() {
         let (_dir, db) = image_db();
         ingest(&db, 3).await;
@@ -4212,6 +4022,37 @@ mod series_tests {
         assert_eq!(page(&mut client, 2, Some(1)).await, [2]);
         assert_eq!(page(&mut client, 3, None).await, [3]);
         assert!(page(&mut client, 4, None).await.is_empty());
+    }
+
+    /// Replies vouch for what they checked: the whole range of an empty
+    /// component, the stretch an instant lookup walked back over, and the
+    /// edge a limit stopped at.
+    #[stellarator::test]
+    async fn replies_say_what_they_cover() {
+        let (_dir, db) = image_db();
+        let mut client = Client::connect(serve(db.clone())).await.unwrap();
+        let f = ComponentId::new("f");
+        let reply = client
+            .request(&GetTimeSeries::range(f, Timestamp(0)..Timestamp(100)))
+            .await
+            .unwrap();
+        assert_eq!(reply.len, 0);
+        assert_eq!(reply.covered, Timestamp(0)..Timestamp(100));
+
+        ingest(&db, 3).await;
+        let reply = client
+            .request(&GetTimeSeries::instant(f, Timestamp(10)))
+            .await
+            .unwrap();
+        assert_eq!(reply.timestamps().unwrap(), [Timestamp(3)]);
+        assert_eq!(reply.data().unwrap(), 3f64.to_le_bytes());
+        assert_eq!(reply.covered, Timestamp(3)..Timestamp(11));
+        let reply = client
+            .request(&GetTimeSeries::range(f, Timestamp(0)..Timestamp(100)).limit(2))
+            .await
+            .unwrap();
+        assert_eq!(reply.timestamps().unwrap(), [Timestamp(1), Timestamp(2)]);
+        assert_eq!(reply.covered, Timestamp(0)..Timestamp(3));
     }
 
     /// The first table packet of a stream on `client`, after its vtable.

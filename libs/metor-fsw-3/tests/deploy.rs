@@ -96,9 +96,8 @@ async fn test_gateway_records_every_target() {
         let series = client
             .request(&GetTimeSeries {
                 id: [0, 0],
-                range: Timestamp(0)..Timestamp(i64::MAX / 2),
-                component_id,
                 limit: Some(64),
+                ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX / 2))
             })
             .await;
         // The table gets each sample from `a` and again through `b`, so a

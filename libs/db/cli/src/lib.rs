@@ -94,9 +94,7 @@ impl Client {
         let stop = Timestamp(stop);
         let msg = GetTimeSeries {
             id: id.to_le_bytes(),
-            range: start..stop,
-            component_id,
-            limit: Some(256),
+            ..GetTimeSeries::range(component_id, start..stop).limit(256)
         };
 
         let time_series = self.request(&msg).await?;
