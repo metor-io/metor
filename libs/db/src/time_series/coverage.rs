@@ -196,7 +196,9 @@ impl Draft {
                     emitted = true;
                 }
             }
-            if !emitted {
+            // A peer's head is re-listed rather than kept shadowed: the
+            // next listing describes it afresh.
+            if !emitted && remote.source != SpanSource::PeerHead {
                 self.shadowed.push(seal);
             }
         }
@@ -356,7 +358,16 @@ impl Claims {
 /// that fetch settles against the residency it started from. Compared by
 /// sample rather than by range, since the peer's nodes leave sample-free
 /// gaps between each other that a local node spans.
-pub(super) fn remote_holds(manifest: &ComponentManifest, timestamps: &[Timestamp]) -> bool {
+///
+/// A peer's unsealed head counts only with `heads`: it backs a range-fetch
+/// fragment, which was read from it, but not local data the peer never
+/// promised to keep (a mirror's live copy), since an ephemeral peer loses
+/// its head the moment it exits.
+pub(super) fn remote_holds(
+    manifest: &ComponentManifest,
+    timestamps: &[Timestamp],
+    heads: bool,
+) -> bool {
     let Some(first) = timestamps.first() else {
         return true;
     };
@@ -370,7 +381,11 @@ pub(super) fn remote_holds(manifest: &ComponentManifest, timestamps: &[Timestamp
     let mut seals: Vec<(i64, i64)> = manifest
         .spans
         .iter()
-        .filter(|s| s.state == SpanState::RemoteOnly && !fetching.contains(&&s.seal))
+        .filter(|s| {
+            s.state == SpanState::RemoteOnly
+                && (heads || s.source != SpanSource::PeerHead)
+                && !fetching.contains(&&s.seal)
+        })
         .map(|s| &s.seal)
         .chain(manifest.shadowed.iter())
         .filter(|s| s.start_ts.0 <= last.0 && first.0 <= s.end_ts.0)

@@ -29,6 +29,17 @@ pub enum SpanSource {
     /// [`ComponentManifest::shadowed`]), so dropping a mirrored node only
     /// gives its range back to them.
     Mirrored,
+    /// A stretch of a peer's unsealed head (see
+    /// [`metor_proto_wkt::UnsealedHead`]): history the peer holds but has
+    /// not sealed into a node, so a mirror can read it before the peer
+    /// seals. Always [`SpanState::RemoteOnly`], and only range-fetchable:
+    /// its seal is a synthetic record (checksum 0) no `FetchNode` serves,
+    /// which every listing of the peer replaces, by the next head or by the
+    /// sealed nodes the peer cut from it. Fragments read from it stay valid
+    /// across that, as they would over any remote span. In memory only:
+    /// never persisted, never shadowed, and never a reason to drop local
+    /// data, since the peer has not committed to keeping it.
+    PeerHead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +368,7 @@ impl ComponentManifest {
         let spans = self
             .spans
             .iter()
+            .filter(|span| span.source != SpanSource::PeerHead)
             .map(|span| NodeSpan {
                 state: if span.state == SpanState::Fetching {
                     SpanState::RemoteOnly

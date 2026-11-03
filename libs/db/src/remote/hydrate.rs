@@ -9,10 +9,10 @@ use metor_proto::types::{ComponentId, Timestamp};
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 
-use super::range::{Completion, FetchError, Outcome, RangeKey};
+use super::range::{Completion, FetchError, Outcome, RangeKey, RangeQuery};
 use crate::{
     AtomicTimestampExt, ComponentSchema, DB, Error,
-    manifest::{GapVec, SpanState},
+    manifest::{GapVec, SpanSource, SpanState},
     store::{NodeKey, NodeStaging, NodeStore, StoreError},
     time_series::TimeSeries,
 };
@@ -387,13 +387,17 @@ impl Hydrator {
                 let next = self.inner.queue.lock().unwrap().pop(Instant::now());
                 let Some(Request {
                     key: (component_id, range),
+                    priority,
                     ..
                 }) = next
                 else {
                     let _ = self.inner.waker.wait().await;
                     continue;
                 };
-                if let Err(err) = self.serve(&db, store.as_ref(), component_id, range).await {
+                if let Err(err) = self
+                    .serve(&db, store.as_ref(), component_id, range, priority)
+                    .await
+                {
                     warn!(?err, ?component_id, "hydration request failed");
                 }
             }
@@ -407,6 +411,7 @@ impl Hydrator {
         store: &dyn NodeStore,
         component_id: ComponentId,
         range: Range<Timestamp>,
+        priority: HydratePriority,
     ) -> Result<(), Error> {
         let Some((component, name)) = db.with_state(|state| {
             let component = state.components.get(&component_id)?.clone();
@@ -420,8 +425,17 @@ impl Hydrator {
         };
         let mut gaps = GapVec::new();
         component.time_series.coverage(range, &mut gaps);
+        let manifest = component.time_series.manifest();
         for gap in gaps {
             if gap.state != SpanState::RemoteOnly {
+                continue;
+            }
+            // A peer's unsealed head is no node: it is read by range.
+            if manifest
+                .span(gap.start_ts)
+                .is_some_and(|span| span.source == SpanSource::PeerHead)
+            {
+                self.request_range(component_id, RangeQuery::range(gap.range), priority);
                 continue;
             }
             // Keyed by seal: a seal's pieces, and so their keys, move as

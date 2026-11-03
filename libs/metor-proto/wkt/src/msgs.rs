@@ -1103,7 +1103,11 @@ pub struct LogEvent {
 /// a version-6 server answers a `GetTimeSeries` in the old layout, which a
 /// version-7 client misreads (its `covered` is the first 16 bytes of
 /// timestamps), so every client checks the feature bit before asking.
-pub const NODE_PROTOCOL_VERSION: u32 = 7;
+///
+/// Version 8 appended `head` to [`NodeManifestResp`]
+/// ([`FEATURE_UNSEALED_HEAD`]). Older clients never read it; a version-8
+/// client reads a version-7 server's reply as [`NodeManifestRespV7`].
+pub const NODE_PROTOCOL_VERSION: u32 = 8;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
@@ -1112,6 +1116,11 @@ pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
 /// [`GetTimeSeries`] and says what each reply covers, so a mirror can fetch
 /// a range or an instant instead of a whole sealed node.
 pub const FEATURE_RANGE_FETCH: u64 = 1 << 2;
+
+/// [`DbInfoResp::features`] bit: [`NodeManifestResp`] says where the
+/// server's unsealed head lies, so a mirror can range-fetch history the
+/// server has not sealed into a node yet.
+pub const FEATURE_UNSEALED_HEAD: u64 = 1 << 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetDbInfo;
@@ -1132,7 +1141,7 @@ pub struct DbInfoResp {
     /// Capability bits; clients gate post-version-1 requests on these.
     /// Bit 0 was the retired envelope protocol ([224,56]/[224,57]) and
     /// must not be reused. Bit 1 is [`FEATURE_MSG_SYNC`], bit 2
-    /// [`FEATURE_RANGE_FETCH`].
+    /// [`FEATURE_RANGE_FETCH`], bit 3 [`FEATURE_UNSEALED_HEAD`].
     pub features: u64,
     /// The msg ids a client should forward up this connection: requests
     /// going to the server, never records coming back. Added in version 3.
@@ -1365,16 +1374,51 @@ impl Request for GetNodeManifest {
 }
 
 /// Every sealed node the server can currently serve for the component,
-/// sorted by start timestamp. The live (unsealed) head is never listed —
-/// its samples arrive via streaming instead.
+/// sorted by start timestamp, and where its unsealed head lies.
+///
+/// The head is not a node anyone can fetch: it is still being written, and
+/// it is only ever read with a range fetch ([`GetTimeSeries`]). `nodes` and
+/// `head` come from one snapshot, so together they cover everything the
+/// server holds: a node sealed after the snapshot is still part of `head`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NodeManifestResp {
     pub component_id: ComponentId,
     pub nodes: Vec<SealRecord>,
+    /// The samples past the sealed nodes, or `None` when there are none.
+    /// Added in version 8.
+    pub head: Option<UnsealedHead>,
 }
 
 impl Msg for NodeManifestResp {
     const ID: PacketId = [224, 48];
+}
+
+/// [`NodeManifestResp`] as a server before version 8 sends it: no head.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeManifestRespV7 {
+    pub component_id: ComponentId,
+    pub nodes: Vec<SealRecord>,
+}
+
+impl Msg for NodeManifestRespV7 {
+    const ID: PacketId = NodeManifestResp::ID;
+}
+
+/// The stretch of a component a server holds but has not sealed: its live
+/// head, and any node it rolled past but has not sealed yet.
+///
+/// A summary, not a seal: there is no checksum, since the bytes are still
+/// changing, and `end_ts` is only where the head ended when the server
+/// answered.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsealedHead {
+    /// The oldest unsealed sample.
+    pub start_ts: Timestamp,
+    /// The newest sample when the server answered.
+    pub end_ts: Timestamp,
+    /// Samples in `start_ts..=end_ts`, for cost estimates.
+    pub count: u64,
+    pub element_size: u64,
 }
 
 /// Ask the server to stream one sealed node's payloads as [`NodeChunk`]s
@@ -2182,6 +2226,50 @@ mod link_info_tests {
 #[cfg(test)]
 mod db_info_tests {
     use super::*;
+
+    /// A version-7 client reads a version-8 manifest reply up to the head
+    /// it doesn't know, and a version-7 reply is read as
+    /// [`NodeManifestRespV7`], which a version-8 reply's prefix also is.
+    #[test]
+    fn node_manifest_head_is_a_trailing_field() {
+        let seal = SealRecord {
+            start_ts: Timestamp(1),
+            end_ts: Timestamp(9),
+            count: 3,
+            index_len: 24,
+            data_len: 24,
+            checksum: 5,
+            element_size: 8,
+        };
+        let v8 = NodeManifestResp {
+            component_id: ComponentId(4),
+            nodes: vec![seal],
+            head: Some(UnsealedHead {
+                start_ts: Timestamp(10),
+                end_ts: Timestamp(20),
+                count: 2,
+                element_size: 8,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&v8).expect("encode");
+        let v7: NodeManifestRespV7 = postcard::from_bytes(&bytes).expect("decode v8 as v7");
+        assert_eq!((v7.component_id, v7.nodes), (ComponentId(4), vec![seal]));
+        let back: NodeManifestResp = postcard::from_bytes(&bytes).expect("round trip");
+        assert_eq!(back.head, v8.head);
+
+        let old = postcard::to_allocvec(&NodeManifestRespV7 {
+            component_id: ComponentId(4),
+            nodes: vec![seal],
+        })
+        .expect("encode");
+        assert!(postcard::from_bytes::<NodeManifestResp>(&old).is_err());
+        assert_eq!(
+            postcard::from_bytes::<NodeManifestRespV7>(&old)
+                .expect("decode v7")
+                .nodes,
+            vec![seal]
+        );
+    }
 
     /// A v2 reader decodes a current reply: postcard stops at the fields it
     /// knows and ignores the trailing bytes.

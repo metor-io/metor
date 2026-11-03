@@ -132,9 +132,10 @@ pub enum FetchError {
     #[error("the peer cannot answer this read")]
     Unsupported,
     /// The peer answered, but nothing of the answer could be held here:
-    /// no remote span covers it, as for history the peer sealed since the
-    /// manifest was last seeded (re-listed on the spot, so asking again
-    /// shortly works) or still holds in its unsealed head.
+    /// no remote span covers it, as for history the peer sealed, or its
+    /// head grew over, since the manifest was last seeded (re-listed on the
+    /// spot, so asking again shortly works), or the unsealed head of a peer
+    /// too old to report it.
     #[error("the peer's answer lies where no remote span here covers it")]
     NotHeld,
     #[error("{0}")]
@@ -410,11 +411,11 @@ impl Hydrator {
     }
 
     /// [`land`] a reply, and when no span here covers its answer (the peer
-    /// sealed it after the manifest was last seeded), re-list the
-    /// component's remote spans and land it again. Re-listing waits
-    /// [`RESEED_AFTER`] per component, so a read whose answer stays
-    /// unspanned (the peer's unsealed head) costs a listing at most that
-    /// often.
+    /// sealed it, or its head grew over it, after the manifest was last
+    /// seeded), re-list the component's remote spans and land it again.
+    /// Re-listing waits [`RESEED_AFTER`] per component, so a read whose
+    /// answer stays unspanned (a peer too old to report its head) costs a
+    /// listing at most that often.
     async fn land_or_reseed(
         &self,
         db: &Arc<DB>,
@@ -437,7 +438,7 @@ impl Hydrator {
 
     /// Re-list `component`'s remote spans from `store`, unless that was
     /// done within [`RESEED_AFTER`]. Returns whether the listing recorded
-    /// any seal not known before.
+    /// any seal not known before, or a head.
     async fn reseed(
         &self,
         db: &Arc<DB>,
@@ -460,15 +461,20 @@ impl Hydrator {
             }
         }
         let name = component_name(db, component_id);
-        let seals = match store.list(component_id, &name).await {
-            Ok(seals) => seals,
+        let listing = match store.listing(component_id, &name).await {
+            Ok(listing) => listing,
             Err(err) => {
                 warn!(?err, ?component_id, "failed to re-list remote spans");
                 return false;
             }
         };
-        match component.time_series.sync_remote_spans(seals) {
-            Ok(added) => added > 0,
+        let head = listing.head.is_some();
+        match component
+            .time_series
+            .sync_remote(listing.nodes, listing.head)
+        {
+            // The head may have grown over the answer, too.
+            Ok(added) => added > 0 || head,
             Err(err) => {
                 warn!(?err, ?component_id, "failed to merge re-listed spans");
                 false
@@ -694,10 +700,12 @@ mod tests {
     const A: &str = "a";
 
     /// A peer store that counts range-fetch batches, or answers none of
-    /// them, as a peer predating range fetches does.
+    /// them, as a peer predating range fetches does; and that reports its
+    /// unsealed head when listed, or not, as one predating heads does.
     struct Peer {
         store: PeerStore,
         ranges: bool,
+        heads: std::sync::atomic::AtomicBool,
         batches: Mutex<Vec<usize>>,
         fetched_nodes: AtomicUsize,
     }
@@ -726,6 +734,20 @@ mod tests {
             component_name: &'a str,
         ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>> {
             self.store.list(component_id, component_name)
+        }
+
+        fn listing<'a>(
+            &'a self,
+            component_id: ComponentId,
+            component_name: &'a str,
+        ) -> BoxFuture<'a, Result<crate::store::Listing, StoreError>> {
+            Box::pin(async move {
+                let mut listing = self.store.listing(component_id, component_name).await?;
+                if !self.heads.load(Ordering::Relaxed) {
+                    listing.head = None;
+                }
+                Ok(listing)
+            })
         }
 
         fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>> {
@@ -786,7 +808,7 @@ mod tests {
     }
 
     /// [`setup_with`], the peer also holding samples every `step` over
-    /// `head` in its unsealed head, which it never lists.
+    /// `head` in its unsealed head, which the mirror hasn't listed yet.
     fn setup_live(
         dir: &std::path::Path,
         ranges: bool,
@@ -835,6 +857,7 @@ mod tests {
         let store = Arc::new(Peer {
             store: PeerStore::new(addr),
             ranges,
+            heads: true.into(),
             batches: Mutex::new(Vec::new()),
             fetched_nodes: AtomicUsize::new(0),
         });
@@ -1030,14 +1053,15 @@ mod tests {
         assert_eq!(*peer.batches.lock().unwrap(), [1]);
     }
 
-    /// An answer in the peer's unsealed head can't land, since no span
-    /// here covers it and re-listing finds none: the read says so instead
-    /// of claiming success.
+    /// An answer in the unsealed head of a peer too old to report it can't
+    /// land, since no span here covers it and re-listing finds none: the
+    /// read says so instead of claiming success.
     #[stellarator::test]
     async fn an_answer_no_span_covers_is_not_held() {
         let dir = tempfile::tempdir().unwrap();
         let (mirror, hydrator, peer) =
             setup_live(dir.path(), true, &[(0, 1000)], 10, 1, 2000..3000);
+        peer.heads.store(false, Ordering::Relaxed);
         let a = ComponentId::new(A);
         let err = hydrator.point(a, Timestamp(2505), SELECTED).await;
         assert_eq!(err, Err(FetchError::NotHeld));
@@ -1047,6 +1071,112 @@ mod tests {
         let again = hydrator.point(a, Timestamp(2505), SELECTED).await;
         assert_eq!(again, Err(FetchError::NotHeld));
         assert_eq!(*peer.batches.lock().unwrap(), [1, 1]);
+    }
+
+    /// A peer that has sealed nothing yet: its whole history is its head,
+    /// which a mirror reads by range. A fragment of it is evictable (the
+    /// peer still holds it), and survives the peer sealing that stretch,
+    /// after which it is cache over an ordinary sealed span.
+    #[stellarator::test]
+    async fn a_peers_head_is_read_by_range_and_outlives_its_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(DB::create(dir.path().join("peer")).unwrap());
+        with_a(&peer);
+        series(&peer).set_max_node_age(Duration::from_micros(1000));
+        let mut writer = series(&peer).writer().unwrap();
+        for t in (0..1000).step_by(10) {
+            writer
+                .push_buf(Timestamp(t), &(t as f64).to_le_bytes())
+                .unwrap();
+        }
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = crate::Server {
+            listener,
+            db: peer.clone(),
+        };
+        stellarator::struc_con::stellar(move || server.run());
+        let mirror = Arc::new(DB::create(dir.path().join("mirror")).unwrap());
+        with_a(&mirror);
+        let store = Arc::new(Peer {
+            store: PeerStore::new(addr),
+            ranges: true,
+            heads: true.into(),
+            batches: Mutex::new(Vec::new()),
+            fetched_nodes: AtomicUsize::new(0),
+        });
+        let hydrator = Hydrator::new();
+        stellarator::spawn(hydrator.clone().run(mirror.clone(), store.clone()));
+        let a = ComponentId::new(A);
+        let sync = || async {
+            let listing = store.listing(a, A).await.unwrap();
+            series(&mirror)
+                .sync_remote(listing.nodes, listing.head)
+                .unwrap();
+        };
+        let gaps = |range: Range<i64>| {
+            let mut gaps = GapVec::new();
+            series(&mirror).coverage(Timestamp(range.start)..Timestamp(range.end), &mut gaps);
+            gaps.iter()
+                .map(|g| (g.range.start.0, g.range.end.0))
+                .collect::<Vec<_>>()
+        };
+
+        sync().await;
+        let manifest = series(&mirror).manifest();
+        let [head] = &manifest.spans[..] else {
+            panic!("one head span: {:?}", manifest.spans);
+        };
+        assert_eq!(
+            (
+                head.source,
+                head.state,
+                head.cover_start.0,
+                head.cover_end.0
+            ),
+            (SpanSource::PeerHead, SpanState::RemoteOnly, 0, 990)
+        );
+        assert_eq!(head.seal.count, 100);
+        assert!(series(&mirror).begin_fetch(Timestamp(0)).is_none());
+        assert_eq!(gaps(0..1000), [(0, 991)]);
+
+        let query = RangeQuery::range(Timestamp(0)..Timestamp(991));
+        let covered = hydrator.fetch_range(a, query.clone(), SELECTED).await;
+        assert_eq!(covered, Ok(Timestamp(0)..Timestamp(991)));
+        assert_eq!(value(&series(&mirror), 500), Some(500.0));
+        assert!(gaps(0..1000).is_empty());
+        // The peer still holds it, so the fragment may go, and the head
+        // reads as a gap again.
+        assert!(series(&mirror).purge_fragment(Timestamp(0)).unwrap());
+        assert_eq!(gaps(0..1000), [(0, 991)]);
+        assert_eq!(value(&series(&mirror), 500), None);
+        hydrator.fetch_range(a, query, SELECTED).await.unwrap();
+        assert_eq!(value(&series(&mirror), 500), Some(500.0));
+
+        // The peer rolls its head and seals what it held.
+        writer
+            .push_buf(Timestamp(1500), &1500f64.to_le_bytes())
+            .unwrap();
+        drop(writer);
+        assert!(series(&peer).seal_rolled_nodes().unwrap());
+        sync().await;
+        let manifest = series(&mirror).manifest();
+        let sealed = manifest.span(Timestamp(0)).unwrap();
+        assert_eq!(
+            (sealed.source, sealed.state, sealed.seal.end_ts.0),
+            (SpanSource::RemoteFetch, SpanState::RemoteOnly, 990)
+        );
+        let head = manifest.span(Timestamp(1500)).unwrap();
+        assert_eq!(head.source, SpanSource::PeerHead);
+        assert_eq!(manifest.fragments.len(), 1);
+        assert_eq!(value(&series(&mirror), 500), Some(500.0));
+        assert_eq!(gaps(0..1600), [(1500, 1501)]);
+        // Dropping the fragment hands its stretch to the sealed span, which
+        // a whole node can now fill.
+        assert!(series(&mirror).purge_fragment(Timestamp(0)).unwrap());
+        assert_eq!(gaps(0..1000), [(0, 991)]);
+        assert!(series(&mirror).begin_fetch(Timestamp(0)).is_some());
+        assert_eq!(store.fetched_nodes.load(Ordering::Relaxed), 0);
     }
 
     /// A peer found too old for range fetches is asked again once the
@@ -1093,6 +1223,7 @@ mod tests {
         let store = Arc::new(Peer {
             store: PeerStore::new(dead),
             ranges: true,
+            heads: true.into(),
             batches: Mutex::new(Vec::new()),
             fetched_nodes: AtomicUsize::new(0),
         });

@@ -1966,7 +1966,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             });
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
-                features: FEATURE_MSG_SYNC | FEATURE_RANGE_FETCH,
+                features: FEATURE_MSG_SYNC | FEATURE_RANGE_FETCH | FEATURE_UNSEALED_HEAD,
                 command_ids,
                 namespace,
                 commands,
@@ -1982,21 +1982,23 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             // syncing peer "never heard of it" and "no sealed nodes yet"
             // call for the same response.
             let component = db.with_state(|state| state.components.get(&component_id).cloned());
-            let nodes: Vec<SealRecord> = component
+            let (nodes, head) = component
                 .map(|component| {
-                    component
-                        .time_series
-                        .manifest()
+                    let series = &component.time_series;
+                    let manifest = series.manifest();
+                    let nodes: Vec<SealRecord> = manifest
                         .spans
                         .iter()
                         .filter(|s| s.state == manifest::SpanState::Resident)
                         .map(|s| s.seal)
-                        .collect()
+                        .collect();
+                    (nodes, series.unsealed_head(&manifest))
                 })
                 .unwrap_or_default();
             tx.send_msg(&NodeManifestResp {
                 component_id,
                 nodes,
+                head,
             })
             .await?;
         }
