@@ -17,10 +17,15 @@ use crate::{
     time_series::TimeSeries,
 };
 
-/// Most requests waiting at once; past this the least important, oldest one
-/// is dropped. Render loops re-request visible gaps every frame, so dropped
-/// entries are re-discovered immediately.
+/// Most whole-node requests waiting at once; past this the least important,
+/// oldest one is dropped. Render loops re-request visible gaps every frame,
+/// so dropped entries are re-discovered immediately.
 const QUEUE_CAP: usize = 64;
+
+/// [`QUEUE_CAP`] for range fetches and point reads. A dashboard scrub asks
+/// one point read per instrument at once, and they are cheap, so they must
+/// not push each other out.
+pub(super) const RANGE_QUEUE_CAP: usize = 1024;
 
 /// How long a waiting request lives without being asked for again. Views
 /// re-request what they still need every frame, so a request that has gone
@@ -132,14 +137,26 @@ impl<K> Request<K> {
 pub(super) struct Queue<K> {
     waiting: Vec<Request<K>>,
     seq: u64,
+    cap: usize,
 }
 
 impl<K> Default for Queue<K> {
     fn default() -> Self {
+        Self::with_cap(QUEUE_CAP)
+    }
+}
+
+impl<K> Queue<K> {
+    pub(super) fn with_cap(cap: usize) -> Self {
         Self {
             waiting: Vec::new(),
             seq: 0,
+            cap,
         }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
     }
 }
 
@@ -147,6 +164,10 @@ impl<K: PartialEq> Queue<K> {
     /// Add or refresh a request. A repeat keeps one entry, taking the newer
     /// ask and the higher of the two priorities. With `await_it`, returns
     /// the completion the request's outcome will land in.
+    ///
+    /// A full queue makes room by dropping its least important request that
+    /// nobody awaits; awaited ones are never dropped, so the queue grows
+    /// past its cap only by what callers are awaiting.
     pub(super) fn push(
         &mut self,
         key: K,
@@ -165,7 +186,7 @@ impl<K: PartialEq> Queue<K> {
                 at
             }
             None => {
-                if self.waiting.len() >= QUEUE_CAP
+                if self.waiting.len() >= self.cap
                     && let Some(least) = self.least_important()
                 {
                     self.waiting
@@ -214,12 +235,28 @@ impl<K: PartialEq> Queue<K> {
         Some(self.waiting.swap_remove(next))
     }
 
-    /// Take up to `max` requests, most urgent first.
-    pub(super) fn pop_batch(&mut self, now: Instant, max: usize) -> Vec<Request<K>> {
+    /// Take up to `max` requests, most urgent first, stopping before the
+    /// one that would take their summed `weight` past `budget` (the first is
+    /// always taken).
+    pub(super) fn pop_batch(
+        &mut self,
+        now: Instant,
+        max: usize,
+        budget: usize,
+        weight: impl Fn(&K) -> usize,
+    ) -> Vec<Request<K>> {
         self.expire(now);
         self.waiting
             .sort_unstable_by_key(|r| std::cmp::Reverse((r.priority, r.seq)));
-        let take = self.waiting.len().min(max);
+        let mut total = 0usize;
+        let mut take = 0;
+        for request in self.waiting.iter().take(max) {
+            total = total.saturating_add(weight(&request.key));
+            if take > 0 && total > budget {
+                break;
+            }
+            take += 1;
+        }
         self.waiting.drain(..take).collect()
     }
 
@@ -227,6 +264,7 @@ impl<K: PartialEq> Queue<K> {
         self.waiting
             .iter()
             .enumerate()
+            .filter(|(_, r)| !r.awaited())
             .min_by_key(|(_, r)| (r.priority, r.seq))
             .map(|(i, _)| i)
     }
@@ -256,6 +294,9 @@ pub(super) struct HydratorInner {
     /// neither waits on the other (see [`super::range`]).
     pub(super) ranges: std::sync::Mutex<Queue<RangeKey>>,
     pub(super) range_waker: WaitQueue,
+    /// When each component's manifest was last re-listed for a range read
+    /// whose answer no span covered (see [`super::range`]).
+    pub(super) reseeded: std::sync::Mutex<HashMap<ComponentId, Instant>>,
 }
 
 impl Hydrator {
@@ -265,8 +306,9 @@ impl Hydrator {
                 queue: std::sync::Mutex::new(Queue::default()),
                 backoff: std::sync::Mutex::new(HashMap::new()),
                 waker: WaitQueue::new(),
-                ranges: std::sync::Mutex::new(Queue::default()),
+                ranges: std::sync::Mutex::new(Queue::with_cap(RANGE_QUEUE_CAP)),
                 range_waker: WaitQueue::new(),
+                reseeded: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -327,10 +369,12 @@ impl Hydrator {
         self.inner.waker.wake();
     }
 
-    /// Whether requests are waiting behind the one being served — the
-    /// signal for callers that only re-request when they repaint to repaint.
+    /// Whether requests are waiting behind the one being served, whole
+    /// nodes or range fetches — the signal for callers that only re-request
+    /// when they repaint to repaint.
     pub fn backlogged(&self) -> bool {
-        !self.inner.queue.lock().unwrap().waiting.is_empty()
+        !self.inner.queue.lock().unwrap().is_empty()
+            || !self.inner.ranges.lock().unwrap().is_empty()
     }
 
     /// Serve requests until the runtime shuts down. Spawn once per DB
@@ -543,16 +587,55 @@ mod tests {
     }
 
     #[test]
-    fn a_request_pushed_out_completes_as_expired() {
+    fn a_request_whose_awaiter_left_can_be_pushed_out() {
         let mut queue = Queue::default();
         let now = Instant::now();
         let id = ComponentId(1);
         let least = queue
             .push((id, range(-10)), HydratePriority::Prefetch, now, true)
             .unwrap();
+        drop(least);
         for i in 0..QUEUE_CAP as i64 {
             queue.push((id, range(i * 10)), HydratePriority::Visible, now, false);
         }
-        assert!(matches!(least.outcome(), Some(Err(FetchError::Expired))));
+        assert_eq!(queue.waiting.len(), QUEUE_CAP);
+        assert!(queue.waiting.iter().all(|r| r.key != (id, range(-10))));
+    }
+
+    /// Point reads someone awaits are never pushed out by more of them: the
+    /// queue drops what nobody awaits first, and otherwise grows.
+    #[test]
+    fn awaited_requests_are_never_pushed_out() {
+        let mut queue = Queue::default();
+        let now = Instant::now();
+        let id = ComponentId(1);
+        let unawaited = (id, range(-10));
+        queue.push(unawaited.clone(), HydratePriority::Selected, now, false);
+        let awaited: Vec<_> = (0..QUEUE_CAP as i64 + 10)
+            .map(|i| {
+                queue
+                    .push((id, range(i * 10)), HydratePriority::Selected, now, true)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(queue.waiting.len(), QUEUE_CAP + 10);
+        assert!(queue.waiting.iter().all(|r| r.key != unawaited));
+        assert!(awaited.iter().all(|done| done.outcome().is_none()));
+    }
+
+    #[test]
+    fn batches_stop_at_their_byte_budget() {
+        let mut queue = Queue::default();
+        let now = Instant::now();
+        let id = ComponentId(1);
+        for i in 0..10 {
+            push(&mut queue, id, range(i * 10), HydratePriority::Visible, now);
+        }
+        let weight = |key: &Key| if key.1.start.0 < 50 { 10 } else { 1 };
+        // Newest first: 90 down to 50 weigh 1 each, then 40 tips past 7.
+        assert_eq!(queue.pop_batch(now, 64, 7, weight).len(), 5);
+        // One heavier than the budget still goes, alone.
+        assert_eq!(queue.pop_batch(now, 64, 5, weight).len(), 1);
+        assert_eq!(queue.pop_batch(now, 2, 1000, weight).len(), 2);
     }
 }

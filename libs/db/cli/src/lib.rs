@@ -90,8 +90,8 @@ impl Client {
             Some(supported) => supported,
             None => {
                 let info: DbInfoResp = self.request(&GetDbInfo).await?;
-                let supported = info.protocol_version >= 7
-                    && info.features & FEATURE_RANGE_FETCH != 0;
+                let supported =
+                    info.protocol_version >= 7 && info.features & FEATURE_RANGE_FETCH != 0;
                 self.range_fetch = Some(supported);
                 supported
             }
