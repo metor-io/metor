@@ -224,7 +224,14 @@ pub(crate) fn plan(
     let fit = fit(size)?;
     let limit = req.limit.unwrap_or(usize::MAX);
     match req.stride {
-        Some(stride) => Ok(cells(flat, held, req.from, limit.min(fit), stride)),
+        Some(stride) => Ok(cells(
+            flat,
+            held,
+            &req.range,
+            req.from,
+            limit.min(fit),
+            stride,
+        )),
         None => run(flat, held, req.from, limit.min(fit), fit, size),
     }
 }
@@ -316,9 +323,18 @@ fn run(
 
 /// The last sample of each stride cell, at most `limit` cells counted from
 /// `from`'s end. Each cell costs one binary search; empty cells cost none.
+///
+/// `covered` ends on cell boundaries wherever this server chose the edge:
+/// at a limit, and where `held` stops short of the requested `range` at a
+/// stretch it only knows remotely, since a cell cut there might hold a
+/// later sample than the one it would report. A cell cut by that is left
+/// out, pick and all. An edge the request itself set is kept as asked, so
+/// a cell it cuts reports its last sample within `range`; requests whose
+/// replies are merged align their ranges to the stride.
 fn cells(
     flat: &Flat,
     held: Range<Timestamp>,
+    range: &Range<Timestamp>,
     from: SeriesEnd,
     limit: usize,
     stride: std::time::Duration,
@@ -328,22 +344,21 @@ fn cells(
     let cell_start = |c: i64| Timestamp(c.saturating_mul(width));
     let n = flat.len();
     let mut picks = Vec::new();
-    match from {
+    let mut covered = match from {
         SeriesEnd::Oldest => {
             let mut i = 0;
             while i < n && picks.len() < limit {
                 let next = cell_start(cell(flat.stamp(i)).saturating_add(1));
-                let end = flat.partition_point(|t| t.0 < next.0);
+                // The next cell's start saturates at the end of time; always
+                // step past the cell, so a sample there (unreachable today,
+                // ranges being end-exclusive) could never stall the walk.
+                let end = flat.partition_point(|t| t.0 < next.0).max(i + 1);
                 picks.push(end - 1);
                 i = end;
             }
-            let covered = match i < n {
+            match i < n {
                 true => held.start..cell_start(cell(flat.stamp(i))).max(held.start),
                 false => held,
-            };
-            Reply {
-                picks: Picks::Cells(picks),
-                covered,
             }
         }
         SeriesEnd::Newest => {
@@ -354,17 +369,25 @@ fn cells(
                 end = flat.partition_point(|t| t.0 < start.0);
             }
             picks.reverse();
-            let covered = match end > 0 {
+            match end > 0 {
                 true => {
                     cell_start(cell(flat.stamp(end - 1)).saturating_add(1)).min(held.end)..held.end
                 }
                 false => held,
-            };
-            Reply {
-                picks: Picks::Cells(picks),
-                covered,
             }
         }
+    };
+    let aligned = |t: Timestamp| cell_start(cell(t)) == t;
+    if covered.end != range.end && !aligned(covered.end) {
+        covered.end = cell_start(cell(covered.end)).max(covered.start);
+    }
+    if covered.start != range.start && !aligned(covered.start) {
+        covered.start = cell_start(cell(covered.start).saturating_add(1)).min(covered.end);
+    }
+    picks.retain(|i| covered.contains(&flat.stamp(*i)));
+    Reply {
+        picks: Picks::Cells(picks),
+        covered,
     }
 }
 
@@ -531,6 +554,38 @@ mod tests {
         assert_eq!(ask(&s, &at(150)), (vec![], 151..151));
         assert_eq!(ask(&s, &at(250)), (vec![], 200..251));
         assert_eq!(ask(&s, &at(50)), (vec![30], 21..51));
+    }
+
+    /// Where the server stops at a stretch it only knows remotely, the cell
+    /// that cuts is left out: its last sample may lie beyond.
+    #[test]
+    fn strided_coverage_stops_on_a_cell_boundary_at_a_remote_stretch() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = series(dir.path(), &[1, 4, 9, 11, 14]);
+        let remote = SealRecord {
+            start_ts: Timestamp(15),
+            end_ts: Timestamp(40),
+            count: 3,
+            index_len: 24,
+            data_len: 24,
+            checksum: 7,
+            element_size: 8,
+        };
+        s.merge_remote_spans([remote]).unwrap();
+        let ten = Duration::from_micros(10);
+        assert_eq!(ask(&s, &req(0, 30).stride(ten)), (vec![9], 0..10));
+        assert_eq!(
+            ask(&s, &req(41, 100).stride(ten).newest()),
+            (vec![], 41..100)
+        );
+    }
+
+    #[test]
+    fn strides_reach_the_end_of_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = series(dir.path(), &[5, i64::MAX - 1]);
+        let req = req(0, i64::MAX).stride(Duration::from_micros(u64::MAX));
+        assert_eq!(ask(&s, &req), (vec![i64::MAX - 1], 0..i64::MAX));
     }
 
     #[test]
