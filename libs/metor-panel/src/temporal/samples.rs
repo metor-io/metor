@@ -1522,6 +1522,32 @@ mod tests {
         }
     }
 
+    /// History a peer holds unsealed, from before this side's data, reaches
+    /// the extent (so the temporal range's data start), and an instant in
+    /// it is a remote gap a point read fetches.
+    #[test]
+    fn a_peers_unsealed_head_is_history_like_any_remote_span() {
+        let (_temp, _db, c) = fixture();
+        let head = metor_proto_wkt::UnsealedHead {
+            start_ts: Timestamp(-500),
+            end_ts: Timestamp(5),
+            count: 50,
+            element_size: 8,
+        };
+        c.time_series.sync_remote(Vec::new(), Some(head)).unwrap();
+        let extent = crate::data_binding::component_extent(&c).unwrap();
+        assert_eq!(extent, Timestamp(-500)..Timestamp(101));
+        let gap = newest_gap(&c.time_series.manifest(), Timestamp(0)).unwrap();
+        assert_eq!(
+            (gap.range, gap.state),
+            (Timestamp(-500)..Timestamp(1), SpanState::RemoteOnly)
+        );
+        assert_eq!(
+            prefetch(&c.time_series.manifest(), Timestamp(-400), Timestamp(-350)),
+            Some(Timestamp(-400)..Timestamp(-300))
+        );
+    }
+
     #[test]
     fn fragments_answer_what_they_claim_and_nothing_past_it() {
         let (_temp, _db, c) = fixture();

@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use gpui::Global;
-use metor_db::manifest::{ComponentManifest, Gap};
+use metor_db::manifest::{ComponentManifest, Gap, SpanSource};
 use metor_db::remote::{
     FetchError, HydratePriority, Hydrator, PAGE_BYTES, REQUEST_TTL, RangeQuery,
 };
@@ -165,7 +165,8 @@ impl Hydrators {
     }
 
     /// Ask for a remote-only `gap` a plot shows: as the whole node holding
-    /// it, unless [`range_fetch`] finds the node far bigger than the gap.
+    /// it, unless [`range_fetch`] finds the node far bigger than the gap or
+    /// there is no node yet.
     pub fn request_gap(
         &self,
         component_id: ComponentId,
@@ -218,6 +219,10 @@ const NODE_TO_GAP: u64 = 8;
 /// fits one page ([`PAGE_BYTES`], one round trip) and is at most an eighth
 /// of the node; anything wider fetches the node.
 ///
+/// A peer's unsealed head ([`SpanSource::PeerHead`]) has no node to
+/// fetch, so its gaps are always range-fetched; a wide one pages in over
+/// repeated asks.
+///
 /// The gap is first widened to a power-of-two grid within its span, so a
 /// panning plot mostly repeats one ask instead of making a new one per
 /// frame.
@@ -229,6 +234,9 @@ fn range_fetch(manifest: &ComponentManifest, gap: &Gap) -> Option<Range<Timestam
     let start = gap.range.start.0.div_euclid(grid) * grid;
     let end = gap.range.end.0.saturating_add(grid - 1).div_euclid(grid) * grid;
     let range = Timestamp(start.max(cover.start.0))..Timestamp(end.min(cover.end.0));
+    if span.source == SpanSource::PeerHead {
+        return Some(range);
+    }
     let seal_len = (span.seal.end_ts.0 - span.seal.start_ts.0) as u128 + 1;
     let share = (span.bytes() as u128 * (range.end.0 - range.start.0) as u128 / seal_len) as u64;
     (share <= PAGE_BYTES as u64 && share.saturating_mul(NODE_TO_GAP) <= span.bytes())
@@ -260,6 +268,10 @@ mod tests {
     /// A remote span over 0..=999_999 holding `bytes`, and its gap over
     /// `range`.
     fn gap(bytes: u64, range: Range<i64>) -> Option<Range<i64>> {
+        gap_in(SpanSource::RemoteFetch, bytes, range)
+    }
+
+    fn gap_in(source: SpanSource, bytes: u64, range: Range<i64>) -> Option<Range<i64>> {
         let seal = SealRecord {
             start_ts: Timestamp(0),
             end_ts: Timestamp(999_999),
@@ -270,13 +282,7 @@ mod tests {
             element_size: 8,
         };
         let manifest = ComponentManifest {
-            spans: [NodeSpan::whole(
-                seal,
-                SpanState::RemoteOnly,
-                SpanSource::RemoteFetch,
-                false,
-            )]
-            .into(),
+            spans: [NodeSpan::whole(seal, SpanState::RemoteOnly, source, false)].into(),
             ..Default::default()
         };
         let gap = Gap {
@@ -298,5 +304,19 @@ mod tests {
         assert_eq!(gap(MB, 0..200_000), None);
         // The grid never reaches past the span.
         assert_eq!(gap(64 * MB, 999_000..999_990), Some(998_400..1_000_000));
+    }
+
+    /// A peer's unsealed head has no node to fetch: however wide the gap,
+    /// it is read by range.
+    #[test]
+    fn a_gap_in_a_peers_head_is_always_range_fetched() {
+        assert_eq!(
+            gap_in(SpanSource::PeerHead, MB, 0..500_000),
+            Some(0..524_288)
+        );
+        assert_eq!(
+            gap_in(SpanSource::PeerHead, 64 * MB, 1000..2000),
+            Some(0..2048)
+        );
     }
 }
