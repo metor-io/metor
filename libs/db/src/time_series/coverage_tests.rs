@@ -658,9 +658,10 @@ fn a_fragment_at_the_head_is_never_written_or_sealed() {
 }
 
 /// Where a whole peer node ends on a timestamp its neighbour's seal also
-/// holds, a range fetch over the neighbour claims the shared timestamp
-/// but leaves its samples to the node; purging the node takes such a
-/// fragment with it, so the shared timestamp is offered again.
+/// holds, a range fetch over the neighbour claims the shared timestamp and
+/// keeps the neighbour's samples there, dropping only as many as the node
+/// holds itself, so reads match the origin's. Purging the node takes such
+/// a fragment with it, so the shared timestamp is offered again.
 #[test]
 fn a_fragment_on_a_nodes_edge_goes_with_the_node() {
     let dir = tempfile::tempdir().unwrap();
@@ -677,9 +678,9 @@ fn a_fragment_on_a_nodes_edge_goes_with_the_node() {
     series.begin_fetch(Timestamp(10)).unwrap();
     series.install_fetched(stage(&cdir, &a, &sa), &sa).unwrap();
     assert_eq!(gaps(&series, 0, 100).1, [(20, 31)]);
-    // The peer replies with both 20s; only b's 30 is new here.
+    // The peer replies with both 20s, a's first; b's 20 and 30 are new.
     let reply = [Timestamp(20), Timestamp(20), Timestamp(30)];
-    let data: Vec<u8> = [20u64, 20, 30]
+    let data: Vec<u8> = [20u64, 2020, 30]
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
@@ -687,8 +688,42 @@ fn a_fragment_on_a_nodes_edge_goes_with_the_node() {
         .install_fragment(Timestamp(20)..Timestamp(31), 8, &reply, &data)
         .unwrap();
     assert_eq!(gaps(&series, 0, 100).0, Coverage::Complete);
-    assert_eq!(stamps(&series, 0, 100), [10, 20, 30]);
+    assert_eq!(stamps(&series, 0, 100), [10, 20, 20, 30]);
+    // The newer node's sample answers at the tie, as on the origin.
+    assert_eq!(
+        series.get(Timestamp(20)).unwrap().data(),
+        2020u64.to_le_bytes()
+    );
     assert!(series.purge_span(Timestamp(10)).unwrap());
     assert!(series.manifest().fragments.is_empty());
     assert_eq!(gaps(&series, 0, 100).1, [(10, 21), (20, 31)]);
+}
+
+/// The other side of a tie: a fragment ending on the first timestamp of a
+/// resident node keeps the older node's samples there.
+#[test]
+fn a_fragment_before_a_node_keeps_the_older_side_of_a_tie() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    std::fs::create_dir_all(&cdir).unwrap();
+    let series = TimeSeries::create(&cdir).unwrap();
+    let a = peer_node(&dir.path().join("pa"), &[10, 20]);
+    let b = peer_node(&dir.path().join("pb"), &[20, 30]);
+    let (sa, sb) = (
+        SealRecord::compute(&a).unwrap(),
+        SealRecord::compute(&b).unwrap(),
+    );
+    series.merge_remote_spans([sa, sb]).unwrap();
+    series.begin_fetch(Timestamp(20)).unwrap();
+    series.install_fetched(stage(&cdir, &b, &sb), &sb).unwrap();
+    let reply = [Timestamp(10), Timestamp(20), Timestamp(20)];
+    let data: Vec<u8> = [10u64, 1020, 20]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    series
+        .install_fragment(Timestamp(0)..Timestamp(21), 8, &reply, &data)
+        .unwrap();
+    assert_eq!(gaps(&series, 0, 100).0, Coverage::Complete);
+    assert_eq!(stamps(&series, 0, 100), [10, 20, 20, 30]);
 }

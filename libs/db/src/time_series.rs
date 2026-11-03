@@ -1007,12 +1007,24 @@ impl TimeSeries {
     /// Only the parts of `covered` still remote-only here are claimed, each
     /// stretch as a [`Fragment`] with the reply's samples in it (or none),
     /// so whatever is resident, mid-fetch, already claimed by a fragment,
-    /// or above an unsealed head is left alone. A stretch is never claimed
-    /// across a resident node; at a timestamp a resident node starts or
-    /// ends on, the node's samples answer and the reply's are dropped, as
-    /// a peer node tying with its neighbour leaves that timestamp to it.
+    /// or above an unsealed head is left alone. Time no span covers is
+    /// never claimed: nothing would hand it back as a gap once the fragment
+    /// went, so the caller learns of it from an empty or short return and
+    /// re-seeds the manifest instead.
+    ///
+    /// A stretch is never claimed across a resident node. At a timestamp a
+    /// resident node starts or ends on (two peer nodes tying), the reply
+    /// lists the tie oldest node first, so the node's own samples there are
+    /// dropped from the reply's front when the node lies before the stretch
+    /// and from its back when it lies after, and the rest stay in the
+    /// fragment, which then shares the node's edge timestamp.
     /// Every fragment lands in one swap of the node list and one publish.
     /// Returns the stretches claimed, oldest first.
+    ///
+    /// Fragment nodes are staged and flushed under the structural lock,
+    /// which a reply of [`crate::remote::PAGE_BYTES`] holds for one 4 MB
+    /// write; staging first would mean re-deriving the stretches after
+    /// taking the lock, as the manifest can move in between.
     pub fn install_fragment(
         &self,
         covered: Range<Timestamp>,
@@ -1063,13 +1075,36 @@ impl TimeSeries {
             let at = resident.partition_point(|e| e.end < t);
             resident.get(at).is_some_and(|e| e.start <= t)
         };
+        // Samples stamped `t` in resident nodes, which answer for that many
+        // of the reply's.
+        let resident_at = |t: i64| -> usize {
+            if !held(t) {
+                return 0;
+            }
+            self.list
+                .iter()
+                .filter(|node| !node.fragment)
+                .map(|node| {
+                    let stamps = node.timestamps();
+                    stamps.partition_point(|s| s.0 <= t) - stamps.partition_point(|s| s.0 < t)
+                })
+                .sum()
+        };
         let mut fragments = Vec::new();
         let mut nodes = Vec::new();
         for (start, end) in stretches {
             for (start, end) in around_nodes(start, end, &resident) {
-                let lo = timestamps.partition_point(|t| t.0 < start);
-                let hi = timestamps.partition_point(|t| t.0 <= end);
-                let samples: Vec<usize> = (lo..hi).filter(|i| !held(timestamps[*i].0)).collect();
+                let mut lo = timestamps.partition_point(|t| t.0 < start);
+                let mut hi = timestamps.partition_point(|t| t.0 <= end);
+                // A node before the stretch is the older side of a tie at
+                // `start`, one after it the newer side of a tie at `end`.
+                let tie_end = timestamps.partition_point(|t| t.0 <= start).min(hi);
+                lo += resident_at(start).min(tie_end.saturating_sub(lo));
+                if end != start {
+                    let tie_start = timestamps.partition_point(|t| t.0 < end).max(lo);
+                    hi -= resident_at(end).min(hi.saturating_sub(tie_start));
+                }
+                let samples: Vec<usize> = (lo..hi).collect();
                 let mut fragment = Fragment {
                     start: Timestamp(start),
                     end: Timestamp(end),
@@ -1300,9 +1335,17 @@ impl TimeSeries {
         if nodes.is_empty() && replaced.is_empty() {
             return Ok(());
         }
-        // Newest first by first sample; an empty node can only be the
-        // writer's fresh head, newer than anything installed.
-        let key = |node: &TimeSeriesNode| node.timestamps().first().map_or(i64::MAX, |t| t.0);
+        // Newest first by first sample, then by last: a fragment holding
+        // only the newer side of a tie at a node's first timestamp would
+        // otherwise order arbitrarily against it. An empty node can only
+        // be the writer's fresh head, newer than anything installed.
+        let key = |node: &TimeSeriesNode| {
+            let stamps = node.timestamps();
+            match (stamps.first(), stamps.last()) {
+                (Some(first), Some(last)) => (first.0, last.0),
+                _ => (i64::MAX, i64::MAX),
+            }
+        };
         if self.list.replace(replaced, nodes, |a, b| key(a) > key(b)) {
             Ok(())
         } else {
