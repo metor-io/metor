@@ -178,9 +178,11 @@ async fn first_sample(client: &mut Client, component: &str) -> Vec<u8> {
     loop {
         let query = GetTimeSeries {
             id: [0, 0],
-            range: Timestamp(i64::MIN)..Timestamp(i64::MAX),
-            component_id: ComponentId::new(component),
             limit: Some(1),
+            ..GetTimeSeries::range(
+                ComponentId::new(component),
+                Timestamp(i64::MIN)..Timestamp(i64::MAX),
+            )
         };
         if let Ok(series) = client.request(&query).await
             && let Ok(data) = series.data()

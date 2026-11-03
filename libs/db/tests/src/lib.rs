@@ -749,9 +749,8 @@ mod tests {
         // Query the time series data
         let query = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(10000),
-            component_id,
             limit: Some(256),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(10000))
         };
 
         let time_series = client.request(&query).await.unwrap();
@@ -1027,23 +1026,23 @@ mod tests {
 
         let query = GetTimeSeries {
             id: 1u16.to_le_bytes(),
-            range: Timestamp(0)..Timestamp(10000),
-            component_id,
             limit: None,
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(10000))
         };
 
-        let result = client.request(&query).await;
-
-        result.unwrap_err();
+        // A component with no samples answers with nothing, vouching for
+        // the whole range rather than failing.
+        let reply = client.request(&query).await.unwrap();
+        assert_eq!(reply.len, 0);
+        assert_eq!(reply.covered, Timestamp(0)..Timestamp(10000));
 
         // Now try with non-existent component
         let non_existent_component_id = ComponentId::new("non_existent_component");
 
         let query = GetTimeSeries {
             id: 1u16.to_le_bytes(),
-            range: Timestamp(0)..Timestamp(10000),
-            component_id: non_existent_component_id,
             limit: None,
+            ..GetTimeSeries::range(non_existent_component_id, Timestamp(0)..Timestamp(10000))
         };
 
         // Should return an error for non-existent component
@@ -1207,9 +1206,8 @@ mod tests {
         let mut verification_client = Client::connect(addr).await.unwrap();
         let query = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: Some(NUM_CLIENTS * WRITES_PER_CLIENT),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
 
         let time_series = verification_client.request(&query).await.unwrap();
@@ -1266,9 +1264,8 @@ mod tests {
 
             let query = GetTimeSeries {
                 id: vtable_id,
-                range: Timestamp(0)..Timestamp(i64::MAX),
-                component_id,
                 limit: Some(256),
+                ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
             };
             let time_series = client.request(&query).await.unwrap();
             let data_before = <[f64]>::ref_from_bytes(time_series.data().unwrap()).unwrap();
@@ -1298,9 +1295,8 @@ mod tests {
 
         let query = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: Some(256),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
         let new_time_series = new_client.request(&query).await.unwrap();
         let data_after = <[f64]>::ref_from_bytes(new_time_series.data().unwrap()).unwrap();
@@ -1358,9 +1354,8 @@ mod tests {
 
         let query_limited = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: Some(10),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
 
         let time_series_limited = client.request(&query_limited).await.unwrap();
@@ -1368,9 +1363,8 @@ mod tests {
 
         let query_all = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: None,
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
 
         let time_series_all = client.request(&query_all).await.unwrap();

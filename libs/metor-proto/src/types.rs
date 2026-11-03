@@ -578,18 +578,31 @@ pub struct Packet {
     pub body: [u8],
 }
 
+/// A time series packet's body: a sample count, the range the sender
+/// vouches for (see [`OwnedTimeSeries::covered`]), then the timestamps and
+/// the samples, oldest first.
 #[derive(TryFromBytes, Unaligned, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct TimeSeries {
     pub len: [u8; 8],
+    pub covered_start: [u8; 8],
+    pub covered_end: [u8; 8],
     pub body: [u8],
 }
 
 impl TimeSeries {
+    /// Bytes ahead of the timestamps.
+    pub const HEAD: usize = 3 * size_of::<u64>();
+
     fn len(&self) -> Result<usize, Error> {
         u64::from_le_bytes(self.len)
             .try_into()
             .map_err(|_| Error::OffsetOverflow)
+    }
+
+    fn covered(&self) -> core::ops::Range<Timestamp> {
+        Timestamp(i64::from_le_bytes(self.covered_start))
+            ..Timestamp(i64::from_le_bytes(self.covered_end))
     }
 }
 
@@ -828,11 +841,13 @@ impl<B: IoBuf> OwnedPacket<B> {
             PacketTy::TimeSeries => {
                 let time_series = TimeSeries::try_ref_from_bytes(&buf)?;
                 let len = time_series.len()?;
+                let covered = time_series.covered();
                 OwnedPacket::TimeSeries(OwnedTimeSeries {
                     id,
                     req_id,
                     buf,
                     len,
+                    covered,
                 })
             }
         })
@@ -895,12 +910,18 @@ pub struct OwnedTimeSeries<B: IoBuf> {
     pub id: PacketId,
     pub req_id: RequestId,
     pub len: usize,
+    /// The stretch of time the sender vouches for: it holds no samples
+    /// there but these. Narrower than what was asked when a limit or the
+    /// size budget cut the reply short, or the sender doesn't hold part of
+    /// it locally; empty when it could answer nothing. Strided replies
+    /// vouch per cell: every cell in it is represented by its last sample.
+    pub covered: core::ops::Range<Timestamp>,
     pub buf: Slice<B>,
 }
 
 impl<B: IoBuf> OwnedTimeSeries<B> {
     pub fn timestamps(&self) -> Result<&[Timestamp], Error> {
-        let start = size_of::<u64>();
+        let start = TimeSeries::HEAD;
         let end = start + self.len * size_of::<i64>();
         let timestamps = stellarator_buf::deref(&self.buf)
             .get(start..end)
@@ -909,7 +930,7 @@ impl<B: IoBuf> OwnedTimeSeries<B> {
     }
 
     pub fn data(&self) -> Result<&[u8], Error> {
-        let start = size_of::<u64>();
+        let start = TimeSeries::HEAD;
         let end = start + self.len * size_of::<i64>();
         stellarator_buf::deref(&self.buf)
             .get(end..)

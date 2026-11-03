@@ -129,12 +129,88 @@ impl Msg for SetStreamState {
     const ID: PacketId = [224, 2];
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Asks a db for one component's samples within `range` (end exclusive),
+/// in a [`TimeSeriesReply`]. Gated on [`FEATURE_RANGE_FETCH`]: older servers
+/// read only the leading fields and reply in a layout without `covered`.
+///
+/// Every way a client reads history it doesn't hold goes through this one
+/// request: pages of a range (`from: Oldest`, paging on `covered.end`), the
+/// sample shown at an instant (`range: ..t + 1, from: Newest, limit: 1`),
+/// and a decimated pick for fast playback (`stride`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GetTimeSeries {
     pub id: PacketId,
     pub range: Range<Timestamp>,
     pub component_id: ComponentId,
+    /// At most this many samples, counted from `from`. A timestamp is never
+    /// split across replies, so a reply can hold more when the limit falls
+    /// inside a run of equal timestamps.
     pub limit: Option<usize>,
+    /// Which end of `range` the reply starts from, and so which end its
+    /// `covered` range keeps when the limit or size budget cuts it short.
+    pub from: SeriesEnd,
+    /// At most one sample per epoch-aligned cell of this width (cell `k`
+    /// is `[k * stride, (k + 1) * stride)` in microseconds): the last real
+    /// sample in the cell, unchanged. Aligned like the LoD buckets, so
+    /// replies to different requests merge. `limit` then counts cells.
+    pub stride: Option<Duration>,
+}
+
+impl GetTimeSeries {
+    /// The oldest samples of `range`, as many as fit one reply.
+    pub fn range(component_id: ComponentId, range: Range<Timestamp>) -> Self {
+        Self {
+            id: [0, 0],
+            range,
+            component_id,
+            limit: None,
+            from: SeriesEnd::Oldest,
+            stride: None,
+        }
+    }
+
+    /// The sample a reader shows at `t`: the newest at or before it.
+    pub fn instant(component_id: ComponentId, t: Timestamp) -> Self {
+        Self {
+            from: SeriesEnd::Newest,
+            limit: Some(1),
+            ..Self::range(
+                component_id,
+                Timestamp(i64::MIN)..Timestamp(t.0.saturating_add(1)),
+            )
+        }
+    }
+
+    pub fn limit(self, limit: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            ..self
+        }
+    }
+
+    pub fn newest(self) -> Self {
+        Self {
+            from: SeriesEnd::Newest,
+            ..self
+        }
+    }
+
+    pub fn stride(self, stride: Duration) -> Self {
+        Self {
+            stride: Some(stride),
+            ..self
+        }
+    }
+}
+
+/// The end of a range a [`GetTimeSeries`] counts its limit from.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SeriesEnd {
+    /// From the start forward: pages of history, oldest first.
+    #[default]
+    Oldest,
+    /// From the end backward: the latest samples before a point.
+    Newest,
 }
 
 impl Msg for GetTimeSeries {
@@ -144,6 +220,10 @@ impl Msg for GetTimeSeries {
 impl Request for GetTimeSeries {
     type Reply<B: IoBuf + Clone> = OwnedTimeSeries<B>;
 }
+
+/// What a [`GetTimeSeries`] gets back: an [`OwnedTimeSeries`], whose
+/// `covered` range is the stretch the server vouches for.
+pub type TimeSeriesReply<B> = OwnedTimeSeries<B>;
 
 #[derive(Serialize, Deserialize)]
 pub struct SchemaMsg(pub Schema<Vec<u64>>);
@@ -1016,10 +1096,19 @@ pub struct LogEvent {
 /// telemetry, so probing with anything else pollutes the remote DB.
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
-pub const NODE_PROTOCOL_VERSION: u32 = 6;
+///
+/// Version 7 extended [`GetTimeSeries`] with `from` and `stride`, made its
+/// range end exclusive, and added `covered` to the reply
+/// ([`FEATURE_RANGE_FETCH`]).
+pub const NODE_PROTOCOL_VERSION: u32 = 7;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
+
+/// [`DbInfoResp::features`] bit: the server answers the extended
+/// [`GetTimeSeries`] and says what each reply covers, so a mirror can fetch
+/// a range or an instant instead of a whole sealed node.
+pub const FEATURE_RANGE_FETCH: u64 = 1 << 2;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetDbInfo;
@@ -1039,7 +1128,8 @@ pub struct DbInfoResp {
     pub protocol_version: u32,
     /// Capability bits; clients gate post-version-1 requests on these.
     /// Bit 0 was the retired envelope protocol ([224,56]/[224,57]) and
-    /// must not be reused. Bit 1 is [`FEATURE_MSG_SYNC`].
+    /// must not be reused. Bit 1 is [`FEATURE_MSG_SYNC`], bit 2
+    /// [`FEATURE_RANGE_FETCH`].
     pub features: u64,
     /// The msg ids a client should forward up this connection: requests
     /// going to the server, never records coming back. Added in version 3.
