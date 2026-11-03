@@ -920,18 +920,25 @@ pub struct OwnedTimeSeries<B: IoBuf> {
 }
 
 impl<B: IoBuf> OwnedTimeSeries<B> {
+    /// Where the timestamps end and the samples begin. `len` comes off the
+    /// wire, so a malformed count is an error rather than an overflow.
+    fn stamps_end(&self) -> Result<usize, Error> {
+        self.len
+            .checked_mul(size_of::<i64>())
+            .and_then(|stamps| stamps.checked_add(TimeSeries::HEAD))
+            .ok_or(Error::OffsetOverflow)
+    }
+
     pub fn timestamps(&self) -> Result<&[Timestamp], Error> {
-        let start = TimeSeries::HEAD;
-        let end = start + self.len * size_of::<i64>();
+        let end = self.stamps_end()?;
         let timestamps = stellarator_buf::deref(&self.buf)
-            .get(start..end)
+            .get(TimeSeries::HEAD..end)
             .ok_or(Error::BufferUnderflow)?;
         Ok(<[Timestamp]>::ref_from_bytes(timestamps)?)
     }
 
     pub fn data(&self) -> Result<&[u8], Error> {
-        let start = TimeSeries::HEAD;
-        let end = start + self.len * size_of::<i64>();
+        let end = self.stamps_end()?;
         stellarator_buf::deref(&self.buf)
             .get(end..)
             .ok_or(Error::BufferUnderflow)
@@ -1129,6 +1136,25 @@ impl<R: Request> Request for &'_ R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A count off the wire too large for the buffer, or for `usize`
+    /// arithmetic, is an error, never a panic.
+    #[cfg(feature = "std")]
+    #[test]
+    fn malformed_time_series_counts_are_errors() {
+        use stellarator_buf::IoBuf;
+        for len in [usize::MAX, usize::MAX / 8, 4] {
+            let series = OwnedTimeSeries {
+                id: [0, 0],
+                req_id: 0,
+                len,
+                covered: Timestamp(0)..Timestamp(1),
+                buf: vec![0u8; TimeSeries::HEAD + 8].try_slice(..).unwrap(),
+            };
+            assert!(series.timestamps().is_err());
+            assert!(series.data().is_err());
+        }
+    }
 
     #[test]
     fn test_padding() {

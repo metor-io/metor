@@ -1099,7 +1099,10 @@ pub struct LogEvent {
 ///
 /// Version 7 extended [`GetTimeSeries`] with `from` and `stride`, made its
 /// range end exclusive, and added `covered` to the reply
-/// ([`FEATURE_RANGE_FETCH`]).
+/// ([`FEATURE_RANGE_FETCH`]). That is a hard wire break with no fallback:
+/// a version-6 server answers a `GetTimeSeries` in the old layout, which a
+/// version-7 client misreads (its `covered` is the first 16 bytes of
+/// timestamps), so every client checks the feature bit before asking.
 pub const NODE_PROTOCOL_VERSION: u32 = 7;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
