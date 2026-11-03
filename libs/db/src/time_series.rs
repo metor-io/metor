@@ -58,6 +58,13 @@ pub struct TimeSeries {
     /// A new mirror run began; the writer starts a fresh node on its next
     /// sample, so no node spans the time a mirror was disconnected.
     roll_pending: Arc<AtomicBool>,
+    /// The first sample the latest mirror run wrote, or `i64::MIN` before
+    /// any has. A peer's listed head reaches up to it, so the backfill a
+    /// head offers meets the live stream (see [`Self::head_seal`]).
+    run_start: Arc<AtomicI64>,
+    /// The head the peer's last complete listing reported, kept to be cut
+    /// again when a mirror run starts. Changed under `structural`.
+    peer_head: Arc<Mutex<Option<UnsealedHead>>>,
 }
 
 /// One mirror connection's lifetime.
@@ -519,6 +526,8 @@ impl TimeSeries {
             max_node_age: Arc::new(AtomicI64::new(0)),
             mirror_run: Arc::new(AtomicU64::new(0)),
             roll_pending: Arc::new(AtomicBool::new(false)),
+            run_start: Arc::new(AtomicI64::new(i64::MIN)),
+            peer_head: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -553,6 +562,8 @@ impl TimeSeries {
             max_node_age: Arc::new(AtomicI64::new(0)),
             mirror_run: Arc::new(AtomicU64::new(0)),
             roll_pending: Arc::new(AtomicBool::new(false)),
+            run_start: Arc::new(AtomicI64::new(i64::MIN)),
+            peer_head: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -774,12 +785,21 @@ impl TimeSeries {
         }
     }
 
-    /// Background task that seals nodes as the writer rolls past them.
+    /// Background task that seals nodes as the writer rolls past them, and
+    /// carries a peer's head up to each mirror run that starts.
     /// Spawn one per component alongside the persist task.
     pub async fn lifecycle(self) {
+        let mut run_start = i64::MIN;
         loop {
             if let Err(err) = self.seal_rolled_nodes() {
                 warn!(?err, path = ?self.path, "failed to seal rolled nodes");
+            }
+            let started = self.run_start.load(Ordering::Acquire);
+            if started != run_start {
+                run_start = started;
+                if let Err(err) = self.meet_mirror_run() {
+                    warn!(?err, path = ?self.path, "failed to extend a peer's head");
+                }
             }
             let _ = self.lifecycle_waker.wait().await;
         }
@@ -1599,6 +1619,13 @@ impl TimeSeries {
     /// fill. What the head covered and the peer has since sealed arrives
     /// in the same listing as sealed spans, so a fragment read from the
     /// head never loses the remote span under it.
+    ///
+    /// A listing is a snapshot: the peer wrote on after it, and a mirror's
+    /// live data starts wherever its stream did. So the head reaches up to
+    /// the current mirror run's first sample, which the peer held by the
+    /// time it streamed it, and the backfill meets the stream rather than
+    /// stopping wherever the listing happened to. A run that starts after
+    /// the listing carries it there then ([`Self::meet_mirror_run`]).
     pub fn sync_remote(
         &self,
         listing: Vec<SealRecord>,
@@ -1607,23 +1634,43 @@ impl TimeSeries {
         self.update_remote_spans(listing, true, head)
     }
 
-    /// The seal a peer's `head` is recorded under: its stretch below this
-    /// side's [`Self::install_ceiling`], with the count prorated to it, and
-    /// a zero checksum, which no node a peer serves carries in practice.
+    /// Carry the listed peer head up to the mirror run that just started
+    /// (see [`Self::sync_remote`]). The lifecycle task calls this when the
+    /// writer starts a run, since the head listed on connect is usually
+    /// cut before the stream's first sample arrives.
+    pub fn meet_mirror_run(&self) -> Result<(), Error> {
+        self.update_remote_spans(Vec::new(), false, None)?;
+        Ok(())
+    }
+
+    /// The seal a peer's `head` is recorded under, and a zero checksum,
+    /// which no node a peer serves carries in practice.
+    ///
+    /// It runs up to the current mirror run's first sample when that is
+    /// past the listing's end, and stops below this side's
+    /// [`Self::install_ceiling`] either way. Cut short, the count is
+    /// prorated; carried on, it stays what the peer counted, since the
+    /// stretch past the listing may be anywhere from no samples to many.
     fn head_seal(&self, head: UnsealedHead) -> Option<SealRecord> {
         let (start, listed_end) = (head.start_ts.0, head.end_ts.0);
         if head.count == 0 || listed_end < start {
             return None;
         }
+        let run_start = self.run_start.load(Ordering::Acquire);
+        let reach = match run_start {
+            i64::MIN => listed_end,
+            run_start => listed_end.max(run_start - 1),
+        };
         let end = match self.install_ceiling() {
-            Some(ceiling) => listed_end.min(ceiling.0.saturating_sub(1)),
-            None => listed_end,
+            Some(ceiling) => reach.min(ceiling.0.saturating_sub(1)),
+            None => reach,
         };
         if end < start {
             return None;
         }
         let len = |end: i64| (end as i128 - start as i128 + 1) as u128;
-        let count = ((head.count as u128 * len(end)) / len(listed_end)).max(1) as u64;
+        let count =
+            ((head.count as u128 * len(end.min(listed_end))) / len(listed_end)).max(1) as u64;
         Some(SealRecord {
             start_ts: head.start_ts,
             end_ts: Timestamp(end),
@@ -1662,6 +1709,9 @@ impl TimeSeries {
         head
     }
 
+    /// Merge `seals`, a complete listing when `complete`. Only a complete
+    /// listing replaces the peer's `head`; otherwise the listed one is cut
+    /// again, against where this side's live data stands now.
     fn update_remote_spans(
         &self,
         mut seals: Vec<SealRecord>,
@@ -1675,8 +1725,15 @@ impl TimeSeries {
             .iter()
             .find(|s| s.source == SpanSource::PeerHead)
             .map(|s| s.seal);
+        let head = {
+            let mut listed = self.peer_head.lock().unwrap();
+            if complete {
+                *listed = head;
+            }
+            *listed
+        };
         let new_head = head.and_then(|head| self.head_seal(head));
-        let head_moved = complete && old_head != new_head;
+        let head_moved = old_head != new_head;
         seals.retain(|seal| seal.count > 0 && seal.start_ts.0 <= seal.end_ts.0);
         seals.sort_unstable_by_key(|seal| (seal.start_ts.0, seal.checksum));
         seals.dedup();
@@ -2056,6 +2113,7 @@ impl TimeSeries {
             Some(TimerSeriesWriter {
                 time_series: self.clone(),
                 current: None,
+                run: 0,
             })
         }
     }
@@ -2067,6 +2125,9 @@ pub struct TimerSeriesWriter {
     /// have not written (first write, reopen, a structural splice, or an
     /// installed node), we re-check that it is safe to append.
     current: Option<Arc<AtomicNode<TimeSeriesNode>>>,
+    /// The mirror run this writer last pushed for, so it notices the
+    /// first sample of the next one.
+    run: u64,
 }
 
 impl TimerSeriesWriter {
@@ -2084,10 +2145,19 @@ impl TimerSeriesWriter {
             let _ = self.time_series.list.try_push(node);
             rolled = true;
         }
-        if rolled {
-            // The previous head is now immutable; let the lifecycle task
-            // seal it off the hot path.
-            self.time_series.lifecycle_waker.wake_all();
+        let run = self.time_series.mirror_run.load(Ordering::Relaxed);
+        let started = run != self.run;
+        if started {
+            self.run = run;
+            self.time_series
+                .run_start
+                .store(timestamp.0, Ordering::Release);
+        }
+        if rolled || started {
+            // The previous head is now immutable, or a mirror run started;
+            // let the lifecycle task seal and re-cut off the hot path. A
+            // stored wakeup reaches it even while it is busy.
+            self.time_series.lifecycle_waker.wake();
         }
         self.time_series.data_waker.wake_all();
         Ok(())
@@ -2496,6 +2566,45 @@ mod tests {
         assert_eq!(head_pieces(&other), [(0, 10)]);
         other.sync_remote(Vec::new(), None).unwrap();
         assert!(other.manifest().spans.is_empty());
+    }
+
+    /// A listing is a snapshot taken before the stream starts: the peer's
+    /// head reaches on to the first sample of the mirror run, whether the
+    /// run starts before the listing lands or after, so nothing the peer
+    /// wrote in between is left without a span.
+    #[test]
+    fn a_peer_head_meets_the_mirror_run() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Listed first, the run starts after.
+        let series = TimeSeries::create(dir.path().join("after")).unwrap();
+        let mut writer = series.writer().unwrap();
+        series.sync_remote(Vec::new(), Some(head(0, 100))).unwrap();
+        assert_eq!(head_pieces(&series), [(0, 100)]);
+        series.enter_mirror_run(MirrorRun::next());
+        writer.push_buf(Timestamp(250), &[0; 8]).unwrap();
+        series.meet_mirror_run().unwrap();
+        assert_eq!(head_pieces(&series), [(0, 249)]);
+        // The peer's count stands for the stretch it listed.
+        assert_eq!(
+            series.manifest().span(Timestamp(0)).unwrap().seal.count,
+            101
+        );
+
+        // The run started first, the listing lands after.
+        let series = TimeSeries::create(dir.path().join("before")).unwrap();
+        let mut writer = series.writer().unwrap();
+        series.enter_mirror_run(MirrorRun::next());
+        writer.push_buf(Timestamp(250), &[0; 8]).unwrap();
+        series.sync_remote(Vec::new(), Some(head(0, 100))).unwrap();
+        assert_eq!(head_pieces(&series), [(0, 249)]);
+
+        // A reconnect carries the last listing to the new run's start.
+        series.enter_mirror_run(MirrorRun::next());
+        writer.push_buf(Timestamp(400), &[0; 8]).unwrap();
+        assert!(series.seal_rolled_nodes().unwrap());
+        series.meet_mirror_run().unwrap();
+        assert_eq!(head_pieces(&series), [(0, 249), (251, 399)]);
     }
 
     #[test]
