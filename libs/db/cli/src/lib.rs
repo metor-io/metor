@@ -49,6 +49,8 @@ pub use mlua;
 
 pub struct Client {
     client: metor_proto_stellar::Client,
+    /// Whether the server answers the extended `GetTimeSeries`, once asked.
+    range_fetch: Option<bool>,
 }
 
 impl Client {
@@ -59,7 +61,10 @@ impl Client {
             .next()
             .ok_or_else(|| anyhow!("missing socket ip"))?;
         let client = metor_proto_stellar::Client::connect(addr).await?;
-        Ok(Client { client })
+        Ok(Client {
+            client,
+            range_fetch: None,
+        })
     }
 
     pub async fn request<M: Request + IntoLenPacket>(
@@ -77,6 +82,30 @@ impl Client {
         futures_lite::future::race(timeout, resp).await
     }
 
+    /// `GetTimeSeries` replies changed layout in protocol version 7, and an
+    /// older server's reply would be misread rather than refused, so ask
+    /// the server what it speaks before sending one.
+    async fn require_range_fetch(&mut self) -> anyhow::Result<()> {
+        let supported = match self.range_fetch {
+            Some(supported) => supported,
+            None => {
+                let info: DbInfoResp = self.request(&GetDbInfo).await?;
+                let supported = info.protocol_version >= 7
+                    && info.features & FEATURE_RANGE_FETCH != 0;
+                self.range_fetch = Some(supported);
+                supported
+            }
+        };
+        match supported {
+            true => Ok(()),
+            false => Err(anyhow!(
+                "the server predates protocol version 7 and answers time series \
+                 queries in a layout this client cannot read; use a matching \
+                 metor-db CLI"
+            )),
+        }
+    }
+
     pub async fn get_time_series(
         &mut self,
         lua: &Lua,
@@ -89,6 +118,7 @@ impl Client {
         let id = fastrand::u16(..);
 
         let component_id: ComponentId = lua.from_value(component_id)?;
+        self.require_range_fetch().await?;
         let schema = self.client.request(&GetSchema { component_id }).await?;
         let start = Timestamp(start);
         let stop = Timestamp(stop);
