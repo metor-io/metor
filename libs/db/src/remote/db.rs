@@ -9,12 +9,12 @@ use metor_proto_wkt::{
 };
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
-use stellarator::sync::Mutex;
+use stellarator::sync::{Mutex, WaitQueue};
 use tracing::{info, warn};
 
 use crate::{
-    AtomicTimestampExt as _, ComponentSchema, ConnState, DB, Error, PacketTx, store::NodeStore,
-    store::PeerStore,
+    AtomicTimestampExt as _, ComponentSchema, ConnState, DB, Error, PacketTx,
+    store::{Listing, NodeStore, PeerStore},
 };
 
 use super::Hydrator;
@@ -118,7 +118,8 @@ impl RemoteDb {
             }
         };
         stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
-        stellarator::spawn(seed_loop(db.clone(), store.clone()));
+        let connected = Arc::new(WaitQueue::new());
+        stellarator::spawn(seed_loop(db.clone(), store.clone(), connected.clone()));
         stellarator::spawn(async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
             const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
@@ -126,6 +127,15 @@ impl RemoteDb {
             loop {
                 let connected_at = std::time::Instant::now();
                 emit(MirrorEvent::Connecting);
+                let emit = |event| {
+                    // The peer may have restarted, or run on while this side
+                    // was away: its head has moved, so list it again now
+                    // rather than at the next timed pass.
+                    if event == MirrorEvent::Connected {
+                        connected.wake();
+                    }
+                    emit(event)
+                };
                 match mirror(&db, addr, expected, &emit).await {
                     Ok(event) => {
                         warn!(
@@ -267,14 +277,15 @@ async fn ingest(
     }
 }
 
-/// Periodically import the peer's sealed-node manifests, on the bulk
-/// store connection so a year of GetNodeManifest round trips never delays
-/// live ingest. The first pass per peer connect imports pre-connect
-/// history; later passes pick up spans the peer sealed since — hidden
-/// components (derived LoD series) especially, which never ride the live
-/// stream. The merge is idempotent, so re-seeding is cheap when nothing
-/// changed.
-async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>) {
+/// Periodically import the peer's sealed-node manifests and unsealed
+/// heads, on the bulk store connection so a year of GetNodeManifest round
+/// trips never delays live ingest. A pass runs at start and on every
+/// connect of the live mirror (`connected`), which imports pre-connect
+/// history, the peer's unsealed head included; timed passes pick up spans
+/// the peer sealed since, and where its head moved to — hidden components
+/// (derived LoD series) especially, which never ride the live stream. The
+/// merge is idempotent, so re-seeding is cheap when nothing changed.
+async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>, connected: Arc<WaitQueue>) {
     const RESEED_INTERVAL: Duration = Duration::from_secs(60);
     loop {
         match store.dump_schema().await {
@@ -283,7 +294,12 @@ async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>) {
                 warn!(?err, "failed to dump peer schemas for manifest seeding");
             }
         }
-        stellarator::sleep(RESEED_INTERVAL).await;
+        // A connect while that pass ran stored its wakeup, so it is
+        // answered at once.
+        futures_lite::future::or(stellarator::sleep(RESEED_INTERVAL), async {
+            let _ = connected.wait().await;
+        })
+        .await;
     }
 }
 
@@ -442,6 +458,104 @@ mod tests {
         assert_eq!(source(&server_db), Some(false));
     }
 
+    /// History a peer wrote before the mirror connected and has not sealed
+    /// is listed as the peer's head on connect, so it is range-fetchable
+    /// at once, while live data lands beside it; the mirror's earliest
+    /// timestamp reaches back to it.
+    #[stellarator::test]
+    async fn a_peers_unsealed_history_is_fetchable_from_connect() {
+        use crate::manifest::{SpanSource, SpanState};
+        use metor_proto::types::PrimType;
+        use metor_proto::vtable::builder::{
+            component, raw_field, raw_table, schema, timestamp, vtable,
+        };
+
+        const ID: metor_proto::types::PacketId = [9, 5];
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
+        peer.insert_vtable(metor_proto_wkt::VTableMsg {
+            id: ID,
+            vtable: vtable([raw_field(
+                8,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
+            )]),
+        })
+        .unwrap();
+        let write = |ts: i64| {
+            let mut table = ts.to_le_bytes().to_vec();
+            table.extend_from_slice(&(ts as f64).to_le_bytes());
+            peer.ingest_table(ID, &table).unwrap();
+        };
+        for ts in 1000..1500 {
+            write(ts);
+        }
+        let a = ComponentId::new("a");
+        let series = |db: &DB| db.with_state(|s| s.get_component(a).map(|c| c.time_series.clone()));
+        assert!(series(&peer).unwrap().manifest().spans.is_empty());
+
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::Server {
+            listener,
+            db: peer.clone(),
+        };
+        stellarator::struc_con::stellar(move || server.run());
+        let mirror = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        let remote = RemoteDb::new(addr);
+        let hydrator = remote.hydrator();
+        remote.spawn(mirror.clone());
+
+        let mut ts = 1500;
+        let head = |mirror: &DB| {
+            let manifest = series(mirror)?.manifest();
+            manifest
+                .spans
+                .iter()
+                .find(|s| s.source == SpanSource::PeerHead)
+                .copied()
+        };
+        eventually("the peer's head listed, with live data beside it", || {
+            write(ts);
+            ts += 1;
+            let live = series(&mirror).and_then(|s| s.latest()).is_some();
+            live && head(&mirror).is_some_and(|span| span.cover_start == Timestamp(1000))
+        })
+        .await;
+        let span = head(&mirror).unwrap();
+        assert_eq!(span.state, SpanState::RemoteOnly);
+        // It ends below the live data the mirror holds itself.
+        let live_start = series(&mirror)
+            .unwrap()
+            .list
+            .iter()
+            .filter_map(|n| n.timestamps().first().copied())
+            .min()
+            .unwrap();
+        assert!(span.cover_end < live_start, "{span:?} vs {live_start:?}");
+        assert!(mirror.earliest_timestamp.latest() <= Timestamp(1000));
+
+        // What a plot asks for as nodes is read by range.
+        let read = |t: i64| {
+            let sample = series(&mirror)?.get(Timestamp(t))?;
+            Some(f64::from_le_bytes(sample.data().try_into().unwrap()))
+        };
+        eventually("the head read by range", || {
+            hydrator.request(
+                a,
+                Timestamp(1000)..Timestamp(1500),
+                super::super::HydratePriority::Visible,
+            );
+            read(1000) == Some(1000.0) && read(1499) == Some(1499.0)
+        })
+        .await;
+        let mut gaps = crate::manifest::GapVec::new();
+        series(&mirror)
+            .unwrap()
+            .coverage(Timestamp(1000)..Timestamp(1500), &mut gaps);
+        assert!(gaps.is_empty(), "{gaps:?}");
+    }
+
     /// Polls `check` every 20 ms until it holds, failing after ten seconds.
     async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
         for _ in 0..500 {
@@ -545,7 +659,16 @@ mod tests {
                 stellarator::sleep(Duration::from_millis(1)).await;
             }
         }
-        let sealed = |db: &DB| series(db).map_or(0, |ts| ts.manifest().spans.len());
+        // Sealed spans, not the peer's head, which the cache never keeps.
+        let sealed = |db: &DB| {
+            series(db).map_or(0, |ts| {
+                let manifest = ts.manifest();
+                let spans = manifest.spans.iter();
+                spans
+                    .filter(|s| s.source != crate::manifest::SpanSource::PeerHead)
+                    .count()
+            })
+        };
         eventually("the peer sealing its history", || sealed(&peer) >= 2).await;
 
         let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -649,12 +772,13 @@ mod tests {
 }
 
 /// Import the peer's sealed-node manifest for every component it knows,
-/// so history that never rides the live stream shows up as fetchable
-/// remote-only coverage. Components are created on demand (a seeded
-/// component has no live writer, so the merge cannot conflict with
-/// ingest); ones with no sealed history are skipped rather than created
-/// empty. Per-component failures are logged and skipped — one bad
-/// component must not hide the rest of the archive.
+/// with its unsealed head, so history that never rides the live stream,
+/// and history from before the mirror connected that the peer has not
+/// sealed yet, shows up as fetchable remote-only coverage. Components are
+/// created on demand (a seeded component has no live writer, so the merge
+/// cannot conflict with ingest); ones with no history at all are skipped
+/// rather than created empty. Per-component failures are logged and
+/// skipped — one bad component must not hide the rest of the archive.
 async fn seed_manifests(
     db: &Arc<DB>,
     store: &Arc<PeerStore>,
@@ -670,8 +794,8 @@ async fn seed_manifests(
                     .map(|m| m.name.clone())
             })
             .unwrap_or_default();
-        let seals = match store.list(component_id, &name).await {
-            Ok(seals) => seals,
+        let Listing { nodes, head } = match store.listing(component_id, &name).await {
+            Ok(listing) => listing,
             Err(err) => {
                 warn!(?err, ?component_id, "failed to list remote sealed nodes");
                 continue;
@@ -680,9 +804,9 @@ async fn seed_manifests(
         // An empty listing still matters to a component seeded before: the
         // peer dropped every seal it had.
         let existing = db.with_state(|state| state.components.get(&component_id).cloned());
-        if seals.is_empty() {
+        if nodes.is_empty() && head.is_none() {
             if let Some(component) = existing
-                && let Err(err) = component.time_series.sync_remote_spans(seals)
+                && let Err(err) = component.time_series.sync_remote(nodes, None)
             {
                 warn!(?err, ?component_id, "failed to sync remote spans");
             }
@@ -699,21 +823,21 @@ async fn seed_manifests(
         else {
             continue;
         };
-        let bounds = seals
+        let bounds = nodes
             .iter()
-            .fold(None::<(i64, i64)>, |acc, seal| match acc {
-                Some((min, max)) => Some((min.min(seal.start_ts.0), max.max(seal.end_ts.0))),
-                None => Some((seal.start_ts.0, seal.end_ts.0)),
-            });
-        match component.time_series.sync_remote_spans(seals) {
-            Ok(0) => {}
+            .map(|seal| (seal.start_ts.0, seal.end_ts.0))
+            .chain(head.map(|head| (head.start_ts.0, head.end_ts.0)))
+            .reduce(|(min, max), (start, end)| (min.min(start), max.max(end)));
+        match component.time_series.sync_remote(nodes, head) {
             Ok(added) => {
                 if let Some((min, max)) = bounds {
                     db.earliest_timestamp.update_min(Timestamp(min));
                     db.last_updated.update_max(Timestamp(max));
                 }
-                components += 1;
-                spans += added;
+                if added > 0 {
+                    components += 1;
+                    spans += added;
+                }
             }
             Err(err) => {
                 warn!(?err, ?component_id, "failed to merge remote spans");

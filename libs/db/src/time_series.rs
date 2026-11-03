@@ -15,6 +15,7 @@ use std::{
 };
 
 use metor_proto::types::{ComponentView, Timestamp};
+use metor_proto_wkt::UnsealedHead;
 use smallvec::SmallVec;
 
 use crate::ComponentSchema;
@@ -795,14 +796,18 @@ impl TimeSeries {
     ///
     /// Returns a claimed span (its seal keys the fetch) when the claim won;
     /// `None` means the span is missing, already resident, another fetch is
-    /// in flight, or what is left of it lies above an unsealed head, where
-    /// no install could land.
+    /// in flight, it is a peer's unsealed head (range fetches only), or
+    /// what is left of it lies above an unsealed head, where no install
+    /// could land.
     pub fn begin_fetch(&self, cover_start: Timestamp) -> Option<NodeSpan> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
         let span = *manifest.span(cover_start)?;
         let claimed = |s: &NodeSpan| s.seal == span.seal && s.state == SpanState::Fetching;
-        if span.state != SpanState::RemoteOnly || manifest.spans.iter().any(claimed) {
+        if span.state != SpanState::RemoteOnly
+            || span.source == SpanSource::PeerHead
+            || manifest.spans.iter().any(claimed)
+        {
             return None;
         }
         let ceiling = self.install_ceiling();
@@ -919,7 +924,7 @@ impl TimeSeries {
             return Ok(false);
         };
         let mirrored = !span.acked && span.source == SpanSource::Mirrored;
-        if !span.acked && !(mirrored && remote_holds(&manifest, node.timestamps())) {
+        if !span.acked && !(mirrored && remote_holds(&manifest, node.timestamps(), false)) {
             return Ok(false);
         }
         let node_is_head = self
@@ -987,7 +992,7 @@ impl TimeSeries {
     ) -> Result<bool, Error> {
         let gone = self.fragments_over(manifest, &[(start.0, start.0)]);
         if let Some(node) = gone.nodes.first()
-            && !remote_holds(manifest, node.timestamps())
+            && !remote_holds(manifest, node.timestamps(), true)
         {
             return Ok(false);
         }
@@ -1569,7 +1574,7 @@ impl TimeSeries {
         &self,
         seals: impl IntoIterator<Item = SealRecord>,
     ) -> Result<usize, Error> {
-        self.update_remote_spans(seals.into_iter().collect(), false)
+        self.update_remote_spans(seals.into_iter().collect(), false, None)
     }
 
     /// [`Self::merge_remote_spans`] for a peer's complete listing: seals
@@ -1581,16 +1586,97 @@ impl TimeSeries {
     /// Seals with a fetch in flight are left to that fetch. Returns the
     /// number of seals recorded.
     pub fn sync_remote_spans(&self, listing: Vec<SealRecord>) -> Result<usize, Error> {
-        self.update_remote_spans(listing, true)
+        self.update_remote_spans(listing, true, None)
+    }
+
+    /// [`Self::sync_remote_spans`] with the peer's unsealed head from the
+    /// same listing, recorded as [`SpanSource::PeerHead`] coverage in place
+    /// of the head the last listing reported (`None` drops it).
+    ///
+    /// The head is cut off below an unsealed head of this side's own: a
+    /// mirror's live ingest already holds the head's newest stretch, and a
+    /// remote span reaching above its live head would be a gap nothing can
+    /// fill. What the head covered and the peer has since sealed arrives
+    /// in the same listing as sealed spans, so a fragment read from the
+    /// head never loses the remote span under it.
+    pub fn sync_remote(
+        &self,
+        listing: Vec<SealRecord>,
+        head: Option<UnsealedHead>,
+    ) -> Result<usize, Error> {
+        self.update_remote_spans(listing, true, head)
+    }
+
+    /// The seal a peer's `head` is recorded under: its stretch below this
+    /// side's [`Self::install_ceiling`], with the count prorated to it, and
+    /// a zero checksum, which no node a peer serves carries in practice.
+    fn head_seal(&self, head: UnsealedHead) -> Option<SealRecord> {
+        let (start, listed_end) = (head.start_ts.0, head.end_ts.0);
+        if head.count == 0 || listed_end < start {
+            return None;
+        }
+        let end = match self.install_ceiling() {
+            Some(ceiling) => listed_end.min(ceiling.0.saturating_sub(1)),
+            None => listed_end,
+        };
+        if end < start {
+            return None;
+        }
+        let len = |end: i64| (end as i128 - start as i128 + 1) as u128;
+        let count = ((head.count as u128 * len(end)) / len(listed_end)).max(1) as u64;
+        Some(SealRecord {
+            start_ts: head.start_ts,
+            end_ts: Timestamp(end),
+            count,
+            index_len: count.saturating_mul(size_of::<Timestamp>() as u64),
+            data_len: count.saturating_mul(head.element_size),
+            checksum: 0,
+            element_size: head.element_size,
+        })
+    }
+
+    /// What this side holds past its sealed spans, as a peer listing it
+    /// reports: the live head, and any node rolled past but not sealed yet.
+    /// Read against one manifest snapshot, so a node sealed meanwhile still
+    /// counts here, where a listing taken from the same snapshot omits it.
+    pub fn unsealed_head(&self, manifest: &ComponentManifest) -> Option<UnsealedHead> {
+        let mut head: Option<UnsealedHead> = None;
+        for node in self.list.iter() {
+            if is_sealed(manifest, &node) {
+                continue;
+            }
+            let timestamps = node.timestamps();
+            let (Some(first), Some(last)) = (timestamps.first(), timestamps.last()) else {
+                continue;
+            };
+            let head = head.get_or_insert(UnsealedHead {
+                start_ts: *first,
+                end_ts: *last,
+                count: 0,
+                element_size: node.element_size() as u64,
+            });
+            head.start_ts = head.start_ts.min(*first);
+            head.end_ts = head.end_ts.max(*last);
+            head.count += timestamps.len() as u64;
+        }
+        head
     }
 
     fn update_remote_spans(
         &self,
         mut seals: Vec<SealRecord>,
         complete: bool,
+        head: Option<UnsealedHead>,
     ) -> Result<usize, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
+        let old_head = manifest
+            .spans
+            .iter()
+            .find(|s| s.source == SpanSource::PeerHead)
+            .map(|s| s.seal);
+        let new_head = head.and_then(|head| self.head_seal(head));
+        let head_moved = complete && old_head != new_head;
         seals.retain(|seal| seal.count > 0 && seal.start_ts.0 <= seal.end_ts.0);
         seals.sort_unstable_by_key(|seal| (seal.start_ts.0, seal.checksum));
         seals.dedup();
@@ -1661,18 +1747,32 @@ impl TimeSeries {
             .map(|s| s.cover_start)
             .collect();
         let added: Vec<SealRecord> = seals.iter().filter(|seal| !known(seal)).copied().collect();
-        if added.is_empty() && stale.is_empty() && !stale_settled && reacked.is_empty() {
+        let durable =
+            !(added.is_empty() && stale.is_empty() && !stale_settled && reacked.is_empty());
+        if !durable && !head_moved {
             return Ok(0);
         }
         let count = added.len();
+        // The time a dropped seal or the old head answered for, which the
+        // seals around it may take back.
         let freed = stale
             .iter()
+            .chain(old_head.iter().filter(|_| head_moved))
             .map(|s| s.start_ts.0..=s.end_ts.0)
             .reduce(|a, b| *a.start().min(b.start())..=*a.end().max(b.end()));
         let resident = extents(self.list.iter(), None);
-        self.publish_manifest(true, |draft| {
+        let head = new_head.filter(|_| head_moved).map(|seal| RemoteSeal {
+            seal,
+            source: SpanSource::PeerHead,
+            acked: false,
+        });
+        // Heads are never persisted, so moving one alone skips the write.
+        self.publish_manifest(durable, |draft| {
             for seal in &stale {
                 draft.forget(seal);
+            }
+            if head_moved {
+                draft.spans.retain(|s| s.source != SpanSource::PeerHead);
             }
             for span in draft.spans.iter_mut() {
                 if reacked.binary_search(&span.cover_start).is_ok() {
@@ -1688,7 +1788,11 @@ impl TimeSeries {
                         .is_ok()
                 });
             }
-            draft.derive(&resident, freed, added.into_iter().map(RemoteSeal::peer));
+            draft.derive(
+                &resident,
+                freed,
+                added.into_iter().map(RemoteSeal::peer).chain(head),
+            );
         })?;
         Ok(count)
     }
@@ -2308,6 +2412,90 @@ mod tests {
         assert_eq!(span.source, SpanSource::RemoteFetch);
         assert_eq!(span.seal, peer);
         assert!(manifest.shadowed.is_empty());
+    }
+
+    fn head(start: i64, end: i64) -> UnsealedHead {
+        UnsealedHead {
+            start_ts: Timestamp(start),
+            end_ts: Timestamp(end),
+            count: (end - start + 1) as u64,
+            element_size: 8,
+        }
+    }
+
+    fn head_pieces(series: &TimeSeries) -> Vec<(i64, i64)> {
+        series
+            .manifest()
+            .spans
+            .iter()
+            .filter(|s| s.source == SpanSource::PeerHead)
+            .map(|s| (s.cover_start.0, s.cover_end.0))
+            .collect()
+    }
+
+    /// A peer's head beside a mirror's live data: it answers for what the
+    /// mirror missed (before it connected, and while it was disconnected)
+    /// but stops below the live head, never backs a purge of the mirror's
+    /// own copy, and is never persisted.
+    #[test]
+    fn a_peer_head_fills_around_mirrored_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        series.enter_mirror_run(MirrorRun::next());
+        for ts in (800..=950).step_by(10) {
+            writer.push_buf(Timestamp(ts), &[0; 8]).unwrap();
+        }
+        // A reconnect: the old run's node seals, the new run's is live.
+        series.enter_mirror_run(MirrorRun::next());
+        writer.push_buf(Timestamp(2000), &[0; 8]).unwrap();
+        assert!(series.seal_rolled_nodes().unwrap());
+
+        series.sync_remote(Vec::new(), Some(head(0, 2100))).unwrap();
+        assert_eq!(head_pieces(&series), [(0, 799), (951, 1999)]);
+        let manifest = series.manifest();
+        let piece = manifest.span(Timestamp(0)).unwrap();
+        assert_eq!(piece.seal.end_ts, Timestamp(1999));
+        assert_eq!(piece.seal.count, 2000);
+        assert!(series.begin_fetch(Timestamp(0)).is_none());
+        // Only the peer's head has the mirrored samples: they stay.
+        assert!(!series.purge_span(Timestamp(800)).unwrap());
+
+        // The head grows; what is above the live head is still left out.
+        series.sync_remote(Vec::new(), Some(head(0, 2500))).unwrap();
+        assert_eq!(head_pieces(&series), [(0, 799), (951, 1999)]);
+
+        // A durable change alongside a head persists without it.
+        series
+            .sync_remote(vec![remote_seal(3000, 3100)], Some(head(0, 2500)))
+            .unwrap();
+        drop(writer);
+        let reopened = TimeSeries::open(dir.path()).unwrap();
+        assert!(head_pieces(&reopened).is_empty());
+        assert!(reopened.manifest().span(Timestamp(3000)).is_some());
+        drop(reopened);
+
+        // The peer seals what its head held: a sealed span takes over, and
+        // now backs the mirrored copy.
+        series
+            .sync_remote(
+                vec![remote_seal(0, 1999), remote_seal(3000, 3100)],
+                Some(head(2000, 2600)),
+            )
+            .unwrap();
+        assert!(head_pieces(&series).is_empty());
+        assert_eq!(
+            series.manifest().span(Timestamp(0)).unwrap().source,
+            SpanSource::RemoteFetch
+        );
+        assert!(series.purge_span(Timestamp(800)).unwrap());
+
+        // A listing without a head drops the old one.
+        let other = TimeSeries::create(dir.path().join("other")).unwrap();
+        other.sync_remote(Vec::new(), Some(head(0, 10))).unwrap();
+        assert_eq!(head_pieces(&other), [(0, 10)]);
+        other.sync_remote(Vec::new(), None).unwrap();
+        assert!(other.manifest().spans.is_empty());
     }
 
     #[test]

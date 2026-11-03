@@ -382,6 +382,22 @@ pub trait NodeStore: Send + Sync + 'static {
         component_name: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>>;
 
+    /// [`Self::list`], plus the unsealed head a live database holds past
+    /// its sealed nodes, taken from the same snapshot. Stores of sealed
+    /// nodes have no head.
+    fn listing<'a>(
+        &'a self,
+        component_id: ComponentId,
+        component_name: &'a str,
+    ) -> BoxFuture<'a, Result<Listing, StoreError>> {
+        Box::pin(async move {
+            Ok(Listing {
+                nodes: self.list(component_id, component_name).await?,
+                head: None,
+            })
+        })
+    }
+
     fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// Answer range fetches ([`GetTimeSeries`]) instead of whole nodes, one
@@ -396,6 +412,14 @@ pub trait NodeStore: Send + Sync + 'static {
         let _ = requests;
         Box::pin(async { Err(StoreError::Unsupported) })
     }
+}
+
+/// Everything a store can give back for one component: its sealed nodes,
+/// sorted by start, and the unsealed head a live database holds past them.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    pub nodes: Vec<SealRecord>,
+    pub head: Option<metor_proto_wkt::UnsealedHead>,
 }
 
 /// One reply to a range fetch, owning its buffer.

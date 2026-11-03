@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, DumpSchema, DumpSchemaResp, ErrorResponse, FEATURE_RANGE_FETCH, FetchNode,
-    FetchNodeDone, GetDbInfo, GetNodeManifest, GetTimeSeries, InstanceId, NODE_PROTOCOL_VERSION,
-    NodeAck, NodeChunk, NodeManifestResp, OfferNode, OfferNodeResp, PushNodeDone,
+    DbInfoResp, DumpSchema, DumpSchemaResp, ErrorResponse, FEATURE_RANGE_FETCH,
+    FEATURE_UNSEALED_HEAD, FetchNode, FetchNodeDone, GetDbInfo, GetNodeManifest, GetTimeSeries,
+    InstanceId, NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, NodeManifestRespV7,
+    OfferNode, OfferNodeResp, PushNodeDone,
 };
 use stellarator::sync::{Mutex, MutexGuard};
 use tracing::warn;
@@ -13,8 +15,8 @@ use tracing::warn;
 use crate::seal::SealRecord;
 
 use super::{
-    BoxFuture, CHUNK_BYTES, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode, SeriesReply,
-    StoreError,
+    BoxFuture, CHUNK_BYTES, Listing, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode,
+    SeriesReply, StoreError,
 };
 
 /// Most range fetches one batch pipelines; also the request ids it uses.
@@ -71,6 +73,9 @@ pub struct PeerStore {
     /// point reads must not queue behind one. Requests on it are pipelined
     /// in batches (see [`NodeStore::time_series`]).
     ranges: Mutex<Option<RangeConn>>,
+    /// Whether the peer [`Self::client`] last dialed reports its unsealed
+    /// head in manifest replies. Only read under that connection's lock.
+    heads: AtomicBool,
 }
 
 /// The range-fetch connection, and whether the peer at its far end
@@ -88,6 +93,7 @@ impl PeerStore {
             expected: None,
             client: Mutex::new(None),
             ranges: Mutex::new(None),
+            heads: AtomicBool::new(false),
         }
     }
 
@@ -100,7 +106,10 @@ impl PeerStore {
     async fn lock_connected(&self) -> Result<MutexGuard<'_, Option<Client>>, StoreError> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
-            *guard = Some(self.dial().await?.0);
+            let (client, info) = self.dial().await?;
+            let heads = info.protocol_version >= 8 && info.features & FEATURE_UNSEALED_HEAD != 0;
+            self.heads.store(heads, Ordering::Relaxed);
+            *guard = Some(client);
         }
         Ok(guard)
     }
@@ -353,15 +362,39 @@ impl NodeStore for PeerStore {
     fn list<'a>(
         &'a self,
         component_id: metor_proto::types::ComponentId,
-        _component_name: &'a str,
+        component_name: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>> {
+        Box::pin(async move { Ok(self.listing(component_id, component_name).await?.nodes) })
+    }
+
+    /// One `GetNodeManifest`, read in the layout the peer's version sends.
+    fn listing<'a>(
+        &'a self,
+        component_id: metor_proto::types::ComponentId,
+        _component_name: &'a str,
+    ) -> BoxFuture<'a, Result<Listing, StoreError>> {
         Box::pin(async move {
             let mut guard = self.lock_connected().await?;
             let client = guard.as_mut().expect("just connected");
-            match client.request(&GetNodeManifest { component_id }).await {
-                Ok(NodeManifestResp { nodes, .. }) => Ok(nodes),
-                Err(err) => Err(request_err(&mut guard, err)),
-            }
+            let request = GetNodeManifest { component_id };
+            let reply = match self.heads.load(Ordering::Relaxed) {
+                true => client
+                    .request(&request)
+                    .await
+                    .map(|r: NodeManifestResp| Listing {
+                        nodes: r.nodes,
+                        head: r.head,
+                    }),
+                // The request is the same; only the reply's layout differs.
+                false => match client.send((&request).with_request_id(1)).await.0 {
+                    Ok(()) => client.recv(1).await.map(|r: NodeManifestRespV7| Listing {
+                        nodes: r.nodes,
+                        head: None,
+                    }),
+                    Err(err) => Err(err.into()),
+                },
+            };
+            reply.map_err(|err| request_err(&mut guard, err))
         })
     }
 
