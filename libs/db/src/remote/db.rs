@@ -482,13 +482,13 @@ mod tests {
             )]),
         })
         .unwrap();
-        let write = |ts: i64| {
+        let write = |peer: &DB, ts: i64| {
             let mut table = ts.to_le_bytes().to_vec();
             table.extend_from_slice(&(ts as f64).to_le_bytes());
             peer.ingest_table(ID, &table).unwrap();
         };
         for ts in 1000..1500 {
-            write(ts);
+            write(&peer, ts);
         }
         let a = ComponentId::new("a");
         let series = |db: &DB| db.with_state(|s| s.get_component(a).map(|c| c.time_series.clone()));
@@ -506,7 +506,20 @@ mod tests {
         let hydrator = remote.hydrator();
         remote.spawn(mirror.clone());
 
-        let mut ts = 1500;
+        // The peer writes on while the mirror connects, so it holds more
+        // than it listed by the time the stream starts.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (peer, stop) = (peer.clone(), stop.clone());
+            move || {
+                let mut ts = 1500;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    write(&peer, ts);
+                    ts += 1;
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+        });
         let head = |mirror: &DB| {
             let manifest = series(mirror)?.manifest();
             manifest
@@ -516,15 +529,14 @@ mod tests {
                 .copied()
         };
         eventually("the peer's head listed, with live data beside it", || {
-            write(ts);
-            ts += 1;
             let live = series(&mirror).and_then(|s| s.latest()).is_some();
             live && head(&mirror).is_some_and(|span| span.cover_start == Timestamp(1000))
         })
         .await;
         let span = head(&mirror).unwrap();
         assert_eq!(span.state, SpanState::RemoteOnly);
-        // It ends below the live data the mirror holds itself.
+        // It ends right below the live data the mirror holds itself, though
+        // the peer wrote on between its listing and the stream's start.
         let live_start = series(&mirror)
             .unwrap()
             .list
@@ -532,7 +544,10 @@ mod tests {
             .filter_map(|n| n.timestamps().first().copied())
             .min()
             .unwrap();
-        assert!(span.cover_end < live_start, "{span:?} vs {live_start:?}");
+        eventually("the head meets the live data", || {
+            head(&mirror).is_some_and(|span| span.cover_end.0 + 1 == live_start.0)
+        })
+        .await;
         assert!(mirror.earliest_timestamp.latest() <= Timestamp(1000));
 
         // What a plot asks for as nodes is read by range.
@@ -543,16 +558,19 @@ mod tests {
         eventually("the head read by range", || {
             hydrator.request(
                 a,
-                Timestamp(1000)..Timestamp(1500),
+                Timestamp(1000)..live_start,
                 super::super::HydratePriority::Visible,
             );
-            read(1000) == Some(1000.0) && read(1499) == Some(1499.0)
+            let last = live_start.0 - 1;
+            read(1000) == Some(1000.0) && read(last) == Some(last as f64)
         })
         .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
         let mut gaps = crate::manifest::GapVec::new();
         series(&mirror)
             .unwrap()
-            .coverage(Timestamp(1000)..Timestamp(1500), &mut gaps);
+            .coverage(Timestamp(1000)..live_start, &mut gaps);
         assert!(gaps.is_empty(), "{gaps:?}");
     }
 
