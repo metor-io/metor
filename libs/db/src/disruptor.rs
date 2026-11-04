@@ -17,7 +17,7 @@ pub struct Disruptor {
 impl Disruptor {
     pub fn new(capacity: usize) -> Self {
         let core = Arc::new(DistruptorCore {
-            ringbuf: (0..capacity).map(|_| UnsafeCell::new(0)).collect(),
+            ringbuf: zeroed(capacity),
             write_head: WriteHead {
                 committed: AtomicU64::new(0),
                 // `u64::MAX` means "no pending wrap gap"; only a real wrap sets a
@@ -30,7 +30,18 @@ impl Disruptor {
         });
         Self { core }
     }
+}
 
+/// A zeroed ring of `len` bytes, from one zeroed allocation: building it
+/// byte by byte took most of a debug build's startup, a WAL per component.
+fn zeroed(len: usize) -> Box<[UnsafeCell<u8>]> {
+    let bytes = Box::into_raw(vec![0u8; len].into_boxed_slice());
+    // SAFETY: `UnsafeCell<u8>` is `repr(transparent)` over `u8`, so the
+    // slice has the same layout, and the box keeps its allocation.
+    unsafe { Box::from_raw(bytes as *mut [UnsafeCell<u8>]) }
+}
+
+impl Disruptor {
     // TODO(sphw): this function "works", but can cause deadlocks due to the mutex lock
     // pub async fn grant(&self, len: usize) -> Result<WriteGrant<'_>, DisruptorError> {
     //     let Disruptor { core } = self;
