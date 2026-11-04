@@ -1693,15 +1693,19 @@ impl PanelApp {
         let tasks = crate::background_tasks::BackgroundTasks::default();
         if let Some(addr) = server_addr.filter(|_| !offline) {
             let server_db = db.clone();
-            tasks.spawn(stellarator::util::CancelToken::new(), move || async move {
-                let server = Server {
-                    listener: TcpListener::bind(addr).unwrap(),
-                    db: server_db,
-                };
-                if let Err(err) = server.run().await {
-                    tracing::error!(%err, "panel server failed");
-                }
-            });
+            tasks.spawn(
+                "metor-panel-serve",
+                stellarator::util::CancelToken::new(),
+                move || async move {
+                    let server = Server {
+                        listener: TcpListener::bind(addr).unwrap(),
+                        db: server_db,
+                    };
+                    if let Err(err) = server.run().await {
+                        tracing::error!(%err, "panel server failed");
+                    }
+                },
+            );
         }
 
         cx.set_global(tasks.clone());

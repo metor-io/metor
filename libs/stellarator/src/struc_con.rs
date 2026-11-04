@@ -34,6 +34,24 @@ impl<T> Thread<T> {
         self.cancel_token.cancel();
         let _ = self.handle.join();
     }
+
+    /// Ties the thread to the returned guard, which cancels and joins it
+    /// when dropped.
+    pub fn cancel_on_drop(self) -> ThreadGuard<T> {
+        ThreadGuard(Some(self))
+    }
+}
+
+/// A [`Thread`] that is cancelled and joined when dropped, for an owner
+/// whose fields must outlive everything the thread runs.
+pub struct ThreadGuard<T>(Option<Thread<T>>);
+
+impl<T> Drop for ThreadGuard<T> {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            thread.cancel_and_wait();
+        }
+    }
 }
 
 impl<T: Send + Sync> Joinable<T> for Thread<T> {

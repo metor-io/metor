@@ -145,10 +145,7 @@ impl SessionStorage {
         };
         tracing::info!(%id, fresh = cached.fresh, path = %cached.path().display(), "mirroring into peer cache");
         Some((
-            Self {
-                directory: StorageDirectory::Cached(cached, peer),
-                source: None,
-            },
+            Self::new(&db, StorageDirectory::Cached(cached, peer), None),
             db,
         ))
     }

@@ -71,9 +71,13 @@ impl DynamicWorker {
     fn with_tasks(tasks: crate::background_tasks::BackgroundTasks) -> Self {
         let (tx, rx) = unbounded::<Job>();
         let (dispose_tx, dispose_rx) = unbounded::<Arc<Node>>();
-        tasks.spawn(stellarator::util::CancelToken::new(), move || async move {
-            run_worker(rx, dispose_rx).await;
-        });
+        tasks.spawn(
+            "metor-panel-dynamic",
+            stellarator::util::CancelToken::new(),
+            move || async move {
+                run_worker(rx, dispose_rx).await;
+            },
+        );
         Self {
             handle: WorkerHandle { tx, dispose_tx },
         }

@@ -102,9 +102,17 @@ impl RemoteDb {
         self.store.clone()
     }
 
-    /// Spawn the supervisor: the reconnecting live mirror plus the
-    /// hydration worker. Tasks run until the runtime shuts down.
+    /// Spawn [`run`](Self::run) onto the current executor, for a caller
+    /// whose executor is already the mirror's own.
     pub fn spawn(self, db: Arc<DB>) {
+        stellarator::spawn(self.run(db));
+    }
+
+    /// The mirror's ingest: the reconnecting live mirror, the manifest
+    /// seeder and the hydration worker, all writing into `db`. Runs until
+    /// dropped, so whoever awaits it owns its thread; a panel connection
+    /// awaits it on a thread of its own, which its disconnect cancels.
+    pub async fn run(self, db: Arc<DB>) {
         let Self {
             addr,
             expected,
@@ -117,51 +125,66 @@ impl RemoteDb {
                 f(event);
             }
         };
-        stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
         let connected = Arc::new(WaitQueue::new());
-        stellarator::spawn(seed_loop(db.clone(), store.clone(), connected.clone()));
-        stellarator::spawn(async move {
-            const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
-            const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
-            let mut backoff = INITIAL_BACKOFF;
-            loop {
-                let connected_at = std::time::Instant::now();
-                emit(MirrorEvent::Connecting);
-                let emit = |event| {
-                    // The peer may have restarted, or run on while this side
-                    // was away: its head has moved, so list it again now
-                    // rather than at the next timed pass.
-                    if event == MirrorEvent::Connected {
-                        connected.wake();
-                    }
-                    emit(event)
-                };
-                match mirror(&db, addr, expected, &emit).await {
-                    Ok(event) => {
-                        warn!(
-                            ?addr,
-                            ?event,
-                            "a different database answered; mirror stopped"
-                        );
-                        emit(event);
-                        return;
-                    }
-                    Err(err) if err.is_stream_closed() => {
-                        info!(?addr, "remote db disconnected; reconnecting");
-                        emit(MirrorEvent::Disconnected);
-                    }
-                    Err(err) => {
-                        warn!(?err, ?addr, "remote db mirror failed; reconnecting");
-                        emit(MirrorEvent::Failed);
-                    }
-                }
-                if connected_at.elapsed() >= HEALTHY_CONNECTION {
-                    backoff = INITIAL_BACKOFF;
-                }
-                stellarator::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(10));
+        // Separate tasks, so a live packet's wakeup polls only the mirror.
+        let _hydrate = stellarator::spawn(hydrator.run(db.clone(), store.clone())).drop_guard();
+        let _seed =
+            stellarator::spawn(seed_loop(db.clone(), store, connected.clone())).drop_guard();
+        supervise(&db, addr, expected, &connected, &emit).await;
+        // The bulk store refuses a wrong peer on its own, so hydration and
+        // seeding idle on until the owner stops the mirror.
+        std::future::pending::<()>().await
+    }
+}
+
+/// Reconnects the live mirror with backoff until a different database
+/// answers at `addr`.
+async fn supervise(
+    db: &Arc<DB>,
+    addr: SocketAddr,
+    expected: Option<InstanceId>,
+    connected: &WaitQueue,
+    emit: &impl Fn(MirrorEvent),
+) {
+    const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+    const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        let connected_at = std::time::Instant::now();
+        emit(MirrorEvent::Connecting);
+        let emit = |event| {
+            // The peer may have restarted, or run on while this side
+            // was away: its head has moved, so list it again now
+            // rather than at the next timed pass.
+            if event == MirrorEvent::Connected {
+                connected.wake();
             }
-        });
+            emit(event)
+        };
+        match mirror(db, addr, expected, &emit).await {
+            Ok(event) => {
+                warn!(
+                    ?addr,
+                    ?event,
+                    "a different database answered; mirror stopped"
+                );
+                emit(event);
+                return;
+            }
+            Err(err) if err.is_stream_closed() => {
+                info!(?addr, "remote db disconnected; reconnecting");
+                emit(MirrorEvent::Disconnected);
+            }
+            Err(err) => {
+                warn!(?err, ?addr, "remote db mirror failed; reconnecting");
+                emit(MirrorEvent::Failed);
+            }
+        }
+        if connected_at.elapsed() >= HEALTHY_CONNECTION {
+            backoff = INITIAL_BACKOFF;
+        }
+        stellarator::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(10));
     }
 }
 

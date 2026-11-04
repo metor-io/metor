@@ -16,6 +16,7 @@ use metor_proto_wkt::{CommandInfo, ComponentMetadata, VTableMsg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use stellarator::net::TcpListener;
+use stellarator::struc_con::{ThreadBuilder, ThreadGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::MakeError;
@@ -129,6 +130,8 @@ const SCRATCH_PREFIX: &str = "metor-db-";
 /// A link that stores every record wired into it in an embedded metor-db.
 pub struct Db {
     listener: Option<TcpListener>,
+    /// The serve thread. Declared before `db` so it stops first on drop.
+    serving: Option<ThreadGuard<Option<()>>>,
     db: Arc<DB>,
     params: DbParams,
     /// The temporary directory a deleted-on-exit database without a `path`
@@ -169,6 +172,7 @@ impl Db {
         db.set_ephemeral(params.path.is_none() || params.on_exit() == OnExit::Delete);
         Ok(Self {
             listener: Some(listener),
+            serving: None,
             db: Arc::new(db),
             params,
             scratch,
@@ -189,7 +193,7 @@ impl Db {
     /// Stops persisting the database, then deletes its directory if the
     /// params ask for it, or flushes what is left otherwise.
     ///
-    /// Called once the serve task and the writer have stopped, so nothing
+    /// Called once the serve thread and the writer have stopped, so nothing
     /// writes the directory afterwards. Clients may still map its files;
     /// unix keeps those mappings valid after the directory is gone.
     fn finish(&mut self, log: &mut Log) {
@@ -250,16 +254,7 @@ pub async fn db(
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
     }
-    let udp_task = addr.map(|addr| {
-        let db = db.clone();
-        let udp = async move {
-            if let Err(error) = Server::handle_udp(addr, db).await {
-                tracing::warn!(%error, "db udp ended");
-            }
-        };
-        stellarator::spawn(udp).drop_guard()
-    });
-    let serve_task = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
+    s.serving = Some(spawn_serve(listener, db.clone()));
     metor_db::lod::enable(&db);
 
     let mut status = DbStatus::default();
@@ -283,8 +278,7 @@ pub async fn db(
             reported = status;
         }
     }
-    drop(serve_task);
-    drop(udp_task);
+    s.serving = None;
     s.finish(log);
 }
 
@@ -305,24 +299,35 @@ fn describe(db: &DB, commands: &[(&str, RecordSchema)], log: &mut Log) -> Vec<Co
         .collect()
 }
 
-/// Accepts every client and serves each on its own task.
+/// Serves the database on its own thread, so clients never wait on ingest.
 ///
-/// Closed connections are pruned on each accept, and dropping this future
-/// closes every connection.
-async fn serve(listener: TcpListener, db: Arc<DB>, stop: Stop) {
-    // Dropping a guard cancels its client's task.
-    let mut conns: Vec<stellarator::JoinHandleDropGuard<()>> = Vec::new();
-    let accept = async {
-        loop {
-            let Some(stream) = accept(&listener).await else {
-                continue;
-            };
-            conns.retain(|conn| !conn.is_finished());
-            let task = stellarator::spawn(metor_db::handle_conn(stream, db.clone()));
-            conns.push(task.drop_guard());
+/// The listener only reaches a reactor on its first accept, so it moves
+/// threads freely. Dropping the guard stops the thread, and its executor
+/// drops every connection with it.
+fn spawn_serve(listener: TcpListener, db: Arc<DB>) -> ThreadGuard<Option<()>> {
+    ThreadBuilder::default()
+        .name("metor-db-serve")
+        .stellar(move || serve(listener, db))
+        .cancel_on_drop()
+}
+
+/// Serves UDP on the listener's address, and each TCP client on its own
+/// task.
+async fn serve(listener: TcpListener, db: Arc<DB>) {
+    if let Ok(addr) = listener.local_addr() {
+        stellarator::spawn(udp(addr, db.clone()));
+    }
+    loop {
+        if let Some(stream) = accept(&listener).await {
+            stellarator::spawn(metor_db::handle_conn(stream, db.clone()));
         }
-    };
-    futures_lite::future::or(accept, stop.wait()).await;
+    }
+}
+
+async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
+    if let Err(error) = Server::handle_udp(addr, db).await {
+        tracing::warn!(%error, "db udp ended");
+    }
 }
 
 /// Accepts the next client, or returns `None` after an accept fails.
@@ -617,8 +622,7 @@ mod tests {
     async fn test_serve_every_client_until_dropped() {
         let (_dir, db) = store();
         let (listener, addr) = listener();
-        let (_handle, stop) = Stop::pair();
-        let served = stellarator::spawn(serve(listener, db, stop)).drop_guard();
+        let served = spawn_serve(listener, db);
 
         let mut clients = Vec::new();
         for _ in 0..12 {

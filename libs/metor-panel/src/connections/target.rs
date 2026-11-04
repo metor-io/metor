@@ -111,7 +111,16 @@ impl ConnectContext {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        self.tasks.spawn(self.cancel.clone(), f);
+        self.spawn_named("metor-connection", f);
+    }
+
+    /// [`spawn`](Self::spawn), on a thread called `name`.
+    pub fn spawn_named<F, Fut>(&self, name: &str, f: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        self.tasks.spawn(name, self.cancel.clone(), f);
     }
 }
 
@@ -338,6 +347,11 @@ fn mirror_status(status: StatusHandle) -> impl Fn(MirrorEvent) + Send + Sync + '
     }
 }
 
+/// The thread a db mirror ingests on.
+const MIRROR_THREAD: &str = "metor-db-mirror";
+/// The thread an fsw link streams into the panel's DB on.
+const FSW_LINK_THREAD: &str = "metor-fsw-link";
+
 struct TcpBackend {
     addr: SocketAddr,
 }
@@ -349,12 +363,8 @@ impl ConnectionBackend for TcpBackend {
             .on_event(mirror_status(ctx.status.clone()));
         let hydrator = remote.hydrator();
         let db = ctx.db.clone();
-        ctx.spawn(move || async move {
-            remote.spawn(db);
-            // The mirror and hydrator tasks own this thread's runtime; park
-            // so it never winds down until the cancel token fires.
-            std::future::pending::<()>().await
-        });
+        // The mirror's ingest gets the thread to itself until disconnect.
+        ctx.spawn_named(MIRROR_THREAD, move || remote.run(db));
         Connected {
             hydrator: Some(hydrator),
             local_authority: false,
@@ -416,7 +426,7 @@ struct FswBackend {
 impl ConnectionBackend for FswBackend {
     fn connect(&self, ctx: ConnectContext) -> Connected {
         let (db, status, addr) = (ctx.db.clone(), ctx.status.clone(), self.addr);
-        ctx.spawn(move || async move { fsw_loop(addr, db, status, None).await });
+        ctx.spawn_named(FSW_LINK_THREAD, move || fsw_loop(addr, db, status, None));
         Connected {
             hydrator: None,
             // The panel's DB is the system of record for an fsw stream, the
@@ -439,7 +449,7 @@ impl ConnectionBackend for DiscoverBackend {
         let (tx, rx) = std::sync::mpsc::channel();
         let (db, status, addr) = (ctx.db.clone(), ctx.status.clone(), self.addr);
         let expected = ctx.expect_instance;
-        ctx.spawn(move || async move {
+        ctx.spawn_named("metor-discover", move || async move {
             let mut backoff = LINK_BACKOFF_INITIAL;
             loop {
                 status.set(ConnectionStatus::Connecting);
@@ -455,9 +465,8 @@ impl ConnectionBackend for DiscoverBackend {
                             local_authority: false,
                         });
                         // The probe connection is gone; the mirror dials and
-                        // supervises itself from here.
-                        remote.spawn(db.clone());
-                        std::future::pending::<()>().await
+                        // supervises itself from here, on this thread.
+                        remote.run(db.clone()).await
                     }
                     Ok(peer @ Peer::Fsw { .. }) => {
                         let _ = tx.send(Resolved {

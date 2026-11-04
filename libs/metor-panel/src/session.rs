@@ -7,7 +7,7 @@ use metor_db::scratch::{self, ScratchDir};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Weak, atomic::AtomicBool};
 
 mod archive;
 mod commands;
@@ -21,8 +21,23 @@ pub(crate) use commands::{
 };
 
 pub(crate) struct SessionStorage {
+    /// Declared before `directory`, so a session dropped without
+    /// [`finish`](Self::finish) still stops writing before it lets go of the
+    /// directory or its lock.
+    _persistence: StopPersistence,
     directory: StorageDirectory,
     source: Option<PathBuf>,
+}
+
+/// Stops a DB's persistence thread on drop, if the DB is still alive.
+struct StopPersistence(Weak<DB>);
+
+impl Drop for StopPersistence {
+    fn drop(&mut self) {
+        if let Some(db) = self.0.upgrade() {
+            db.stop_persistence();
+        }
+    }
 }
 /// The temp-dir prefix of a session's own database.
 const SESSION_PREFIX: &str = "metor-panel-";
@@ -68,6 +83,14 @@ struct RecordingManifest {
     created_unix_micros: u128,
 }
 impl SessionStorage {
+    fn new(db: &Arc<DB>, directory: StorageDirectory, source: Option<PathBuf>) -> Self {
+        Self {
+            _persistence: StopPersistence(Arc::downgrade(db)),
+            directory,
+            source,
+        }
+    }
+
     pub(crate) fn create() -> Result<(Self, Arc<DB>), metor_db::Error> {
         let directory = ScratchDir::create(SESSION_PREFIX)?;
         let db = Arc::new(DB::create(directory.path().to_owned())?);
@@ -75,10 +98,7 @@ impl SessionStorage {
         // cache it or count on it for history.
         db.set_ephemeral(true);
         Ok((
-            Self {
-                directory: StorageDirectory::Temporary(directory),
-                source: None,
-            },
+            Self::new(&db, StorageDirectory::Temporary(directory), None),
             db,
         ))
     }
@@ -114,13 +134,14 @@ impl SessionStorage {
                     .unwrap_or(Path::new(".")),
             )?;
             Ok((
-                Self {
-                    directory: StorageDirectory::Recording {
+                Self::new(
+                    &db,
+                    StorageDirectory::Recording {
                         path: path.clone(),
                         _lock: lock,
                     },
-                    source: None,
-                },
+                    None,
+                ),
                 db,
             ))
         })();
@@ -171,10 +192,7 @@ impl SessionStorage {
         }
         let source = Some(path.canonicalize()?);
         Ok((
-            Self {
-                directory: StorageDirectory::Temporary(directory),
-                source,
-            },
+            Self::new(&db, StorageDirectory::Temporary(directory), source),
             db,
             imported,
         ))

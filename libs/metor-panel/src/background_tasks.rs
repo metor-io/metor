@@ -20,7 +20,9 @@ struct State {
 impl Global for BackgroundTasks {}
 
 impl BackgroundTasks {
-    pub(crate) fn spawn<F, Fut>(&self, cancel: CancelToken, f: F)
+    /// Runs `f` on a stellar thread called `name`, so profiles and panics
+    /// say which role it plays.
+    pub(crate) fn spawn<F, Fut>(&self, name: &str, cancel: CancelToken, f: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
@@ -31,6 +33,7 @@ impl BackgroundTasks {
             return;
         }
         let thread = ThreadBuilder::default()
+            .name(name)
             .cancel_token(cancel.clone())
             .stellar(f);
         state.threads.push((cancel, thread));
@@ -74,7 +77,7 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = Dropped(dropped.clone());
         let (tx, rx) = std::sync::mpsc::channel();
-        tasks.spawn(CancelToken::new(), move || async move {
+        tasks.spawn("test", CancelToken::new(), move || async move {
             stellarator::spawn(async move {
                 let _guard = guard;
                 tx.send(()).unwrap();
@@ -86,7 +89,7 @@ mod tests {
         tasks.shutdown().unwrap();
         assert!(dropped.load(Ordering::SeqCst));
         let cancel = CancelToken::new();
-        tasks.spawn(cancel.clone(), || async {
+        tasks.spawn("test", cancel.clone(), || async {
             panic!("spawned after shutdown")
         });
         assert!(cancel.is_cancelled());
