@@ -1513,9 +1513,18 @@ impl Server {
         let udp_db = db.clone();
         stellarator::struc_con::stellar(move || Self::handle_udp(addr, udp_db));
         loop {
-            let stream = listener.accept().await?;
-            let peer_addr = stream.peer_addr()?;
-            trace!(?peer_addr, "accepted connection");
+            // A failed accept is the host's (out of descriptors, say), and a
+            // client gone before its address is read is its own: neither
+            // ends the server.
+            let stream = match listener.accept().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(?err, "accept failed, backing off");
+                    stellarator::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+            trace!(peer_addr = ?stream.peer_addr().ok(), "accepted connection");
             let conn_db = db.clone();
             stellarator::struc_con::stellar(move || handle_conn(stream, conn_db));
         }
