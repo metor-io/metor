@@ -20,9 +20,11 @@ typedef struct packet_header_t packet_header_t;
 struct packet_header_t {
     uint32_t len;
     uint8_t ty;
-    uint8_t packet_id[2];
+    uint8_t packet_id[8];
     uint8_t request_id;
+    uint8_t pad[2];
 };
+_Static_assert(sizeof(packet_header_t) == 16, "the body starts at byte 16");
 
 typedef struct sensor_data_t sensor_data_t;
 struct sensor_data_t {
@@ -74,7 +76,7 @@ int main()
         .humidity = 3.0
     };
     packet_header_t sensor_data_header = {
-        .len = 4 + sizeof(sensor_data),
+        .len = sizeof(packet_header_t) - sizeof(uint32_t) + sizeof(sensor_data),
         .ty = TABLE,
         .packet_id = { 1, 0 },
         .request_id = 0,

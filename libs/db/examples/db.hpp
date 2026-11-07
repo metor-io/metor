@@ -1603,13 +1603,13 @@ struct Stream {
 struct MsgStream {
   static constexpr std::string_view TYPE_NAME = "MsgStream";
 
-  std::tuple<uint8_t, uint8_t> msg_id;
+  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> msg_id;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u8();size += postcard_size_u8();
+    size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();
     
     return size;
   }
@@ -1658,6 +1658,36 @@ struct MsgStream {
                             result = postcard_encode_u8(slice, val);
                         }
                         
+                        {
+                            auto val = std::get<2>(msg_id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<3>(msg_id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<4>(msg_id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<5>(msg_id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<6>(msg_id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<7>(msg_id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -1680,7 +1710,19 @@ struct MsgStream {
     result = postcard_decode_u8(slice, &val0);
     uint8_t val1;
     result = postcard_decode_u8(slice, &val1);
-    msg_id =  std::tuple<uint8_t, uint8_t>(val0, val1);
+    uint8_t val2;
+    result = postcard_decode_u8(slice, &val2);
+    uint8_t val3;
+    result = postcard_decode_u8(slice, &val3);
+    uint8_t val4;
+    result = postcard_decode_u8(slice, &val4);
+    uint8_t val5;
+    result = postcard_decode_u8(slice, &val5);
+    uint8_t val6;
+    result = postcard_decode_u8(slice, &val6);
+    uint8_t val7;
+    result = postcard_decode_u8(slice, &val7);
+    msg_id =  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t>(val0, val1, val2, val3, val4, val5, val6, val7);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -1691,17 +1733,17 @@ struct MsgStream {
 struct Field {
   static constexpr std::string_view TYPE_NAME = "Field";
 
-  uint16_t offset;
-  uint16_t len;
-  uint16_t arg;
+  uint32_t offset;
+  uint32_t len;
+  uint32_t arg;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(offset);
-    size += postcard_size_u16(len);
-    size += postcard_size_u16(arg);
+    size += postcard_size_u32(offset);
+    size += postcard_size_u32(len);
+    size += postcard_size_u32(arg);
     
     return size;
   }
@@ -1739,11 +1781,11 @@ struct Field {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, offset);
+    result = postcard_encode_u32(slice, offset);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, len);
+    result = postcard_encode_u32(slice, len);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, arg);
+    result = postcard_encode_u32(slice, arg);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -1762,13 +1804,94 @@ struct Field {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &offset);
+    result = postcard_decode_u32(slice, &offset);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &len);
+    result = postcard_decode_u32(slice, &len);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &arg);
+    result = postcard_decode_u32(slice, &arg);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    
+    return POSTCARD_SUCCESS;
+  }
+};
+
+struct ElementFields {
+  static constexpr std::string_view TYPE_NAME = "ElementFields";
+
+  uint32_t start;
+  uint32_t count;
+  
+
+
+  size_t encoded_size() const {
+    size_t size = 0;
+    size += postcard_size_u32(start);
+    size += postcard_size_u32(count);
+    
+    return size;
+  }
+
+  postcard_error_t encode(std::span<uint8_t>& output) const {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, output.data(), output.size());
+    auto res = encode_raw(&slice);
+    if(res != POSTCARD_SUCCESS) return res;
+    output = output.subspan(0, slice.len);
+    return POSTCARD_SUCCESS;
+  }
+
+  std::vector<uint8_t> encode_vec() const {
+    // Pre-allocate vector with the required size
+    std::vector<uint8_t> vec(encoded_size());
+
+    // Create a span from the vector
+    auto span = std::span<uint8_t>(vec);
+
+    // Encode into the span
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, span.data(), span.size());
+    auto res = encode_raw(&slice);
+
+    // Resize to actual used length if successful
+    if (res == POSTCARD_SUCCESS) {
+      vec.resize(slice.len);
+    } else {
+      vec.clear(); // Clear the vector on error
+    }
+
+    return vec;
+  }
+
+  postcard_error_t encode_raw(postcard_slice_t* slice) const {
+    postcard_error_t result;
+    result = postcard_encode_u32(slice, start);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = postcard_encode_u32(slice, count);
+        if(result != POSTCARD_SUCCESS) return result;
+    
+    return POSTCARD_SUCCESS;
+  }
+
+  postcard_error_t decode(std::span<const uint8_t>& input) {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, const_cast<uint8_t*>(input.data()), input.size());
+    postcard_error_t result = decode_raw(&slice);
+    if (result == POSTCARD_SUCCESS) {
+      // Update the input span to point past the decoded data
+      input = input.subspan(slice.len);
+    }
+    return result;
+  }
+
+  postcard_error_t decode_raw(postcard_slice_t* slice) {
+    postcard_error_t result;
+    result = postcard_decode_u32(slice, &start);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = postcard_decode_u32(slice, &count);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -1779,15 +1902,15 @@ struct Field {
 struct OpData {
   static constexpr std::string_view TYPE_NAME = "OpData";
 
-  uint16_t offset;
-  uint16_t len;
+  uint32_t offset;
+  uint32_t len;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(offset);
-    size += postcard_size_u16(len);
+    size += postcard_size_u32(offset);
+    size += postcard_size_u32(len);
     
     return size;
   }
@@ -1825,9 +1948,9 @@ struct OpData {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, offset);
+    result = postcard_encode_u32(slice, offset);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, len);
+    result = postcard_encode_u32(slice, len);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -1846,10 +1969,10 @@ struct OpData {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &offset);
+    result = postcard_decode_u32(slice, &offset);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &len);
+    result = postcard_decode_u32(slice, &len);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -1860,15 +1983,15 @@ struct OpData {
 struct OpTable {
   static constexpr std::string_view TYPE_NAME = "OpTable";
 
-  uint16_t offset;
-  uint16_t len;
+  uint32_t offset;
+  uint32_t len;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(offset);
-    size += postcard_size_u16(len);
+    size += postcard_size_u32(offset);
+    size += postcard_size_u32(len);
     
     return size;
   }
@@ -1906,9 +2029,9 @@ struct OpTable {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, offset);
+    result = postcard_encode_u32(slice, offset);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, len);
+    result = postcard_encode_u32(slice, len);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -1927,10 +2050,10 @@ struct OpTable {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &offset);
+    result = postcard_decode_u32(slice, &offset);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &len);
+    result = postcard_decode_u32(slice, &len);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -1941,13 +2064,13 @@ struct OpTable {
 struct OpComponent {
   static constexpr std::string_view TYPE_NAME = "OpComponent";
 
-  uint16_t component_id;
+  uint32_t component_id;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(component_id);
+    size += postcard_size_u32(component_id);
     
     return size;
   }
@@ -1985,7 +2108,7 @@ struct OpComponent {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, component_id);
+    result = postcard_encode_u32(slice, component_id);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -2004,7 +2127,7 @@ struct OpComponent {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &component_id);
+    result = postcard_decode_u32(slice, &component_id);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -2015,17 +2138,17 @@ struct OpComponent {
 struct OpSchema {
   static constexpr std::string_view TYPE_NAME = "OpSchema";
 
-  uint16_t ty;
-  uint16_t dim;
-  uint16_t arg;
+  uint32_t ty;
+  uint32_t dim;
+  uint32_t arg;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(ty);
-    size += postcard_size_u16(dim);
-    size += postcard_size_u16(arg);
+    size += postcard_size_u32(ty);
+    size += postcard_size_u32(dim);
+    size += postcard_size_u32(arg);
     
     return size;
   }
@@ -2063,11 +2186,11 @@ struct OpSchema {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, ty);
+    result = postcard_encode_u32(slice, ty);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, dim);
+    result = postcard_encode_u32(slice, dim);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, arg);
+    result = postcard_encode_u32(slice, arg);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -2086,13 +2209,13 @@ struct OpSchema {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &ty);
+    result = postcard_decode_u32(slice, &ty);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &dim);
+    result = postcard_decode_u32(slice, &dim);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &arg);
+    result = postcard_decode_u32(slice, &arg);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -2103,15 +2226,15 @@ struct OpSchema {
 struct OpTimestamp {
   static constexpr std::string_view TYPE_NAME = "OpTimestamp";
 
-  uint16_t source;
-  uint16_t arg;
+  uint32_t source;
+  uint32_t arg;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(source);
-    size += postcard_size_u16(arg);
+    size += postcard_size_u32(source);
+    size += postcard_size_u32(arg);
     
     return size;
   }
@@ -2149,9 +2272,9 @@ struct OpTimestamp {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, source);
+    result = postcard_encode_u32(slice, source);
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, arg);
+    result = postcard_encode_u32(slice, arg);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -2170,10 +2293,10 @@ struct OpTimestamp {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &source);
+    result = postcard_decode_u32(slice, &source);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &arg);
+    result = postcard_decode_u32(slice, &arg);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -2184,17 +2307,17 @@ struct OpTimestamp {
 struct OpExt {
   static constexpr std::string_view TYPE_NAME = "OpExt";
 
-  uint16_t arg;
-  std::tuple<uint8_t, uint8_t> id;
-  uint16_t data;
+  uint32_t arg;
+  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id;
+  uint32_t data;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(arg);
-    size += postcard_size_u8();size += postcard_size_u8();
-    size += postcard_size_u16(data);
+    size += postcard_size_u32(arg);
+    size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();
+    size += postcard_size_u32(data);
     
     return size;
   }
@@ -2232,7 +2355,7 @@ struct OpExt {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, arg);
+    result = postcard_encode_u32(slice, arg);
         if(result != POSTCARD_SUCCESS) return result;
     
                         {
@@ -2245,8 +2368,38 @@ struct OpExt {
                             result = postcard_encode_u8(slice, val);
                         }
                         
+                        {
+                            auto val = std::get<2>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<3>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<4>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<5>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<6>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<7>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
         if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_u16(slice, data);
+    result = postcard_encode_u32(slice, data);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -2265,17 +2418,29 @@ struct OpExt {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &arg);
+    result = postcard_decode_u32(slice, &arg);
     if(result != POSTCARD_SUCCESS) return result;
 
     uint8_t val0;
     result = postcard_decode_u8(slice, &val0);
     uint8_t val1;
     result = postcard_decode_u8(slice, &val1);
-    id =  std::tuple<uint8_t, uint8_t>(val0, val1);
+    uint8_t val2;
+    result = postcard_decode_u8(slice, &val2);
+    uint8_t val3;
+    result = postcard_decode_u8(slice, &val3);
+    uint8_t val4;
+    result = postcard_decode_u8(slice, &val4);
+    uint8_t val5;
+    result = postcard_decode_u8(slice, &val5);
+    uint8_t val6;
+    result = postcard_decode_u8(slice, &val6);
+    uint8_t val7;
+    result = postcard_decode_u8(slice, &val7);
+    id =  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t>(val0, val1, val2, val3, val4, val5, val6, val7);
     if(result != POSTCARD_SUCCESS) return result;
 
-    result = postcard_decode_u16(slice, &data);
+    result = postcard_decode_u32(slice, &data);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -2283,11 +2448,349 @@ struct OpExt {
   }
 };
 
-class Op : public std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt> {
+struct OpFrame {
+  static constexpr std::string_view TYPE_NAME = "OpFrame";
+
+  uint32_t component_id;
+  uint32_t arg;
+  
+
+
+  size_t encoded_size() const {
+    size_t size = 0;
+    size += postcard_size_u32(component_id);
+    size += postcard_size_u32(arg);
+    
+    return size;
+  }
+
+  postcard_error_t encode(std::span<uint8_t>& output) const {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, output.data(), output.size());
+    auto res = encode_raw(&slice);
+    if(res != POSTCARD_SUCCESS) return res;
+    output = output.subspan(0, slice.len);
+    return POSTCARD_SUCCESS;
+  }
+
+  std::vector<uint8_t> encode_vec() const {
+    // Pre-allocate vector with the required size
+    std::vector<uint8_t> vec(encoded_size());
+
+    // Create a span from the vector
+    auto span = std::span<uint8_t>(vec);
+
+    // Encode into the span
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, span.data(), span.size());
+    auto res = encode_raw(&slice);
+
+    // Resize to actual used length if successful
+    if (res == POSTCARD_SUCCESS) {
+      vec.resize(slice.len);
+    } else {
+      vec.clear(); // Clear the vector on error
+    }
+
+    return vec;
+  }
+
+  postcard_error_t encode_raw(postcard_slice_t* slice) const {
+    postcard_error_t result;
+    result = postcard_encode_u32(slice, component_id);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = postcard_encode_u32(slice, arg);
+        if(result != POSTCARD_SUCCESS) return result;
+    
+    return POSTCARD_SUCCESS;
+  }
+
+  postcard_error_t decode(std::span<const uint8_t>& input) {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, const_cast<uint8_t*>(input.data()), input.size());
+    postcard_error_t result = decode_raw(&slice);
+    if (result == POSTCARD_SUCCESS) {
+      // Update the input span to point past the decoded data
+      input = input.subspan(slice.len);
+    }
+    return result;
+  }
+
+  postcard_error_t decode_raw(postcard_slice_t* slice) {
+    postcard_error_t result;
+    result = postcard_decode_u32(slice, &component_id);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = postcard_decode_u32(slice, &arg);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    
+    return POSTCARD_SUCCESS;
+  }
+};
+
+struct OpList {
+  static constexpr std::string_view TYPE_NAME = "OpList";
+
+  uint32_t name;
+  ElementFields members;
+  uint32_t stride;
+  
+
+
+  size_t encoded_size() const {
+    size_t size = 0;
+    size += postcard_size_u32(name);
+    size += members.encoded_size();
+    size += postcard_size_u32(stride);
+    
+    return size;
+  }
+
+  postcard_error_t encode(std::span<uint8_t>& output) const {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, output.data(), output.size());
+    auto res = encode_raw(&slice);
+    if(res != POSTCARD_SUCCESS) return res;
+    output = output.subspan(0, slice.len);
+    return POSTCARD_SUCCESS;
+  }
+
+  std::vector<uint8_t> encode_vec() const {
+    // Pre-allocate vector with the required size
+    std::vector<uint8_t> vec(encoded_size());
+
+    // Create a span from the vector
+    auto span = std::span<uint8_t>(vec);
+
+    // Encode into the span
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, span.data(), span.size());
+    auto res = encode_raw(&slice);
+
+    // Resize to actual used length if successful
+    if (res == POSTCARD_SUCCESS) {
+      vec.resize(slice.len);
+    } else {
+      vec.clear(); // Clear the vector on error
+    }
+
+    return vec;
+  }
+
+  postcard_error_t encode_raw(postcard_slice_t* slice) const {
+    postcard_error_t result;
+    result = postcard_encode_u32(slice, name);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = members.encode_raw(slice);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = postcard_encode_u32(slice, stride);
+        if(result != POSTCARD_SUCCESS) return result;
+    
+    return POSTCARD_SUCCESS;
+  }
+
+  postcard_error_t decode(std::span<const uint8_t>& input) {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, const_cast<uint8_t*>(input.data()), input.size());
+    postcard_error_t result = decode_raw(&slice);
+    if (result == POSTCARD_SUCCESS) {
+      // Update the input span to point past the decoded data
+      input = input.subspan(slice.len);
+    }
+    return result;
+  }
+
+  postcard_error_t decode_raw(postcard_slice_t* slice) {
+    postcard_error_t result;
+    result = postcard_decode_u32(slice, &name);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = members.decode_raw(slice);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = postcard_decode_u32(slice, &stride);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    
+    return POSTCARD_SUCCESS;
+  }
+};
+
+struct OpMap {
+  static constexpr std::string_view TYPE_NAME = "OpMap";
+
+  uint32_t name;
+  ElementFields members;
+  uint32_t stride;
+  uint32_t value_offset;
+  
+
+
+  size_t encoded_size() const {
+    size_t size = 0;
+    size += postcard_size_u32(name);
+    size += members.encoded_size();
+    size += postcard_size_u32(stride);
+    size += postcard_size_u32(value_offset);
+    
+    return size;
+  }
+
+  postcard_error_t encode(std::span<uint8_t>& output) const {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, output.data(), output.size());
+    auto res = encode_raw(&slice);
+    if(res != POSTCARD_SUCCESS) return res;
+    output = output.subspan(0, slice.len);
+    return POSTCARD_SUCCESS;
+  }
+
+  std::vector<uint8_t> encode_vec() const {
+    // Pre-allocate vector with the required size
+    std::vector<uint8_t> vec(encoded_size());
+
+    // Create a span from the vector
+    auto span = std::span<uint8_t>(vec);
+
+    // Encode into the span
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, span.data(), span.size());
+    auto res = encode_raw(&slice);
+
+    // Resize to actual used length if successful
+    if (res == POSTCARD_SUCCESS) {
+      vec.resize(slice.len);
+    } else {
+      vec.clear(); // Clear the vector on error
+    }
+
+    return vec;
+  }
+
+  postcard_error_t encode_raw(postcard_slice_t* slice) const {
+    postcard_error_t result;
+    result = postcard_encode_u32(slice, name);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = members.encode_raw(slice);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = postcard_encode_u32(slice, stride);
+        if(result != POSTCARD_SUCCESS) return result;
+    result = postcard_encode_u32(slice, value_offset);
+        if(result != POSTCARD_SUCCESS) return result;
+    
+    return POSTCARD_SUCCESS;
+  }
+
+  postcard_error_t decode(std::span<const uint8_t>& input) {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, const_cast<uint8_t*>(input.data()), input.size());
+    postcard_error_t result = decode_raw(&slice);
+    if (result == POSTCARD_SUCCESS) {
+      // Update the input span to point past the decoded data
+      input = input.subspan(slice.len);
+    }
+    return result;
+  }
+
+  postcard_error_t decode_raw(postcard_slice_t* slice) {
+    postcard_error_t result;
+    result = postcard_decode_u32(slice, &name);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = members.decode_raw(slice);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = postcard_decode_u32(slice, &stride);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    result = postcard_decode_u32(slice, &value_offset);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    
+    return POSTCARD_SUCCESS;
+  }
+};
+
+struct OpPathComponent {
+  static constexpr std::string_view TYPE_NAME = "OpPathComponent";
+
+  uint32_t name;
+  
+
+
+  size_t encoded_size() const {
+    size_t size = 0;
+    size += postcard_size_u32(name);
+    
+    return size;
+  }
+
+  postcard_error_t encode(std::span<uint8_t>& output) const {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, output.data(), output.size());
+    auto res = encode_raw(&slice);
+    if(res != POSTCARD_SUCCESS) return res;
+    output = output.subspan(0, slice.len);
+    return POSTCARD_SUCCESS;
+  }
+
+  std::vector<uint8_t> encode_vec() const {
+    // Pre-allocate vector with the required size
+    std::vector<uint8_t> vec(encoded_size());
+
+    // Create a span from the vector
+    auto span = std::span<uint8_t>(vec);
+
+    // Encode into the span
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, span.data(), span.size());
+    auto res = encode_raw(&slice);
+
+    // Resize to actual used length if successful
+    if (res == POSTCARD_SUCCESS) {
+      vec.resize(slice.len);
+    } else {
+      vec.clear(); // Clear the vector on error
+    }
+
+    return vec;
+  }
+
+  postcard_error_t encode_raw(postcard_slice_t* slice) const {
+    postcard_error_t result;
+    result = postcard_encode_u32(slice, name);
+        if(result != POSTCARD_SUCCESS) return result;
+    
+    return POSTCARD_SUCCESS;
+  }
+
+  postcard_error_t decode(std::span<const uint8_t>& input) {
+    postcard_slice_t slice;
+    postcard_init_slice(&slice, const_cast<uint8_t*>(input.data()), input.size());
+    postcard_error_t result = decode_raw(&slice);
+    if (result == POSTCARD_SUCCESS) {
+      // Update the input span to point past the decoded data
+      input = input.subspan(slice.len);
+    }
+    return result;
+  }
+
+  postcard_error_t decode_raw(postcard_slice_t* slice) {
+    postcard_error_t result;
+    result = postcard_decode_u32(slice, &name);
+    if(result != POSTCARD_SUCCESS) return result;
+
+    
+    return POSTCARD_SUCCESS;
+  }
+};
+
+class Op : public std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent> {
 public:
   static constexpr std::string_view TYPE_NAME = "Op";
   // Inherit constructors from std::variant
-  using std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>::variant;
+  using std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>::variant;
 
   
   // Static constructor for Data variant
@@ -2302,11 +2805,11 @@ public:
   }
   
   const OpData* get_data() const {
-    return std::get_if<0>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<0>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   OpData* get_data() {
-    return std::get_if<0>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<0>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2323,11 +2826,11 @@ public:
   }
   
   const OpTable* get_table() const {
-    return std::get_if<1>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<1>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   OpTable* get_table() {
-    return std::get_if<1>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<1>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2344,11 +2847,11 @@ public:
   }
   
   const std::monostate* get_none() const {
-    return std::get_if<2>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<2>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   std::monostate* get_none() {
-    return std::get_if<2>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<2>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2365,11 +2868,11 @@ public:
   }
   
   const OpComponent* get_component() const {
-    return std::get_if<3>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<3>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   OpComponent* get_component() {
-    return std::get_if<3>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<3>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2386,11 +2889,11 @@ public:
   }
   
   const OpSchema* get_schema() const {
-    return std::get_if<4>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<4>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   OpSchema* get_schema() {
-    return std::get_if<4>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<4>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2407,11 +2910,11 @@ public:
   }
   
   const OpTimestamp* get_timestamp() const {
-    return std::get_if<5>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<5>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   OpTimestamp* get_timestamp() {
-    return std::get_if<5>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<5>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2428,11 +2931,95 @@ public:
   }
   
   const OpExt* get_ext() const {
-    return std::get_if<6>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<6>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
 
   OpExt* get_ext() {
-    return std::get_if<6>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this);
+    return std::get_if<6>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+  
+
+  
+  // Static constructor for Frame variant
+  static Op Frame(const OpFrame& value) {
+    return Op{std::in_place_index<7>, value};
+  }
+  
+
+  // Accessor method for variant Frame
+  bool is_frame() const {
+    return this->index() == 7;
+  }
+  
+  const OpFrame* get_frame() const {
+    return std::get_if<7>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+
+  OpFrame* get_frame() {
+    return std::get_if<7>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+  
+
+  
+  // Static constructor for List variant
+  static Op List(const OpList& value) {
+    return Op{std::in_place_index<8>, value};
+  }
+  
+
+  // Accessor method for variant List
+  bool is_list() const {
+    return this->index() == 8;
+  }
+  
+  const OpList* get_list() const {
+    return std::get_if<8>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+
+  OpList* get_list() {
+    return std::get_if<8>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+  
+
+  
+  // Static constructor for Map variant
+  static Op Map(const OpMap& value) {
+    return Op{std::in_place_index<9>, value};
+  }
+  
+
+  // Accessor method for variant Map
+  bool is_map() const {
+    return this->index() == 9;
+  }
+  
+  const OpMap* get_map() const {
+    return std::get_if<9>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+
+  OpMap* get_map() {
+    return std::get_if<9>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+  
+
+  
+  // Static constructor for PathComponent variant
+  static Op PathComponent(const OpPathComponent& value) {
+    return Op{std::in_place_index<10>, value};
+  }
+  
+
+  // Accessor method for variant PathComponent
+  bool is_path_component() const {
+    return this->index() == 10;
+  }
+  
+  const OpPathComponent* get_path_component() const {
+    return std::get_if<10>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
+  }
+
+  OpPathComponent* get_path_component() {
+    return std::get_if<10>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this);
   }
   
 
@@ -2444,25 +3031,37 @@ public:
     // Tag size (discriminant)
     size += postcard_size_u8(); // Just for the variant tag
 
-    if ([[maybe_unused]] auto val = std::get_if<0>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    if ([[maybe_unused]] auto val = std::get_if<0>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         size += (*val).encoded_size();
     }
-    else if ([[maybe_unused]] auto val = std::get_if<1>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<1>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         size += (*val).encoded_size();
     }
-    else if ([[maybe_unused]] auto val = std::get_if<2>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<2>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         
     }
-    else if ([[maybe_unused]] auto val = std::get_if<3>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<3>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         size += (*val).encoded_size();
     }
-    else if ([[maybe_unused]] auto val = std::get_if<4>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<4>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         size += (*val).encoded_size();
     }
-    else if ([[maybe_unused]] auto val = std::get_if<5>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<5>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         size += (*val).encoded_size();
     }
-    else if ([[maybe_unused]] auto val = std::get_if<6>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<6>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        size += (*val).encoded_size();
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<7>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        size += (*val).encoded_size();
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<8>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        size += (*val).encoded_size();
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<9>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        size += (*val).encoded_size();
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<10>((const std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         size += (*val).encoded_size();
     }
     
@@ -2504,44 +3103,68 @@ public:
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
 
-    if ([[maybe_unused]] auto val = std::get_if<0>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    if ([[maybe_unused]] auto val = std::get_if<0>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 0);
         if (result != POSTCARD_SUCCESS) return result;
         result = (*val).encode_raw(slice);
         if (result != POSTCARD_SUCCESS) return result;
     }
-    else if ([[maybe_unused]] auto val = std::get_if<1>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<1>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 1);
         if (result != POSTCARD_SUCCESS) return result;
         result = (*val).encode_raw(slice);
         if (result != POSTCARD_SUCCESS) return result;
     }
-    else if ([[maybe_unused]] auto val = std::get_if<2>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<2>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 2);
         if (result != POSTCARD_SUCCESS) return result;
         
         if (result != POSTCARD_SUCCESS) return result;
     }
-    else if ([[maybe_unused]] auto val = std::get_if<3>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<3>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 3);
         if (result != POSTCARD_SUCCESS) return result;
         result = (*val).encode_raw(slice);
         if (result != POSTCARD_SUCCESS) return result;
     }
-    else if ([[maybe_unused]] auto val = std::get_if<4>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<4>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 4);
         if (result != POSTCARD_SUCCESS) return result;
         result = (*val).encode_raw(slice);
         if (result != POSTCARD_SUCCESS) return result;
     }
-    else if ([[maybe_unused]] auto val = std::get_if<5>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<5>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 5);
         if (result != POSTCARD_SUCCESS) return result;
         result = (*val).encode_raw(slice);
         if (result != POSTCARD_SUCCESS) return result;
     }
-    else if ([[maybe_unused]] auto val = std::get_if<6>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt>*)this)) {
+    else if ([[maybe_unused]] auto val = std::get_if<6>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
         result = postcard_encode_u8(slice, 6);
+        if (result != POSTCARD_SUCCESS) return result;
+        result = (*val).encode_raw(slice);
+        if (result != POSTCARD_SUCCESS) return result;
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<7>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        result = postcard_encode_u8(slice, 7);
+        if (result != POSTCARD_SUCCESS) return result;
+        result = (*val).encode_raw(slice);
+        if (result != POSTCARD_SUCCESS) return result;
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<8>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        result = postcard_encode_u8(slice, 8);
+        if (result != POSTCARD_SUCCESS) return result;
+        result = (*val).encode_raw(slice);
+        if (result != POSTCARD_SUCCESS) return result;
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<9>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        result = postcard_encode_u8(slice, 9);
+        if (result != POSTCARD_SUCCESS) return result;
+        result = (*val).encode_raw(slice);
+        if (result != POSTCARD_SUCCESS) return result;
+    }
+    else if ([[maybe_unused]] auto val = std::get_if<10>((std::variant<OpData, OpTable, std::monostate, OpComponent, OpSchema, OpTimestamp, OpExt, OpFrame, OpList, OpMap, OpPathComponent>*)this)) {
+        result = postcard_encode_u8(slice, 10);
         if (result != POSTCARD_SUCCESS) return result;
         result = (*val).encode_raw(slice);
         if (result != POSTCARD_SUCCESS) return result;
@@ -2632,6 +3255,42 @@ public:
             
             break;
         }
+        case 7: {  // Frame
+            
+            OpFrame val;
+            result = val.decode_raw(slice);
+            if (result != POSTCARD_SUCCESS) return result;
+            this->emplace<7>(val);
+            
+            break;
+        }
+        case 8: {  // List
+            
+            OpList val;
+            result = val.decode_raw(slice);
+            if (result != POSTCARD_SUCCESS) return result;
+            this->emplace<8>(val);
+            
+            break;
+        }
+        case 9: {  // Map
+            
+            OpMap val;
+            result = val.decode_raw(slice);
+            if (result != POSTCARD_SUCCESS) return result;
+            this->emplace<9>(val);
+            
+            break;
+        }
+        case 10: {  // PathComponent
+            
+            OpPathComponent val;
+            result = val.decode_raw(slice);
+            if (result != POSTCARD_SUCCESS) return result;
+            this->emplace<10>(val);
+            
+            break;
+        }
         
         default:
             return POSTCARD_ERROR_INVALID_INPUT;
@@ -2644,11 +3303,11 @@ public:
 struct OpRef {
   static constexpr std::string_view TYPE_NAME = "OpRef";
 
-  uint16_t value;
+  uint32_t value;
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u16(value);
+    size += postcard_size_u32(value);
     return size;
   }
 
@@ -2685,7 +3344,7 @@ struct OpRef {
 
   postcard_error_t encode_raw(postcard_slice_t* slice) const {
     postcard_error_t result;
-    result = postcard_encode_u16(slice, value);
+    result = postcard_encode_u32(slice, value);
     return result;
   }
 
@@ -2702,7 +3361,7 @@ struct OpRef {
 
   postcard_error_t decode_raw(postcard_slice_t* slice) {
     postcard_error_t result;
-    result = postcard_decode_u16(slice, &value);
+    result = postcard_decode_u32(slice, &value);
     return result;
   }
 };
@@ -3330,14 +3989,14 @@ struct VTable {
 struct VTableMsg {
   static constexpr std::string_view TYPE_NAME = "VTableMsg";
 
-  std::tuple<uint8_t, uint8_t> id;
+  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id;
   VTable vtable;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u8();size += postcard_size_u8();
+    size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();
     size += vtable.encoded_size();
     
     return size;
@@ -3387,6 +4046,36 @@ struct VTableMsg {
                             result = postcard_encode_u8(slice, val);
                         }
                         
+                        {
+                            auto val = std::get<2>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<3>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<4>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<5>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<6>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<7>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
         if(result != POSTCARD_SUCCESS) return result;
     result = vtable.encode_raw(slice);
         if(result != POSTCARD_SUCCESS) return result;
@@ -3411,7 +4100,19 @@ struct VTableMsg {
     result = postcard_decode_u8(slice, &val0);
     uint8_t val1;
     result = postcard_decode_u8(slice, &val1);
-    id =  std::tuple<uint8_t, uint8_t>(val0, val1);
+    uint8_t val2;
+    result = postcard_decode_u8(slice, &val2);
+    uint8_t val3;
+    result = postcard_decode_u8(slice, &val3);
+    uint8_t val4;
+    result = postcard_decode_u8(slice, &val4);
+    uint8_t val5;
+    result = postcard_decode_u8(slice, &val5);
+    uint8_t val6;
+    result = postcard_decode_u8(slice, &val6);
+    uint8_t val7;
+    result = postcard_decode_u8(slice, &val7);
+    id =  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t>(val0, val1, val2, val3, val4, val5, val6, val7);
     if(result != POSTCARD_SUCCESS) return result;
 
     result = vtable.decode_raw(slice);
@@ -3425,13 +4126,13 @@ struct VTableMsg {
 struct VTableStream {
   static constexpr std::string_view TYPE_NAME = "VTableStream";
 
-  std::tuple<uint8_t, uint8_t> id;
+  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id;
   
 
 
   size_t encoded_size() const {
     size_t size = 0;
-    size += postcard_size_u8();size += postcard_size_u8();
+    size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();size += postcard_size_u8();
     
     return size;
   }
@@ -3480,6 +4181,36 @@ struct VTableStream {
                             result = postcard_encode_u8(slice, val);
                         }
                         
+                        {
+                            auto val = std::get<2>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<3>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<4>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<5>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<6>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
+                        {
+                            auto val = std::get<7>(id);
+                            result = postcard_encode_u8(slice, val);
+                        }
+                        
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -3502,7 +4233,19 @@ struct VTableStream {
     result = postcard_decode_u8(slice, &val0);
     uint8_t val1;
     result = postcard_decode_u8(slice, &val1);
-    id =  std::tuple<uint8_t, uint8_t>(val0, val1);
+    uint8_t val2;
+    result = postcard_decode_u8(slice, &val2);
+    uint8_t val3;
+    result = postcard_decode_u8(slice, &val3);
+    uint8_t val4;
+    result = postcard_decode_u8(slice, &val4);
+    uint8_t val5;
+    result = postcard_decode_u8(slice, &val5);
+    uint8_t val6;
+    result = postcard_decode_u8(slice, &val6);
+    uint8_t val7;
+    result = postcard_decode_u8(slice, &val7);
+    id =  std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t>(val0, val1, val2, val3, val4, val5, val6, val7);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -3516,7 +4259,6 @@ struct ComponentMetadata {
   uint64_t component_id;
   std::string name;
   std::unordered_map<std::string, std::string> metadata;
-  bool asset;
   
 
 
@@ -3529,7 +4271,6 @@ struct ComponentMetadata {
       size += postcard_size_string(k.length());
       size += postcard_size_string(v.length());
     }
-    size += postcard_size_bool();
     
     return size;
   }
@@ -3577,8 +4318,6 @@ struct ComponentMetadata {
       result = postcard_encode_string(slice, v.c_str(), v.length());
       if(result != POSTCARD_SUCCESS) return result;
     }
-        if(result != POSTCARD_SUCCESS) return result;
-    result = postcard_encode_bool(slice, asset);
         if(result != POSTCARD_SUCCESS) return result;
     
     return POSTCARD_SUCCESS;
@@ -3637,9 +4376,6 @@ struct ComponentMetadata {
         if (result != POSTCARD_SUCCESS) return result;
         metadata[k] = v;
     }
-    if(result != POSTCARD_SUCCESS) return result;
-
-    result = postcard_decode_bool(slice, &asset);
     if(result != POSTCARD_SUCCESS) return result;
 
     
@@ -3759,10 +4495,10 @@ inline uint16_t fnv1a_hash_16_xor(const std::string_view str)
     return upper ^ lower;
 }
 
-inline std::array<uint8_t, 2> msg_id(const std::string_view str)
+inline std::array<uint8_t, 8> msg_id(const std::string_view str)
 {
     auto hash = fnv1a_hash_16_xor(str);
-    return { static_cast<uint8_t>(hash & 0xff), static_cast<uint8_t>((hash >> 8) & 0xff) };
+    return { static_cast<uint8_t>(hash & 0xff), static_cast<uint8_t>((hash >> 8) & 0xff), 0, 0, 0, 0, 0, 0 };
 }
 
 inline uint64_t component_id(const std::string_view str)
@@ -3780,9 +4516,14 @@ enum class PacketType : uint8_t {
 struct PacketHeader {
     uint32_t len;
     PacketType ty;
-    std::array<uint8_t, 2> packet_id;
+    std::array<uint8_t, 8> packet_id;
     uint8_t request_id;
+    std::array<uint8_t, 2> pad;
 };
+static_assert(sizeof(PacketHeader) == 16);
+
+/// The bytes the length prefix counts ahead of a packet's body.
+inline constexpr uint32_t PACKET_HEADER_LEN = sizeof(PacketHeader) - sizeof(uint32_t);
 
 template <typename T>
 class Msg {
@@ -3798,6 +4539,7 @@ public:
             .ty = PacketType::MSG,
             .packet_id = packet_id,
             .request_id = 0,
+            .pad = {},
         };
         payload = p;
     }
@@ -3805,7 +4547,7 @@ public:
     std::vector<uint8_t> encode_vec()
     {
         auto t_size = payload.encoded_size();
-        header.len = t_size + 4;
+        header.len = t_size + PACKET_HEADER_LEN;
         auto header_len = sizeof(PacketHeader);
         auto buf = std::vector<uint8_t>(t_size + header_len);
         std::memcpy(buf.data(), &header, header_len);
@@ -3864,6 +4606,13 @@ SetComponentMetadata set_component_metadata(std::string name, const std::vector<
 
 namespace vtable {
 
+// NOTE(WP2b): the Rust `Op` enum also has dynamic-frame variants
+// `Frame`/`List`/`Map`/`PathComponent` (see metor-proto vtable.rs). The generated `Op`/`ElementFields`
+// types in db.hpp cover them on the parse side, but this hand-written *builder*
+// intentionally does NOT yet expose them: C++ producers cannot emit dynamic
+// frames until WP2b. This is an explicit, documented omission, not a silent gap —
+// `std::visit` below only ever constructs the static variants it lists.
+
 /// A builder for VTable operations
 class OpBuilder {
 public:
@@ -3893,7 +4642,7 @@ public:
     };
 
     struct Ext {
-        std::tuple<uint8_t, uint8_t> id;
+        std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id;
         std::shared_ptr<OpBuilder> data;
         std::shared_ptr<OpBuilder> arg;
     };
@@ -4025,7 +4774,7 @@ namespace builder {
     /**
      * Creates an extension operation builder from a message ID, data, and an argument
      */
-    inline std::shared_ptr<OpBuilder> ext(std::tuple<uint8_t, uint8_t> id, std::shared_ptr<OpBuilder> data,
+    inline std::shared_ptr<OpBuilder> ext(std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id, std::shared_ptr<OpBuilder> data,
         std::shared_ptr<OpBuilder> arg)
     {
         OpBuilder::Ext ext { id, std::move(data), std::move(arg) };
