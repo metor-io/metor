@@ -50,8 +50,6 @@ tokio-test = "0.4"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.11", features = ["fmt", "env-filter"] }
 
-[target.'cfg(not(loom))'.dev-dependencies]
-proptest = "1"
 tokio = { version = "1.32", features = ["rt", "macros"] }
 
 [target.'cfg(loom)'.dev-dependencies]

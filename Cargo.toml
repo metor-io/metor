@@ -13,7 +13,6 @@ members = [
     "libs/metor-proto/stellar",
     "libs/metor-proto/wkt",
     "libs/metor-proto/bbq",
-    "libs/metor-proto/frame",
     "libs/db",
     "libs/db/tests",
     "libs/stellarator",
