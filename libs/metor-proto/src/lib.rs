@@ -30,7 +30,7 @@
 //! ## Msgs
 //!
 //! Sometimes you have data that does not cleanly fit into a fixed-size tensor (i.e a command that contains a string).
-//! For that use case you can send arbitrary bytes over the protocol. Messages are prefixed with a 2 byte ID that identifies the message
+//! For that use case you can send arbitrary bytes over the protocol. Messages carry an ID in the packet header that identifies the message
 //! By convention most messages are [https://docs.rs/postcard/latest/postcard/](postcard) formatted, but this is not a technical requirement
 
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]

@@ -557,11 +557,11 @@ pub enum PacketTy {
     MsgWithTimestamp = 3,
 }
 
-pub type PacketId = [u8; 2];
+pub type PacketId = [u8; 8];
 
 pub type RequestId = u8;
 
-pub const PACKET_HEADER_LEN: usize = 4;
+pub const PACKET_HEADER_LEN: usize = 12;
 
 #[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug, IntoBytes)]
 #[repr(C)]
@@ -569,6 +569,7 @@ pub struct PacketHeader {
     pub packet_ty: PacketTy,
     pub id: PacketId,
     pub req_id: RequestId,
+    pub _pad: [u8; 2],
 }
 
 #[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug, IntoBytes)]
@@ -613,27 +614,33 @@ pub trait Msg: Serialize {
 /// Note that this blanket id is the bare fold: unlike [`msg_id`] it does not apply the
 /// reserved-row remap, so a schema name whose fold lands on `[224, _]` keeps it.
 impl<T: Serialize + postcard_schema::Schema> Msg for T {
-    const ID: PacketId = const_fnv1a_hash::fnv1a_hash_str_16_xor(T::SCHEMA.name).to_le_bytes();
+    const ID: PacketId = short_id(const_fnv1a_hash::fnv1a_hash_str_16_xor(T::SCHEMA.name).to_le_bytes());
 }
 
-/// Fold a 16-bit hash onto a packet id, off the reserved protocol row: `[224, x]` becomes `[223, x]`.
-pub const fn off_reserved(bytes: [u8; 2]) -> PacketId {
-    if bytes[0] == 224 {
-        [223, bytes[1]]
-    } else {
-        bytes
+/// Zero-extends a 16-bit id: a message's fold or a hand-allocated protocol id.
+pub const fn short_id(bytes: [u8; 2]) -> PacketId {
+    [bytes[0], bytes[1], 0, 0, 0, 0, 0, 0]
+}
+
+/// Moves an id off the reserved protocol row: a first byte of 224 becomes 223.
+pub const fn off_reserved(mut id: PacketId) -> PacketId {
+    if id[0] == 224 {
+        id[0] = 223;
     }
+    id
 }
 
 pub const fn msg_id(name: &str) -> PacketId {
-    off_reserved(const_fnv1a_hash::fnv1a_hash_str_16_xor(name).to_le_bytes())
+    off_reserved(short_id(
+        const_fnv1a_hash::fnv1a_hash_str_16_xor(name).to_le_bytes(),
+    ))
 }
 
-/// A table's packet id: the fold of its announced vtable's postcard bytes, off the reserved row.
+/// A table's packet id: the 64-bit hash of its announced vtable's postcard bytes, off the reserved row.
 #[cfg(feature = "alloc")]
 pub fn table_id(vtable: &crate::vtable::VTable) -> PacketId {
     let bytes = postcard::to_allocvec(vtable).expect("vtable with owned buffers cannot fail");
-    off_reserved(const_fnv1a_hash::fnv1a_hash_16_xor(&bytes, None).to_le_bytes())
+    off_reserved(const_fnv1a_hash::fnv1a_hash_64(&bytes, None).to_le_bytes())
 }
 
 #[cfg(feature = "alloc")]
@@ -673,11 +680,11 @@ pub struct LenPacket {
 #[cfg(feature = "alloc")]
 impl LenPacket {
     pub fn new(ty: PacketTy, id: PacketId, cap: usize) -> Self {
-        let mut inner = Vec::with_capacity(cap + 8);
+        let mut inner = Vec::with_capacity(cap + size_of::<u32>() + PACKET_HEADER_LEN);
         inner.extend_from_slice(&(PACKET_HEADER_LEN as u32).to_le_bytes());
         inner.push(ty as u8);
         inner.extend_from_slice(&id);
-        inner.push(0);
+        inner.extend_from_slice(&[0; 3]);
         Self { inner }
     }
 
@@ -805,6 +812,7 @@ impl<B: IoBuf> OwnedPacket<B> {
                     packet_ty,
                     req_id,
                     id,
+                    ..
                 },
             ..
         } = Packet::try_ref_from_bytes(buf)?;
@@ -1145,7 +1153,7 @@ mod tests {
         use stellarator_buf::IoBuf;
         for len in [usize::MAX, usize::MAX / 8, 4] {
             let series = OwnedTimeSeries {
-                id: [0, 0],
+                id: [0; 8],
                 req_id: 0,
                 len,
                 covered: Timestamp(0)..Timestamp(1),
@@ -1189,9 +1197,10 @@ mod tests {
 
     #[test]
     fn off_reserved_moves_the_protocol_row() {
-        assert_eq!(off_reserved([224, 7]), [223, 7]);
-        assert_eq!(off_reserved([223, 7]), [223, 7]);
-        assert_eq!(off_reserved([1, 0]), [1, 0]);
+        assert_eq!(off_reserved(short_id([224, 7])), short_id([223, 7]));
+        assert_eq!(off_reserved(short_id([223, 7])), short_id([223, 7]));
+        assert_eq!(off_reserved(short_id([1, 0])), short_id([1, 0]));
+        assert_eq!(off_reserved([224, 7, 1, 2, 3, 4, 5, 6]), [223, 7, 1, 2, 3, 4, 5, 6]);
 
         let mut on_the_row = None;
         for i in 0..100_000u32 {
@@ -1203,7 +1212,123 @@ mod tests {
             }
         }
         let (name, raw) = on_the_row.expect("no name folds onto the reserved row");
-        assert_eq!(msg_id(&name), off_reserved(raw));
+        assert_eq!(msg_id(&name), off_reserved(short_id(raw)));
         assert_eq!(msg_id(&name)[0], 223);
+    }
+
+    const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    /// The frame's bytes after its length prefix, as a receiver sees them.
+    #[cfg(feature = "alloc")]
+    fn parse(pkt: LenPacket) -> Result<OwnedPacket<Vec<u8>>, Error> {
+        OwnedPacket::parse_with_offset(pkt.inner, size_of::<u32>())
+    }
+
+    #[test]
+    fn header_layout_keeps_the_body_at_byte_16() {
+        assert_eq!(size_of::<PacketHeader>(), PACKET_HEADER_LEN);
+        assert_eq!(core::mem::offset_of!(PacketHeader, id), 1);
+        assert_eq!(core::mem::offset_of!(PacketHeader, req_id), 9);
+        assert_eq!(core::mem::offset_of!(PacketHeader, _pad), 10);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn len_packet_writes_the_wire_layout() {
+        let mut pkt = LenPacket::table(WIDE, 1).with_request_id(9);
+        pkt.extend_from_slice(&[0xab]);
+        assert_eq!(
+            pkt.inner,
+            [13, 0, 0, 0, PacketTy::Table as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0xab]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn every_packet_type_round_trips_the_full_id() {
+        let mut series = LenPacket::time_series(WIDE, TimeSeries::HEAD);
+        series.extend_from_slice(&[0; TimeSeries::HEAD]);
+        let packets = [
+            LenPacket::msg(WIDE, 0),
+            LenPacket::msg_with_timestamp(WIDE, Timestamp(5), 0),
+            LenPacket::table(WIDE, 0),
+            series,
+        ];
+        for pkt in packets {
+            let parsed = parse(pkt.with_request_id(9)).expect("valid packet");
+            assert_eq!(parsed.req_id(), 9);
+            let id = match &parsed {
+                OwnedPacket::Msg(msg) => msg.id,
+                OwnedPacket::Table(table) => table.id,
+                OwnedPacket::TimeSeries(series) => series.id,
+            };
+            assert_eq!(id, WIDE);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn aligned_writes_stay_aligned_relative_to_the_body() {
+        let mut pkt = LenPacket::table(WIDE, 16);
+        pkt.push_aligned(1u8);
+        pkt.extend_aligned(&[2.5f64]);
+        let parsed = parse(pkt).expect("valid packet");
+        let OwnedPacket::Table(table) = parsed else {
+            panic!("not a table");
+        };
+        let body = stellarator_buf::deref(&table.buf);
+        assert_eq!(body.len(), 16);
+        assert_eq!(body[8..], 2.5f64.to_le_bytes());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn padding_bytes_are_ignored_on_receive() {
+        let mut pkt = LenPacket::table(WIDE, 1);
+        pkt.extend_from_slice(&[0xab]);
+        let pad = size_of::<u32>() + core::mem::offset_of!(PacketHeader, _pad);
+        pkt.inner[pad..pad + 2].fill(0xff);
+        let OwnedPacket::Table(table) = parse(pkt).expect("valid packet") else {
+            panic!("not a table");
+        };
+        assert_eq!(table.id, WIDE);
+        assert_eq!(stellarator_buf::deref(&table.buf), [0xab]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn short_or_unknown_frames_are_rejected() {
+        let mut short = LenPacket::msg(WIDE, 0);
+        short.inner.truncate(size_of::<u32>() + PACKET_HEADER_LEN - 1);
+        assert!(parse(short).is_err());
+
+        let mut unknown = LenPacket::msg(WIDE, 0);
+        unknown.inner[size_of::<u32>()] = 0xff;
+        assert!(parse(unknown).is_err());
+    }
+
+    #[test]
+    fn short_ids_keep_their_16_bit_values() {
+        assert_eq!(short_id([0x34, 0x12]), [0x34, 0x12, 0, 0, 0, 0, 0, 0]);
+        let fold = const_fnv1a_hash::fnv1a_hash_str_16_xor("imu").to_le_bytes();
+        assert_eq!(msg_id("imu"), off_reserved(short_id(fold)));
+        assert_eq!(msg_id("imu")[2..], [0; 6]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn table_ids_separate_vtables_the_16_bit_fold_could_not() {
+        let mut folds = alloc::collections::BTreeMap::new();
+        for i in 0..100_000u32 {
+            let vtable = test_vtable(&alloc::format!("collide_{i}"), &[3]);
+            let bytes = postcard::to_allocvec(&vtable).expect("vtable with owned buffers");
+            let fold = const_fnv1a_hash::fnv1a_hash_16_xor(&bytes, None);
+            let id = table_id(&vtable);
+            if let Some(other) = folds.insert(fold, id) {
+                assert_ne!(other, id);
+                return;
+            }
+        }
+        panic!("no 16-bit fold collision found");
     }
 }

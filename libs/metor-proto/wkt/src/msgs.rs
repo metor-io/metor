@@ -3,7 +3,7 @@ use metor_proto::{
     schema::Schema,
     types::{
         ComponentId, Msg, MsgBuf, OwnedTable, OwnedTimeSeries, PacketId, Request, Timestamp,
-        TryFromPacket,
+        TryFromPacket, short_id,
     },
     vtable::{Field, Op, VTable},
 };
@@ -126,7 +126,7 @@ impl SetStreamState {
 }
 
 impl Msg for SetStreamState {
-    const ID: PacketId = [224, 2];
+    const ID: PacketId = short_id([224, 2]);
 }
 
 /// Asks a db for one component's samples within `range` (end exclusive),
@@ -155,7 +155,7 @@ impl GetTimeSeries {
     /// The oldest samples of `range`, as many as fit one reply.
     pub fn range(component_id: ComponentId, range: Range<Timestamp>) -> Self {
         Self {
-            id: [0, 0],
+            id: short_id([0, 0]),
             range,
             component_id,
             limit: None,
@@ -201,7 +201,7 @@ pub enum SeriesEnd {
 }
 
 impl Msg for GetTimeSeries {
-    const ID: PacketId = [224, 3];
+    const ID: PacketId = short_id([224, 3]);
 }
 
 impl Request for GetTimeSeries {
@@ -211,7 +211,7 @@ impl Request for GetTimeSeries {
 #[derive(Serialize, Deserialize)]
 pub struct SchemaMsg(pub Schema<Vec<u64>>);
 impl Msg for SchemaMsg {
-    const ID: PacketId = [224, 4];
+    const ID: PacketId = short_id([224, 4]);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,7 +220,7 @@ pub struct GetSchema {
 }
 
 impl Msg for GetSchema {
-    const ID: PacketId = [224, 5];
+    const ID: PacketId = short_id([224, 5]);
 }
 
 impl Request for GetSchema {
@@ -233,7 +233,7 @@ pub struct GetComponentMetadata {
 }
 
 impl Msg for GetComponentMetadata {
-    const ID: PacketId = [224, 6];
+    const ID: PacketId = short_id([224, 6]);
 }
 
 impl Request for GetComponentMetadata {
@@ -265,7 +265,7 @@ impl SetComponentMetadata {
 pub struct DumpMetadata;
 
 impl Msg for DumpMetadata {
-    const ID: PacketId = [224, 14];
+    const ID: PacketId = short_id([224, 14]);
 }
 
 impl Request for DumpMetadata {
@@ -280,18 +280,18 @@ pub struct DumpMetadataResp {
 }
 
 impl Msg for DumpMetadataResp {
-    const ID: PacketId = [224, 15];
+    const ID: PacketId = short_id([224, 15]);
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SubscribeLastUpdated;
 
 impl Msg for SubscribeLastUpdated {
-    const ID: PacketId = [224, 17];
+    const ID: PacketId = short_id([224, 17]);
 }
 
 impl Msg for LastUpdated {
-    const ID: PacketId = [224, 18];
+    const ID: PacketId = short_id([224, 18]);
 }
 
 impl Request for SubscribeLastUpdated {
@@ -316,7 +316,7 @@ impl SetDbConfig {
 }
 
 impl Msg for SetDbConfig {
-    const ID: PacketId = [224, 19];
+    const ID: PacketId = short_id([224, 19]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -356,21 +356,21 @@ impl Default for DbConfig {
 }
 
 impl Msg for DbConfig {
-    const ID: PacketId = [224, 20];
+    const ID: PacketId = short_id([224, 20]);
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetDbSettings;
 
 impl Msg for GetDbSettings {
-    const ID: PacketId = [224, 21];
+    const ID: PacketId = short_id([224, 21]);
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct NewConnection;
 
 impl Msg for NewConnection {
-    const ID: PacketId = [225, 1];
+    const ID: PacketId = short_id([225, 1]);
 }
 
 macro_rules! impl_user_data_msg {
@@ -407,7 +407,7 @@ impl_user_data_msg!(UdpVTableStream);
 pub struct GetEarliestTimestamp;
 
 impl Msg for GetEarliestTimestamp {
-    const ID: PacketId = [224, 22];
+    const ID: PacketId = short_id([224, 22]);
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -415,7 +415,7 @@ impl Msg for GetEarliestTimestamp {
 pub struct EarliestTimestamp(pub Timestamp);
 
 impl Msg for EarliestTimestamp {
-    const ID: PacketId = [224, 23];
+    const ID: PacketId = short_id([224, 23]);
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -423,7 +423,7 @@ impl Msg for EarliestTimestamp {
 pub struct DumpSchema;
 
 impl Msg for DumpSchema {
-    const ID: PacketId = [224, 24];
+    const ID: PacketId = short_id([224, 24]);
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -432,7 +432,7 @@ pub struct DumpSchemaResp {
 }
 
 impl Msg for DumpSchemaResp {
-    const ID: PacketId = [224, 25];
+    const ID: PacketId = short_id([224, 25]);
 }
 
 impl Request for DumpSchema {
@@ -446,7 +446,7 @@ pub struct StreamTimestamp {
 }
 
 impl Msg for StreamTimestamp {
-    const ID: PacketId = [224, 26];
+    const ID: PacketId = short_id([224, 26]);
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -454,7 +454,7 @@ impl Msg for StreamTimestamp {
 pub struct SQLQuery(pub String);
 
 impl Msg for SQLQuery {
-    const ID: PacketId = [224, 27];
+    const ID: PacketId = short_id([224, 27]);
 }
 
 impl_user_data_msg!(SQLQuery);
@@ -466,7 +466,7 @@ pub struct ArrowIPC<'a> {
 }
 
 impl Msg for ArrowIPC<'_> {
-    const ID: PacketId = [224, 28];
+    const ID: PacketId = short_id([224, 28]);
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -481,7 +481,7 @@ impl std::fmt::Display for ErrorResponse {
 }
 
 impl Msg for ErrorResponse {
-    const ID: PacketId = [224, 29];
+    const ID: PacketId = short_id([224, 29]);
 }
 
 impl Request for SQLQuery {
@@ -496,7 +496,7 @@ pub struct MsgMetadata {
 }
 
 impl Msg for MsgMetadata {
-    const ID: PacketId = [224, 30];
+    const ID: PacketId = short_id([224, 30]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -506,7 +506,7 @@ pub struct SetMsgMetadata {
 }
 
 impl Msg for SetMsgMetadata {
-    const ID: PacketId = [224, 31];
+    const ID: PacketId = short_id([224, 31]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, postcard_schema::Schema)]
@@ -534,7 +534,7 @@ pub struct GetMsgMetadata {
 }
 
 impl Msg for GetMsgMetadata {
-    const ID: PacketId = [224, 33];
+    const ID: PacketId = short_id([224, 33]);
 }
 
 impl Request for GetMsgMetadata {
@@ -549,7 +549,7 @@ pub struct GetMsgs {
 }
 
 impl Msg for GetMsgs {
-    const ID: PacketId = [224, 34];
+    const ID: PacketId = short_id([224, 34]);
 }
 
 impl Request for GetMsgs {
@@ -562,7 +562,7 @@ pub struct MsgBatch {
 }
 
 impl Msg for MsgBatch {
-    const ID: PacketId = [224, 35];
+    const ID: PacketId = short_id([224, 35]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, postcard_schema::Schema)]
@@ -626,7 +626,7 @@ impl UpdateComponent {
 
 #[cfg(feature = "nox")]
 impl Msg for UpdateComponent {
-    const ID: PacketId = [224, 36];
+    const ID: PacketId = short_id([224, 36]);
 }
 
 /// Stable, human-readable identity for an alarm definition (e.g. `"BATT_OVERTEMP"`).
@@ -1091,7 +1091,10 @@ pub struct LogEvent {
 /// Version 8 appended `head` to [`NodeManifestResp`]
 /// ([`FEATURE_UNSEALED_HEAD`]). Older clients never read it; a version-8
 /// client reads a version-7 server's reply as [`NodeManifestRespV7`].
-pub const NODE_PROTOCOL_VERSION: u32 = 8;
+///
+/// Version 9 widened [`PacketId`] to 8 bytes and the packet prefix to 16,
+/// which older peers cannot frame.
+pub const NODE_PROTOCOL_VERSION: u32 = 9;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
@@ -1110,7 +1113,7 @@ pub const FEATURE_UNSEALED_HEAD: u64 = 1 << 3;
 pub struct GetDbInfo;
 
 impl Msg for GetDbInfo {
-    const ID: PacketId = [224, 45];
+    const ID: PacketId = short_id([224, 45]);
 }
 
 impl Request for GetDbInfo {
@@ -1306,7 +1309,7 @@ pub enum CommandKind {
 }
 
 impl Msg for DbInfoResp {
-    const ID: PacketId = [224, 46];
+    const ID: PacketId = short_id([224, 46]);
 }
 
 /// Asks a db to stream every message log outside its command set over this
@@ -1316,7 +1319,7 @@ impl Msg for DbInfoResp {
 pub struct SyncMsgs;
 
 impl Msg for SyncMsgs {
-    const ID: PacketId = [224, 63];
+    const ID: PacketId = short_id([224, 63]);
 }
 
 /// Durable summary of one sealed storage node. Defined here because it is
@@ -1341,7 +1344,7 @@ pub struct GetNodeManifest {
 }
 
 impl Msg for GetNodeManifest {
-    const ID: PacketId = [224, 47];
+    const ID: PacketId = short_id([224, 47]);
 }
 
 impl Request for GetNodeManifest {
@@ -1365,7 +1368,7 @@ pub struct NodeManifestResp {
 }
 
 impl Msg for NodeManifestResp {
-    const ID: PacketId = [224, 48];
+    const ID: PacketId = short_id([224, 48]);
 }
 
 /// [`NodeManifestResp`] as a server before version 8 sends it: no head.
@@ -1409,7 +1412,7 @@ pub struct FetchNode {
 }
 
 impl Msg for FetchNode {
-    const ID: PacketId = [224, 49];
+    const ID: PacketId = short_id([224, 49]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1431,7 +1434,7 @@ pub struct NodeChunk {
 }
 
 impl Msg for NodeChunk {
-    const ID: PacketId = [224, 50];
+    const ID: PacketId = short_id([224, 50]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -1440,7 +1443,7 @@ pub struct FetchNodeDone {
 }
 
 impl Msg for FetchNodeDone {
-    const ID: PacketId = [224, 51];
+    const ID: PacketId = short_id([224, 51]);
 }
 
 /// Offer a sealed node for archival. The server auto-creates the
@@ -1455,7 +1458,7 @@ pub struct OfferNode {
 }
 
 impl Msg for OfferNode {
-    const ID: PacketId = [224, 52];
+    const ID: PacketId = short_id([224, 52]);
 }
 
 impl Request for OfferNode {
@@ -1469,7 +1472,7 @@ pub struct OfferNodeResp {
 }
 
 impl Msg for OfferNodeResp {
-    const ID: PacketId = [224, 53];
+    const ID: PacketId = short_id([224, 53]);
 }
 
 /// Sent by the uploader after the last [`NodeChunk`] of an offered node.
@@ -1483,7 +1486,7 @@ pub struct PushNodeDone {
 }
 
 impl Msg for PushNodeDone {
-    const ID: PacketId = [224, 54];
+    const ID: PacketId = short_id([224, 54]);
 }
 
 impl Request for PushNodeDone {
@@ -1502,12 +1505,12 @@ pub struct NodeAck {
 }
 
 impl Msg for NodeAck {
-    const ID: PacketId = [224, 55];
+    const ID: PacketId = short_id([224, 55]);
 }
 
 /// Version of the fsw link identity protocol ([`LinkInfo`]), independent
-/// of [`NODE_PROTOCOL_VERSION`].
-pub const LINK_PROTOCOL_VERSION: u32 = 3;
+/// of [`NODE_PROTOCOL_VERSION`]. Version 4 widened [`PacketId`] to 8 bytes.
+pub const LINK_PROTOCOL_VERSION: u32 = 4;
 
 /// Identity push from an fsw link server: the FIRST packet on every
 /// accepted connection, ahead of the schema announce replay. A metor-db
@@ -1573,7 +1576,7 @@ impl<'de> Deserialize<'de> for LinkInfo {
 }
 
 impl Msg for LinkInfo {
-    const ID: PacketId = [224, 61];
+    const ID: PacketId = short_id([224, 61]);
 }
 
 /// DNS-SD service type an fsw link advertises itself under, for mDNS
@@ -1616,8 +1619,8 @@ pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
     // The retired envelope protocol (GetEnvelope/EnvelopeResp). Reserved
     // forever: an old client's stray request must stay ignored here, not
     // get recorded as telemetry.
-    [224, 56],
-    [224, 57],
+    short_id([224, 56]),
+    short_id([224, 57]),
     LinkInfo::ID,
     SyncMsgs::ID,
 ];
@@ -1725,7 +1728,7 @@ mod alarm_tests {
         // Distinct from the previously highest assigned id (UpdateComponent, [224,36] —
         // spelled literally: the type is `nox`-gated, its id is reserved regardless).
         for id in ids {
-            assert_ne!(id, [224, 36]);
+            assert_ne!(id, short_id([224, 36]));
         }
     }
 
@@ -1927,7 +1930,7 @@ mod sequence_tests {
                 "{id:?} collides with the node protocol"
             );
             assert!(
-                ![[224u8, 41], [224, 42], [224, 43]].contains(&id),
+                ![short_id([224, 41]), short_id([224, 42]), short_id([224, 43])].contains(&id),
                 "{id:?} resurrects a retired sequence id"
             );
         }
@@ -1940,10 +1943,10 @@ mod sequence_tests {
     /// unmatched.)
     #[test]
     fn sequence_packet_ids_are_pinned() {
-        assert_eq!(SequenceRegistry::ID, [78, 109]);
-        assert_eq!(SequenceChannelEvent::ID, [133, 5]);
-        assert_eq!(SequenceCommand::ID, [225, 247]);
-        assert_eq!(ReloadSequences::ID, [209, 95]);
+        assert_eq!(SequenceRegistry::ID, short_id([78, 109]));
+        assert_eq!(SequenceChannelEvent::ID, short_id([133, 5]));
+        assert_eq!(SequenceCommand::ID, short_id([225, 247]));
+        assert_eq!(ReloadSequences::ID, short_id([209, 95]));
     }
 }
 
@@ -1955,12 +1958,12 @@ mod alarm_id_tests {
     /// rename, which would silently re-key every persisted recording.
     #[test]
     fn alarm_ids_are_pinned() {
-        assert_eq!(AlarmDef::ID, [178, 74]);
-        assert_eq!(AlarmRaised::ID, [217, 65]);
-        assert_eq!(AlarmCleared::ID, [91, 221]);
-        assert_eq!(AlarmAck::ID, [253, 188]);
-        assert_eq!(AlarmShelved::ID, [83, 33]);
-        assert_eq!(AlarmUnshelved::ID, [200, 230]);
+        assert_eq!(AlarmDef::ID, short_id([178, 74]));
+        assert_eq!(AlarmRaised::ID, short_id([217, 65]));
+        assert_eq!(AlarmCleared::ID, short_id([91, 221]));
+        assert_eq!(AlarmAck::ID, short_id([253, 188]));
+        assert_eq!(AlarmShelved::ID, short_id([83, 33]));
+        assert_eq!(AlarmUnshelved::ID, short_id([200, 230]));
         for id in [
             AlarmDef::ID,
             AlarmRaised::ID,
@@ -1982,7 +1985,7 @@ mod preset_id_tests {
     /// rename, which would silently re-key every persisted recording.
     #[test]
     fn preset_ids_are_pinned() {
-        assert_eq!(PresetDefs::ID, [173, 20]);
+        assert_eq!(PresetDefs::ID, short_id([173, 20]));
         assert!(!NODE_PROTOCOL_MESSAGES.contains(&PresetDefs::ID));
     }
 }
@@ -2018,7 +2021,7 @@ mod log_event_tests {
     /// and its distinctness from every other assigned id in this module.
     #[test]
     fn log_event_id_is_pinned_and_unique() {
-        assert_eq!(LogEvent::ID, [7, 209]);
+        assert_eq!(LogEvent::ID, short_id([7, 209]));
         for id in [
             SequenceRegistry::ID,
             SequenceChannelEvent::ID,
@@ -2049,9 +2052,9 @@ mod link_info_tests {
     /// never-record-as-telemetry hygiene off [`NODE_PROTOCOL_MESSAGES`].
     #[test]
     fn link_info_id_is_pinned_and_protocol_member() {
-        assert_eq!(LinkInfo::ID, [224, 61]);
+        assert_eq!(LinkInfo::ID, short_id([224, 61]));
         assert!(NODE_PROTOCOL_MESSAGES.contains(&LinkInfo::ID));
-        assert_eq!(SyncMsgs::ID, [224, 63]);
+        assert_eq!(SyncMsgs::ID, short_id([224, 63]));
         assert!(NODE_PROTOCOL_MESSAGES.contains(&SyncMsgs::ID));
     }
 
@@ -2107,7 +2110,7 @@ mod link_info_tests {
         let info = LinkInfo {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
-            command_ids: vec![AlarmAck::ID, [9, 9]],
+            command_ids: vec![AlarmAck::ID, short_id([9, 9])],
             namespace: None,
             link: "ground".into(),
             commands: vec![
@@ -2123,7 +2126,7 @@ mod link_info_tests {
                     }),
                 },
                 CommandInfo {
-                    id: [9, 9],
+                    id: short_id([9, 9]),
                     kind: CommandKind::Frame {
                         name: "burn".into(),
                         vtable: vtable([raw_field(
@@ -2201,6 +2204,23 @@ mod link_info_tests {
 #[cfg(test)]
 mod db_info_tests {
     use super::*;
+
+    /// Every byte of a wide id survives the messages that embed one.
+    #[test]
+    fn full_width_ids_round_trip_in_messages() {
+        const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: vec![WIDE],
+            namespace: None,
+            link: String::new(),
+            commands: Vec::new(),
+        };
+        let bytes = postcard::to_allocvec(&info).expect("encode");
+        let decoded: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.command_ids, [WIDE]);
+    }
 
     /// A version-7 client reads a version-8 manifest reply up to the head
     /// it doesn't know, and a version-7 reply is read as
