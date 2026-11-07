@@ -188,7 +188,7 @@ async fn dial_db(addr: SocketAddr) -> Client {
 
 fn query(component: &str, start: i64, limit: Option<usize>) -> GetTimeSeries {
     GetTimeSeries {
-        id: [0, 0],
+        id: [0; 8],
         limit,
         ..GetTimeSeries::range(
             ComponentId::new(component),

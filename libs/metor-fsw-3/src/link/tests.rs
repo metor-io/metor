@@ -130,15 +130,15 @@ fn port(name: &str, max_len: usize) -> PortDef {
 fn test_conn_cap_fits_each_port() {
     let cap = |conn_cap: usize| serde_json::json!({ "conn_cap": conn_cap });
     let ports = [port("small", 16), port("image", 2 << 20)];
-    assert_eq!(conn_cap_check(cap((2 << 20) + 8), &ports), Ok(()));
+    assert_eq!(conn_cap_check(cap((2 << 20) + 16), &ports), Ok(()));
     assert_eq!(conn_cap_check(cap(1), &[]), Ok(()), "no port, any cap");
     let refused = DefError::PortExceedsConnCap {
         port: "image".into(),
         max_len: 2 << 20,
-        conn_cap: (2 << 20) + 7,
+        conn_cap: (2 << 20) + 15,
     };
     assert_eq!(
-        conn_cap_check(cap((2 << 20) + 7), &ports),
+        conn_cap_check(cap((2 << 20) + 15), &ports),
         Err(refused.clone())
     );
     assert!(
@@ -151,9 +151,9 @@ fn test_conn_cap_fits_each_port() {
     assert!(
         matches!(default, Err(DefError::PortExceedsConnCap { conn_cap, .. }) if conn_cap == 1 << 20)
     );
-    assert!(wire::fits(usize::MAX - 8, usize::MAX));
+    assert!(wire::fits(usize::MAX - wire::PACKET_OVERHEAD, usize::MAX));
     assert!(
-        !wire::fits(usize::MAX - 7, usize::MAX),
+        !wire::fits(usize::MAX - wire::PACKET_OVERHEAD + 1, usize::MAX),
         "overflow does not fit"
     );
 }
