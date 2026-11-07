@@ -101,7 +101,7 @@ pub(crate) fn announce(
     link: &str,
 ) -> (Vec<u8>, Vec<PacketId>) {
     let mut blob = link_info(Vec::new(), namespace, link);
-    let mut ids = vec![[0; 2]; defs.len()];
+    let mut ids = vec![[0; 8]; defs.len()];
     for (index, def) in defs.iter().enumerate() {
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             continue;
@@ -193,12 +193,28 @@ pub(crate) fn fits(max_len: usize, conn_cap: usize) -> bool {
 /// The length prefix and header of a packet carrying `payload_len` bytes.
 pub(crate) fn packet_head(ty: PacketTy, id: PacketId, payload_len: usize) -> [u8; PACKET_OVERHEAD] {
     let [a, b, c, d] = ((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes();
-    [a, b, c, d, ty as u8, id[0], id[1], 0]
+    let [e, f, g, h, i, j, k, l] = id;
+    [a, b, c, d, ty as u8, e, f, g, h, i, j, k, l, 0, 0, 0]
+}
+
+/// A packet body in its wire format, without the length prefix.
+#[cfg(test)]
+pub(crate) fn body(ty: PacketTy, id: PacketId, payload: &[u8]) -> Vec<u8> {
+    let mut body = packet_head(ty, id, payload.len())[size_of::<u32>()..].to_vec();
+    body.extend_from_slice(payload);
+    body
 }
 
 #[cfg(test)]
 mod tests {
     use metor_proto::types::{LenPacket, Msg};
+
+    /// The id in a packet body.
+    fn id_of(body: &[u8]) -> PacketId {
+        let mut id = [0; 8];
+        id.copy_from_slice(&body[1..9]);
+        id
+    }
 
     use crate::port::Input;
     use crate::record::MsgCodec;
@@ -267,7 +283,7 @@ mod tests {
         let mut ids = Vec::new();
         let mut rest = &blob[..];
         while let Some((len, body)) = rest.split_first_chunk::<4>() {
-            ids.push([body[1], body[2]]);
+            ids.push(id_of(body));
             rest = &body[u32::from_le_bytes(*len) as usize..];
         }
         let mut expected = vec![LinkInfo::ID, VTableMsg::ID];
@@ -318,7 +334,7 @@ mod tests {
         let mut rest = blob;
         while let Some((len, body)) = rest.split_first_chunk::<4>() {
             let len = u32::from_le_bytes(*len) as usize;
-            packets.push(([body[1], body[2]], &body[PACKET_HEADER_LEN..len]));
+            packets.push((id_of(body), &body[PACKET_HEADER_LEN..len]));
             rest = &body[len..];
         }
         packets
@@ -381,12 +397,40 @@ mod tests {
 
     #[test]
     fn test_packet_head_matches_len_packet() {
-        let mut batch = packet_head(PacketTy::Table, [7, 9], 4).to_vec();
-        batch.extend_from_slice(b"body");
-        let mut expected = LenPacket::table([7, 9], 4);
-        expected.extend_from_slice(b"body");
-        assert_eq!(batch, expected.into_len_packet().inner);
-        let empty = packet_head(PacketTy::Msg, [0, 1], 0);
-        assert_eq!(empty, [4, 0, 0, 0, PacketTy::Msg as u8, 0, 1, 0]);
+        const WIDE: PacketId = [7, 9, 1, 2, 3, 4, 5, 6];
+        for ty in [
+            PacketTy::Msg,
+            PacketTy::Table,
+            PacketTy::TimeSeries,
+            PacketTy::MsgWithTimestamp,
+        ] {
+            let mut batch = packet_head(ty, WIDE, 4).to_vec();
+            batch.extend_from_slice(b"body");
+            let mut expected = LenPacket::new(ty, WIDE, 4);
+            expected.extend_from_slice(b"body");
+            assert_eq!(batch, expected.into_len_packet().inner);
+        }
+        let empty = packet_head(PacketTy::Msg, WIDE, 0);
+        assert_eq!(
+            empty,
+            [
+                12,
+                0,
+                0,
+                0,
+                PacketTy::Msg as u8,
+                7,
+                9,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                0,
+                0,
+                0
+            ]
+        );
     }
 }

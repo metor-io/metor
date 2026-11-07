@@ -95,8 +95,14 @@ mod tests {
 
     #[test]
     fn ids_and_schemas_match_wkt() {
-        assert_eq!(RaisedMsg::schema().packet_id(), [217, 65]);
-        assert_eq!(ClearedMsg::schema().packet_id(), [91, 221]);
+        assert_eq!(
+            RaisedMsg::schema().packet_id(),
+            metor_proto::types::short_id([217, 65])
+        );
+        assert_eq!(
+            ClearedMsg::schema().packet_id(),
+            metor_proto::types::short_id([91, 221])
+        );
         let wkt = RecordSchema::postcard::<AlarmRaised>("alarm_raised");
         assert_eq!(RaisedMsg::schema(), wkt);
         let wkt = RecordSchema::postcard::<AlarmCleared>("alarm_cleared");

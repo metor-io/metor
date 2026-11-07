@@ -452,7 +452,7 @@ async fn test_publish_retries_connection() {
     while seen.len() < 4 {
         match next(&mut rx, &mut buf).await {
             OwnedPacket::Msg(m) => seen.push(m.id),
-            OwnedPacket::Table(_) => seen.push([0, 0]),
+            OwnedPacket::Table(_) => seen.push([0; 8]),
             _ => {}
         }
     }
@@ -464,7 +464,7 @@ async fn test_publish_retries_connection() {
             SetComponentMetadata::ID
         ]
     );
-    assert_eq!(seen[3], [0, 0], "records follow the announce");
+    assert_eq!(seen[3], [0; 8], "records follow the announce");
 }
 
 #[stellarator::test]
@@ -641,7 +641,7 @@ async fn test_subscribe_announces_and_routes() {
 
     // A table no port takes is ignored: it is not routed or counted as
     // dropped, and the connection stays up.
-    tx.send(LenPacket::table([1, 2], 8)).await.0.expect("up");
+    tx.send(LenPacket::table([1; 8], 8)).await.0.expect("up");
     tx.send((&Ping { n: 9 }).into_len_packet())
         .await
         .0

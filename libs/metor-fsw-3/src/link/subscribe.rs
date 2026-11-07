@@ -235,15 +235,11 @@ mod tests {
     use crate::system::{OutputBinding, PortDef};
     use crate::tests::utils::{Fixed, Imu, Note, ring};
 
-    use super::super::peer::ConnectionState;
-    use super::*;
+    use metor_proto::types::short_id;
 
-    /// Builds a packet body in its wire format.
-    fn body(ty: PacketTy, id: PacketId, payload: &[u8]) -> Vec<u8> {
-        let mut body = vec![ty as u8, id[0], id[1], 0];
-        body.extend_from_slice(payload);
-        body
-    }
+    use super::super::peer::ConnectionState;
+    use super::wire::body;
+    use super::*;
 
     fn id_of<R: Record>() -> PacketId {
         R::schema().packet_id()
@@ -331,7 +327,7 @@ mod tests {
         ));
         assert!(!route(
             &mut routes,
-            &body(PacketTy::Table, [9, 9], frame.as_bytes())
+            &body(PacketTy::Table, short_id([9, 9]), frame.as_bytes())
         ));
         let received = imu.drain().next().expect("a record").expect("intact");
         assert_eq!(Imu::decode(received), Ok(&frame));
@@ -346,7 +342,10 @@ mod tests {
         let mut views = rings
             .each_ref()
             .map(|r| r.view(NoWake).expect("a free slot"));
-        assert!(!route(&mut routes, &body(PacketTy::Msg, [9, 9], b"probe")));
+        assert!(!route(
+            &mut routes,
+            &body(PacketTy::Msg, short_id([9, 9]), b"probe")
+        ));
         assert!(views.iter_mut().all(|v| v.drain().next().is_none()));
     }
 

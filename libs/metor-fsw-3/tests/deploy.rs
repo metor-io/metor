@@ -95,7 +95,7 @@ async fn test_gateway_records_every_target() {
     loop {
         let series = client
             .request(&GetTimeSeries {
-                id: [0, 0],
+                id: [0; 8],
                 limit: Some(64),
                 ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX / 2))
             })
