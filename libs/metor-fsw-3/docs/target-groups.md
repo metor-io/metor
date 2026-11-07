@@ -31,7 +31,7 @@ Groups sit one level above composites:
 
 ```python
 from typing import NamedTuple
-from metor_config import Deployment, Group, Loop, OutPort, Peer, Publish, Subscribe, Target, group
+from metor_config import Deployment, Group, Listen, Loop, OutPort, Peer, Publish, Subscribe, Target, group
 
 class Gateway(NamedTuple):
     target: Target
@@ -44,7 +44,7 @@ def gateway_node(g: Group) -> Gateway:
     t = g.target(cycle_rate=50.0)          # namespace: the group's path
     est = g.loop(Est)
     radio = t.add("radio", Radio(est=est))
-    link = t.add("pub", Publish([radio], transport=g.listen()))
+    link = t.add("pub", Publish([radio], transport=Listen("[::]:0")))
     return Gateway(t, link, radio.cmd, est)
 
 class Cpu(NamedTuple):
@@ -56,7 +56,7 @@ def cpu(g: Group, *, gateway: Publish, cmd: OutPort[Cmd]) -> Cpu:
     t = g.target(cycle_rate=120.0)
     up = t.add("uplink", Subscribe(transport=Peer(gateway), items=[cmd]))
     gnc = t.add("gnc", gnc_composite(cmd=up.port(cmd)))
-    link = t.add("pub", Publish([gnc], transport=g.listen()))
+    link = t.add("pub", Publish([gnc], transport=Listen("[::]:0")))
     return Cpu(link, gnc.est)
 
 @group
@@ -70,7 +70,7 @@ def flight(g: Group) -> Flight:
         gw.est.connect(down.port(c.est))
     return Flight(gws, cpus)
 
-d = Deployment(base_port=2240, hosts={"flight": "10.0.0.1", "ground.gse": "10.0.1.1"})
+d = Deployment(hosts={"flight": "10.0.0.1", "ground.gse": "10.0.1.1"})
 fl = d.add("flight", flight())
 d.add("ground", ground(flight=fl))
 ```
@@ -88,26 +88,35 @@ function returns; use a `NamedTuple`, as for a composite.
 | `g.target("io", **kw)` | a `Target` named `{path}.io` |
 | `g.add("cpus", group(..))` | the group's result; its targets go under `{path}.cpus` |
 | `g.loop(Record)` | a `Loop`, as `Target.loop` |
-| `g.listen(host="[::]")` | a `Listen` on the deployment's next free port |
 | `g.path` | the group's dotted path |
 
 `g.target` takes `Target`'s arguments except `namespace`.
 
 ### Deployment
 
-`Deployment` gains `add`, `listen`, and `base_port`. `targets=` still takes
-targets built outside any group, and both forms can be mixed.
+`Deployment` gains `add`. `targets=` still takes targets built outside any
+group, and both forms can be mixed.
 
 - `d.add(name, group(..))` adds a group at the top of the tree.
-- `base_port` is the first port `listen` hands out. Each call takes the next
-  one, in the order the file makes them. The whole tree is always evaluated, so
-  a link's port does not depend on which targets run. `listen` raises
-  `ConfigError` without `base_port`. A hand-written `Listen` still works, and
-  the build still refuses two links on one host and port.
 - `hosts` keys may name a group. The longest matching path wins, so
   `{"flight": a, "flight.cpus.cpu3": b}` puts `cpu3` on `b` and the rest of
   `flight` on `a`. The emitted config lists one host per target, as now. A key
   that matches no target raises `ConfigError`.
+
+### Ports
+
+A peer dials a `Publish` at an address the resolver writes into the config, so
+the `Publish` needs a fixed port. A group added three times runs the same
+`Listen` three times, so a port written in the group collides when its
+instances share a host.
+
+The resolver gives each dialed `Listen` on port 0 a port from the config
+alone: the next one no other link on its host uses, counting up from 2240, in
+step order. It writes that port into the listener's address and every
+dialer's. Every process reads the same resolved config, so they agree; a port
+held by another program fails at bind, as a hand-written one does. `metor
+show` prints the port. A hand-written port works as before, and a `Listen` on
+port 0 that no peer dials still lets the OS pick.
 
 ### Names
 
@@ -190,6 +199,7 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 |---|---|
 | `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, dotted link ids, `recorder` in place of `gateway()`, the nesting check |
 | `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
+| `deploy` resolver | ports for dialed listeners on port 0 |
 | Config format, host, runtime | none |
 
 ## Not covered
@@ -211,15 +221,3 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
   second needs `Peer` to resolve at emit time and gives no `port()`.
 - **Composites spanning targets.** A composite shares one cycle; hiding a link
   inside one would hide its latency.
-
-## Open questions
-
-1. How do links get ports? Peers resolve at build time, so a dialed `Publish`
-   needs a fixed port, and a group added three times cannot hard-code one.
-   Either `g.listen()` counts up from `base_port`, as above, or the resolver
-   gives each dialed `Listen` on port 0 a port from the config alone: the next
-   one no other link on its host uses, counting from a fixed start, in step
-   order. The resolver writes that port into the listener's address and every
-   dialer's, so each process reads the same port from the same resolved
-   config. The second drops `listen` and `base_port` from the Python API, and
-   is a small change in `deploy`; a port is then visible only after resolving.
