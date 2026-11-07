@@ -5,7 +5,6 @@ use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct ComponentPart {
     pub id: ComponentId,
     pub name: CompactString,
@@ -21,7 +20,6 @@ impl ComponentPart {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct ComponentPath {
     pub id: ComponentId,
     pub path: SmallVec<[ComponentPart; 2]>,

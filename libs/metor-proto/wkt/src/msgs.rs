@@ -321,45 +321,15 @@ pub struct SetDbConfig {
     pub metadata: HashMap<String, String>,
 }
 
-impl SetDbConfig {
-    pub fn schematic_content(kdl: String) -> Self {
-        SetDbConfig {
-            metadata: [("schematic.content".to_string(), kdl)]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        }
-    }
-}
-
 impl Msg for SetDbConfig {
     const ID: PacketId = short_id([224, 19]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct DbConfig {
     pub recording: bool,
     pub default_stream_time_step: Duration,
     pub metadata: HashMap<String, String>,
-}
-
-impl DbConfig {
-    pub fn set_schematic_path(&mut self, path: String) {
-        self.metadata.insert("schematic.path".to_string(), path);
-    }
-
-    pub fn schematic_path(&self) -> Option<&str> {
-        self.metadata.get("schematic.path").map(String::as_str)
-    }
-
-    pub fn set_schematic_content(&mut self, path: String) {
-        self.metadata.insert("schematic.content".to_string(), path);
-    }
-
-    pub fn schematic_content(&self) -> Option<&str> {
-        self.metadata.get("schematic.content").map(String::as_str)
-    }
 }
 
 impl Default for DbConfig {
@@ -398,7 +368,6 @@ impl Msg for GetEarliestTimestamp {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct EarliestTimestamp(pub Timestamp);
 
 impl Msg for EarliestTimestamp {
@@ -406,7 +375,6 @@ impl Msg for EarliestTimestamp {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct DumpSchema;
 
 impl Msg for DumpSchema {
