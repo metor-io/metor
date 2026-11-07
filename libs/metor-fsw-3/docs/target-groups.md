@@ -31,26 +31,44 @@ Groups sit one level above composites:
 
 ```python
 from typing import NamedTuple
-from metor_config import Deployment, Group, OutPort, Publish, Sources, group
+from metor_config import Deployment, Group, Loop, OutPort, Peer, Publish, Subscribe, Target, group
+
+class Gateway(NamedTuple):
+    target: Target
+    link: Publish
+    cmd: OutPort[Cmd]
+    est: Loop[Est]
+
+@group
+def gateway_node(g: Group) -> Gateway:
+    t = g.target(cycle_rate=50.0)          # namespace: the group's path
+    est = g.loop(Est)
+    radio = t.add("radio", Radio(est=est))
+    link = t.add("pub", Publish([radio], transport=g.listen()))
+    return Gateway(t, link, radio.cmd, est)
 
 class Cpu(NamedTuple):
     link: Publish
     est: OutPort[Est]
 
 @group
-def cpu(g: Group, *, uplink: Sources[Cmd]) -> Cpu:
-    t = g.target(cycle_rate=120.0)          # namespace: the group's path
-    gnc = t.add("gnc", gnc_composite(cmd=uplink))
+def cpu(g: Group, *, gateway: Publish, cmd: OutPort[Cmd]) -> Cpu:
+    t = g.target(cycle_rate=120.0)
+    up = t.add("uplink", Subscribe(transport=Peer(gateway), items=[cmd]))
+    gnc = t.add("gnc", gnc_composite(cmd=up.port(cmd)))
     link = t.add("pub", Publish([gnc], transport=g.listen()))
     return Cpu(link, gnc.est)
 
 @group
 def flight(g: Group) -> Flight:
-    uplink = g.loop(Cmd)
-    cpus = [g.add(f"cpu{i}", cpu(uplink=uplink)) for i in (1, 2, 3)]
-    gws = g.add("gateways", gateways(est=[c.est for c in cpus]))
-    uplink.connect(gws.cmd)                   # a port on another target
-    return Flight(cpus, gws)
+    gws = [g.add(f"gw{i}", gateway_node()) for i in (1, 2, 3)]
+    cpus = [g.add(f"cpu{i}", cpu(gateway=gw.link, cmd=gw.cmd)) for i, gw in enumerate(gws, 1)]
+    for gw, c in zip(gws, cpus):
+        # Each gateway reads its CPU's estimate, which did not exist when the
+        # gateway was built.
+        down = gw.target.add("down", Subscribe(transport=Peer(c.link), items=[c.est]))
+        gw.est.connect(down.port(c.est))
+    return Flight(gws, cpus)
 
 d = Deployment(base_port=2240, hosts={"flight": "10.0.0.1", "ground.gse": "10.0.1.1"})
 fl = d.add("flight", flight())
@@ -69,7 +87,7 @@ function returns; use a `NamedTuple`, as for a composite.
 | `g.target(**kw)` | a `Target` named by the group's path, as `flight.cpus.cpu1` |
 | `g.target("io", **kw)` | a `Target` named `{path}.io` |
 | `g.add("cpus", group(..))` | the group's result; its targets go under `{path}.cpus` |
-| `g.loop(Record)` | a `Loop`, which may connect to a port on another target |
+| `g.loop(Record)` | a `Loop`, as `Target.loop` |
 | `g.listen(host="[::]")` | a `Listen` on the deployment's next free port |
 | `g.path` | the group's dotted path |
 
@@ -102,39 +120,23 @@ targets built outside any group, and both forms can be mixed.
 
 ## Links between targets
 
-### Loops
+A system reads only ports on its own target. A port on another target reaches
+it through a `Subscribe` on the reading target, which dials a `Publish` on the
+producing target. Groups pass `Publish` handles and ports as arguments, and
+every subscriber is written in the file. Passing another target's port as an
+input stays a `ConfigError`.
 
-A `Loop` connected to a port on another target becomes a link when the
-config is emitted. For each target that reads the loop:
+### Cycles
 
-1. The port's target must have a `Publish` that carries the port. The first
-   one in step order is used. If there is none, `ConfigError` names the port
-   and its target.
-2. The reading target gets one `Subscribe` for each link it reads through,
-   added after its other systems, with the `Publish`'s `conn_cap`.
-3. The loop reads that subscriber's copy of the port.
+When two sibling groups read each other, the one built first cannot name the
+other's link. It returns its `Target` and a `Loop` that its systems read. Once
+the other group exists, the parent adds a `Subscribe` to that target and
+connects the loop to the subscriber's port, as `flight` does above. The
+`adcs-fsw3` plant reads the controller the same way.
 
-One loop can feed systems on several targets; each target gets its own
-subscriber. This is how one uplink reaches all three CPUs of a triple string.
-Passing another target's port as an input, without a loop, stays a
-`ConfigError`.
-
-A subscriber keeps one port per message record, so two loops that read
-different ports of one message record through one link raise `ConfigError`.
-
-A loop on one target reads the previous cycle's value. A loop across targets
-reads the newest sample the subscriber has received, which may be several
-cycles old, or none if the producer is not running.
-
-The `adcs-fsw3` plant already reads the controller this way, by hand: a loop
-connected to a `Subscribe` on its own target.
-
-### Explicit links
-
-A loop feeds only a system's inputs. It has no `field()`, cannot go in a port
-list, and is not a port class such as `SensorsPort`. Use `Subscribe` and
-`port()` for those, and on forward paths where an extra cycle of latency
-matters, since a generated subscriber runs after the systems that read it.
+The subscriber runs after the systems that read the loop, so they read the
+newest sample it received by the previous cycle. Across a link that sample may
+be several cycles old, or missing if the producer is not running.
 
 ### Link names
 
@@ -171,7 +173,7 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 
 | Part | Change |
 |---|---|
-| `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, cross-target loops, dotted link ids, the nesting check |
+| `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, dotted link ids, the nesting check |
 | `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
 | Config format, host, runtime | none |
 
@@ -189,16 +191,21 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
   takes arguments.
 - **Selecting in Python, from an env var.** The config, and so the ports,
   would change with the selection.
-- **A separate `peer_loop`.** It would duplicate `Loop`, and `Peer` would have
-  to resolve names later than it does.
+- **Subscribers generated from loops, or a `Peer` filled in later.** Either
+  closes a cycle inside the child group, but the first hides a link, and the
+  second needs `Peer` to resolve at emit time and gives no `port()`.
 - **Composites spanning targets.** A composite shares one cycle; hiding a link
   inside one would hide its latency.
 
 ## Open questions
 
-1. What should a generated subscriber be called? Its name is in every copied
-   port's path. This doc uses `from_{namespace}_{link}` with `.` as `_`, such as
-   `from_flight_gateways_gw1_pub`, with no override.
-2. How does a group hold a gateway? `gateway()` makes its own `Target`. It
-   could take a `Group` or `Deployment` to add the target to.
-3. Should `base_port` have a default, such as 2240?
+1. How does a group hold a gateway? `gateway()` makes its own `Target`, but it
+   only adds a `Subscribe` per peer and a `Db`. It could become a composite
+   that goes on any target, with `gateway()` kept as a wrapper. That needs
+   dotted link ids, since each subscriber is named for its peer's namespace.
+2. How do links get ports? Peers resolve at build time, so a dialed `Publish`
+   needs a fixed port, and a group added three times cannot hard-code one.
+   Either `g.listen()` counts up from `base_port`, as above, or the resolver
+   gives each dialed `Listen` on port 0 the next free port on its host. The
+   second drops `listen` and `base_port` from the Python API, and is a small
+   change in `deploy`; a port is then visible only after resolving.
