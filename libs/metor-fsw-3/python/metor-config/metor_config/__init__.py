@@ -23,6 +23,7 @@ from ._cal import Cal, Calibrated
 from ._composite import Composite, Scope, composite
 from ._config import ConfigError
 from ._deployment import Deployment, emit
+from ._group import Group, GroupBuild, group
 from ._recorder import Recorder, recorder
 from ._fields import ArrayField, Field
 from ._generated import (
@@ -71,6 +72,9 @@ __all__ = [
     "Can",
     "Composite",
     "Scope",
+    "Group",
+    "GroupBuild",
+    "group",
     "composite",
     "Dir",
     "File",

@@ -404,6 +404,8 @@ fn test_field_typing() {
         "fields_bad.py",
         "composite_ok.py",
         "composite_bad.py",
+        "group_ok.py",
+        "group_bad.py",
     ] {
         let text = std::fs::read_to_string(config.join("tests/typing").join(file)).expect("reads");
         let path = dir.path().join(file);
