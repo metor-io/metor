@@ -29,8 +29,9 @@ fsw.add("pub", Publish(g, transport=Listen("[::]:2240")))
 ## Inputs and params
 
 A composite takes ordinary Python parameters. `Sources[T]` marks an input, and
-any other type is a param. `@composite` removes `s` from the signature callers
-see and keeps the rest, so a type checker checks each call.
+any other type is a param. `@composite` removes `s` from the signature a type
+checker sees and keeps the rest, so each call is checked. At runtime, arguments
+that do not fit raise `TypeError` at the call.
 
 Calling `gnc(..)` stores the arguments. The body runs when the result is
 added, because a port needs its system's final name and target when it is
@@ -48,8 +49,10 @@ ports:
   name.
 - Every system has `status`, so the ports of several systems cannot merge into
   one flat namespace.
-- A `NamedTuple` is a port list, so `Publish(g, ..)` reads each port it holds.
-  A port listed twice is read once.
+- A `NamedTuple` of handles and ports is a port list, so `Publish(g, ..)` reads
+  each port it holds. A port listed twice is read once. A result holding other
+  results is not a port list; pass `[*g.a, *g.b]`. A type checker does not catch
+  this, and `Publish` raises `ConfigError`.
 - Annotate the return type. An inferred one is checked only by pyright.
 
 ## Scope
@@ -74,5 +77,12 @@ calls them outside the composite.
 - A `Publish` or `Subscribe` cannot be inside a composite, since a link's name
   is an identifier. Add links at the top of the target and pass their ports in.
 - A composite's systems share one target.
+- One system's id cannot sit under another's: `a` and `a.b` cannot both be
+  systems, since their port names could match.
+- A peer's subscriber keeps one port per message record, so `log` from several
+  instances arrives on one port. See `Subscribe`.
+- `ChannelRegistry` writes at most 16 KiB, about 46 channels with ids like
+  `gnc.pod12.tick`. Past that it drops every write at runtime, and `metor check`
+  passes.
 - An alarm id, `{ns}.{system}.{name}`, holds at most 96 bytes, so deep nesting
   can fail with `AlarmPrefixTooLong`.

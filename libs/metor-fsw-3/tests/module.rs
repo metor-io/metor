@@ -404,8 +404,8 @@ fn sensors_stub() -> String {
 }
 
 /// Pyright reports an error on each `# expect-error` line of
-/// `tests/typing/fields_bad.py`, and none in `fields_ok.py`, against a stub
-/// stubgen renders.
+/// each `_bad.py` file in `tests/typing`, and none in the `_ok.py` files,
+/// against a stub stubgen renders.
 #[test]
 fn test_field_typing() {
     let Some(pyright) = pyright() else {
@@ -420,7 +420,12 @@ fn test_field_typing() {
         pyright_config.to_string(),
     )
     .expect("writes");
-    for file in ["fields_ok.py", "fields_bad.py"] {
+    for file in [
+        "fields_ok.py",
+        "fields_bad.py",
+        "composite_ok.py",
+        "composite_bad.py",
+    ] {
         let text = std::fs::read_to_string(config.join("tests/typing").join(file)).expect("reads");
         let path = dir.path().join(file);
         std::fs::write(&path, &text).expect("writes");
@@ -433,7 +438,7 @@ fn test_field_typing() {
     }
 }
 
-/// The 1-based lines pyright reports errors on.
+/// The 1-based lines pyright reports errors on, each once.
 fn error_lines(pyright: &[String], cwd: &Path, file: &Path) -> Vec<u64> {
     let output = Command::new(&pyright[0])
         .args(&pyright[1..])
@@ -444,12 +449,14 @@ fn error_lines(pyright: &[String], cwd: &Path, file: &Path) -> Vec<u64> {
         .expect("pyright runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("pyright json");
     let diagnostics = report["generalDiagnostics"].as_array().cloned();
-    diagnostics
+    let mut lines: Vec<u64> = diagnostics
         .unwrap_or_default()
         .iter()
         .filter(|d| d["severity"] == "error")
         .filter_map(|d| d["range"]["start"]["line"].as_u64().map(|l| l + 1))
-        .collect()
+        .collect();
+    lines.dedup();
+    lines
 }
 
 /// The command that runs pyright, or `None` if it is not available.

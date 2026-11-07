@@ -26,6 +26,26 @@ fn test_target_exits_after_fixed_cycles() {
 }
 
 #[test]
+fn test_composites_run_and_show_by_dotted_id() {
+    let target = fixture_dir().join("composite.py");
+    let target = target.display().to_string();
+    let run = metor()
+        .args(["run", &target, "--cycles", "3"])
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    for name in ["rack.a.gain", "rack.b.echo", "solo.gain"] {
+        let show = metor()
+            .args(["show", &target, name])
+            .output()
+            .expect("metor runs");
+        let stderr = String::from_utf8_lossy(&show.stderr);
+        assert!(show.status.success(), "{name}: {stderr}");
+    }
+}
+
+#[test]
 fn test_reject_conflicting_clock_options() {
     let output = metor()
         .args(["run", "target.py", "--wall", "10", "--sim-dt", "0.1"])

@@ -9,11 +9,17 @@ from typing import NamedTuple
 from adcs_stub import Ctrl, Est, Imu, Mode, MotorCmd, Nav, Plant
 
 from metor_config import (
+    ChannelRegistry,
     ConfigError,
+    Db,
+    Deployment,
     Listen,
+    Mux,
     OutPort,
+    Peer,
     Publish,
     Scope,
+    SequenceCommand,
     Sources,
     Subscribe,
     Target,
@@ -204,7 +210,7 @@ class EdgeTest(unittest.TestCase):
 
         self.fsw.add("a", seq())
         self.fsw.add("b", seq())
-        self.assertEqual([name for name, _ in self.fsw._channels()], ["a.mode", "b.mode"])
+        self.assertEqual([channel[0] for channel in self.fsw._channels()], ["a.mode", "b.mode"])
 
     def test_threads_are_shared(self) -> None:
         @composite
@@ -216,6 +222,68 @@ class EdgeTest(unittest.TestCase):
         self.assertEqual(
             [steps(self.fsw)[name]["thread"] for name in ("a.nav", "b.nav")], ["worker", "worker"]
         )
+
+
+class BuiltinsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fsw = Target(10.0, namespace="sat")
+        self.gnc = self.fsw.add("gnc", gnc(imu=self.fsw.add("plant", Plant()).imu))
+
+    def test_db_all_reads_every_port(self) -> None:
+        db = self.fsw.add("db", Db(listen="127.0.0.1:0", all=True))
+        ports = [entry["port"] for entry in steps(self.fsw)[db._name]["inputs"]]
+        self.assertIn("gnc.nav.est", ports)
+        self.assertIn("gnc.ctrl.motor_cmd", ports)
+
+    def test_mux_reads_a_result(self) -> None:
+        mux = self.fsw.add("m", Mux(o=Est(q=self.gnc.nav.est.field("q"))))
+        self.assertEqual(steps(self.fsw)[mux._name]["params"]["inputs"], ["gnc.nav.est"])
+
+    def test_mux_in_a_composite_has_the_prefix(self) -> None:
+        @composite
+        def tap(s: Scope, *, est: OutPort[Est]) -> OutPort[Est]:
+            return s.add("m", Mux(o=Est(q=est.field("q")))).o
+
+        self.assertEqual(self.fsw.add("t", tap(est=self.gnc.nav.est)).name, "t.m.o")
+
+    def test_channel_registry_names_the_full_path(self) -> None:
+        @composite
+        def seq(s: Scope) -> None:
+            s.add("mode", Mode(), channel="c")
+
+        self.fsw.add("a", seq())
+        self.fsw.add("reg", ChannelRegistry())
+        cmds = self.fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
+        self.fsw.commands(cmds.sequence_command)
+        spec = steps(self.fsw)["reg"]["params"]["channels"][0]
+        self.assertEqual(spec["name"], "a.c")
+        self.assertEqual(spec["components"]["state"], "sat.a.mode.channel_status.state")
+
+    def test_channel_registry_tells_reused_instances_apart(self) -> None:
+        shared = Mode()
+
+        @composite
+        def seq(s: Scope) -> None:
+            s.add("mode", shared, channel="c")
+
+        self.fsw.add("a", seq())
+        self.fsw.add("b", seq())
+        self.fsw.add("reg", ChannelRegistry())
+        cmds = self.fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
+        self.fsw.commands(cmds.sequence_command)
+        specs = steps(self.fsw)["reg"]["params"]["channels"]
+        self.assertEqual(
+            [spec["components"]["state"] for spec in specs],
+            ["sat.a.mode.channel_status.state", "sat.b.mode.channel_status.state"],
+        )
+
+    def test_peer_copies_a_result(self) -> None:
+        link = self.fsw.add("pub", Publish(self.gnc, transport=Listen("127.0.0.1:0")))
+        other = Target(10.0, namespace="gw")
+        mirror = other.add("sat", Subscribe(transport=Peer(link), items=[self.gnc.nav.est]))
+        copy = mirror.port(self.gnc.nav.est)
+        self.assertEqual(copy.name, "sat.gnc.nav.est")
+        Deployment(targets=[self.fsw, other])
 
 
 class FailureTest(unittest.TestCase):
@@ -271,6 +339,38 @@ class FailureTest(unittest.TestCase):
         for name, body in (("tx", comms), ("rx", rx)):
             with self.assertRaisesRegex(ConfigError, "a link's name is an identifier"):
                 self.fsw.add(name, body())
+
+    def test_overlapping_ids(self) -> None:
+        self.fsw.add("mode", Mode())
+        self.fsw.add("a.b", Mode())
+        with self.assertRaisesRegex(ConfigError, "`mode.x` overlaps system `mode`"):
+            self.fsw.add("mode.x", gnc(imu=self.imu))
+        with self.assertRaisesRegex(ConfigError, "`a` overlaps system `a.b`"):
+            self.fsw.add("a", Mode())
+        with self.assertRaisesRegex(ConfigError, "`a` overlaps system `a.b`"):
+            self.fsw.add("a", gnc(imu=self.imu))
+
+    def test_siblings_with_a_shared_prefix_are_free(self) -> None:
+        self.fsw.add("gnc", gnc(imu=self.imu))
+        self.fsw.add("gnc2", gnc(imu=self.imu))
+        self.assertIn("gnc2.nav", steps(self.fsw))
+
+    def test_not_a_system(self) -> None:
+        for add in (self.fsw.add, self.fsw.sim):
+            with self.assertRaisesRegex(ConfigError, "takes a system"):
+                add("g", gnc)  # pyright: ignore[reportCallIssue, reportArgumentType]
+        with self.assertRaisesRegex(ConfigError, "takes a system"):
+            self.fsw.sim("g", gnc(imu=self.imu))  # pyright: ignore[reportArgumentType]
+
+    def test_arguments_fail_at_the_call(self) -> None:
+        with self.assertRaises(TypeError):
+            gnc(bogus=1)  # pyright: ignore[reportCallIssue]
+
+    def test_nested_result_is_not_a_port_list(self) -> None:
+        out = self.fsw.add("p", pair(imu=self.imu))
+        with self.assertRaisesRegex(ConfigError, "a port list takes handles and ports"):
+            Publish(out, transport=Listen("127.0.0.1:0"))
+        self.fsw.add("pub", Publish([*out[0], *out[1]], transport=Listen("127.0.0.1:0")))
 
     def test_input_from_another_target(self) -> None:
         other = Target(10.0, namespace="other").add("plant", Plant())

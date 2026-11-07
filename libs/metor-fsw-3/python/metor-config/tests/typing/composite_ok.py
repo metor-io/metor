@@ -4,32 +4,30 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from adcs_stub import Imu, LogEvent, Nav, Plant, SystemStatus
+from sensors_stub import Body, Plant, Sensors
 
 from metor_config import Composite, Listen, OutPort, Publish, Scope, Sources, Target, composite
 
 
 class Out(NamedTuple):
-    nav: Nav
-    log: OutPort[LogEvent]
+    plant: Plant
+    sensors: OutPort[Sensors]
 
 
 @composite
-def gnc(s: Scope, *, imu: Sources[Imu], gain: float = 0.1) -> Out:
-    nav = s.add("nav", Nav(imu=imu, gain=gain))
-    return Out(nav, nav.log)
+def gnc(s: Scope, *, body: Sources[Body], gain: float = 0.1) -> Out:
+    plant = s.add("plant", Plant(body=body))
+    return Out(plant, plant.sensors)
 
 
 @composite
-def outer(s: Scope, *, imu: Sources[Imu]) -> Out:
-    return s.add("inner", gnc(imu=imu))
+def outer(s: Scope, *, body: Sources[Body]) -> Out:
+    return s.add("inner", gnc(body=body))
 
 
 target = Target(10.0)
-plant = target.add("plant", Plant())
-pending: Composite[Out] = gnc(imu=plant.imu, gain=0.2)
+pending: Composite[Out] = gnc(body=target.loop(Body), gain=0.2)
 out: Out = target.add("gnc", pending)
-status: OutPort[SystemStatus] = out.nav.status
-log: OutPort[LogEvent] = out.log
-nav, _ = target.add("outer", outer(imu=target.loop(Imu)))
+sensors: OutPort[Sensors] = out.plant.sensors
+plant, _ = target.add("outer", outer(body=target.loop(Body)))
 target.add("pub", Publish(out, transport=Listen("127.0.0.1:0")))

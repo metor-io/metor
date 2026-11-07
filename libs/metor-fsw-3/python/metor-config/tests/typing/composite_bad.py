@@ -4,26 +4,27 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from adcs_stub import Imu, Nav, Plant
+from sensors_stub import Body, Plant
 
 from metor_config import Scope, Sources, Target, composite
 
 
 class Out(NamedTuple):
-    nav: Nav
+    plant: Plant
 
 
 @composite
-def gnc(s: Scope, *, imu: Sources[Imu], gain: float = 0.1) -> Out:
-    return Out(s.add("nav", Nav(imu=imu, gain=gain)))
+def gnc(s: Scope, *, body: Sources[Body], gain: float = 0.1) -> Out:
+    return Out(s.add("plant", Plant(body=body)))
 
 
 target = Target(10.0)
-plant = target.add("plant", Plant())
+body = target.loop(Body)
+out = target.add("gnc", gnc(body=body))
 gnc()  # expect-error
-gnc(imu=plant.imu, gain="high")  # expect-error
-gnc(imu=plant.log)  # expect-error
-target.add("gnc", gnc(imu=plant.imu)).missing  # expect-error
-target.add("gnc", gnc(imu=plant.imu), thread="t")  # expect-error
-target.add("gnc", gnc)  # expect-error
-target.add("gnc", gnc(imu=plant.imu)).nav.est
+gnc(body=body, gain="high")  # expect-error
+gnc(body=out.plant.sensors)  # expect-error
+out.missing  # expect-error
+target.add("a", gnc(body=body), thread="t")  # expect-error
+target.add("b", gnc)  # expect-error
+out.plant.sensors

@@ -216,8 +216,13 @@ class Target:
         return composite._build(Scope(self, name))
 
     def _check_free(self, name: str) -> None:
+        """Raises `ConfigError` if ``name`` is taken, or if one system's id
+        would sit under another's, since their port names could then match."""
         if name in self._handles or name in self._composites:
             raise ConfigError(f"system `{name}` is already added")
+        for other in self._handles:
+            if name.startswith(f"{other}.") or other.startswith(f"{name}."):
+                raise ConfigError(f"`{name}` overlaps system `{other}`")
 
     def _add(
         self,
@@ -226,6 +231,8 @@ class Target:
         system: S,
         adapter: _Thread | _Channel | None,
     ) -> S:
+        if not isinstance(system, System):
+            raise ConfigError(f"`{name}` takes a system, got {system!r}")
         self._check_free(name)
         self._check_grants(name, system)
         system._bind(self, name)
@@ -276,10 +283,10 @@ class Target:
         """
         self._commands.extend(_sources(COMMANDS_PORT, sources))
 
-    def _channels(self) -> list[tuple[str, System]]:
-        """Returns each channel's name and system, in step order."""
+    def _channels(self) -> list[tuple[str, str, System]]:
+        """Returns each channel's name, system id, and system, in step order."""
         return [
-            (entry.adapter.name, entry.system)
+            (entry.adapter.name, entry.name, entry.system)
             for entry in self._systems
             if isinstance(entry.adapter, _Channel)
         ]

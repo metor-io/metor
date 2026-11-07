@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Concatenate, Generic, ParamSpec, TypeVar, overload
 
@@ -33,11 +34,13 @@ def composite(fn: Callable[Concatenate[Scope, P], R]) -> Callable[P, Composite[R
 
     ``fn`` takes a `Scope`, then its own inputs and params. Its body runs when
     the composite is added, and its result is what `add` returns. A
-    ``NamedTuple`` of ports and handles can be passed as a port list.
+    ``NamedTuple`` of ports and handles can be passed as a port list. Arguments
+    that do not fit ``fn`` raise `TypeError` at the call.
     """
 
     @wraps(fn)
     def bind(*args: P.args, **kwargs: P.kwargs) -> Composite[R]:
+        inspect.signature(fn).bind(None, *args, **kwargs)
         return Composite(lambda scope: fn(scope, *args, **kwargs))
 
     return bind

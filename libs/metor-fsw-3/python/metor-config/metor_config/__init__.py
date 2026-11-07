@@ -64,10 +64,10 @@ from ._model import (
 from ._target import SystemHandle, Target
 
 __all__ = [
-    "Scope",
-    "composite",
     "Can",
     "Composite",
+    "Scope",
+    "composite",
     "Dir",
     "File",
     "GpioLine",
