@@ -1,4 +1,4 @@
-"""Tests for deployments: peers, copied ports, the gateway, and the golden
+"""Tests for deployments: peers, copied ports, the recorder, and the golden
 config file."""
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from metor_config import (
     Publish,
     Subscribe,
     Target,
-    gateway,
+    recorder,
 )
 
 GOLDEN = os.path.join(CRATE, "tests", "golden", "deployment.json")
@@ -42,6 +42,12 @@ def design_example() -> Deployment:
     gw, gw_db = gateway("gw", peers=[a_pub, b_pub], listen="0.0.0.0:2250")
     a.add("cmds", Subscribe(transport=Peer(gw_db), records=[Ping]))
     return Deployment(targets=[a, b, gw], hosts={"a": "10.0.0.2"})
+
+
+def gateway(namespace: str, peers: list, listen: str, **kw) -> tuple[Target, Db]:
+    """A target named ``namespace`` that holds only a recorder, `rec`."""
+    gw = Target(cycle_rate=10.0, namespace=namespace)
+    return gw, gw.add("rec", recorder(peers=peers, listen=listen, **kw)).db
 
 
 def plant_and_peer() -> tuple[Target, Plant, Target]:
@@ -273,25 +279,25 @@ class DeploymentTest(ConfigTest):
         config = Deployment(targets=[a, gw]).to_config()
         self.assertEqual(config["targets"][1]["coordinator"]["systems"][0]["params"]["commands"], [])
 
-    def test_gateway_composes_subscribes_and_db(self) -> None:
+    def test_recorder_composes_subscribes_and_db(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         plant = a.add("plant", Plant())
         a_pub = a.add("pub", Publish([plant], transport=Listen("0.0.0.0:2240")))
         gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
         config = Deployment(targets=[a, gw]).to_config()
         systems = config["targets"][1]["coordinator"]["systems"]
-        self.assertEqual([s["id"] for s in systems], ["a", "db", "io_submit", "io_complete"])
+        self.assertEqual([s["id"] for s in systems], ["rec.a", "rec.db", "io_submit", "io_complete"])
         self.assertEqual(
             [i["port"] for i in systems[1]["inputs"]],
             [
-                "a.plant.imu",
-                "a.plant.log",
-                "a.plant.status",
-                "a.link_status",
-                "a.alarm_raised",
-                "a.alarm_cleared",
-                "a.log",
-                "a.status",
+                "rec.a.plant.imu",
+                "rec.a.plant.log",
+                "rec.a.plant.status",
+                "rec.a.link_status",
+                "rec.a.alarm_raised",
+                "rec.a.alarm_cleared",
+                "rec.a.log",
+                "rec.a.status",
             ],
         )
         self.assertEqual(db.db_status.record.__name__, "DbStatus")

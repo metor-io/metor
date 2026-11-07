@@ -340,12 +340,12 @@
         "namespace": "gw",
         "systems": [
           {
-            "id": "a",
+            "id": "rec.a",
             "ty": "fsw.subscribe",
             "params": {
               "conn_cap": 1048576,
               "dialing": true,
-              "link": "a",
+              "link": "rec.a",
               "namespace": "gw"
             },
             "inputs": [],
@@ -361,20 +361,20 @@
               }
             ],
             "grants": {
-              "ep": "a_ep"
+              "ep": "rec_a_ep"
             },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
-              "line": 23
+              "line": 24
             }
           },
           {
-            "id": "b",
+            "id": "rec.b",
             "ty": "fsw.subscribe",
             "params": {
               "conn_cap": 1048576,
               "dialing": true,
-              "link": "b",
+              "link": "rec.b",
               "namespace": "gw"
             },
             "inputs": [],
@@ -408,15 +408,15 @@
               }
             ],
             "grants": {
-              "ep": "b_ep"
+              "ep": "rec_b_ep"
             },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
-              "line": 23
+              "line": 24
             }
           },
           {
-            "id": "db",
+            "id": "rec.db",
             "ty": "fsw.db",
             "params": {
               "commands": [],
@@ -426,199 +426,199 @@
             },
             "inputs": [
               {
-                "port": "a.sampler.sample",
+                "port": "rec.a.sampler.sample",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "sampler.sample"
                   }
                 ]
               },
               {
-                "port": "a.sampler.log",
+                "port": "rec.a.sampler.log",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "sampler.log"
                   }
                 ]
               },
               {
-                "port": "a.sampler.status",
+                "port": "rec.a.sampler.status",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "sampler.status"
                   }
                 ]
               },
               {
-                "port": "a.link_status",
+                "port": "rec.a.link_status",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "link_status"
                   }
                 ]
               },
               {
-                "port": "a.alarm_raised",
+                "port": "rec.a.alarm_raised",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "alarm_raised"
                   }
                 ]
               },
               {
-                "port": "a.alarm_cleared",
+                "port": "rec.a.alarm_cleared",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "alarm_cleared"
                   }
                 ]
               },
               {
-                "port": "a.log",
+                "port": "rec.a.log",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "log"
                   }
                 ]
               },
               {
-                "port": "a.status",
+                "port": "rec.a.status",
                 "from": [
                   {
-                    "system": "a",
+                    "system": "rec.a",
                     "port": "status"
                   }
                 ]
               },
               {
-                "port": "b.mirror.sampler.sample",
+                "port": "rec.b.mirror.sampler.sample",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.sampler.sample"
                   }
                 ]
               },
               {
-                "port": "b.mirror.sampler.log",
+                "port": "rec.b.mirror.sampler.log",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.sampler.log"
                   }
                 ]
               },
               {
-                "port": "b.mirror.sampler.status",
+                "port": "rec.b.mirror.sampler.status",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.sampler.status"
                   }
                 ]
               },
               {
-                "port": "b.mirror.link_status",
+                "port": "rec.b.mirror.link_status",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.link_status"
                   }
                 ]
               },
               {
-                "port": "b.mirror.alarm_raised",
+                "port": "rec.b.mirror.alarm_raised",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.alarm_raised"
                   }
                 ]
               },
               {
-                "port": "b.mirror.alarm_cleared",
+                "port": "rec.b.mirror.alarm_cleared",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.alarm_cleared"
                   }
                 ]
               },
               {
-                "port": "b.mirror.status",
+                "port": "rec.b.mirror.status",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "mirror.status"
                   }
                 ]
               },
               {
-                "port": "b.meter.output",
+                "port": "rec.b.meter.output",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "meter.output"
                   }
                 ]
               },
               {
-                "port": "b.meter.status",
+                "port": "rec.b.meter.status",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "meter.status"
                   }
                 ]
               },
               {
-                "port": "b.link_status",
+                "port": "rec.b.link_status",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "link_status"
                   }
                 ]
               },
               {
-                "port": "b.alarm_raised",
+                "port": "rec.b.alarm_raised",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "alarm_raised"
                   }
                 ]
               },
               {
-                "port": "b.alarm_cleared",
+                "port": "rec.b.alarm_cleared",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "alarm_cleared"
                   }
                 ]
               },
               {
-                "port": "b.log",
+                "port": "rec.b.log",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "log"
                   }
                 ]
               },
               {
-                "port": "b.status",
+                "port": "rec.b.status",
                 "from": [
                   {
-                    "system": "b",
+                    "system": "rec.b",
                     "port": "status"
                   }
                 ]
@@ -628,7 +628,7 @@
             "thread": "db",
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
-              "line": 23
+              "line": 24
             }
           },
           {
@@ -649,14 +649,14 @@
           }
         ],
         "resources": {
-          "a_ep": {
+          "rec_a_ep": {
             "real": {
               "tcp_dial": {
                 "addr": "127.0.0.1:2240"
               }
             }
           },
-          "b_ep": {
+          "rec_b_ep": {
             "real": {
               "tcp_dial": {
                 "addr": "127.0.0.1:2241"

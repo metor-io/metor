@@ -22,7 +22,8 @@ from ._builtins import (
 from ._cal import Cal, Calibrated
 from ._composite import Composite, Scope, composite
 from ._config import ConfigError
-from ._deployment import Deployment, emit, gateway
+from ._deployment import Deployment, emit
+from ._recorder import Recorder, recorder
 from ._fields import ArrayField, Field
 from ._generated import (
     CONFIG_VERSION,
@@ -90,7 +91,6 @@ __all__ = [
     "DlSlot",
     "SequenceCommand",
     "SequenceRegistry",
-    "gateway",
     "SystemStatus",
     "LogEvent",
     "LinkStatus",
@@ -116,6 +116,8 @@ __all__ = [
     "PortRef",
     "Publish",
     "Record",
+    "Recorder",
+    "recorder",
     "Source",
     "Sources",
     "Subscribe",

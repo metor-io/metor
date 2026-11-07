@@ -8,10 +8,9 @@ import os
 import sys
 from typing import Any, Mapping, Sequence
 
-from ._builtins import Db, Peer, Subscribe, _namespace
 from ._config import OUT_ENV, ConfigError
 from ._generated import CONFIG_VERSION
-from ._target import SystemHandle, Target, _targets
+from ._target import Target, _targets
 
 _deployments: list["Deployment"] = []
 _emitted = False
@@ -64,28 +63,6 @@ def _envelope(targets: Sequence[Target], hosts: Mapping[str, str]) -> dict[str, 
         "hosts": dict(hosts),
         "targets": [target.to_config() for target in targets],
     }
-
-
-def gateway(
-    namespace: str,
-    peers: Sequence[SystemHandle],
-    listen: str,
-    cycle_rate: float = 10.0,
-    path: str | None = None,
-    keep: bool | None = None,
-) -> tuple[Target, SystemHandle]:
-    """Creates a gateway target that records telemetry from other targets.
-
-    The gateway subscribes to each link in ``peers`` and records everything
-    it receives in a `Db`, which clients reach on ``listen``. ``keep`` says
-    whether the db survives the run stopping; by default it is deleted
-    unless ``path`` is given. Returns the gateway target and the db's handle.
-    """
-    gw = Target(cycle_rate=cycle_rate, namespace=namespace)
-    for peer in peers:
-        gw.add(_namespace(peer), Subscribe(transport=Peer(peer)))
-    db = gw.add("db", Db(listen=listen, path=path, all=True, keep=keep), thread="db")
-    return gw, db
 
 
 def to_config() -> dict[str, Any]:
