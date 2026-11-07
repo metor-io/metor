@@ -54,7 +54,7 @@ public:
     };
 
     struct Ext {
-        std::tuple<uint8_t, uint8_t> id;
+        std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id;
         std::shared_ptr<OpBuilder> data;
         std::shared_ptr<OpBuilder> arg;
     };
@@ -186,7 +186,7 @@ namespace builder {
     /**
      * Creates an extension operation builder from a message ID, data, and an argument
      */
-    inline std::shared_ptr<OpBuilder> ext(std::tuple<uint8_t, uint8_t> id, std::shared_ptr<OpBuilder> data,
+    inline std::shared_ptr<OpBuilder> ext(std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t> id, std::shared_ptr<OpBuilder> data,
         std::shared_ptr<OpBuilder> arg)
     {
         OpBuilder::Ext ext { id, std::move(data), std::move(arg) };

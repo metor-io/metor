@@ -103,7 +103,7 @@ void reader_thread_func(const char* ip, uint16_t port)
         std::println("Reader thread: connecting to {}:{}", ip, port);
         auto read_sock = Socket(ip, port);
         read_sock.send(VTableStream {
-            .id = { 2, 0 },
+            .id = { 2, 0, 0, 0, 0, 0, 0, 0 },
         });
 
         // Read loop
@@ -142,7 +142,7 @@ try {
     });
 
     sock.send(VTableMsg {
-        .id = { 2, 0 },
+        .id = { 2, 0, 0, 0, 0, 0, 0, 0 },
         .vtable = table,
     });
     sock.send(set_component_metadata("vehicle.imu.mag", {"x", "y", "z"}));
@@ -167,7 +167,7 @@ try {
     while (true) {
         // send sin wave data continuously
         auto table_header = PacketHeader {
-            .len = 4 + sizeof(sensor_data),
+            .len = PACKET_HEADER_LEN + sizeof(sensor_data),
             .ty = PacketType::TABLE,
             .packet_id = { 2, 0 },
             .request_id = 0,
