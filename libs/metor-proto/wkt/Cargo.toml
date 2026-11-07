@@ -9,7 +9,6 @@ bevy = ["dep:bevy", "std", "gui"]
 nox = ["dep:nox"]
 gui = ["nox"]
 std = ["metor-proto/std", "postcard-schema/use-std"]
-mlua = ["dep:mlua"]
 
 [dependencies]
 metor-proto.path = ".."
@@ -37,7 +36,3 @@ postcard-schema.features = ["use-std"]
 strum.version = "0.27"
 strum.features = ["derive"]
 
-# lua
-mlua.version = "0.10"
-mlua.features = ["serialize"]
-mlua.optional = true

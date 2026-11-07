@@ -53,7 +53,7 @@ cargo +nightly miri test -p metor-db --lib --target x86_64-apple-darwin arc_ring
 `E0308` after a std SIMD signature change). Miri interprets MIR regardless of
 host arch, so building for x86 sidesteps the broken NEON path while still running
 on this macOS host (the `x86_64-apple-darwin` target uses the host toolchain to
-build C deps like `mlua-sys`; the `-linux-gnu` target would need a cross `gcc`).
+build C deps; the `-linux-gnu` target would need a cross `gcc`).
 Drop the flag once `pulp` is fixed for current nightlies.
 
 ## Recommended extra passes
