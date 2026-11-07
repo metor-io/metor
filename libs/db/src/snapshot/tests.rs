@@ -1,5 +1,6 @@
 use super::*;
 use crate::{ComponentSchema, manifest::SpanSource};
+use metor_proto::types::short_id;
 use metor_proto::types::{ComponentId, PrimType};
 use std::{
     path::Path,
@@ -21,7 +22,7 @@ fn database(path: &Path) -> Arc<DB> {
                     &db.path,
                 )
                 .unwrap();
-                s.get_or_insert_msg_log([7, 0], &db.path).unwrap();
+                s.get_or_insert_msg_log(short_id([7, 0]), &db.path).unwrap();
             });
             db
         })
@@ -85,7 +86,11 @@ fn concurrent_capture_contains_complete_records_and_frozen_prefixes() {
         .time_series
         .set_max_node_age(Duration::from_micros(100));
     let mut writer = component.time_series.writer().unwrap();
-    let log = db.with_state_mut(|s| s.get_or_insert_msg_log([7, 0], &db.path).unwrap().clone());
+    let log = db.with_state_mut(|s| {
+        s.get_or_insert_msg_log(short_id([7, 0]), &db.path)
+            .unwrap()
+            .clone()
+    });
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = done.clone();
     let producer = std::thread::spawn(move || {

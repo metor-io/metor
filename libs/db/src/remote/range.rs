@@ -602,7 +602,7 @@ fn wire_request(
         _ => query.range.clone(),
     };
     GetTimeSeries {
-        id: [0, 0],
+        id: [0; 8],
         range,
         component_id,
         limit: Some(query.limit.map_or(page, |limit| limit.min(page))),
@@ -680,6 +680,7 @@ pub fn answered_here(series: &TimeSeries, query: &RangeQuery) -> Option<Range<Ti
 
 #[cfg(test)]
 mod tests {
+    use metor_proto::types::short_id;
     use std::{
         net::SocketAddr,
         sync::atomic::{AtomicUsize, Ordering},
@@ -768,7 +769,7 @@ mod tests {
 
     fn with_a(db: &DB) {
         db.insert_vtable(metor_proto_wkt::VTableMsg {
-            id: [9, 4],
+            id: short_id([9, 4]),
             vtable: vtable([raw_field(
                 8,
                 8,

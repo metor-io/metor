@@ -178,7 +178,7 @@ impl DB {
             }
         }
         for (id, log) in logs {
-            let prefix = format!("db/msgs/{}", u16::from_le_bytes(id));
+            let prefix = format!("db/msgs/{}", u64::from_le_bytes(id));
             if let Some(metadata) = log.metadata() {
                 files.push(SnapshotFile::bytes(
                     format!("{prefix}/metadata"),

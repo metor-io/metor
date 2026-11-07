@@ -258,7 +258,7 @@ async fn ingest(
 ) -> Error {
     let mut conn = ConnState::mirror();
     let mut buf = vec![0u8; 1024 * 1024];
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0; 8], 1024 * 1024);
     loop {
         let pkt = match rx.next_grow(buf).await {
             Ok(pkt) => pkt,
@@ -306,6 +306,7 @@ async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>, connected: Arc<WaitQueue>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metor_proto::types::short_id;
     use std::sync::Mutex as StdMutex;
 
     fn event_log() -> (
@@ -418,7 +419,7 @@ mod tests {
             component, raw_field, raw_table, schema, timestamp, vtable,
         };
 
-        const ID: metor_proto::types::PacketId = [9, 2];
+        const ID: metor_proto::types::PacketId = short_id([9, 2]);
         let dir = tempfile::tempdir().unwrap();
         let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
         server_db
@@ -470,7 +471,7 @@ mod tests {
             component, raw_field, raw_table, schema, timestamp, vtable,
         };
 
-        const ID: metor_proto::types::PacketId = [9, 5];
+        const ID: metor_proto::types::PacketId = short_id([9, 5]);
         let dir = tempfile::tempdir().unwrap();
         let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
         peer.insert_vtable(metor_proto_wkt::VTableMsg {
@@ -644,7 +645,7 @@ mod tests {
         };
         use stellarator::struc_con::Joinable as _;
 
-        const ID: metor_proto::types::PacketId = [9, 3];
+        const ID: metor_proto::types::PacketId = short_id([9, 3]);
         let dir = tempfile::tempdir().unwrap();
         let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
         peer.insert_vtable(metor_proto_wkt::VTableMsg {

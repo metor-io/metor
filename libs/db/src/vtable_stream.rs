@@ -27,7 +27,7 @@ use tracing::{trace, warn};
 use crate::{Component, DB, Error, FixedRateStreamState, disruptor::Reader};
 
 pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
-    id: [u8; 2],
+    id: PacketId,
     vtable: VTable,
     db: Arc<DB>,
     tx: Arc<Mutex<PacketSink<A>>>,
@@ -192,7 +192,7 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
 /// for free: a key absent from the newest ingested table is simply absent from
 /// the next forwarded packet (vtable-dynamic.md §8.6).
 async fn handle_dynamic_vtable_stream<A: AsyncWrite + 'static>(
-    id: [u8; 2],
+    id: PacketId,
     vtable: VTable,
     db: Arc<DB>,
     tx: Arc<Mutex<PacketSink<A>>>,
