@@ -219,15 +219,29 @@ pub fn metor() -> Command {
     Command::new(env!("CARGO_BIN_EXE_metor"))
 }
 
-/// A running `metor` child process. Dropping it kills the process.
+/// A running `metor` child process. Dropping it stops the process.
 pub struct Running(pub Child);
 
 impl Drop for Running {
+    /// Interrupts the process, which stops a deployment's children too, and
+    /// kills it if it has not exited after [`STOP_GRACE`].
     fn drop(&mut self) {
+        let pid = self.0.id().to_string();
+        let _ = Command::new("kill").args(["-INT", &pid]).status();
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
+
+/// How long a [`Running`] process has to stop after an interrupt.
+const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// The ports [`free_ports`] hands out.
 ///
