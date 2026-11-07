@@ -108,7 +108,6 @@ dependencies = [
  "metor-proto",
  "metor-proto-stellar",
  "metor-proto-wkt",
- "metor-star",
  "nox",
  "serde_json",
  "startracker-sim-3",
@@ -146,7 +145,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -2768,7 +2766,7 @@ dependencies = [
  "indexmap 1.9.3",
  "strsim 0.10.0",
  "termcolor",
- "textwrap 0.16.2",
+ "textwrap",
 ]
 
 [[package]]
@@ -2791,7 +2789,7 @@ dependencies = [
  "anstyle",
  "clap_lex 1.1.0",
  "strsim 0.11.1",
- "terminal_size 0.4.4",
+ "terminal_size",
 ]
 
 [[package]]
@@ -2832,12 +2830,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "cobs"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67ba02a97a2bd10f4b59b25c7973101c79642302776489e030cd13cdab09ed15"
 
 [[package]]
 name = "cobs"
@@ -5594,7 +5586,7 @@ dependencies = [
  "smallvec 1.16.0",
  "spin 0.10.1",
  "stacksafe",
- "strum 0.28.0",
+ "strum",
  "sum_tree",
  "taffy",
  "thiserror 2.0.20",
@@ -5699,7 +5691,7 @@ dependencies = [
  "raw-window-handle",
  "smallvec 1.16.0",
  "smol",
- "strum 0.28.0",
+ "strum",
  "url",
  "uuid",
  "wayland-backend",
@@ -5749,7 +5741,7 @@ dependencies = [
  "scheduler",
  "semver",
  "smallvec 1.16.0",
- "strum 0.28.0",
+ "strum",
  "uuid",
 ]
 
@@ -5887,14 +5879,10 @@ dependencies = [
 name = "gst-metor-plugin"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "gst-plugin-version-helper",
  "gstreamer",
  "gstreamer-base",
- "gstreamer-video",
  "metor-proto",
- "metor-proto-wkt",
- "pkg-config",
 ]
 
 [[package]]
@@ -5967,37 +5955,6 @@ checksum = "feea73b4d92dbf9c24a203c9cd0bcc740d584f6b5960d5faf359febf288919b2"
 dependencies = [
  "glib-sys",
  "gobject-sys",
- "libc",
- "system-deps",
-]
-
-[[package]]
-name = "gstreamer-video"
-version = "0.23.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1318b599d77ca4f7702ecbdeac1672d6304cb16b7e5752fabb3ee8260449a666"
-dependencies = [
- "cfg-if",
- "futures-channel",
- "glib",
- "gstreamer",
- "gstreamer-base",
- "gstreamer-video-sys",
- "libc",
- "once_cell",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "gstreamer-video-sys"
-version = "0.23.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a70f0947f12d253b9de9bc3fd92f981e4d025336c18389c7f08cdf388a99f5c"
-dependencies = [
- "glib-sys",
- "gobject-sys",
- "gstreamer-base-sys",
- "gstreamer-sys",
  "libc",
  "system-deps",
 ]
@@ -6859,17 +6816,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "is-terminal"
-version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
-dependencies = [
- "hermit-abi 0.5.2",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "is-wsl"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7082,7 +7028,7 @@ checksum = "d847be338ef16a13f97637c062d97fb52ebe0ff3b77fa18456d5ed366317e4f7"
 dependencies = [
  "colorgrad",
  "formatx",
- "terminal_size 0.4.4",
+ "terminal_size",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "windows-sys 0.61.2",
@@ -7488,7 +7434,6 @@ dependencies = [
  "mycelium-bitfield",
  "pin-project",
  "portable-atomic",
- "proptest 1.11.0",
  "tokio",
  "tokio-test",
  "tracing",
@@ -7697,7 +7642,6 @@ dependencies = [
  "arrow 54.3.1",
  "arrow-schema 54.3.1",
  "clap 4.6.3",
- "convert_case 0.6.0",
  "datafusion",
  "directories",
  "fastrand",
@@ -7706,11 +7650,10 @@ dependencies = [
  "metor-proto",
  "metor-proto-stellar",
  "metor-proto-wkt",
- "miette 7.6.0",
+ "miette",
  "nox",
  "object_store",
  "parquet",
- "pin-project",
  "postcard",
  "postcard-c-codegen",
  "postcard-dyn",
@@ -7736,18 +7679,14 @@ version = "0.1.0"
 dependencies = [
  "arrow 55.2.0",
  "fastrand",
- "futures-lite",
  "metor-db",
  "metor-proto",
  "metor-proto-stellar",
  "metor-proto-wkt",
- "miette 7.6.0",
- "nox",
  "postcard",
  "postcard-schema",
  "serde",
  "stellarator",
- "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
  "zerocopy",
@@ -7758,11 +7697,8 @@ name = "metor-expr"
 version = "0.14.2"
 dependencies = [
  "libm",
- "metor-proto",
- "metor-proto-wkt",
  "nox",
  "postcard",
- "postcard-schema",
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
@@ -7802,9 +7738,8 @@ dependencies = [
  "metor-proto",
  "metor-proto-stellar",
  "metor-proto-wkt",
- "miette 7.6.0",
+ "miette",
  "minijinja",
- "notify",
  "notify-debouncer-mini",
  "polling",
  "postcard",
@@ -7815,10 +7750,10 @@ dependencies = [
  "serde_json",
  "stellarator",
  "strsim 0.11.1",
- "supports-color 3.0.2",
+ "supports-color",
  "tempfile",
  "terminal-colorsaurus",
- "terminal_size 0.4.4",
+ "terminal_size",
  "thingbuf",
  "thiserror 2.0.20",
  "toml 0.8.23",
@@ -7899,7 +7834,6 @@ dependencies = [
  "postcard-schema",
  "regex",
  "reqwest",
- "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
@@ -7925,15 +7859,13 @@ dependencies = [
  "facet",
  "heapless 0.8.0",
  "hifitime",
- "miette 7.6.0",
+ "miette",
  "nox",
  "nox-array",
  "postcard",
  "postcard-schema",
- "replace_with",
  "serde",
  "stellarator-buf",
- "thingbuf",
  "thiserror 2.0.20",
  "zerocopy",
 ]
@@ -7948,14 +7880,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metor-proto-frame"
-version = "0.1.0"
-dependencies = [
- "cobs 0.2.3",
- "metor-proto",
-]
-
-[[package]]
 name = "metor-proto-stellar"
 version = "0.1.0"
 dependencies = [
@@ -7965,13 +7889,12 @@ dependencies = [
  "metor-proto",
  "metor-proto-bbq",
  "metor-proto-wkt",
- "miette 7.6.0",
+ "miette",
  "postcard",
  "serde",
  "stellarator",
  "thingbuf",
  "thiserror 2.0.20",
- "zerocopy",
 ]
 
 [[package]]
@@ -7985,7 +7908,6 @@ dependencies = [
  "postcard-schema",
  "serde",
  "smallvec 1.16.0",
- "strum 0.27.2",
  "zerocopy",
 ]
 
@@ -7997,33 +7919,11 @@ dependencies = [
  "metor-star",
  "naga 30.0.1",
  "nalgebra",
- "nox",
  "pollster 0.4.0",
  "rand 0.9.5",
  "rand_distr 0.5.1",
  "wgpu 30.0.1",
  "zerocopy",
-]
-
-[[package]]
-name = "miette"
-version = "5.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59bb584eaeeab6bd0226ccf3509a69d7936d148cf3d036ad350abe35e8c6856e"
-dependencies = [
- "backtrace",
- "backtrace-ext",
- "is-terminal",
- "miette-derive 5.10.0",
- "once_cell",
- "owo-colors 3.5.0",
- "supports-color 2.1.0",
- "supports-hyperlinks 2.1.0",
- "supports-unicode 2.1.0",
- "terminal_size 0.1.17",
- "textwrap 0.15.2",
- "thiserror 1.0.69",
- "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -8035,25 +7935,14 @@ dependencies = [
  "backtrace",
  "backtrace-ext",
  "cfg-if",
- "miette-derive 7.6.0",
- "owo-colors 4.3.0",
- "supports-color 3.0.2",
- "supports-hyperlinks 3.2.0",
- "supports-unicode 3.0.0",
- "terminal_size 0.4.4",
- "textwrap 0.16.2",
+ "miette-derive",
+ "owo-colors",
+ "supports-color",
+ "supports-hyperlinks",
+ "supports-unicode",
+ "terminal_size",
+ "textwrap",
  "unicode-width 0.1.14",
-]
-
-[[package]]
-name = "miette-derive"
-version = "5.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49e7bc1560b95a3c4a25d03de42fe76ca718ab92d1a22a55b9b4cf67b3ae635c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -8153,7 +8042,6 @@ dependencies = [
  "loom",
  "maitake-sync 0.1.2",
  "mycelium-bitfield",
- "proptest 1.11.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -9237,12 +9125,6 @@ checksum = "e2355d85b9a3786f481747ced0e0ff2ba35213a1f9bd406ed906554d7af805a1"
 
 [[package]]
 name = "owo-colors"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
-
-[[package]]
-name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
@@ -9674,7 +9556,7 @@ version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
 dependencies = [
- "cobs 0.3.0",
+ "cobs",
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
  "heapless 0.7.17",
@@ -9688,7 +9570,7 @@ version = "0.14.2"
 dependencies = [
  "clap 4.6.3",
  "convert_case 0.6.0",
- "miette 7.6.0",
+ "miette",
  "minijinja",
  "postcard-schema",
  "ron 0.9.0",
@@ -10536,12 +10418,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "replace_with"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51743d3e274e2b18df81c4dc6caf8a5b8e15dbe799e0dca05c7617380094e884"
-
-[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10916,15 +10792,6 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safe_arch"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
-name = "safe_arch"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
@@ -11278,7 +11145,7 @@ dependencies = [
  "approx",
  "num-complex",
  "num-traits",
- "wide 1.7.1",
+ "wide",
 ]
 
 [[package]]
@@ -11382,12 +11249,6 @@ name = "smallvec"
 version = "2.0.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
-
-[[package]]
-name = "smawk"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
 
 [[package]]
 name = "smol"
@@ -11629,7 +11490,7 @@ dependencies = [
  "io-uring",
  "libc",
  "maitake",
- "miette 7.6.0",
+ "miette",
  "pin-project",
  "polling",
  "rustix 0.38.44",
@@ -11700,32 +11561,11 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
-dependencies = [
- "strum_macros 0.27.2",
-]
-
-[[package]]
-name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 dependencies = [
- "strum_macros 0.28.0",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
-dependencies = [
- "heck 0.5.0",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "strum_macros",
 ]
 
 [[package]]
@@ -11759,16 +11599,6 @@ dependencies = [
 
 [[package]]
 name = "supports-color"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6398cde53adc3c4557306a96ce67b302968513830a77a95b2b17305d9719a89"
-dependencies = [
- "is-terminal",
- "is_ci",
-]
-
-[[package]]
-name = "supports-color"
 version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c64fc7232dd8d2e4ac5ce4ef302b1d81e0b80d055b9d77c7c4f51f6aa4c867d6"
@@ -11778,27 +11608,9 @@ dependencies = [
 
 [[package]]
 name = "supports-hyperlinks"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84231692eb0d4d41e4cdd0cabfdd2e6cd9e255e65f80c9aa7c98dd502b4233d"
-dependencies = [
- "is-terminal",
-]
-
-[[package]]
-name = "supports-hyperlinks"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e396b6523b11ccb83120b115a0b7366de372751aa6edf19844dfb13a6af97e91"
-
-[[package]]
-name = "supports-unicode"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f850c19edd184a205e883199a261ed44471c81e39bd95b1357f5febbef00e77a"
-dependencies = [
- "is-terminal",
-]
 
 [[package]]
 name = "supports-unicode"
@@ -11942,7 +11754,6 @@ name = "sysstats-fsw3"
 version = "0.14.2"
 dependencies = [
  "metor-fsw-3",
- "metor-proto",
  "metor-proto-stellar",
  "metor-proto-wkt",
  "stellarator",
@@ -12086,33 +11897,12 @@ dependencies = [
 
 [[package]]
 name = "terminal_size"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633c1a546cee861a1a6d0dc69ebeca693bf4296661ba7852b9d21d159e0506df"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
-name = "terminal_size"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "textwrap"
-version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7b3e525a49ec206798b40326a44121291b530c963cfb01018f63e135bac543d"
-dependencies = [
- "smawk",
- "unicode-linebreak",
- "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -12988,34 +12778,24 @@ name = "video-streamer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "byteorder",
- "bytes",
  "clap 4.6.3",
  "ffmpeg-next",
  "kdam",
  "metor-proto",
  "metor-proto-stellar",
- "metor-proto-wkt",
- "miette 5.10.0",
- "postcard",
  "stellarator",
- "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "video-toolbox"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.13.1",
- "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
- "objc2-foundation 0.3.2",
  "objc2-video-toolbox",
  "thiserror 1.0.69",
- "wide 0.7.33",
 ]
 
 [[package]]
@@ -13792,22 +13572,12 @@ dependencies = [
 
 [[package]]
 name = "wide"
-version = "0.7.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
-dependencies = [
- "bytemuck",
- "safe_arch 0.7.4",
-]
-
-[[package]]
-name = "wide"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
 dependencies = [
  "bytemuck",
- "safe_arch 1.2.0",
+ "safe_arch",
 ]
 
 [[package]]

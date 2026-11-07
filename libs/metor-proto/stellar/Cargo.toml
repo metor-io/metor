@@ -9,7 +9,6 @@ queue = [
     "dep:thingbuf",
     "bbq2",
     "metor-proto-bbq",
-    "metor-proto/thingbuf",
     "stellarator/miette"
     ]
 
@@ -23,8 +22,6 @@ futures-concurrency = "7.6.2"
 metor-proto.path = ".."
 metor-proto.features = ["std"]
 metor-proto-wkt.path = "../wkt"
-zerocopy.version = "0.8.2"
-zerocopy.features = ["derive"]
 serde.version = "1.0"
 serde.features = ["derive"]
 postcard.version = "1.0.10"

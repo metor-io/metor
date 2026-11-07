@@ -24,7 +24,6 @@ zerocopy = { version = "0.8", features = ["derive"] }
 metor-star = { path = ".", features = ["gpu", "testkit"] }
 naga = { version = "30", features = ["wgsl-in"] }
 nalgebra = "0.35"
-nox = { workspace = true }
 rand = "0.9"
 rand_distr = "0.5"
 

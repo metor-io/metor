@@ -43,7 +43,6 @@ memmap2 = "0.9"
 smallvec.version = "1.11.2"
 smallvec.features = ["const_generics", "union", "serde"]
 zerocopy.version = "0.8.2"
-pin-project = "1"
 rustfft = "6.2"
 
 # errors
@@ -84,7 +83,6 @@ arrow-schema.version = "54"
 arrow-schema.features = ["canonical_extension_types"]
 datafusion.version = "46"
 datafusion.default-features = false
-convert_case = "0.6.0"
 thingbuf.version = "0.1"
 parquet.version = "54"
 parquet.optional = true

@@ -7,14 +7,12 @@ use arrow::{
     datatypes::*,
 };
 use datafusion::{datasource::MemTable, prelude::SessionContext, sql::TableReference};
-use futures_lite::Stream;
 use metor_proto::types::{PrimType, Timestamp};
 use metor_proto_wkt::ArchiveFormat;
 use std::{
     fs::File,
     ops::{Bound, RangeBounds},
     path::Path,
-    pin::Pin,
     ptr::NonNull,
     sync::Arc,
 };
@@ -26,10 +24,6 @@ mod fft;
 use fft::{FftUDF, FrequencyDomainUDF};
 
 impl<T: IntoBytes + Immutable> AppendLog<T> {
-    pub fn as_arrow_buffer(&self, element_size: usize) -> Buffer {
-        self.as_arrow_buffer_range(.., element_size)
-    }
-
     pub fn as_arrow_buffer_range<R: RangeBounds<usize>>(
         &self,
         range: R,
@@ -58,14 +52,6 @@ impl<T: IntoBytes + Immutable> AppendLog<T> {
 }
 
 impl TimeSeriesNode {
-    pub fn as_data_array(
-        &self,
-        name: impl ToString,
-        schema: &crate::ComponentSchema,
-    ) -> (FieldRef, ArrayRef) {
-        self.as_data_array_range(name, .., schema)
-    }
-
     pub fn as_data_array_range<R: RangeBounds<usize>>(
         &self,
         name: impl ToString,
@@ -108,10 +94,6 @@ impl TimeSeriesNode {
         let array = FixedSizeListArray::new(inner_field, size, array, None);
         let array = Arc::new(array);
         (field, array)
-    }
-
-    pub fn as_time_series_array(&self) -> ArrayRef {
-        self.as_time_series_array_range(..)
     }
 
     pub fn as_time_series_array_range<R: RangeBounds<usize>>(&self, range: R) -> ArrayRef {
@@ -323,16 +305,4 @@ fn node_bool_ref(
     let len = buffer.len();
     let buf = BooleanBuffer::new(buffer, 0, len);
     Arc::new(BooleanArray::new(buf, None))
-}
-
-#[pin_project::pin_project]
-pub struct ComponentStream {
-    stream: Pin<
-        Box<
-            dyn Stream<Item = Result<RecordBatch, datafusion::error::DataFusionError>>
-                + Send
-                + Sync,
-        >,
-    >,
-    schema: SchemaRef,
 }
