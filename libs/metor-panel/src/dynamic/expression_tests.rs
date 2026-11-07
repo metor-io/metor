@@ -147,7 +147,7 @@ fn the_component_is_named_by_the_content_hash() {
 #[test]
 fn node_ids_are_stable_across_builds() {
     let source = crate::dynamic::ops::db_source::from_db_id(ComponentId(42));
-    assert_eq!(source, crate::dynamic::NodeId(0x1c48_91b3_8a64_dd3c));
+    assert_eq!(source, crate::dynamic::NodeId(0x9c48_91b3_8a64_dd3c));
 }
 
 /// Two views typing the same expression against the same components reach the

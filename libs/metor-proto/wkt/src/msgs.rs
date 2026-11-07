@@ -390,36 +390,6 @@ impl Msg for NewConnection {
     const ID: PacketId = [225, 1];
 }
 
-macro_rules! impl_user_data_msg {
-    ($t: ty) => {
-        #[cfg(feature = "mlua")]
-        impl mlua::UserData for $t {
-            fn add_methods<T: mlua::UserDataMethods<Self>>(methods: &mut T) {
-                methods.add_method("msg", |_, this, ()| {
-                    use metor_proto::types::IntoLenPacket;
-                    let msg = this.into_len_packet().inner;
-                    Ok(msg)
-                });
-            }
-        }
-        #[cfg(feature = "mlua")]
-        impl mlua::FromLua for $t {
-            fn from_lua(value: mlua::Value, lua: &mlua::Lua) -> mlua::Result<Self> {
-                mlua::LuaSerdeExt::from_value(lua, value)
-            }
-        }
-    };
-}
-
-impl_user_data_msg!(VTableStream);
-impl_user_data_msg!(VTableMsg);
-impl_user_data_msg!(Stream);
-impl_user_data_msg!(MsgStream);
-impl_user_data_msg!(SetStreamState);
-impl_user_data_msg!(SetComponentMetadata);
-impl_user_data_msg!(UdpUnicast);
-impl_user_data_msg!(UdpVTableStream);
-
 #[derive(Serialize, Deserialize)]
 pub struct GetEarliestTimestamp;
 
@@ -473,8 +443,6 @@ pub struct SQLQuery(pub String);
 impl Msg for SQLQuery {
     const ID: PacketId = [224, 27];
 }
-
-impl_user_data_msg!(SQLQuery);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[repr(transparent)]

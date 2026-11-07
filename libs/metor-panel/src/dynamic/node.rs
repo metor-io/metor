@@ -263,8 +263,7 @@ pub fn hash_id(tag: &[u8], parents: &[NodeId], args: impl FnOnce(&mut StableHash
 ///
 /// Node ids name on-disk components, so they must survive a toolchain
 /// upgrade, which std's `DefaultHasher` does not promise. This runs the bytes
-/// through the same FNV-1a as [`ComponentId::new`], high bit masked the same
-/// way, so an id converts to a `ComponentId` as-is.
+/// through the same FNV-1a as [`ComponentId::new`], so an id converts to a `ComponentId` as-is.
 #[derive(Default)]
 pub struct StableHasher(Vec<u8>);
 
@@ -274,6 +273,6 @@ impl Hasher for StableHasher {
     }
 
     fn finish(&self) -> u64 {
-        const_fnv1a_hash::fnv1a_hash_64(&self.0, None) & !(1 << 63)
+        const_fnv1a_hash::fnv1a_hash_64(&self.0, None)
     }
 }

@@ -15,7 +15,6 @@ members = [
     "libs/metor-proto/bbq",
     "libs/metor-proto/frame",
     "libs/db",
-    "libs/db/cli",
     "libs/db/tests",
     "libs/stellarator",
     "libs/stellarator/buf",

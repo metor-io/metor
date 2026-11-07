@@ -3767,8 +3767,7 @@ inline std::array<uint8_t, 2> msg_id(const std::string_view str)
 
 inline uint64_t component_id(const std::string_view str)
 {
-    auto hash = fnv1a_hash_64(str) & ~(1ul << 63);
-    return hash;
+    return fnv1a_hash_64(str);
 }
 
 enum class PacketType : uint8_t {
