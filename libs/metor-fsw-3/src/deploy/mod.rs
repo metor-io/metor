@@ -11,7 +11,7 @@ mod error;
 mod index;
 mod slot;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -31,6 +31,10 @@ use slot::DeploySlot;
 /// The host a peer is dialed on when the deployment gives it no host.
 pub const LOOPBACK: &str = "127.0.0.1";
 
+/// The first port a dialed listener on port 0 is given, unless
+/// [`Pending::first_port`] sets another.
+pub const FIRST_PORT: u16 = 2240;
+
 /// A resource: the index of its target, and its id.
 type ResourceKey = (usize, String);
 
@@ -39,6 +43,7 @@ type ResourceKey = (usize, String);
 pub struct Pending {
     listen: Listeners,
     slots: Vec<(SystemIndex, DeploySlot)>,
+    first_port: u16,
 }
 
 /// Decodes every slot's params in `envelope` once, and returns them if a
@@ -50,6 +55,7 @@ pub fn pending(envelope: &DeploymentConfig) -> Result<Option<Pending>, DeployErr
     let mut pending = Pending {
         listen: Listeners(HashMap::new()),
         slots: Vec::new(),
+        first_port: FIRST_PORT,
     };
     for (index, system) in SystemIndex::iter(envelope) {
         if let Some(addr) = listen_addr(envelope, index, system) {
@@ -109,8 +115,77 @@ impl Pending {
         store: &Path,
     ) -> Result<(), DeployError> {
         slot::resolve_slots(envelope, tables, store, self.slots)?;
-        resolve_peers(envelope, tables, &self.listen)
+        let mut listen = self.listen;
+        assign_ports(envelope, &mut listen, self.first_port)?;
+        resolve_peers(envelope, tables, &listen)
     }
+
+    /// Sets the first port a dialed listener on port 0 is given.
+    #[must_use]
+    pub fn first_port(self, port: u16) -> Self {
+        Self {
+            first_port: port,
+            ..self
+        }
+    }
+}
+
+/// Gives each listener that a peer dials and that listens on port 0 the
+/// first port, from `first`, that no other listener on its host uses. The
+/// port is written into the listener's address, so its dialers resolve to
+/// it.
+fn assign_ports(
+    envelope: &mut DeploymentConfig,
+    listen: &mut Listeners,
+    first: u16,
+) -> Result<(), DeployError> {
+    let mut taken: HashSet<(String, u16)> = listen
+        .0
+        .keys()
+        .filter_map(|&index| Some((host_of(envelope, index), listen.fixed_port(index)?)))
+        .collect();
+    for index in dialed(envelope) {
+        if listen.port(index) != Some(0) {
+            continue;
+        }
+        let host = host_of(envelope, index);
+        let port = (first..=u16::MAX)
+            .find(|&port| !taken.contains(&(host.clone(), port)))
+            .ok_or_else(|| DeployError::NoFreePort { host: host.clone() })?;
+        taken.insert((host, port));
+        listen.set_port(envelope, index, port);
+    }
+    Ok(())
+}
+
+/// Every system some peer dial names, in target and step order.
+fn dialed(envelope: &DeploymentConfig) -> BTreeSet<SystemIndex> {
+    let peers = envelope.targets.iter().flat_map(|target| {
+        target
+            .coordinator
+            .resources
+            .values()
+            .filter_map(|r| match r {
+                DeployBacking::Peer(peer) => Some(peer),
+                _ => None,
+            })
+    });
+    peers
+        .filter_map(|peer| {
+            let target = envelope
+                .targets
+                .iter()
+                .position(|t| t.namespace() == peer.target)?;
+            let systems = &envelope.targets[target].coordinator.systems;
+            let system = systems.iter().position(|s| s.id == peer.link)?;
+            Some(SystemIndex::new(target, system))
+        })
+        .collect()
+}
+
+/// The host the system at `index` is dialed on.
+fn host_of(envelope: &DeploymentConfig, index: SystemIndex) -> String {
+    host(envelope, envelope.targets[index.target].namespace()).to_string()
 }
 
 /// Resolves every peer reference in `envelope`.
@@ -137,11 +212,42 @@ fn resolve_peers(
 struct Listeners(HashMap<SystemIndex, String>);
 
 impl Listeners {
+    /// The port the system at `index` listens on, if it listens.
+    fn port(&self, index: SystemIndex) -> Option<u16> {
+        self.0.get(&index)?.rsplit_once(':')?.1.parse().ok()
+    }
+
     /// The port the system at `index` listens on, unless it is zero or the
     /// system does not listen.
     fn fixed_port(&self, index: SystemIndex) -> Option<u16> {
-        let port: u16 = self.0.get(&index)?.rsplit_once(':')?.1.parse().ok()?;
-        (port != 0).then_some(port)
+        self.port(index).filter(|&port| port != 0)
+    }
+
+    /// Makes the system at `index` listen on `port`, here and in its
+    /// `listen` param or `tcp_listen` resource.
+    fn set_port(&mut self, envelope: &mut DeploymentConfig, index: SystemIndex, port: u16) {
+        let Some(addr) = self.0.get_mut(&index) else {
+            return;
+        };
+        let Some((host, _)) = addr.rsplit_once(':') else {
+            return;
+        };
+        *addr = format!("{host}:{port}");
+        let system = index.get_mut(envelope);
+        if let Some(listen) = system.params.get_mut("listen") {
+            *listen = Value::String(addr.clone());
+            return;
+        }
+        let grants: Vec<String> = system.grants.values().cloned().collect();
+        let resources = &mut envelope.targets[index.target].coordinator.resources;
+        for id in grants {
+            if let Some(DeployBacking::Runtime(Backing::Real(RealKind::TcpListen {
+                addr, ..
+            }))) = resources.get_mut(&id)
+            {
+                addr.set_port(port);
+            }
+        }
     }
 }
 

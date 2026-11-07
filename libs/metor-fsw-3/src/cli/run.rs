@@ -88,6 +88,9 @@ pub struct Run {
 /// An error running a target.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum RunError {
+    #[error("METOR_FIRST_PORT is `{0}`, not a port")]
+    #[diagnostic(code(M0110), help("set it to a number from 1 to 65535"))]
+    FirstPort(String),
     #[error("no target file at {}", .0.display())]
     #[diagnostic(
         code(M0206),
@@ -494,9 +497,20 @@ fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeploy
             .collect::<Result<_, _>>()?;
         let dir = dir_of(target);
         let dir = std::path::absolute(dir).map_err(io(dir))?;
+        let pending = pending.first_port(first_port()?);
         pending.resolve(&mut config, &tables, &store::dir(&dir))?;
     }
     Ok(config.into_runtime()?)
+}
+
+/// The first port a dialed listener on port 0 is given: `$METOR_FIRST_PORT`,
+/// or [`deploy::FIRST_PORT`].
+fn first_port() -> Result<u16, RunError> {
+    let Ok(value) = std::env::var("METOR_FIRST_PORT") else {
+        return Ok(deploy::FIRST_PORT);
+    };
+    let port = value.parse().ok().filter(|&port: &u16| port != 0);
+    port.ok_or(RunError::FirstPort(value))
 }
 
 /// Returns the dev packs a target depends on.

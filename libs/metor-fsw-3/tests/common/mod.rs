@@ -272,6 +272,21 @@ pub fn free_ports<const N: usize>() -> [u16; N] {
     ports.try_into().expect("enough free test ports")
 }
 
+/// Returns the first of `n` consecutive ports that nothing listened on when
+/// this was called, for a resolver that counts up from it.
+pub fn free_port_run(n: u16) -> u16 {
+    let span = u32::from(TEST_PORTS.end - TEST_PORTS.start - n);
+    let start = std::process::id().wrapping_mul(997);
+    (0..span)
+        .map(|_| start.wrapping_add(NEXT_PORT.fetch_add(u32::from(n), Ordering::Relaxed)) % span)
+        .filter_map(|offset| u16::try_from(offset).ok())
+        .map(|offset| TEST_PORTS.start + offset)
+        .find(|&first| {
+            (first..first + n).all(|port| std::net::TcpStream::connect(local(port)).is_err())
+        })
+        .expect("a free run of test ports")
+}
+
 /// Joins `ports` into the comma-separated list a fixture's ports variable
 /// expects.
 pub fn ports_env(ports: &[u16]) -> String {

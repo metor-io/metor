@@ -333,7 +333,9 @@ writes the records it is sent onto ports of its own. Each takes one
 Both are sequences that hold a `Cap<Endpoint>` named `ep`. `Target.add`
 makes the transport a resource named `{link}_ep` and grants it to `ep`:
 `Listen` a `tcp_listen`, `Connect` a `tcp_dial`, and `Peer` a dial that
-`metor build` points at the listener's `host:port`. A dial's host name
+`metor build` points at the listener's `host:port`. A dialed listener on
+port 0 is given the first port, from `METOR_FIRST_PORT` or 2240, that no
+other listener on its host uses. A dial's host name
 resolves on the target, when it builds. A listening link listens on its
 first cycle and accepts from then on; a taken address fails the listen,
 and the link listens again after a backoff. A listener's `allow` list of

@@ -110,13 +110,14 @@ the `Publish` needs a fixed port. A group added three times runs the same
 `Listen` three times, so a port written in the group collides when its
 instances share a host.
 
-The resolver gives each dialed `Listen` on port 0 a port from the config
-alone: the next one no other link on its host uses, counting up from 2240, in
-step order. It writes that port into the listener's address and every
-dialer's. Every process reads the same resolved config, so they agree; a port
-held by another program fails at bind, as a hand-written one does. `metor
-show` prints the port. A hand-written port works as before, and a `Listen` on
-port 0 that no peer dials still lets the OS pick.
+The resolver gives each dialed listener on port 0 a port from the config
+alone: the first one, counting up from `METOR_FIRST_PORT` (2240 by default),
+that no other listener on its host uses, in step order. It writes that port
+into the listener's address and every dialer's. Every process reads the same
+resolved config, so they agree; a port held by another program fails at
+bind, as a hand-written one does. `metor build` and `metor show --format
+json` give the assigned ports. A hand-written port works as before, and a
+listener on port 0 that no peer dials still lets the OS pick.
 
 ### Names
 

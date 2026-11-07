@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use common::{
-    DEADLINE, Deadline, Fsw, Running, Source, Target, dial_fsw, fixture_dir, free_ports, local,
-    lower_links, metor, ports_env, source,
+    DEADLINE, Deadline, Fsw, Running, Source, Target, dial_fsw, fixture_dir, free_port_run,
+    free_ports, local, lower_links, metor, ports_env, source,
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
@@ -116,6 +116,24 @@ async fn test_gateway_records_every_target() {
     }
 }
 
+/// A `metor run` of `groups.py`, its db on `db` and its links on ports the
+/// build gives them from a free run.
+fn groups(db: &[u16; 1], args: &[&str]) -> std::process::Command {
+    let mut command = metor();
+    command
+        .arg("run")
+        .arg(fixture_dir().join("groups.py"))
+        .args(args)
+        .env(PORTS_ENV, ports_env(db))
+        .env("METOR_FIRST_PORT", free_port_run(9).to_string());
+    command
+}
+
+fn run_groups(db: &[u16; 1], args: &[&str]) -> Running {
+    let child = groups(db, args).stdout(Stdio::null()).spawn();
+    Running(child.expect("metor runs"))
+}
+
 /// Waits until the db announces every name in `wanted`.
 async fn announced(client: &mut Client, wanted: &[String]) {
     let deadline = Deadline::new();
@@ -163,13 +181,9 @@ async fn recorded(client: &mut Client, name: &str) {
 /// ground records the value that went both ways.
 #[stellarator::test]
 async fn test_groups_round_trip_every_string() {
-    let ports: [u16; 10] = free_ports();
-    let _running = run(
-        &fixture_dir().join("groups.py"),
-        &ports,
-        &["--cycles", CYCLES],
-    );
-    let mut client = connect(local(ports[9])).await;
+    let db: [u16; 1] = free_ports();
+    let _running = run_groups(&db, &["--cycles", CYCLES]);
+    let mut client = connect(local(db[0])).await;
     let wanted: Vec<String> = (1..=3)
         .flat_map(|i| {
             [
@@ -188,12 +202,8 @@ async fn test_groups_round_trip_every_string() {
 /// targets still run their cycles.
 #[test]
 fn test_one_string_runs_alone() {
-    let ports: [u16; 10] = free_ports();
-    let output = metor()
-        .arg("run")
-        .arg(fixture_dir().join("groups.py"))
-        .args(["--target", "flight.s1", "--cycles", "200"])
-        .env(PORTS_ENV, ports_env(&ports))
+    let db: [u16; 1] = free_ports();
+    let output = groups(&db, &["--target", "flight.s1", "--cycles", "200"])
         .output()
         .expect("metor runs");
     let stderr = String::from_utf8_lossy(&output.stderr);

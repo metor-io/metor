@@ -17,6 +17,17 @@ fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<()
     }
 }
 
+/// Resolves `envelope`, giving dialed listeners on port 0 ports from `first`.
+fn resolve_from(
+    envelope: &mut DeploymentConfig,
+    tables: &[SystemTable],
+    first: u16,
+) -> Result<(), DeployError> {
+    let pending = pending(envelope)?.expect("peers to resolve");
+    let store = std::path::Path::new("/no/store");
+    pending.first_port(first).resolve(envelope, tables, store)
+}
+
 fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
     Ok(pending(envelope)?.is_some())
 }
@@ -357,7 +368,7 @@ fn test_missing_references_name_themselves() {
 }
 
 #[test]
-fn test_peer_must_listen_on_a_fixed_port() {
+fn test_peer_must_listen() {
     let not_a_listener = DeployError::NotAListener {
         from: "b.mirror".into(),
         target: "a".into(),
@@ -370,9 +381,73 @@ fn test_peer_must_listen_on_a_fixed_port() {
         Err(not_a_listener.clone())
     );
 
-    let mut any_port = envelope();
-    set_resource(&mut any_port, 0, "pub_ep", listen(0));
-    assert_eq!(resolve(&mut any_port, &tables(2)), Err(not_a_listener));
+    let mut no_listener = envelope();
+    no_listener.targets[0]
+        .coordinator
+        .resources
+        .remove("pub_ep");
+    no_listener.targets[0].coordinator.systems[2].grants.clear();
+    assert_eq!(resolve(&mut no_listener, &tables(2)), Err(not_a_listener));
+}
+
+/// `a.pub` and `b.db` both listen on port 0, and each is dialed.
+fn on_port_zero() -> DeploymentConfig {
+    let mut envelope = envelope();
+    set_resource(&mut envelope, 0, "pub_ep", listen(0));
+    envelope.targets[1].coordinator.systems[1].params = db_listen(0);
+    envelope
+}
+
+#[test]
+fn test_dialed_listeners_on_port_0_get_ports() {
+    let mut envelope = on_port_zero();
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    assert_eq!(resource(&envelope, 0, "pub_ep"), &listen(FIRST_PORT));
+    assert_eq!(resource(&envelope, 1, "mirror_ep"), &dial("127.0.0.1:2240"));
+    let db = &envelope.targets[1].coordinator.systems[1];
+    assert_eq!(db.params, db_listen(2241));
+    assert_eq!(resource(&envelope, 0, "cmds_ep"), &dial("127.0.0.1:2241"));
+}
+
+#[test]
+fn test_assigned_ports_skip_fixed_ones() {
+    let mut envelope = on_port_zero();
+    envelope.targets[1].coordinator.systems[1].params = db_listen(2240);
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    assert_eq!(resource(&envelope, 0, "pub_ep"), &listen(2241));
+    assert_eq!(resource(&envelope, 1, "mirror_ep"), &dial("127.0.0.1:2241"));
+}
+
+#[test]
+fn test_each_host_counts_from_the_first_port() {
+    let mut envelope = on_port_zero();
+    envelope.hosts.insert("a".into(), "10.0.0.2".into());
+    resolve_from(&mut envelope, &tables(2), 3000).expect("resolves");
+    assert_eq!(resource(&envelope, 1, "mirror_ep"), &dial("10.0.0.2:3000"));
+    assert_eq!(resource(&envelope, 0, "cmds_ep"), &dial("127.0.0.1:3000"));
+}
+
+#[test]
+fn test_undialed_listener_keeps_port_0() {
+    let mut envelope = on_port_zero();
+    envelope.targets[1]
+        .coordinator
+        .systems
+        .push(link("spare", PUBLISH_TYPE));
+    set_resource(&mut envelope, 1, "spare_ep", listen(0));
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    assert_eq!(resource(&envelope, 1, "spare_ep"), &listen(0));
+}
+
+#[test]
+fn test_no_port_left() {
+    let mut envelope = on_port_zero();
+    assert_eq!(
+        resolve_from(&mut envelope, &tables(2), u16::MAX),
+        Err(DeployError::NoFreePort {
+            host: LOOPBACK.into()
+        })
+    );
 }
 
 #[test]

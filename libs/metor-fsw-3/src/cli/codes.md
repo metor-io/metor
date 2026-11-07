@@ -99,6 +99,17 @@ or select more targets.
 metor run --target flight --except flight.cpu3
 ```
 
+## M0110
+
+**`METOR_FIRST_PORT` is not a port**
+
+`METOR_FIRST_PORT` sets the first port the build gives a dialed listener on
+port 0. Its value is not a number from 1 to 65535.
+
+```
+METOR_FIRST_PORT=3000 metor run
+```
+
 ## M0201
 
 **The target file failed**
@@ -247,16 +258,16 @@ Check the link's id with `metor show`.
 
 ## M0212
 
-**A peer link does not listen on a fixed port**
+**A peer link does not listen**
 
-A link dials a peer link, and the peer cannot be dialed: it does not listen,
-or it listens on port `0`, which the operating system picks at run time. A
-dialer needs a fixed port to connect to.
+A link dials a peer link, and the peer does not listen: its transport is a
+`Connect` or a `Peer`. A dialer needs a listener to connect to.
 
-Give the peer link a `Listen` transport with a non-zero port.
+Give the peer link a `Listen` transport. On port 0, the build gives it a
+port; see M0221.
 
 ```python
-link = plant.add("pub", Publish(all=True, transport=Listen("0.0.0.0:2240")))
+link = plant.add("pub", Publish(all=True, transport=Listen("0.0.0.0:0")))
 fsw.add("plant", Subscribe(transport=Peer(link)))
 ```
 
@@ -360,6 +371,18 @@ most 64 bytes. The file name of a candidate's pack library is longer.
 The file name comes from the pack's library name. Shorten `[lib] name` in
 the pack's `Cargo.toml`, or set `lib` under `[tool.metor.pack]` in its
 `pyproject.toml`, then run `metor pack dev`.
+
+## M0221
+
+**No port is left for a listener**
+
+A link that a peer dials listens on port 0, so the build gives it a port:
+the first one from `METOR_FIRST_PORT`, 2240 by default, that no other
+listener on its host uses. Every port from there to 65535 is taken on that
+host.
+
+Give some of that host's listeners fixed ports below the first port, or set
+`METOR_FIRST_PORT` lower.
 
 ## M0301
 
