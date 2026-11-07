@@ -10,7 +10,6 @@ default = ["alloc", "std"]
 std = ["miette", "alloc", "serde/std", "nox", "nox-array/std", "stellarator-buf/std"]
 alloc = []
 #bevy = ["dep:bevy"]
-mlua = ["dep:mlua"]
 thingbuf = ["dep:thingbuf", "replace_with"]
 hifitime = ["dep:hifitime"]
 nox = ["dep:nox"]
@@ -50,11 +49,6 @@ const-fnv1a-hash = "1.1.0"
 #bevy.version = "0.16"
 #bevy.default-features = false
 #bevy.optional = true
-
-# lua
-mlua.version = "0.10"
-mlua.features = ["serialize"]
-mlua.optional = true
 
 # thingbuf
 thingbuf.version = "0.1.6"

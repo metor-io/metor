@@ -6,8 +6,7 @@
 # Run metor-db in the foreground:
 # - Listening on port 2240
 # - Storing data in the default user data directory ($HOME/.local/share/metor/db)
-# - Using the ./examples/db-config.lua config
-metor-db run [::]:2240 $HOME/.local/share/metor/db --config examples/db-config.lua
+metor-db run [::]:2240 $HOME/.local/share/metor/db
 ```
 
 ### Stream data to the database with C
@@ -29,51 +28,7 @@ This example uses C++23, but the library itself is C++20 compatible.
 c++ -std=c++23 examples/client.cpp -o /tmp/client-cpp; /tmp/client-cpp
 ```
 
-### Connect to the database using the CLI
-
-Launch a LUA REPL to interact with the database:
-```sh
-metor-db lua
-```
-
-Connect to the database and dump all of the metadata:
-```
-db ❯❯ client = connect("127.0.0.1:2240")
-db ❯❯ client:dump_metadata()
-```
-
-Run `:help` in the REPL to see all available commands:
-```
-db ❯❯ :help
-Impeller Lua REPL
-- `connect(addr)`
-   Connects to a new database and returns a client
-- `Client:dump_metadata()`
-   Dumps all metadata from the db
-...
-```
-
 The example C client just streams a sine wave component to entity "1". You can view this in the editor by creating a graph for entity "1" and selecting the only component available for that entity.
-
-### Mirror data from one db instance to another
-
-Launch a secondary db instance:
-
-```sh
-metor-db run [::]:2241 $HOME/.local/share/metor/ground-station
-```
-
-Run the `downlink.lua` script to sync metadata from the primary db instance to the secondary db instance *and* command the primary instance to start streaming data to the secondary instance:
-
-```sh
-FC_ADDR="127.0.0.1:2240" GROUND_STATION_ADDR="127.0.0.1:2241" metor-db lua examples/downlink.lua
-```
-
-Confirm that the secondary instance is receiving data by connecting to it via the Metor Editor:
-
-```sh
-metor editor 127.0.0.1:2241
-```
 
 ### Generate C++ Header
 

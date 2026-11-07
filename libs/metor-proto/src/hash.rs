@@ -22,10 +22,9 @@ const FNV_PRIME_64: u64 = 0x0000_0100_0000_01B3;
 /// A rolling fnv1a-64 hasher over a dotted component path.
 ///
 /// Segments are separated by `.`; empty segments contribute nothing and emit no
-/// separator, matching the `ComponentPath`/`ChainPath` join rules. The final
-/// [`finish`](PathHasher::finish) masks the top bit exactly like
-/// [`ComponentId::new`](crate::types::ComponentId::new) (so the id fits in an
-/// `i64` and stays Lua-compatible).
+/// separator, matching the `ComponentPath`/`ChainPath` join rules, so
+/// [`finish`](PathHasher::finish) agrees with
+/// [`ComponentId::new`](crate::types::ComponentId::new) on the dotted name.
 #[derive(Clone, Copy, Debug)]
 pub struct PathHasher {
     hash: u64,
@@ -95,10 +94,10 @@ impl PathHasher {
         self.push_bytes(&buf[i..]);
     }
 
-    /// Finalizes the hash into a [`ComponentId`], masking the top bit.
+    /// Finalizes the hash into a [`ComponentId`].
     #[inline]
     pub fn finish(self) -> ComponentId {
-        ComponentId(self.hash & !(1u64 << 63))
+        ComponentId(self.hash)
     }
 }
 
@@ -116,7 +115,10 @@ mod tests {
 
     #[test]
     fn matches_component_id_new() {
-        assert_eq!(via_hasher(&["processes", "htop", "pid"]), ComponentId::new("processes.htop.pid"));
+        assert_eq!(
+            via_hasher(&["processes", "htop", "pid"]),
+            ComponentId::new("processes.htop.pid")
+        );
         assert_eq!(via_hasher(&["a"]), ComponentId::new("a"));
         assert_eq!(via_hasher(&[]), ComponentId::new(""));
         // empty segments are skipped, matching ChainPath join rules
@@ -144,7 +146,9 @@ mod tests {
         // Small deterministic LCG so the test needs no rng dependency.
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state >> 33
         };
         const ALPHABET: &[u8] = b"abcdefABCDEF0123_";
