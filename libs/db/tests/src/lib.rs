@@ -1,13 +1,14 @@
 #[cfg(test)]
 mod tests {
+    use metor_proto::types::short_id;
 
     use arrow::{array::AsArray, datatypes::Float64Type};
+    use metor_db::{DB, Error, Server};
     use metor_proto::{
         types::{ComponentId, IntoLenPacket, LenPacket, Msg, PrimType, Timestamp},
         vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable},
     };
     use metor_proto_stellar::Client;
-    use metor_db::{DB, Error, Server};
     use postcard_schema::{Schema, schema::owned::OwnedNamedType};
     use std::{net::SocketAddr, sync::Arc, time::Duration};
     use stellarator::{net::TcpListener, sleep, spawn, struc_con::stellar, test};
@@ -93,8 +94,8 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         let component_id = ComponentId(4242);
         let node_dir = scratch.join("1000");
-        let node = metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(1_000), 8)
-            .unwrap();
+        let node =
+            metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(1_000), 8).unwrap();
         for i in 0..64i64 {
             node.data.write(&(1_000 + i).to_le_bytes()).unwrap();
             node.index
@@ -188,12 +189,16 @@ mod tests {
                 metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(start), 8)
                     .unwrap();
             for i in 0..64i64 {
-                node.data.write(&((start + i) as u64).to_le_bytes()).unwrap();
+                node.data
+                    .write(&((start + i) as u64).to_le_bytes())
+                    .unwrap();
                 node.index
                     .write(&Timestamp(start + i).to_le_bytes())
                     .unwrap();
             }
-            let seal = metor_db::seal::seal_node(&node, &node_dir).unwrap().unwrap();
+            let seal = metor_db::seal::seal_node(&node, &node_dir)
+                .unwrap()
+                .unwrap();
             store
                 .put(
                     NodeKey {
@@ -246,7 +251,11 @@ mod tests {
                 .filter_map(|id| {
                     let meta = state.get_component_metadata(*id)?;
                     assert!(meta.is_hidden(), "lod companions must be hidden");
-                    let ratio = meta.metadata.get(metor_db::lod::LOD_RATIO_KEY)?.parse().ok()?;
+                    let ratio = meta
+                        .metadata
+                        .get(metor_db::lod::LOD_RATIO_KEY)?
+                        .parse()
+                        .ok()?;
                     let bucket = meta
                         .metadata
                         .get(metor_db::lod::LOD_BUCKET_US_KEY)?
@@ -321,22 +330,21 @@ mod tests {
         )]);
         producer
             .send(&VTableMsg {
-                id: 2u16.to_le_bytes(),
+                id: 2u64.to_le_bytes(),
                 vtable,
             })
             .await
             .0
             .unwrap();
 
-        let local_dir =
-            std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
+        let local_dir = std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
         let local_db = Arc::new(DB::create(local_dir).unwrap());
         metor_db::remote::RemoteDb::new(addr).spawn(local_db.clone());
         // Let the mirror connect and subscribe before data flows.
         sleep(Duration::from_millis(300)).await;
 
         let floats = [4.0f64, 5.0];
-        let mut pkt = LenPacket::table(2u16.to_le_bytes(), 16);
+        let mut pkt = LenPacket::table(2u64.to_le_bytes(), 16);
         pkt.extend_aligned(&floats);
         producer.send(pkt).await.0.unwrap();
 
@@ -395,8 +403,8 @@ mod tests {
         panic!("never saw {what}");
     }
 
-    const MIRROR_LOG: metor_proto::types::PacketId = [0x41, 7];
-    const MIRROR_CMD: metor_proto::types::PacketId = [0x42, 7];
+    const MIRROR_LOG: metor_proto::types::PacketId = short_id([0x41, 7]);
+    const MIRROR_CMD: metor_proto::types::PacketId = short_id([0x42, 7]);
 
     /// `SyncMsgs` carries a log's metadata, its latest record with the
     /// source timestamp, and every record pushed afterwards.
@@ -419,7 +427,9 @@ mod tests {
                 )
             })
             .unwrap();
-        src_db.push_msg(Timestamp(100), MIRROR_LOG, b"seed").unwrap();
+        src_db
+            .push_msg(Timestamp(100), MIRROR_LOG, b"seed")
+            .unwrap();
 
         let local_db = mirror_db(addr);
         let probe = local_db.clone();
@@ -437,7 +447,9 @@ mod tests {
             "the log's metadata crossed with it",
         );
 
-        src_db.push_msg(Timestamp(101), MIRROR_LOG, b"live").unwrap();
+        src_db
+            .push_msg(Timestamp(101), MIRROR_LOG, b"live")
+            .unwrap();
         let probe = local_db.clone();
         wait_for(
             move || log_records(&probe, MIRROR_LOG).len() == 2,
@@ -550,13 +562,13 @@ mod tests {
         )]);
         client
             .send(&VTableMsg {
-                id: 1u16.to_le_bytes(),
+                id: 1u64.to_le_bytes(),
                 vtable,
             })
             .await
             .0
             .unwrap();
-        let mut pkt = LenPacket::table(1u16.to_le_bytes(), 16);
+        let mut pkt = LenPacket::table(1u64.to_le_bytes(), 16);
         let floats = [1.0f64, 2.0];
         pkt.extend_aligned(&floats);
         client.send(pkt).await.0.unwrap();
@@ -584,7 +596,7 @@ mod tests {
             schema(PrimType::F64, &[1], component(component_id)),
         )]);
 
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         let msg = VTableMsg {
             id: vtable_id,
             vtable: vtable.clone(),
@@ -662,7 +674,7 @@ mod tests {
             .0
             .unwrap();
 
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         client
             .send(&VTableMsg {
                 id: vtable_id,
@@ -722,7 +734,7 @@ mod tests {
             ),
         )]);
 
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         client
             .send(&VTableMsg {
                 id: vtable_id,
@@ -778,7 +790,7 @@ mod tests {
 
         client
             .send(&VTableMsg {
-                id: 1u16.to_le_bytes(),
+                id: 1u64.to_le_bytes(),
                 vtable,
             })
             .await
@@ -839,7 +851,7 @@ mod tests {
 
         client
             .send(&VTableMsg {
-                id: 1u16.to_le_bytes(),
+                id: 1u64.to_le_bytes(),
                 vtable: vtable1,
             })
             .await
@@ -848,7 +860,7 @@ mod tests {
 
         client
             .send(&VTableMsg {
-                id: 2u16.to_le_bytes(),
+                id: 2u64.to_le_bytes(),
                 vtable: vtable2,
             })
             .await
@@ -947,7 +959,7 @@ mod tests {
             schema(PrimType::F64, &[1], component(component_id)),
         )]);
 
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         client
             .send(&VTableMsg {
                 id: vtable_id,
@@ -1017,7 +1029,7 @@ mod tests {
 
         client
             .send(&VTableMsg {
-                id: 1u16.to_le_bytes(),
+                id: 1u64.to_le_bytes(),
                 vtable: vtable([raw_field(
                     0,
                     4,
@@ -1029,7 +1041,7 @@ mod tests {
             .unwrap();
 
         let query = GetTimeSeries {
-            id: 1u16.to_le_bytes(),
+            id: 1u64.to_le_bytes(),
             limit: None,
             ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(10000))
         };
@@ -1044,7 +1056,7 @@ mod tests {
         let non_existent_component_id = ComponentId::new("non_existent_component");
 
         let query = GetTimeSeries {
-            id: 1u16.to_le_bytes(),
+            id: 1u64.to_le_bytes(),
             limit: None,
             ..GetTimeSeries::range(non_existent_component_id, Timestamp(0)..Timestamp(10000))
         };
@@ -1105,7 +1117,7 @@ mod tests {
         let (addr, _db) = setup_test_db().await.unwrap();
         let mut client = Client::connect(addr).await.unwrap();
 
-        let msg_id = 9999u16.to_le_bytes();
+        let msg_id = 9999u64.to_le_bytes();
 
         let get_metadata = GetMsgMetadata { msg_id };
 
@@ -1125,7 +1137,7 @@ mod tests {
         let mut client = Client::connect(addr).await.unwrap();
 
         // Try to get messages for a non-existent message ID
-        let msg_id = 9999u16.to_le_bytes();
+        let msg_id = 9999u64.to_le_bytes();
 
         let get_msgs = GetMsgs {
             msg_id,
@@ -1152,7 +1164,7 @@ mod tests {
             8,
             schema(PrimType::F64, &[1], component(component_id)),
         )]);
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
 
         // Set up the vtable and metadata
         let mut setup_client = Client::connect(addr).await.unwrap();
@@ -1223,7 +1235,7 @@ mod tests {
     async fn test_database_restart() {
         let temp_dir =
             std::env::temp_dir().join(format!("metor_db_restart_test_{}", fastrand::u64(..)));
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         let test_value = 42.0;
         let component_id = ComponentId::new("restart_test");
 
@@ -1324,7 +1336,7 @@ mod tests {
             schema(PrimType::F64, &[100], component(component_id)),
         )]);
 
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         client
             .send(&VTableMsg {
                 id: vtable_id,
@@ -1409,8 +1421,8 @@ mod tests {
             schema(PrimType::F64, &[], component("sensor2.temp")),
         )]);
 
-        let vtable_id1 = 1u16.to_le_bytes();
-        let vtable_id2 = 2u16.to_le_bytes();
+        let vtable_id1 = 1u64.to_le_bytes();
+        let vtable_id2 = 2u64.to_le_bytes();
 
         client
             .send(&VTableMsg {
@@ -1502,7 +1514,7 @@ mod tests {
             schema(PrimType::F64, &[], component(component_id)),
         )]);
 
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         client
             .send(&VTableMsg {
                 id: vtable_id,
@@ -1547,14 +1559,14 @@ mod tests {
 
             client
                 .send(&VTableMsg {
-                    id: 1u16.to_le_bytes(),
+                    id: 1u64.to_le_bytes(),
                     vtable,
                 })
                 .await
                 .0
                 .unwrap();
 
-            let mut pkt = LenPacket::table(1u16.to_le_bytes(), 8);
+            let mut pkt = LenPacket::table(1u64.to_le_bytes(), 8);
             pkt.extend_aligned(&[42.0f64]);
             client.send(pkt).await.0.unwrap();
         }
@@ -1567,7 +1579,7 @@ mod tests {
             schema(PrimType::F32, &[1], component(component_id)),
         )]);
 
-        let vtable_id = 2u16.to_le_bytes();
+        let vtable_id = 2u64.to_le_bytes();
         client
             .send(
                 VTableMsg {
@@ -1592,7 +1604,7 @@ mod tests {
             std::env::temp_dir().join(format!("metor_db_persistence_test_{}", fastrand::u64(..)));
 
         let component_id = ComponentId::new("subscription_test");
-        let vtable_id = 1u16.to_le_bytes();
+        let vtable_id = 1u64.to_le_bytes();
         let test_value = 123.45f64;
 
         // Define message type for testing

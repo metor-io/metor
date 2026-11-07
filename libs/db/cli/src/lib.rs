@@ -115,7 +115,7 @@ impl Client {
     ) -> anyhow::Result<()> {
         let start = start.unwrap_or(i64::MIN);
         let stop = stop.unwrap_or(i64::MAX);
-        let id = fastrand::u16(..);
+        let id = fastrand::u64(..);
 
         let component_id: ComponentId = lua.from_value(component_id)?;
         self.require_range_fetch().await?;
@@ -219,7 +219,7 @@ impl Client {
             size as u32,
             schema(prim_type, &shape, component(component_id)),
         )]);
-        let id: [u8; 2] = fastrand::u16(..).to_le_bytes();
+        let id = fastrand::u64(..).to_le_bytes();
         let msg = VTableMsg { id, vtable };
         self.client.send(&msg).await.0?;
         let mut table = LenPacket::table(id, 8);
@@ -319,7 +319,7 @@ impl Client {
     }
 
     pub async fn vtable_stream(&mut self, vtable: VTable) -> anyhow::Result<()> {
-        let id = fastrand::u16(..).to_le_bytes();
+        let id = fastrand::u64(..).to_le_bytes();
         let vtable_msg = VTableMsg { vtable, id };
         self.client.send(&vtable_msg).await.0?;
         let stream = self.client.stream(&VTableStream { id }).await?;
@@ -782,7 +782,7 @@ pub fn lua() -> anyhow::Result<Lua> {
     lua.globals().set(
         "vtable_msg",
         lua.create_function(
-            |lua, (id, fields): (u16, Vec<UserDataRef<LuaFieldBuilder>>)| {
+            |lua, (id, fields): (u64, Vec<UserDataRef<LuaFieldBuilder>>)| {
                 let fields = fields.into_iter().map(|field| field.0.clone());
                 let vtable = vtable::builder::vtable(fields);
                 let id = id.to_le_bytes();
@@ -792,7 +792,7 @@ pub fn lua() -> anyhow::Result<Lua> {
     )?;
     lua.globals().set(
         "udp_vtable_stream",
-        lua.create_function(|lua, (id, addr): (u16, String)| {
+        lua.create_function(|lua, (id, addr): (u64, String)| {
             let id = id.to_le_bytes();
             lua.create_ser_userdata(UdpVTableStream { id, addr })
         })?,

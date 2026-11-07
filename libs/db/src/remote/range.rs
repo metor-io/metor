@@ -560,6 +560,7 @@ fn answers(series: &TimeSeries, query: &GetTimeSeries, held: &Range<Timestamp>) 
 
 #[cfg(test)]
 mod tests {
+    use metor_proto::types::short_id;
     use std::{
         net::SocketAddr,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -686,7 +687,7 @@ mod tests {
         ranges: bool,
     ) -> (Arc<DB>, Hydrator, Arc<Peer>) {
         let mirror = Arc::new(DB::create(dir.join("mirror")).unwrap());
-        with_f64(&mirror, [9, 4], A);
+        with_f64(&mirror, short_id([9, 4]), A);
         let store = Peer::new(addr, ranges);
         let hydrator = Hydrator::new();
         stellarator::spawn(hydrator.clone().run(mirror.clone(), store.clone()));
@@ -712,7 +713,7 @@ mod tests {
         head: Range<i64>,
     ) -> (Arc<DB>, Hydrator, Arc<Peer>) {
         let peer = Arc::new(DB::create(dir.join("peer")).unwrap());
-        with_f64(&peer, [9, 4], A);
+        with_f64(&peer, short_id([9, 4]), A);
         for node in nodes {
             let values: Vec<(Timestamp, [u8; 8])> = (node.0..node.1)
                 .step_by(step)
@@ -938,7 +939,7 @@ mod tests {
     async fn a_peers_head_is_read_by_range_and_outlives_its_seal() {
         let dir = tempfile::tempdir().unwrap();
         let peer = Arc::new(DB::create(dir.path().join("peer")).unwrap());
-        with_f64(&peer, [9, 4], A);
+        with_f64(&peer, short_id([9, 4]), A);
         series(&peer).set_max_node_age(Duration::from_micros(1000));
         let mut writer = series(&peer).writer().unwrap();
         for t in (0..1000).step_by(10) {
