@@ -21,6 +21,7 @@ Publishers and subscribers each derive the id from the vtable, so ids cannot be 
 - Message ids keep their current 16-bit values, zero-extended.
 - The header has no version field. `ty` has unused values that can carry a version later.
 - There is no compatibility with the old format. All peers upgrade together.
+- A mismatched peer is not detected. The length prefix is unchanged, so its packets still frame. Any old-format message with at least 8 body bytes parses under a wrong id, and the DB records it as a message log named for that id.
 
 ## Wire format
 
