@@ -1,7 +1,7 @@
 //! Runs the fixture deployment with `metor run`.
 //!
 //! Target `a` publishes samples, `b` subscribes to them and sends pings, and
-//! the gateway's db records both.
+//! the gateway's db records both. `groups.py` runs a tree of targets.
 
 mod common;
 
@@ -32,7 +32,7 @@ const CYCLES: &str = "20000";
 
 const PORTS_ENV: &str = "METOR_DEPLOY_PORTS";
 
-fn run(target: &Path, ports: &[u16; 3], args: &[&str]) -> Running {
+fn run(target: &Path, ports: &[u16], args: &[&str]) -> Running {
     let child = metor()
         .arg("run")
         .arg(target)
@@ -61,7 +61,7 @@ async fn metadata(client: &mut Client) -> DumpMetadataResp {
 
 #[stellarator::test]
 async fn test_gateway_records_every_target() {
-    let ports = free_ports();
+    let ports: [u16; 3] = free_ports();
     let _running = run(
         &fixture_dir().join("deploy.py"),
         &ports,
@@ -114,6 +114,113 @@ async fn test_gateway_records_every_target() {
             .tick(format!("the series never filled: {series:?}"))
             .await;
     }
+}
+
+/// Waits until the db announces every name in `wanted`.
+async fn announced(client: &mut Client, wanted: &[String]) {
+    let deadline = Deadline::new();
+    loop {
+        let dump = metadata(client).await;
+        let names: Vec<&str> = dump
+            .component_metadata
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        if wanted.iter().all(|name| names.contains(&name.as_str())) {
+            return;
+        }
+        deadline.tick(format!("announced only {names:?}")).await;
+    }
+}
+
+/// Waits until the db holds a sample of the component `name`.
+async fn recorded(client: &mut Client, name: &str) {
+    let deadline = Deadline::new();
+    loop {
+        let series = client
+            .request(&GetTimeSeries {
+                id: [0; 8],
+                limit: Some(8),
+                ..GetTimeSeries::range(
+                    ComponentId::new(name),
+                    Timestamp(0)..Timestamp(i64::MAX / 2),
+                )
+            })
+            .await;
+        if let Ok(series) = &series
+            && series.timestamps().is_ok_and(|stamps| !stamps.is_empty())
+        {
+            return;
+        }
+        deadline
+            .tick(format!("{name} never filled: {series:?}"))
+            .await;
+    }
+}
+
+/// Each string's gateway sends its CPU a sample, the CPU sends it back
+/// through a subscriber the string added once the CPU existed, and the
+/// ground records the value that went both ways.
+#[stellarator::test]
+async fn test_groups_round_trip_every_string() {
+    let ports: [u16; 10] = free_ports();
+    let _running = run(
+        &fixture_dir().join("groups.py"),
+        &ports,
+        &["--cycles", CYCLES],
+    );
+    let mut client = connect(local(ports[9])).await;
+    let wanted: Vec<String> = (1..=3)
+        .flat_map(|i| {
+            [
+                format!("flight.s{i}.cpu.relay.sample.value"),
+                format!("flight.s{i}.gw.back.sample.value"),
+            ]
+        })
+        .collect();
+    announced(&mut client, &wanted).await;
+    for i in 1..=3 {
+        recorded(&mut client, &format!("flight.s{i}.gw.back.sample.value")).await;
+    }
+}
+
+/// One string runs alone: the ground is not running, and the string's
+/// targets still run their cycles.
+#[test]
+fn test_one_string_runs_alone() {
+    let ports: [u16; 10] = free_ports();
+    let output = metor()
+        .arg("run")
+        .arg(fixture_dir().join("groups.py"))
+        .args(["--target", "flight.s1", "--cycles", "200"])
+        .env(PORTS_ENV, ports_env(&ports))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for ns in ["flight.s1.gw", "flight.s1.cpu"] {
+        assert!(
+            stderr
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{ns} "))),
+            "{stderr}"
+        );
+    }
+    assert!(!stderr.contains("ground "), "{stderr}");
+}
+
+/// A selection that leaves nothing fails before any target starts.
+#[test]
+fn test_empty_selection_fails() {
+    let output = metor()
+        .arg("run")
+        .arg(fixture_dir().join("groups.py"))
+        .args(["--target", "flight", "--except", "flight"])
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("M0109"), "{stderr}");
 }
 
 /// Runs `metor build` on the fixture deployment and returns the resolved
