@@ -33,6 +33,9 @@ Tests:
 
 ## 2. `recorder` replaces `gateway()`
 
+After review, `recorder` and `Recorder` were renamed `gateway` and
+`Gateway`.
+
 - `_deployment.py`: delete `gateway`. Add `recorder` as a `@composite` in a
   new `_recorder.py`:
   `recorder(s, *, peers: Sequence[SystemHandle], listen: str, path: str | None = None) -> Recorder`.

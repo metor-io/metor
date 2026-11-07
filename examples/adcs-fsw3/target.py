@@ -3,7 +3,7 @@
 `plant` simulates the spacecraft. `fsw` runs its measurements through three
 composites: `gnc`, which holds nav, ctrl, and the `commission` sequence;
 `monitor`, which checks sensor health; and `downlink`, which sends the beacon.
-The gateway's recorder keeps both targets' telemetry in a db. `commission`
+The gateway keeps both targets' telemetry in a db. `commission`
 runs as a wasm module and takes its commands through the gateway.
 `METOR_DEPLOY_PORTS` sets the three listen ports so tests can pick free ones.
 """
@@ -44,7 +44,7 @@ from metor_config import (
     Subscribe,
     Target,
     composite,
-    recorder,
+    gateway,
 )
 
 
@@ -195,7 +195,7 @@ torque.connect(ctrl_cmds.port(g.ctrl.torque_cmd))
 mtq.connect(ctrl_cmds.port(g.ctrl.mtq_cmd))
 
 gw = Target(cycle_rate=120.0, namespace="gw")
-db = gw.add("rec", recorder(peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}")).db
+db = gw.add("rec", gateway(peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}")).db
 
 # The ground commands `gnc.commission` through the gateway's db.
 ground_cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Peer(db)))

@@ -1,4 +1,4 @@
-"""`recorder`, a composite that records other targets' telemetry."""
+"""`gateway`, a composite that records other targets' telemetry."""
 
 from __future__ import annotations
 
@@ -9,21 +9,21 @@ from ._composite import Scope, composite
 from ._target import SystemHandle
 
 
-class Recorder(NamedTuple):
-    """What `recorder` returns."""
+class Gateway(NamedTuple):
+    """What `gateway` returns."""
 
     db: Db
 
 
 @composite
-def recorder(
+def gateway(
     s: Scope,
     *,
     peers: Sequence[SystemHandle],
     listen: str,
     path: str | None = None,
     keep: bool | None = None,
-) -> Recorder:
+) -> Gateway:
     """Records telemetry from other targets.
 
     Subscribes to each link in ``peers``, named for its target's namespace,
@@ -34,4 +34,4 @@ def recorder(
     for peer in peers:
         s.add(_namespace(peer), Subscribe(transport=Peer(peer)))
     db = s.add("db", Db(listen=listen, path=path, all=True, keep=keep), thread="db")
-    return Recorder(db)
+    return Gateway(db)

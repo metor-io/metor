@@ -1,5 +1,5 @@
 """The fixture's tree: `flight` holds three strings, each a gateway and a
-CPU, and `ground` records every gateway.
+CPU, and `ground` records every string through a `gateway`.
 
 A gateway's sampler reaches its CPU, which muxes it into `relay`. The
 string adds a subscriber to the gateway once the CPU exists, and muxes the
@@ -22,15 +22,15 @@ from metor_config import (
     Publish,
     Subscribe,
     Target,
+    gateway,
     group,
-    recorder,
 )
 
 db_port = os.environ.get("METOR_DEPLOY_PORTS", "2250")
 ANY = Listen("127.0.0.1:0")
 
 
-class Gateway(NamedTuple):
+class Radio(NamedTuple):
     target: Target
     link: Publish
     sample: OutPort[Sample]
@@ -42,11 +42,11 @@ class Cpu(NamedTuple):
 
 
 @group
-def gateway(g: Group) -> Gateway:
+def radio(g: Group) -> Radio:
     t = g.target(cycle_rate=1000.0)
     sampler = t.add("sampler", Sampler())
     link = t.add("up", Publish([sampler], transport=ANY))
-    return Gateway(t, link, sampler.sample)
+    return Radio(t, link, sampler.sample)
 
 
 @group
@@ -61,7 +61,7 @@ def cpu(g: Group, *, gateway: Publish, sample: OutPort[Sample]) -> Cpu:
 
 @group
 def string(g: Group) -> Publish:
-    gw = g.add("gw", gateway())
+    gw = g.add("gw", radio())
     c = g.add("cpu", cpu(gateway=gw.link, sample=gw.sample))
     down = gw.target.add("down", Subscribe(transport=Peer(c.link), items=[c.relay]))
     seen = down.port(c.relay)
@@ -77,4 +77,4 @@ def flight(g: Group) -> list[Publish]:
 ground = Target(cycle_rate=1000.0, namespace="ground")
 d = Deployment(targets=[ground])
 links = d.add("flight", flight())
-ground.add("rec", recorder(peers=links, listen=f"127.0.0.1:{db_port}"))
+ground.add("rec", gateway(peers=links, listen=f"127.0.0.1:{db_port}"))

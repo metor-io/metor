@@ -356,7 +356,7 @@ announced, so a peer built against other definitions shows up on `log`.
 A gateway is a target whose `Db` embeds a metor-db. It subscribes to every
 peer and records what arrives. The ground reads one database, not each
 target's stream, and a slow reader never holds a target's rings.
-`recorder(..)` is a composite that adds the subscribers and the db to a
+`gateway(..)` is a composite that adds the subscribers and the db to a
 target.
 
 The ground commands a target through a `Subscribe` whose records are

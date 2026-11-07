@@ -1,4 +1,4 @@
-"""Tests for deployments: peers, copied ports, the recorder, and the golden
+"""Tests for deployments: peers, copied ports, the gateway, and the golden
 config file."""
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from metor_config import (
     Publish,
     Subscribe,
     Target,
-    recorder,
+    gateway,
 )
 
 GOLDEN = os.path.join(CRATE, "tests", "golden", "deployment.json")
@@ -39,15 +39,15 @@ def design_example() -> Deployment:
     b.add("ctrl", Ctrl(est=mirror.port(nav.est), mode=mode.cmd))
     b_pub = b.add("pub", Publish(transport=Listen("0.0.0.0:2241"), all=True))
 
-    gw, gw_db = gateway("gw", peers=[a_pub, b_pub], listen="0.0.0.0:2250")
+    gw, gw_db = gateway_target("gw", peers=[a_pub, b_pub], listen="0.0.0.0:2250")
     a.add("cmds", Subscribe(transport=Peer(gw_db), records=[Ping]))
     return Deployment(targets=[a, b, gw], hosts={"a": "10.0.0.2"})
 
 
-def gateway(namespace: str, peers: list, listen: str, **kw) -> tuple[Target, Db]:
-    """A target named ``namespace`` that holds only a recorder, `rec`."""
+def gateway_target(namespace: str, peers: list, listen: str, **kw) -> tuple[Target, Db]:
+    """A target named ``namespace`` that holds only a gateway, `rec`."""
     gw = Target(cycle_rate=10.0, namespace=namespace)
-    return gw, gw.add("rec", recorder(peers=peers, listen=listen, **kw)).db
+    return gw, gw.add("rec", gateway(peers=peers, listen=listen, **kw)).db
 
 
 def plant_and_peer() -> tuple[Target, Plant, Target]:
@@ -238,7 +238,7 @@ class DeploymentTest(ConfigTest):
         self.assertEqual(plant.imu.record, Imu)
 
     def test_db_keep_sets_on_exit(self) -> None:
-        gw, db = gateway("gw", peers=[], listen="0.0.0.0:2250", keep=True)
+        gw, db = gateway_target("gw", peers=[], listen="0.0.0.0:2250", keep=True)
         tmp = Target(cycle_rate=10.0, namespace="tmp")
         tmp.add("db", Db(listen="0.0.0.0:2251", path="/data/db", keep=False))
         config = Deployment(targets=[gw, tmp]).to_config()
@@ -253,7 +253,7 @@ class DeploymentTest(ConfigTest):
         a_pub = a.add("pub", Publish([plant], transport=Listen("0.0.0.0:2240")))
         b = Target(cycle_rate=100.0, namespace="b")
         b.add("cmds", Subscribe(records=[Ping], transport=Listen("0.0.0.0:2260")))
-        gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
+        gw, db = gateway_target("gw", peers=[a_pub], listen="0.0.0.0:2250")
         a.add("cmds", Subscribe(transport=Peer(db), records=[Ping, LogEvent]))
         b.add("pings", Subscribe(transport=Peer(db), records=[Ping]))
         gw.add("local", Subscribe(transport=Peer(db), records=[LogEvent]))
@@ -263,7 +263,7 @@ class DeploymentTest(ConfigTest):
 
     def test_db_lays_out_frame_commands_for_their_port(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
-        gw, db = gateway("gw", peers=[], listen="0.0.0.0:2250")
+        gw, db = gateway_target("gw", peers=[], listen="0.0.0.0:2250")
         a.add("cmds", Subscribe(transport=Peer(db), records=[Ping, Imu]))
         config = Deployment(targets=[a, gw]).to_config()
         db_entry = config["targets"][1]["coordinator"]["systems"][0]
@@ -275,15 +275,15 @@ class DeploymentTest(ConfigTest):
     def test_db_without_subscribers_has_no_commands(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         a.add("cmds", Subscribe(records=[Ping], transport=Listen("0.0.0.0:2260")))
-        gw, _ = gateway("gw", peers=[], listen="0.0.0.0:2250")
+        gw, _ = gateway_target("gw", peers=[], listen="0.0.0.0:2250")
         config = Deployment(targets=[a, gw]).to_config()
         self.assertEqual(config["targets"][1]["coordinator"]["systems"][0]["params"]["commands"], [])
 
-    def test_recorder_composes_subscribes_and_db(self) -> None:
+    def test_gateway_composes_subscribes_and_db(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         plant = a.add("plant", Plant())
         a_pub = a.add("pub", Publish([plant], transport=Listen("0.0.0.0:2240")))
-        gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
+        gw, db = gateway_target("gw", peers=[a_pub], listen="0.0.0.0:2250")
         config = Deployment(targets=[a, gw]).to_config()
         systems = config["targets"][1]["coordinator"]["systems"]
         self.assertEqual([s["id"] for s in systems], ["rec.a", "rec.db", "io_submit", "io_complete"])

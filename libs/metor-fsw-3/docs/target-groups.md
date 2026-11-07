@@ -33,19 +33,19 @@ Groups sit one level above composites:
 from typing import NamedTuple
 from metor_config import Deployment, Group, Listen, Loop, OutPort, Peer, Publish, Subscribe, Target, group
 
-class Gateway(NamedTuple):
+class Radio(NamedTuple):
     target: Target
     link: Publish
     cmd: OutPort[Cmd]
     est: Loop[Est]
 
 @group
-def gateway_node(g: Group) -> Gateway:
+def radio(g: Group) -> Radio:
     t = g.target(cycle_rate=50.0)          # namespace: the group's path
     est = g.loop(Est)
     radio = t.add("radio", Radio(est=est))
     link = t.add("pub", Publish([radio], transport=Listen("[::]:0")))
-    return Gateway(t, link, radio.cmd, est)
+    return Radio(t, link, radio.cmd, est)
 
 class Cpu(NamedTuple):
     link: Publish
@@ -61,7 +61,7 @@ def cpu(g: Group, *, gateway: Publish, cmd: OutPort[Cmd]) -> Cpu:
 
 @group
 def flight(g: Group) -> Flight:
-    gws = [g.add(f"gw{i}", gateway_node()) for i in (1, 2, 3)]
+    gws = [g.add(f"gw{i}", radio()) for i in (1, 2, 3)]
     cpus = [g.add(f"cpu{i}", cpu(gateway=gw.link, cmd=gw.cmd)) for i, gw in enumerate(gws, 1)]
     for gw, c in zip(gws, cpus):
         # Each gateway reads its CPU's estimate, which did not exist when the
@@ -150,18 +150,18 @@ be several cycles old, or missing if the producer is not running.
 
 ### Link names
 
-A link's id may be dotted, so links can sit inside composites, and `recorder`
+A link's id may be dotted, so links can sit inside composites, and `gateway`
 can name a subscriber for its peer's dotted namespace. The link's resource is
 its id with `.` replaced by `_`, then `_ep`.
 
-### Recording
+### Gateways
 
-`gateway()` is removed. Its systems become a composite, `recorder`, which goes
+`gateway()` is now a composite. It no longer makes its own target, so it goes
 on any target, inside a group or not:
 
 ```python
 gse = g.target(cycle_rate=10.0)
-rec = gse.add("rec", recorder(peers=[c.link for c in cpus], listen="127.0.0.1:2250"))
+rec = gse.add("rec", gateway(peers=[c.link for c in cpus], listen="127.0.0.1:2250"))
 rec.db  # the db's handle, for a `Subscribe` that commands through it
 ```
 
@@ -198,7 +198,7 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 
 | Part | Change |
 |---|---|
-| `metor_config` | `group`, `Group`, `Deployment.add`, `hosts` prefixes, dotted link ids, `recorder` in place of `gateway()`, the nesting check |
+| `metor_config` | `group`, `Group`, `Deployment.add`, `hosts` prefixes, dotted link ids, `gateway` as a composite, the nesting check |
 | `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
 | `deploy` resolver | ports for dialed listeners on port 0 |
 | Config format, host, runtime | none |

@@ -7,7 +7,7 @@ their values, and `gw` records both into a db.
 import os
 
 from echo_pack import Meter, Sampler
-from metor_config import Deployment, Listen, Peer, Publish, Subscribe, Target, recorder
+from metor_config import Deployment, Listen, Peer, Publish, Subscribe, Target, gateway
 
 p_a, p_b, p_db = os.environ.get("METOR_DEPLOY_PORTS", "2240,2241,2250").split(",")
 
@@ -21,6 +21,6 @@ b.add("meter", Meter(sample=mirror.port(sampler.sample)))
 b_pub = b.add("pub", Publish(transport=Listen(f"127.0.0.1:{p_b}"), all=True))
 
 gw = Target(cycle_rate=1000.0, namespace="gw")
-gw.add("rec", recorder(peers=[a_pub, b_pub], listen=f"127.0.0.1:{p_db}"))
+gw.add("rec", gateway(peers=[a_pub, b_pub], listen=f"127.0.0.1:{p_db}"))
 
 Deployment(targets=[a, b, gw])

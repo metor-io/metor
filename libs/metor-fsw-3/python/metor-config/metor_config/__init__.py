@@ -24,7 +24,7 @@ from ._composite import Composite, Scope, composite
 from ._config import ConfigError
 from ._deployment import Deployment, emit
 from ._group import Group, GroupBuild, group
-from ._recorder import Recorder, recorder
+from ._gateway import Gateway, gateway
 from ._fields import ArrayField, Field
 from ._generated import (
     CONFIG_VERSION,
@@ -120,8 +120,8 @@ __all__ = [
     "PortRef",
     "Publish",
     "Record",
-    "Recorder",
-    "recorder",
+    "Gateway",
+    "gateway",
     "Source",
     "Sources",
     "Subscribe",
