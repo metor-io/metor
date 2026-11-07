@@ -197,7 +197,7 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 
 | Part | Change |
 |---|---|
-| `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, dotted link ids, `recorder` in place of `gateway()`, the nesting check |
+| `metor_config` | `group`, `Group`, `Deployment.add`, `hosts` prefixes, dotted link ids, `recorder` in place of `gateway()`, the nesting check |
 | `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
 | `deploy` resolver | ports for dialed listeners on port 0 |
 | Config format, host, runtime | none |
