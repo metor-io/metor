@@ -1108,8 +1108,9 @@ pub struct LogEvent {
 /// ([`FEATURE_UNSEALED_HEAD`]). Older clients never read it; a version-8
 /// client reads a version-7 server's reply as [`NodeManifestRespV7`].
 ///
-/// Version 9 widened [`PacketId`] to 8 bytes and the packet prefix to 16,
-/// which older peers cannot frame.
+/// Version 9 widened [`PacketId`] to 8 bytes and the packet prefix to 16.
+/// The length prefix is unchanged, so an older peer's packets still frame
+/// but decode to the wrong id and body.
 pub const NODE_PROTOCOL_VERSION: u32 = 9;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
@@ -1955,7 +1956,12 @@ mod sequence_tests {
                 "{id:?} collides with the node protocol"
             );
             assert!(
-                ![short_id([224, 41]), short_id([224, 42]), short_id([224, 43])].contains(&id),
+                ![
+                    short_id([224, 41]),
+                    short_id([224, 42]),
+                    short_id([224, 43])
+                ]
+                .contains(&id),
                 "{id:?} resurrects a retired sequence id"
             );
         }

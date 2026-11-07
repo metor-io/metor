@@ -44,3 +44,6 @@ bbq2.default-features = false
 bbq2.optional = true
 metor-proto-bbq.path = "../bbq"
 metor-proto-bbq.optional = true
+
+[dev-dependencies]
+metor-proto-stellar = { path = ".", features = ["queue"] }
