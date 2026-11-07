@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, cast, overload
 
+from ._composite import Composite, Scope
 from ._config import ConfigError, simulated_clock, wall_clock
 from ._generated import CHANNEL_PORTS, COMMANDS_PORT, Io, ResourceStatus
 from ._io import Kind, ResourceHandle, SimKind
@@ -17,6 +18,7 @@ IO_TYPE = f"{Io._pack.id}.{Io._ty}"
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
 P = TypeVar("P", bound=OutPort[Any])
+R = TypeVar("R")
 
 _targets: list["Target"] = []
 
@@ -122,6 +124,7 @@ class Target:
         self._systems: list[_Entry] = []
         self._sims: list[_Entry] = []
         self._handles: dict[str, SystemHandle] = {}
+        self._composites: set[str] = set()
         self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
         self._wasm: dict[str, dict[str, Any]] = {}
@@ -152,6 +155,7 @@ class Target:
         """
         return Loop(record)
 
+    @overload
     def add(
         self,
         name: str,
@@ -159,7 +163,19 @@ class Target:
         thread: str | None = None,
         channel: str | None = None,
         start: str | None = None,
-    ) -> S:
+    ) -> S: ...
+
+    @overload
+    def add(self, name: str, system: Composite[R]) -> R: ...
+
+    def add(
+        self,
+        name: str,
+        system: Any,
+        thread: str | None = None,
+        channel: str | None = None,
+        start: str | None = None,
+    ) -> Any:
         """Adds ``system`` to the target under ``name``.
 
         Returns a handle whose attributes are the system's output ports.
@@ -172,7 +188,14 @@ class Target:
         which carries the channel's state each cycle, and a ``channel_message``
         output, which carries each message as it is raised. ``start`` sets the
         channel's state at boot: ``"running"`` (the default) or ``"stopped"``.
+
+        A `Composite` adds its systems here, under ``{name}.``, and returns
+        its function's result. It takes no adapter; its systems set their own.
         """
+        if isinstance(system, Composite):
+            if thread is not None or channel is not None or start is not None:
+                raise ConfigError(f"composite `{name}` takes no adapter; set it on its systems")
+            return self._add_composite(name, system)
         return self._add(self._systems, name, system, _adapter(thread, channel, start))
 
     def sim(self, name: str, system: S) -> S:
@@ -185,6 +208,17 @@ class Target:
         """
         return self._add(self._sims, name, system, None)
 
+    def _add_composite(self, name: str, composite: Composite[R]) -> R:
+        if not all(part.isidentifier() for part in name.split(".")):
+            raise ConfigError(f"a composite's name is an identifier, got {name!r}")
+        self._check_free(name)
+        self._composites.add(name)
+        return composite._build(Scope(self, name))
+
+    def _check_free(self, name: str) -> None:
+        if name in self._handles or name in self._composites:
+            raise ConfigError(f"system `{name}` is already added")
+
     def _add(
         self,
         systems: list[_Entry],
@@ -192,8 +226,7 @@ class Target:
         system: S,
         adapter: _Thread | _Channel | None,
     ) -> S:
-        if name in self._handles:
-            raise ConfigError(f"system `{name}` is already added")
+        self._check_free(name)
         self._check_grants(name, system)
         system._bind(self, name)
         for pack in (system._pack, *system._record_packs):
