@@ -157,9 +157,8 @@ metor run deploy.json --target flight.cpus.cpu1     # one host, prebuilt config
   `P.`. It can repeat. `--except P` removes targets the same way. A pattern
   that matches nothing is an error.
 - One selected target runs in this process; several run as children, as now.
-- At start, `metor run` lists each link a selected target dials whose peer was
-  not selected. That link keeps redialing, and the systems reading it get no
-  samples.
+- A link to a peer that was not selected keeps redialing and logging the
+  failure, and the systems reading it get no samples.
 - `metor show P` shows a group's targets; `metor show flight.cpus.cpu1.gnc`
   finds a system by the longest namespace that matches.
 - `metor build` is unchanged. Evaluating the tree builds every target's packs,
@@ -173,7 +172,7 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 | Part | Change |
 |---|---|
 | `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, cross-target loops, dotted link ids, the nesting check |
-| `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions, the open-link notice |
+| `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
 | Config format, host, runtime | none |
 
 ## Not covered
@@ -197,11 +196,9 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 
 ## Open questions
 
-1. Should a selected target that dials an unselected peer be allowed by
-   default? This doc says yes, with the notice.
-2. What should a generated subscriber be called? Its name is in every copied
+1. What should a generated subscriber be called? Its name is in every copied
    port's path. This doc uses `from_{namespace}_{link}` with `.` as `_`, such as
    `from_flight_gateways_gw1_pub`, with no override.
-3. How does a group hold a gateway? `gateway()` makes its own `Target`. It
+2. How does a group hold a gateway? `gateway()` makes its own `Target`. It
    could take a `Group` or `Deployment` to add the target to.
-4. Should `base_port` have a default, such as 2240?
+3. Should `base_port` have a default, such as 2240?
