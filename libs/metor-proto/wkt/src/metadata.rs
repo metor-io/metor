@@ -16,7 +16,6 @@ pub const FRAME_ROOT_KEY: &str = "frame.root";
 pub const FRAME_MAPS_KEY: &str = "frame.maps";
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Schema)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct ComponentMetadata {
     pub component_id: ComponentId,
     pub name: String,
@@ -199,7 +198,6 @@ impl From<&str> for ComponentMetadata {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Schema)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct EntityMetadata {
     pub entity_id: EntityId,
     pub name: String,

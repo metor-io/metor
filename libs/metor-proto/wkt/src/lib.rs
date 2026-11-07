@@ -19,53 +19,7 @@ pub use tile::*;
 #[cfg(feature = "nox")]
 pub use value::*;
 
-#[cfg(feature = "gui")]
-mod gui;
-#[cfg(feature = "gui")]
-pub use gui::*;
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
-pub struct Color {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-}
-
-impl Color {
-    pub const BLACK: Self = Self::rgb(0., 0., 0.);
-    pub const WHITE: Self = Self::rgb(1., 1., 1.);
-
-    pub const TURQUOISE: Self = Self::rgb(0.41, 0.7, 0.75);
-    pub const SLATE: Self = Self::rgb(0.5, 0.44, 1.);
-    pub const PUMPKIN: Self = Self::rgb(1.0, 0.44, 0.12);
-    pub const YOLK: Self = Self::rgb(1., 0.77, 0.02);
-    pub const PEACH: Self = Self::rgb(1., 0.84, 0.7);
-    pub const REDDISH: Self = Self::rgb(0.913, 0.125, 0.0335);
-    pub const HYPERBLUE: Self = Self::rgb(0.08, 0.38, 0.82);
-    pub const MINT: Self = Self::rgb(0.53, 0.87, 0.62);
-    pub const TRANSPARENT: Self = Self::rgba(0., 0., 0., 0.);
-
-    pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
-        Self { r, g, b, a: 1. }
-    }
-
-    pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Self::TRANSPARENT
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize, Default, Copy)]
-#[cfg_attr(
-    feature = "bevy",
-    derive(bevy::prelude::Resource, bevy::prelude::Component)
-)]
 pub struct Tick(pub u64);
 
 #[cfg(feature = "nox")]
@@ -100,10 +54,6 @@ impl metor_proto::component::Component for Tick {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(
-    feature = "bevy",
-    derive(bevy::prelude::Resource, bevy::prelude::Component)
-)]
 pub struct SimulationTimeStep(pub f64);
 
 impl SimulationTimeStep {
@@ -144,16 +94,13 @@ impl metor_proto::com_de::Decomponentize for SimulationTimeStep {
 }
 
 #[derive(Clone, Serialize, Deserialize, Copy)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct LastUpdated(pub Timestamp);
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct IsRecording(pub bool);
 
 #[cfg(feature = "nox")]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct WorldPos {
     pub att: nox::Quaternion<f64, nox::ArrayRepr>,
     pub pos: nox::Vector3<f64, nox::ArrayRepr>,
@@ -197,10 +144,6 @@ impl metor_proto::com_de::Decomponentize for WorldPos {
 }
 
 #[derive(Clone, Serialize, Deserialize, Copy)]
-#[cfg_attr(
-    feature = "bevy",
-    derive(bevy::prelude::Resource, bevy::prelude::Component)
-)]
 pub struct CurrentTimestamp(pub Timestamp);
 
 impl Default for CurrentTimestamp {
