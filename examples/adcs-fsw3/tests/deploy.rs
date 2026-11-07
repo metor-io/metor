@@ -177,7 +177,7 @@ async fn first_sample(client: &mut Client, component: &str) -> Vec<u8> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let query = GetTimeSeries {
-            id: [0, 0],
+            id: [0; 8],
             limit: Some(1),
             ..GetTimeSeries::range(
                 ComponentId::new(component),

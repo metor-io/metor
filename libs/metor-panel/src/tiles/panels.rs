@@ -507,7 +507,9 @@ mod tests {
         // The stored kind parses back to the same key.
         assert_eq!(
             crate::plot_events::kind_key_from_string(&back.event_overlays[1].kind),
-            Some(crate::plot_events::EventKindKey::Msg([0xe0, 0x3c]))
+            Some(crate::plot_events::EventKindKey::Msg(
+                metor_proto::types::short_id([0xe0, 0x3c])
+            ))
         );
         assert_eq!(back.traces[0].axis_index, 1);
         assert_eq!(back.axes.len(), 2);

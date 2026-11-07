@@ -24,7 +24,7 @@ pub(super) fn populate(db: &Arc<DB>) {
                 .unwrap();
             db.push_msg(
                 Timestamp(124),
-                [7, 0],
+                metor_proto::types::short_id([7, 0]),
                 b"a message longer than the inline buffer",
             )
             .unwrap();
@@ -53,7 +53,9 @@ pub(super) fn assert_bundle(path: &Path) {
                         .sum::<usize>(),
                     1
                 );
-                let log = s.get_or_insert_msg_log([7, 0], &db.path).unwrap();
+                let log = s
+                    .get_or_insert_msg_log(metor_proto::types::short_id([7, 0]), &db.path)
+                    .unwrap();
                 let message = log.latest().unwrap();
                 assert_eq!(message.timestamp(), Timestamp(124));
                 assert_eq!(

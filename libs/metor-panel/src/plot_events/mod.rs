@@ -71,8 +71,21 @@ pub fn kind_key_to_string(key: EventKindKey) -> String {
         EventKindKey::Logs => "logs".to_string(),
         EventKindKey::Alarms => "alarms".to_string(),
         EventKindKey::Sequences => "sequences".to_string(),
-        EventKindKey::Msg(id) => format!("msg:{:02x}{:02x}", id[0], id[1]),
+        EventKindKey::Msg(id) => format!("msg:{}", id_hex(id, "")),
     }
+}
+
+/// An id in hex: two bytes when its upper bytes are zero, otherwise all eight.
+fn id_hex(id: PacketId, separator: &str) -> String {
+    match id {
+        [a, b, 0, 0, 0, 0, 0, 0] => format!("{a:02x}{separator}{b:02x}"),
+        id => id.iter().map(|byte| format!("{byte:02x}")).collect(),
+    }
+}
+
+/// The label for a message log with no name.
+pub(crate) fn msg_label(id: PacketId) -> String {
+    format!("msg {}", id_hex(id, ":"))
 }
 
 /// Parse a [`kind_key_to_string`] string back to a key. `None` for an unknown
@@ -84,12 +97,14 @@ pub fn kind_key_from_string(s: &str) -> Option<EventKindKey> {
         "sequences" => Some(EventKindKey::Sequences),
         _ => {
             let hex = s.strip_prefix("msg:")?;
-            if hex.len() != 4 {
+            if !matches!(hex.len(), 4 | 16) {
                 return None;
             }
-            let hi = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let lo = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            Some(EventKindKey::Msg([hi, lo]))
+            let mut id = [0; 8];
+            for (byte, pair) in id.iter_mut().zip(hex.as_bytes().chunks(2)) {
+                *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+            }
+            Some(EventKindKey::Msg(id))
         }
     }
 }
@@ -479,7 +494,7 @@ impl MsgEventStore {
     fn name(&self) -> SharedString {
         match &self.meta {
             Some(meta) if !meta.name.is_empty() => meta.name.clone().into(),
-            _ => format!("msg {:02x}:{:02x}", self.id[0], self.id[1]).into(),
+            _ => msg_label(self.id).into(),
         }
     }
 
@@ -549,7 +564,7 @@ impl EventSource for MsgEventSource {
 
     fn default_color(&self, cx: &App) -> Hsla {
         let colors = theme(cx).line_colors;
-        colors[u16::from_le_bytes(self.id) as usize % colors.len()]
+        colors[u64::from_le_bytes(self.id) as usize % colors.len()]
     }
 
     fn generation(&self, cx: &App) -> u64 {

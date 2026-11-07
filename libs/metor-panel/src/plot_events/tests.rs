@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use metor_proto::types::short_id;
 use metor_proto_wkt::MsgMetadata;
 use postcard_schema::Schema;
 use postcard_schema::schema::owned::OwnedNamedType;
@@ -47,23 +48,37 @@ fn kind_key_string_round_trip() {
         EventKindKey::Logs,
         EventKindKey::Alarms,
         EventKindKey::Sequences,
-        EventKindKey::Msg([0xe0, 0x3c]),
+        EventKindKey::Msg(short_id([0xe0, 0x3c])),
     ] {
         let s = kind_key_to_string(key);
         assert_eq!(kind_key_from_string(&s), Some(key));
     }
     // Exact wire form for a message id.
     assert_eq!(
-        kind_key_to_string(EventKindKey::Msg([0xe0, 0x3c])),
+        kind_key_to_string(EventKindKey::Msg(short_id([0xe0, 0x3c]))),
         "msg:e03c"
     );
     assert_eq!(
         kind_key_from_string("msg:e03c"),
-        Some(EventKindKey::Msg([0xe0, 0x3c]))
+        Some(EventKindKey::Msg(short_id([0xe0, 0x3c])))
     );
+    // A full-width id keeps all its bytes.
+    let wide = [1, 2, 3, 4, 5, 6, 7, 8];
+    assert_eq!(
+        kind_key_to_string(EventKindKey::Msg(wide)),
+        "msg:0102030405060708"
+    );
+    assert_eq!(
+        kind_key_from_string("msg:0102030405060708"),
+        Some(EventKindKey::Msg(wide))
+    );
+    assert_eq!(msg_label(short_id([0xe0, 0x3c])), "msg e0:3c");
+    assert_eq!(msg_label(wide), "msg 0102030405060708");
     // Malformed ids and unknown tags drop.
     assert_eq!(kind_key_from_string("msg:zz"), None);
     assert_eq!(kind_key_from_string("msg:e03"), None);
+    assert_eq!(kind_key_from_string("msg:01020304050607"), None);
+    assert_eq!(kind_key_from_string("msg:éé"), None);
     assert_eq!(kind_key_from_string("bogus"), None);
 }
 
