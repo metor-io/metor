@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use metor_proto::types::{ComponentId, PrimType, Timestamp};
+use metor_proto::types::{ComponentId, PacketId, PrimType, Timestamp, short_id};
 use metor_proto::vtable::builder::{component, raw_field, raw_table, schema, vtable};
 use metor_proto_wkt::{CommandInfo, CommandKind, ComponentMetadata, MsgMetadata};
 use postcard_schema::Schema;
@@ -169,7 +169,7 @@ fn a_sequence_command_encodes_with_its_payload_variant() {
     assert!(matches!(sent.command, SequenceCommandKind::Load { name } if name == "detumble"));
 }
 
-fn msg_info(id: [u8; 2], name: &str, schema: OwnedNamedType, codec: Option<&str>) -> CommandInfo {
+fn msg_info(id: PacketId, name: &str, schema: OwnedNamedType, codec: Option<&str>) -> CommandInfo {
     CommandInfo {
         id,
         kind: CommandKind::Msg(MsgMetadata {
@@ -189,7 +189,7 @@ fn the_codec_picks_the_form() {
     let none = |_| None;
     let bytes_schema: OwnedNamedType = <Vec<u8>>::SCHEMA.into();
     let json_form = Form::of(
-        &msg_info([1, 0], "Note", bytes_schema.clone(), Some("json")),
+        &msg_info(short_id([1, 0]), "Note", bytes_schema.clone(), Some("json")),
         &none,
     );
     assert_eq!(json_form, Form::Json);
@@ -199,7 +199,7 @@ fn the_codec_picks_the_form() {
     );
 
     let raw = Form::of(
-        &msg_info([2, 0], "Blob", bytes_schema, Some("bytes")),
+        &msg_info(short_id([2, 0]), "Blob", bytes_schema, Some("bytes")),
         &none,
     );
     assert!(matches!(raw, Form::Unsupported(_)));
@@ -209,7 +209,7 @@ fn the_codec_picks_the_form() {
     ));
 
     let postcard = Form::of(
-        &msg_info([3, 0], "Point", Point::SCHEMA.into(), None),
+        &msg_info(short_id([3, 0]), "Point", Point::SCHEMA.into(), None),
         &none,
     );
     assert_eq!(postcard, point_form());
@@ -345,7 +345,7 @@ fn only_a_live_link_carries_a_command() {
     );
 }
 
-const POINT: [u8; 2] = [7, 1];
+const POINT: PacketId = short_id([7, 1]);
 
 /// Every record pushed onto `id`'s log since `reader` was taken.
 fn sent(reader: &mut metor_db::disruptor::Reader) -> Vec<Vec<u8>> {
@@ -403,7 +403,7 @@ fn type_into(rows: &mut Rows, label: &str, text: &str, window: &mut gpui::Window
 #[gpui::test]
 fn a_payload_enum_is_edited_through_its_variants(cx: &mut gpui::TestAppContext) {
     use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
-    const SEQ: [u8; 2] = [7, 2];
+    const SEQ: PacketId = short_id([7, 2]);
     let temp = tempfile::tempdir().unwrap();
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     db.add_commands(&[msg_info(

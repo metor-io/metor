@@ -107,7 +107,7 @@ fn preset_components() -> Vec<ComponentId> {
 /// before the first.
 async fn u64s(client: &mut Client, component: &str) -> Vec<(i64, u64)> {
     let query = GetTimeSeries {
-        id: [0, 0],
+        id: [0; 8],
         limit: None,
         ..GetTimeSeries::range(
             ComponentId::new(component),
