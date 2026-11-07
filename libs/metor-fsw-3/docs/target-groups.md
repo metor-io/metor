@@ -140,9 +140,24 @@ be several cycles old, or missing if the producer is not running.
 
 ### Link names
 
-A link's id may be dotted, so links can sit inside composites, and `gateway`
-can subscribe to a peer by its dotted namespace. The link's resource is its id
-with `.` replaced by `_`, then `_ep`.
+A link's id may be dotted, so links can sit inside composites, and `recorder`
+can name a subscriber for its peer's dotted namespace. The link's resource is
+its id with `.` replaced by `_`, then `_ep`.
+
+### Recording
+
+`gateway()` is removed. Its systems become a composite, `recorder`, which goes
+on any target, inside a group or not:
+
+```python
+gse = g.target(cycle_rate=10.0)
+rec = gse.add("rec", recorder(peers=[c.link for c in cpus], listen="127.0.0.1:2250"))
+rec.db  # the db's handle, for a `Subscribe` that commands through it
+```
+
+It adds one `Subscribe` per peer, named for the peer's namespace, and a `Db`
+on the thread `db`. `adcs-fsw3`, the echo-pack deploy fixture, and
+`DESIGN.md` move to it.
 
 ## Selecting targets
 
@@ -173,7 +188,7 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 
 | Part | Change |
 |---|---|
-| `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, dotted link ids, the nesting check |
+| `metor_config` | `group`, `Group`, `Deployment.add`, `listen`, `base_port`, `hosts` prefixes, dotted link ids, `recorder` in place of `gateway()`, the nesting check |
 | `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
 | Config format, host, runtime | none |
 
@@ -199,13 +214,12 @@ is a function argument, such as `flight(rf=sim_rf)`, not a selection.
 
 ## Open questions
 
-1. How does a group hold a gateway? `gateway()` makes its own `Target`, but it
-   only adds a `Subscribe` per peer and a `Db`. It could become a composite
-   that goes on any target, with `gateway()` kept as a wrapper. That needs
-   dotted link ids, since each subscriber is named for its peer's namespace.
-2. How do links get ports? Peers resolve at build time, so a dialed `Publish`
+1. How do links get ports? Peers resolve at build time, so a dialed `Publish`
    needs a fixed port, and a group added three times cannot hard-code one.
    Either `g.listen()` counts up from `base_port`, as above, or the resolver
-   gives each dialed `Listen` on port 0 the next free port on its host. The
-   second drops `listen` and `base_port` from the Python API, and is a small
-   change in `deploy`; a port is then visible only after resolving.
+   gives each dialed `Listen` on port 0 a port from the config alone: the next
+   one no other link on its host uses, counting from a fixed start, in step
+   order. The resolver writes that port into the listener's address and every
+   dialer's, so each process reads the same port from the same resolved
+   config. The second drops `listen` and `base_port` from the Python API, and
+   is a small change in `deploy`; a port is then visible only after resolving.
