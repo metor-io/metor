@@ -95,12 +95,16 @@ Postcard messages that embed a `PacketId` change encoding (`VTableMsg`, `Command
 
 Panel layouts store `msg:<4 hex>`. Parsing accepts 4 hex characters as a zero-extended id and 16 as a full id. Writing emits 4 when the upper six bytes are zero, so existing layouts and their output are unchanged.
 
+## Lua
+
+Lua integers are `i64`, so an id at or past 2^63 arrives negative and keeps its bits. Message ids accept a name, an integer, or a table of 2 or 8 bytes. A 2-byte table is zero-extended.
+
 ## Sites the compiler will not catch
 
 These use `id[0]`, `id[1]` or fixed offsets and still compile after the type change:
 
 - `metor-fsw-3/src/link/peer.rs:119` and `subscribe.rs:243`: `vec![ty as u8, id[0], id[1], 0]`
-- `metor-fsw-3/src/link/batch.rs:165`, `:284`: test offsets
+- `metor-fsw-3/src/link/batch.rs:165`: test offsets
 - `metor-panel/src/plot_events/mod.rs:74`, `:482`, and `inspector/registry/builders.rs:376`: id formatting
 - `metor-proto/src/types.rs`: `LenPacket::new` writes fields by position and hardcodes `cap + 8`
 
