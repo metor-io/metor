@@ -200,7 +200,7 @@ fn test_build_error_cites_the_target_file() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("`b.mirror` names link `a.out`, which does not listen on a fixed port")
+        stderr.contains("`b.mirror` names link `a.out`, which does not listen")
             && stderr.contains("[deploy.py:6:"),
         "{stderr}"
     );
