@@ -28,12 +28,12 @@ pub enum ConfigError {
     #[error("the config did not decode: {0}")]
     #[diagnostic(code(M0205))]
     Decode(#[from] serde_json::Error),
-    #[error("the deployment has several targets; pick one with --target: {0}")]
-    #[diagnostic(code(M0103))]
-    SelectTarget(String),
-    #[error("no target is named `{name}`")]
+    #[error("no target is named `{name}` or sits under it")]
     #[diagnostic(code(M0102), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_TARGETS)))]
     NoSuchTarget { name: String, known: Vec<String> },
+    #[error("`--except` leaves out every target `--target` selects")]
+    #[diagnostic(code(M0109), help("drop an `--except`, or select more with `--target`"))]
+    NothingSelected,
 }
 
 /// A port on a link of another target in the same deployment.
@@ -178,24 +178,59 @@ impl TargetConfig<DeploySystem, DeployBacking> {
     }
 }
 
+/// Whether `namespace` is `pattern` or sits under it.
+fn under(namespace: &str, pattern: &str) -> bool {
+    namespace
+        .strip_prefix(pattern)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 impl<S, R> DeploymentConfig<S, R> {
-    /// Returns the index of the target named `namespace`.
+    /// Returns the targets `include` selects, less those `exclude` selects,
+    /// in file order.
     ///
-    /// With no namespace, this returns the only target, or an error if there
-    /// are several.
-    pub fn target(&self, namespace: Option<&str>) -> Result<usize, ConfigError> {
-        match namespace {
-            Some(name) => self
-                .targets
-                .iter()
-                .position(|target| target.namespace() == name)
-                .ok_or_else(|| ConfigError::NoSuchTarget {
-                    name: name.to_string(),
-                    known: self.namespaces().into_iter().map(String::from).collect(),
-                }),
-            None if self.targets.len() == 1 => Ok(0),
-            None => Err(ConfigError::SelectTarget(self.namespaces().join(", "))),
+    /// A pattern selects each target whose namespace is the pattern or sits
+    /// under it, as `flight.cpu1` sits under `flight`. With no `include`,
+    /// every target is selected.
+    ///
+    /// # Errors
+    /// Returns an error for a pattern that selects no target, or if nothing
+    /// is left.
+    pub fn select(&self, include: &[String], exclude: &[String]) -> Result<Vec<usize>, ConfigError> {
+        let namespaces = self.namespaces();
+        if let Some(name) = include
+            .iter()
+            .chain(exclude)
+            .find(|pattern| !namespaces.iter().any(|ns| under(ns, pattern)))
+        {
+            return Err(ConfigError::NoSuchTarget {
+                name: name.clone(),
+                known: namespaces.into_iter().map(String::from).collect(),
+            });
         }
+        let picked: Vec<usize> = (0..namespaces.len())
+            .filter(|&i| include.is_empty() || include.iter().any(|p| under(namespaces[i], p)))
+            .filter(|&i| !exclude.iter().any(|p| under(namespaces[i], p)))
+            .collect();
+        match picked.is_empty() {
+            true => Err(ConfigError::NothingSelected),
+            false => Ok(picked),
+        }
+    }
+
+    /// Returns every group path above a target, as `flight` above
+    /// `flight.cpu1`, in the order first seen.
+    pub fn groups(&self) -> Vec<&str> {
+        let mut groups: Vec<&str> = Vec::new();
+        for namespace in self.namespaces() {
+            let dots = namespace.match_indices('.').map(|(at, _)| &namespace[..at]);
+            for group in dots {
+                if !groups.contains(&group) {
+                    groups.push(group);
+                }
+            }
+        }
+        groups
     }
 
     /// Returns every target's namespace, in file order.
@@ -298,23 +333,56 @@ mod tests {
     fn test_golden_builds() {
         let config = golden();
         assert_eq!(config.namespaces(), ["cube_sat"]);
-        let index = config.target(None).expect("one target");
+        let index = config.select(&[], &[]).expect("one target")[0];
         let config = config.into_runtime().expect("no peers");
         let coordinator = config.targets[index].coordinator.clone().build(&table());
         assert!(coordinator.is_ok(), "{:?}", coordinator.err());
     }
 
+    fn select(config: &ResolvedDeployment, include: &[&str], exclude: &[&str]) -> Result<Vec<usize>, ConfigError> {
+        let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        config.select(&owned(include), &owned(exclude))
+    }
+
     #[test]
-    fn test_select_target_by_namespace() {
+    fn test_select_by_namespace_and_prefix() {
+        let config = envelope(vec![member("flight.a"), member("flight.b"), member("ground")]);
+        assert_eq!(select(&config, &[], &[]).ok(), Some(vec![0, 1, 2]));
+        assert_eq!(select(&config, &["flight"], &[]).ok(), Some(vec![0, 1]));
+        assert_eq!(select(&config, &["flight.b"], &[]).ok(), Some(vec![1]));
+        assert_eq!(select(&config, &["ground", "flight.a"], &[]).ok(), Some(vec![0, 2]));
+        assert_eq!(select(&config, &[], &["flight.a"]).ok(), Some(vec![1, 2]));
+        assert_eq!(select(&config, &["flight"], &["flight.b"]).ok(), Some(vec![0]));
+    }
+
+    #[test]
+    fn test_select_matches_whole_names() {
+        let config = envelope(vec![member("flight"), member("flightx.a")]);
+        assert_eq!(select(&config, &["flight"], &[]).ok(), Some(vec![0]));
+        assert!(matches!(
+            select(&config, &["fli"], &[]),
+            Err(ConfigError::NoSuchTarget { name, .. }) if name == "fli"
+        ));
+    }
+
+    #[test]
+    fn test_groups_lists_each_path_above_a_target() {
+        let config = envelope(vec![member("flight.s1.cpu"), member("flight.s1.gw"), member("gse")]);
+        assert_eq!(config.groups(), ["flight", "flight.s1"]);
+        assert!(envelope(vec![member("a"), member("b")]).groups().is_empty());
+    }
+
+    #[test]
+    fn test_select_refuses_unknown_and_empty() {
         let config = envelope(vec![member("a"), member("b")]);
-        assert_eq!(config.target(Some("b")).expect("named"), 1);
-        assert!(
-            matches!(config.target(Some("c")), Err(ConfigError::NoSuchTarget { name, .. }) if name == "c")
-        );
-        let Err(ConfigError::SelectTarget(names)) = config.target(None) else {
-            panic!("two targets need a name")
-        };
-        assert_eq!(names, "a, b");
+        assert!(matches!(
+            select(&config, &[], &["c"]),
+            Err(ConfigError::NoSuchTarget { name, .. }) if name == "c"
+        ));
+        assert!(matches!(
+            select(&config, &["a"], &["a"]),
+            Err(ConfigError::NothingSelected)
+        ));
     }
 
     #[test]

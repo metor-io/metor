@@ -53,10 +53,13 @@ pub struct Run {
     /// this directory or one above it.
     #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
-    /// The namespace of the target to run. Without it, a deployment with
-    /// several targets runs all of them.
+    /// Run the targets named NS or under it, as `flight` for
+    /// `flight.cpu1`. Repeatable. Without it, every target runs.
     #[arg(long = "target", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
-    pub member: Option<String>,
+    pub targets: Vec<String>,
+    /// Leave out the targets named NS or under it. Repeatable.
+    #[arg(long = "except", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
+    pub except: Vec<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
     pub cycles: Option<u64>,
@@ -204,12 +207,13 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         route: route.clone(),
     });
     let config = prepare(args.target.as_deref(), ui)?;
-    let namespaces = config.namespaces();
-    if namespaces.len() > 1 && args.member.is_none() {
-        ui.emit(Event::Running(&namespaces));
-        return run_children(&config, &args, ui);
-    }
-    let member = config.target(args.member.as_deref())?;
+    let selected = config.select(&args.targets, &args.except)?;
+    let [member] = selected[..] else {
+        let namespaces = config.namespaces();
+        let names: Vec<&str> = selected.iter().map(|&i| namespaces[i]).collect();
+        ui.emit(Event::Running(&names));
+        return run_children(&config, &names, &args, ui);
+    };
     let latched = run_member(&config, member, &args, &route, ui)?;
     if !latched.is_empty() {
         return Err(RunError::Latched(latched.join(", ")));
@@ -331,20 +335,24 @@ fn source_width(config: &ResolvedDeployment) -> usize {
         .unwrap_or(0)
 }
 
-/// Runs every target in `config` as a child process.
+/// Runs the targets `namespaces` of `config`, each as a child process.
 ///
 /// The resolved config is written to a temp file for the children to read.
 /// Returns once every child has exited.
-fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), RunError> {
+fn run_children(
+    config: &ResolvedDeployment,
+    namespaces: &[&str],
+    args: &Run,
+    ui: &Ui,
+) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
     let bytes = serde_json::to_vec(config).map_err(ConfigError::Decode)?;
     std::fs::write(&path, bytes).map_err(io(&path))?;
     watch_sigint();
     let started = Instant::now();
-    let namespaces = config.namespaces();
-    let relay = Relay::new(ui.clone(), &namespaces);
+    let relay = Relay::new(ui.clone(), namespaces);
     ui.emit(Event::SourceWidth(source_width(config)));
-    let waited = super::children::spawn_all(&path, &namespaces, args, &relay)
+    let waited = super::children::spawn_all(&path, namespaces, args, &relay)
         .map(super::children::wait_all)
         .map_err(RunError::Spawn);
     let _ = std::fs::remove_file(&path);

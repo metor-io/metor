@@ -107,6 +107,8 @@ const EXAMPLES: &str = "Examples:
 const RUN_EXAMPLES: &str = "Examples:
   metor run                            the nearest target.py
   metor run --target fsw               one target of a deployment
+  metor run --target flight --except flight.cpu3
+                                       a group, less one of its targets
   metor run --sim-dt 10ms --for 30s    30 s of simulated time
   metor run --wall 50hz --cycles 500   pace at 50 Hz, stop after 500 cycles";
 

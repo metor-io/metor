@@ -21,12 +21,13 @@ use crate::deploy::ResolvedDeployment;
 pub const TARGET: &str = "target";
 pub const SYSTEM: &str = "system";
 
-/// The cache of `config`'s names: its targets, then every name `show`
-/// takes.
+/// The cache of `config`'s names: its groups and targets, then every name
+/// `show` takes.
 pub fn cache(config: &ResolvedDeployment) -> String {
     let targets = config
-        .namespaces()
+        .groups()
         .into_iter()
+        .chain(config.namespaces())
         .filter(|ns| !ns.is_empty())
         .map(|ns| format!("{TARGET} {ns}\n"));
     let names = show::names(config).into_iter();

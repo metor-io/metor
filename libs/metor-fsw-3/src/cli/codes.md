@@ -21,25 +21,15 @@ fsw = Target(cycle_rate=100, sim_dt=0.01, epoch=0)
 
 **No target has that name**
 
-`--target` names a target the deployment does not have. Targets are named by
-their namespace, the `namespace` argument of `Target`.
+`--target` or `--except` names a target the deployment does not have, and
+no target sits under it. Targets are named by their namespace, the
+`namespace` argument of `Target`, or by their group's path, as
+`flight.cpu1`. A name selects a target only by whole parts: `flight`
+selects `flight.cpu1`, and `fli` selects nothing.
 
 The help line suggests the closest name and lists the targets. `metor show`
 lists them too. Check the spelling, and check that the target file gives the
 target a namespace.
-
-```
-metor run --target fsw
-```
-
-## M0103
-
-**The deployment has several targets**
-
-The command needed one target, and the deployment has more than one. The
-message lists their namespaces.
-
-Pick one with `--target`.
 
 ```
 metor run --target fsw
@@ -96,6 +86,17 @@ metor new target my-sat
 `metor new` writes into a new directory and does not touch an existing one,
 so nothing is overwritten. Pick a path that does not exist yet, or remove
 the old directory first.
+
+## M0109
+
+**Nothing is left to run**
+
+`--except` leaves out every target `--target` selected. Drop an `--except`,
+or select more targets.
+
+```
+metor run --target flight --except flight.cpu3
+```
 
 ## M0201
 
