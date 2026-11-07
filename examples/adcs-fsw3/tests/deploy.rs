@@ -118,12 +118,12 @@ async fn test_gateway_records_both_members() {
 
     let wanted = [
         "plant.plant.sensors.gyro_b",
-        "fsw.nav.attitude_estimate.omega_b",
-        "fsw.est_body.body.q_b_eci",
-        "fsw.sensor_split.css.css.0",
-        "fsw.sensor_split.mag.mag_b",
-        "fsw.hk.hk.omega_b",
-        "fsw.hk.hk.dipole_b",
+        "fsw.gnc.nav.attitude_estimate.omega_b",
+        "fsw.gnc.est_body.body.q_b_eci",
+        "fsw.monitor.sensor_split.css.css.0",
+        "fsw.monitor.sensor_split.mag.mag_b",
+        "fsw.downlink.hk.hk.omega_b",
+        "fsw.downlink.hk.hk.dipole_b",
     ];
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -159,9 +159,9 @@ async fn test_gateway_receives_mux_rows() {
     let ports = free_ports();
     let _running = run(&ports);
     let mut client = connect(SocketAddr::from(([127, 0, 0, 1], ports[2]))).await;
-    let omega = first_sample(&mut client, "fsw.hk.hk.omega_b").await;
+    let omega = first_sample(&mut client, "fsw.downlink.hk.hk.omega_b").await;
     assert_eq!(omega.len(), 3 * 8, "three f64");
-    let mag = first_sample(&mut client, "fsw.sensor_split.mag.mag_b").await;
+    let mag = first_sample(&mut client, "fsw.monitor.sensor_split.mag.mag_b").await;
     let b: Vec<f64> = mag
         .as_chunks::<8>()
         .0

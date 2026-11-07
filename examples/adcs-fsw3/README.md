@@ -14,7 +14,8 @@ systems/adcs/     adcs-systems-3: plant, nav, ctrl, mode, and pack()
 systems/seqs/     adcs-seqs-3: commission and pack()
 sim.py            the whole loop in one process, with mode
 target.py         a deployment of three targets: plant, fsw, and a gateway;
-                  fsw runs commission as a wasm module
+                  fsw groups its systems into composites and runs commission
+                  as a wasm module
 tests/            the convergence and deployment tests
 ```
 
@@ -74,8 +75,8 @@ both, each as a child process:
 cargo run -p metor-fsw-3 --bin metor -- run examples/adcs-fsw3/target.py
 ```
 
-Connect a panel to the gateway on `127.0.0.1:2250`; the `commission` channel
-takes its commands through it. The plant and the flight software listen on 2240
+Connect a panel to the gateway on `127.0.0.1:2250`; the `gnc.commission`
+channel takes its commands through it. The plant and the flight software listen on 2240
 and 2241. `METOR_DEPLOY_PORTS=a,b,c` overrides all three ports, which lets the
 tests pick free ones.
 `metor build examples/adcs-fsw3/target.py` prints the resolved deployment
