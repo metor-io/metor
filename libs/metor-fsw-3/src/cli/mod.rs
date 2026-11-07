@@ -115,6 +115,7 @@ const RUN_EXAMPLES: &str = "Examples:
 const SHOW_EXAMPLES: &str = "Examples:
   metor show                   every target
   metor show fsw               one target
+  metor show flight            every target in a group
   metor show fsw.nav           one system, with its params and grants";
 
 #[derive(Subcommand)]

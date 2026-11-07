@@ -32,7 +32,10 @@ pub enum ConfigError {
     #[diagnostic(code(M0102), help("{}", crate::cli::diagnostic::suggest(.name, .known, crate::cli::diagnostic::SHOW_TARGETS)))]
     NoSuchTarget { name: String, known: Vec<String> },
     #[error("`--except` leaves out every target `--target` selects")]
-    #[diagnostic(code(M0109), help("drop an `--except`, or select more with `--target`"))]
+    #[diagnostic(
+        code(M0109),
+        help("drop an `--except`, or select more with `--target`")
+    )]
     NothingSelected,
 }
 
@@ -196,7 +199,11 @@ impl<S, R> DeploymentConfig<S, R> {
     /// # Errors
     /// Returns an error for a pattern that selects no target, or if nothing
     /// is left.
-    pub fn select(&self, include: &[String], exclude: &[String]) -> Result<Vec<usize>, ConfigError> {
+    pub fn select(
+        &self,
+        include: &[String],
+        exclude: &[String],
+    ) -> Result<Vec<usize>, ConfigError> {
         let namespaces = self.namespaces();
         if let Some(name) = include
             .iter()
@@ -339,20 +346,34 @@ mod tests {
         assert!(coordinator.is_ok(), "{:?}", coordinator.err());
     }
 
-    fn select(config: &ResolvedDeployment, include: &[&str], exclude: &[&str]) -> Result<Vec<usize>, ConfigError> {
+    fn select(
+        config: &ResolvedDeployment,
+        include: &[&str],
+        exclude: &[&str],
+    ) -> Result<Vec<usize>, ConfigError> {
         let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
         config.select(&owned(include), &owned(exclude))
     }
 
     #[test]
     fn test_select_by_namespace_and_prefix() {
-        let config = envelope(vec![member("flight.a"), member("flight.b"), member("ground")]);
+        let config = envelope(vec![
+            member("flight.a"),
+            member("flight.b"),
+            member("ground"),
+        ]);
         assert_eq!(select(&config, &[], &[]).ok(), Some(vec![0, 1, 2]));
         assert_eq!(select(&config, &["flight"], &[]).ok(), Some(vec![0, 1]));
         assert_eq!(select(&config, &["flight.b"], &[]).ok(), Some(vec![1]));
-        assert_eq!(select(&config, &["ground", "flight.a"], &[]).ok(), Some(vec![0, 2]));
+        assert_eq!(
+            select(&config, &["ground", "flight.a"], &[]).ok(),
+            Some(vec![0, 2])
+        );
         assert_eq!(select(&config, &[], &["flight.a"]).ok(), Some(vec![1, 2]));
-        assert_eq!(select(&config, &["flight"], &["flight.b"]).ok(), Some(vec![0]));
+        assert_eq!(
+            select(&config, &["flight"], &["flight.b"]).ok(),
+            Some(vec![0])
+        );
     }
 
     #[test]
@@ -367,7 +388,11 @@ mod tests {
 
     #[test]
     fn test_groups_lists_each_path_above_a_target() {
-        let config = envelope(vec![member("flight.s1.cpu"), member("flight.s1.gw"), member("gse")]);
+        let config = envelope(vec![
+            member("flight.s1.cpu"),
+            member("flight.s1.gw"),
+            member("gse"),
+        ]);
         assert_eq!(config.groups(), ["flight", "flight.s1"]);
         assert!(envelope(vec![member("a"), member("b")]).groups().is_empty());
     }

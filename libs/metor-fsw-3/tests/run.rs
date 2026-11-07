@@ -74,7 +74,11 @@ fn run_tree(args: &[&str]) -> (Option<i32>, Vec<String>, String) {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let ran = ["flight.s1.cpu", "flight.s1.gw", "ground"]
         .into_iter()
-        .filter(|ns| stderr.lines().any(|line| line.trim_start().starts_with(&format!("{ns} "))))
+        .filter(|ns| {
+            stderr
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{ns} ")))
+        })
         .map(String::from)
         .collect();
     (output.status.code(), ran, stderr)
@@ -98,6 +102,31 @@ fn test_except_leaves_targets_out() {
     let (code, ran, stderr) = run_tree(&["--target", "flight", "--except", "flight.s1.cpu"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(ran, ["flight.s1.gw"], "{stderr}");
+}
+
+#[test]
+fn test_show_finds_groups_and_their_systems() {
+    let target = fixture_dir().join("tree.py").display().to_string();
+    let show = |name: &str| {
+        let output = metor()
+            .args(["show", &target, name])
+            .output()
+            .expect("metor runs");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        (output.status.success(), stdout, stderr)
+    };
+    let (ok, stdout, stderr) = show("flight");
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("flight.s1.cpu") && stdout.contains("flight.s1.gw"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("ground"), "{stdout}");
+    let (ok, _, stderr) = show("flight.s1.gw.sampler");
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = show("flight.s");
+    assert!(!ok && stderr.contains("M0104"), "{stderr}");
 }
 
 #[test]

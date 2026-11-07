@@ -33,6 +33,7 @@ pub fn cache(config: &ResolvedDeployment) -> String {
     let names = show::names(config).into_iter();
     let systems = names
         .filter(|name| !config.namespaces().contains(&name.as_str()))
+        .filter(|name| !config.groups().contains(&name.as_str()))
         .map(|name| format!("{SYSTEM} {name}\n"));
     targets.chain(systems).collect()
 }

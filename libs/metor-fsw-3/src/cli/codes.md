@@ -39,9 +39,10 @@ metor run --target fsw
 
 **Nothing in the deployment has that name**
 
-`metor show` or `metor graph` was given a name that is neither a target nor
-a system. A target is named by its namespace, such as `fsw`. A system is
-named `target.system`, such as `fsw.nav`. In a deployment of one target, the
+`metor show` or `metor graph` was given a name that is not a target, a
+group, or a system. A target is named by its namespace, such as `fsw`, and a
+group by its path, such as `flight`. A system is named `target.system`, such
+as `fsw.nav`. In a deployment of one target, the
 system's id alone also works.
 
 The help line suggests the closest name. Run `metor show` with no name to

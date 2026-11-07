@@ -46,6 +46,7 @@ pub fn graph(args: Graph, ui: &Ui) -> Result<(), RunError> {
     let chosen = match select(&config, name.as_deref())? {
         Selection::All => (0..config.targets.len()).collect(),
         Selection::Target(target) | Selection::System(target, _) => vec![target],
+        Selection::Targets(targets) => targets,
     };
     let links = links(&config);
     let targets: Vec<export::Target<'_>> = chosen
