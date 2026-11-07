@@ -10,8 +10,8 @@ their pack has no library and is left out of the config's pack list.
 `Publish` and `Subscribe` each take one `transport`: `Listen` on an
 address, `Connect` to an address, or dial a `Peer` link in the same
 deployment, which `metor build` turns into an address. `Target.add` makes
-the transport a resource named ``{name}_ep`` and grants it to the link's
-`ep`. A `Db` only listens.
+the transport a resource named ``{name}_ep``, with each `.` of the name as
+`_`, and grants it to the link's `ep`. A `Db` only listens.
 """
 
 from __future__ import annotations
@@ -127,8 +127,6 @@ class Link(System):
         return self._transport.link if isinstance(self._transport, Peer) else None
 
     def _bind(self, target: Target, name: str) -> None:
-        if not name.isidentifier():
-            raise ConfigError(f"a link's name is an identifier, got {name!r}")
         target.resource(_endpoint(name), self._transport._kind())
 
     def _grants_for(self, target: Target, index: int) -> dict[str, Any]:
@@ -149,7 +147,7 @@ class Link(System):
 
 def _endpoint(link: str) -> str:
     """The name of the resource link ``link`` is granted as its `ep`."""
-    return f"{link}_ep"
+    return f"{link.replace('.', '_')}_ep"
 
 
 class _Sink(System):

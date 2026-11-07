@@ -4,7 +4,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{fixture_dir, fixture_wasm, metor, panicked};
+use common::{fixture_dir, fixture_wasm, free_ports, metor, panicked, ports_env};
 use metor_fsw_3::cli::run::{Run, load};
 use metor_fsw_3::coordinator::CoordinatorConfig;
 use metor_fsw_3::deploy::TargetConfig;
@@ -43,6 +43,23 @@ fn test_composites_run_and_show_by_dotted_id() {
         let stderr = String::from_utf8_lossy(&show.stderr);
         assert!(show.status.success(), "{name}: {stderr}");
     }
+}
+
+#[test]
+fn test_links_in_composites_connect() {
+    let target = fixture_dir().join("composite_links.py");
+    let ports: [u16; 1] = free_ports();
+    let run = metor()
+        .args(["run", &target.display().to_string(), "--cycles", "2000"])
+        .env("METOR_DEPLOY_PORTS", ports_env(&ports))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    let dialed = stderr
+        .lines()
+        .any(|line| line.contains("b.rx.sub") && line.contains("connected to"));
+    assert!(dialed, "{stderr}");
 }
 
 #[test]
