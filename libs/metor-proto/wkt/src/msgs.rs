@@ -837,19 +837,6 @@ pub struct SequenceRegistry {
     pub channels: Vec<SequenceChannelSpec>,
 }
 
-/// Run state of a channel's loaded sequence, as fsw-2 reports it. Kept only
-/// for fsw-2, and deleted with it; fsw-3 reports [`SequenceChannelState`].
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SequenceRunState {
-    Idle,
-    Running,
-    Stopped,
-    Aborted,
-    Completed,
-    Failed,
-}
-
 /// A single transition in a channel's lifecycle, as fsw-2 reports it. Events arrive in
 /// order through one log, so the per-channel state machine (`Loaded` → `Started` →
 /// `Progress`* → terminal) is totally ordered. Kept only for fsw-2, and deleted with it.
@@ -1520,18 +1507,6 @@ impl Msg for LinkInfo {
 /// discovery on the local link. A ground tool browses this type to find
 /// every reachable fsw by name.
 pub const FSW_SERVICE_TYPE: &str = "_metor-fsw._tcp.local.";
-
-/// TXT-record key for the advertised [`LINK_PROTOCOL_VERSION`], so a
-/// browser can skip an incompatible link before it dials.
-pub const TXT_PROTOCOL_VERSION: &str = "pv";
-
-/// TXT-record key for the fsw's telemetry namespace, when it has one — the
-/// same bare dotted prefix its components carry.
-pub const TXT_NAMESPACE: &str = "ns";
-
-/// TXT-record key for the serving link's declaration name, the second half
-/// of the machine identity a subscriber matches on (`ns` is the first).
-pub const TXT_LINK: &str = "link";
 
 /// TXT-record key naming the advertised role, always `"fsw"` for a link
 /// server; reserved so one service type can grow sibling roles later.

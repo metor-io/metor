@@ -9,7 +9,6 @@ repository.workspace = true
 default = ["alloc", "std"]
 std = ["miette", "alloc", "serde/std", "nox", "nox-array/std", "stellarator-buf/std"]
 alloc = []
-thingbuf = ["dep:thingbuf", "replace_with"]
 hifitime = ["dep:hifitime"]
 nox = ["dep:nox"]
 facet = ["dep:facet"]
@@ -43,12 +42,6 @@ miette.optional = true
 
 # hash
 const-fnv1a-hash = "1.1.0"
-
-# thingbuf
-thingbuf.version = "0.1.6"
-thingbuf.optional = true
-replace_with.version = "0.1.7"
-replace_with.optional = true
 
 # integrations
 hifitime.version = "4.0"

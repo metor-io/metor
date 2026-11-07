@@ -9,12 +9,8 @@ stellarator = { path = "../../stellarator" }
 metor-proto = { path = "../../metor-proto" }
 metor-proto-wkt = { path = "../../metor-proto/wkt" }
 metor-proto-stellar = { path = "../../metor-proto/stellar" }
-nox = { path = "../../nox" }
 fastrand = "2.2.0"
-futures-lite = "2.5.0"
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "2"
-miette = { version = "7.2", features = ["fancy"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "chrono"] }
 zerocopy = "0.8"

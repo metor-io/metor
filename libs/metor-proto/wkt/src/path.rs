@@ -59,10 +59,6 @@ impl ComponentPath {
         let last = last.name.split(".").last().expect("missing last");
         ComponentPart::new(last)
     }
-
-    pub fn is_top_level(&self) -> bool {
-        self.path.len() == 1
-    }
 }
 
 impl Display for ComponentPath {

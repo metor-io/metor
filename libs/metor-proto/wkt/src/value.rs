@@ -523,18 +523,3 @@ impl_from_val!(I64, i64);
 impl_from_val!(Bool, bool);
 impl_from_val!(F32, f32);
 impl_from_val!(F64, f64);
-
-#[derive(Debug)]
-pub enum ElementValueMut<'a> {
-    U8(&'a mut u8),
-    U16(&'a mut u16),
-    U32(&'a mut u32),
-    U64(&'a mut u64),
-    I8(&'a mut i8),
-    I16(&'a mut i16),
-    I32(&'a mut i32),
-    I64(&'a mut i64),
-    F64(&'a mut f64),
-    F32(&'a mut f32),
-    Bool(&'a mut bool),
-}
