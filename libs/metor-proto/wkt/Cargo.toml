@@ -5,9 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-bevy = ["dep:bevy", "std", "gui"]
 nox = ["dep:nox"]
-gui = ["nox"]
 std = ["metor-proto/std", "postcard-schema/use-std"]
 
 [dependencies]
@@ -22,10 +20,6 @@ zerocopy.features = ["derive"]
 # data-structs
 smallvec.version = "1.11.2"
 compact_str = "0.9"
-
-# bevy
-bevy.version = "0.16"
-bevy.optional = true
 
 # serde
 serde.version = "1.0"

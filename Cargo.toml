@@ -26,7 +26,6 @@ members = [
     "apps/inscriber",
     "fsw/video-streamer",
     "fsw/gstreamer",
-    "libs/metor-proto/kdl",
     "libs/metor-panel",
     "libs/metor-expr",
     "examples/adcs-fsw3",

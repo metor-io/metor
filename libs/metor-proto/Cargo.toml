@@ -9,7 +9,6 @@ repository.workspace = true
 default = ["alloc", "std"]
 std = ["miette", "alloc", "serde/std", "nox", "nox-array/std", "stellarator-buf/std"]
 alloc = []
-#bevy = ["dep:bevy"]
 thingbuf = ["dep:thingbuf", "replace_with"]
 hifitime = ["dep:hifitime"]
 nox = ["dep:nox"]
@@ -44,11 +43,6 @@ miette.optional = true
 
 # hash
 const-fnv1a-hash = "1.1.0"
-
-# bevy
-#bevy.version = "0.16"
-#bevy.default-features = false
-#bevy.optional = true
 
 # thingbuf
 thingbuf.version = "0.1.6"
