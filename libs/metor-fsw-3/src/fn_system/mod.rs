@@ -6,6 +6,7 @@
 
 mod ctor;
 mod param;
+mod path;
 mod set;
 
 use core::marker::PhantomData;
@@ -23,8 +24,9 @@ use crate::{
 };
 
 pub use ctor::{Bound, Ctor, WithDef, WithIo};
-pub use param::{Cycle, Param, ParamNames, Refresh, Views, Writers};
-pub(crate) use param::{Defs, Instance, param_name};
+pub use param::{Cycle, Param, Refresh, Views, Writers};
+pub(crate) use param::{Defs, Instance};
+pub use path::ParamPath;
 pub use set::{InSet, LOG_PORT, OutSet};
 
 /// Describes the parameters of a system written as a fn.

@@ -8,7 +8,7 @@ use metor_proto::types::{PacketId, PacketTy};
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
+use crate::fn_system::{Cycle, Defs, Param, ParamPath, Views, Writers};
 use crate::io::{Cap, Endpoint, IoInit};
 use crate::log::Log;
 use crate::port::{DynOutputs, InputWake, Output};
@@ -123,24 +123,17 @@ impl<W: InputWake> Param<W> for SubscribeOutputs {
     type Out = SubscribeOutputs;
     type Item<'a> = &'a mut SubscribeOutputs;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         let first = defs.outputs.len();
-        <DynOutputs as Param<W>>::append_defs(names, cx, defs)?;
+        <DynOutputs as Param<W>>::append_defs(at, cx, defs)?;
         check_route_keys(&defs.outputs[first..])?;
         check_conn_cap(cx, &defs.outputs[first..])
     }
 
     fn bind_in(_views: &mut Views<W>) {}
 
-    fn bind_out(
-        names: &mut ParamNames<'_>,
-        writers: &mut Writers,
-    ) -> Result<SubscribeOutputs, MakeError> {
-        <DynOutputs as Param<W>>::bind_out(names, writers).map(SubscribeOutputs)
+    fn bind_out(at: &ParamPath<'_>, writers: &mut Writers) -> Result<SubscribeOutputs, MakeError> {
+        <DynOutputs as Param<W>>::bind_out(at, writers).map(SubscribeOutputs)
     }
 
     fn get<'a>(

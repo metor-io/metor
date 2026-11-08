@@ -23,6 +23,8 @@ use crate::{
     system::{InputBinding, OutputBinding, PortDef},
 };
 
+use super::path::ParamPath;
+
 /// Hands out port bindings to parameters, in parameter order.
 ///
 /// Each declared parameter takes one binding. A dynamic parameter
@@ -133,9 +135,6 @@ impl Instance {
     }
 }
 
-/// The parameter names that [`Param::append_defs`] reads from.
-pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
-
 /// The ports a system's parameters take under one instance's config.
 #[derive(Default)]
 pub struct Defs {
@@ -177,7 +176,7 @@ impl Defs {
 
     /// Appends the ports `S`'s parameters take under the config in `cx`.
     fn walk<S: crate::fn_system::FnSignature>(mut self, cx: &DefCx<'_>) -> Result<Self, DefError> {
-        S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut self)?;
+        S::Params::append_defs(&ParamPath::Args(S::NAMES), cx, &mut self)?;
         self.append_io(cx);
         Ok(self)
     }
@@ -280,23 +279,20 @@ pub trait Param<W: InputWake> {
     where
         Self: 'a;
 
+    /// Whether a struct of parameters passed as a fn argument adds no
+    /// segment to its fields' paths.
+    const FLATTEN: bool = false;
+
     /// Declares the ports this parameter takes under the config in `cx`.
     ///
-    /// Takes the parameter's name from `names` and appends any ports to
-    /// `defs`.
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError>;
+    /// Names them after `at` and appends them to `defs`.
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError>;
 
     /// Binds this parameter's input, if it has one, from `views`.
     fn bind_in(views: &mut Views<W>) -> Self::In;
 
     /// Binds this parameter's output, if it has one, from `writers`.
-    ///
-    /// Takes the parameter's name from `names`.
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError>;
+    fn bind_out(at: &ParamPath<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError>;
 
     /// Returns the value passed to the system fn this cycle.
     fn get<'a>(
@@ -336,12 +332,6 @@ impl<T: Frame + Copy> Refresh for SampleRefresh<'_, T> {
     }
 }
 
-/// Takes the name of the next non-tuple parameter.
-pub(crate) fn param_name(names: &mut ParamNames<'_>) -> &'static str {
-    // PANIC Safety: `#[system]` emits one name per parameter.
-    names.next().expect("one name per parameter")
-}
-
 /// Takes one binding from `views` as an input.
 fn bind_input<T: Record + ?Sized, W: InputWake>(views: &mut Views<W>) -> Input<T, W> {
     // PANIC Safety: the coordinator binds one list per declared input;
@@ -357,12 +347,8 @@ impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
     type Out = ();
     type Item<'a> = &'a mut Input<T, W>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        defs.inputs.push(Input::<T>::def(cx, param_name(names)));
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+        defs.inputs.push(Input::<T>::def(cx, at.to_name()));
         Ok(())
     }
 
@@ -370,8 +356,7 @@ impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
         bind_input(views)
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         Ok(())
     }
 
@@ -393,12 +378,8 @@ impl<T: Frame + Copy + 'static> Param<NoWake> for Sample<T> {
     type Out = ();
     type Item<'a> = &'a Sample<T>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        defs.inputs.push(Input::<T>::def(cx, param_name(names)));
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+        defs.inputs.push(Input::<T>::def(cx, at.to_name()));
         Ok(())
     }
 
@@ -406,8 +387,7 @@ impl<T: Frame + Copy + 'static> Param<NoWake> for Sample<T> {
         SampledInput::new(bind_input(views))
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         Ok(())
     }
 
@@ -441,19 +421,14 @@ impl Param<NoWake> for Rng {
     type Out = Rng;
     type Item<'a> = &'a mut Rng;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        _defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, _cx: &DefCx<'_>, _defs: &mut Defs) -> Result<(), DefError> {
         Ok(())
     }
 
     fn bind_in(_views: &mut Views<NoWake>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Rng, MakeError> {
-        Ok(writers.instance.rng(param_name(names)))
+    fn bind_out(at: &ParamPath<'_>, writers: &mut Writers) -> Result<Rng, MakeError> {
+        Ok(writers.instance.rng(&at.to_name()))
     }
 
     fn get<'a>(_input: &'a mut (), output: &'a mut Rng, _cx: &mut Cycle<'a>) -> &'a mut Rng {
@@ -468,12 +443,7 @@ impl Param<NoWake> for Alarms {
     type Out = Alarms;
     type Item<'a> = &'a mut Alarms;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         defs.outputs
             .push(Output::<RaisedMsg>::def(cx, ALARM_RAISED_PORT));
         defs.outputs
@@ -483,8 +453,7 @@ impl Param<NoWake> for Alarms {
 
     fn bind_in(_views: &mut Views<NoWake>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Alarms, MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, writers: &mut Writers) -> Result<Alarms, MakeError> {
         // PANIC Safety: the coordinator binds one writer per declared output;
         // a mismatch is a coordinator bug.
         let mut next = || writers.bindings.next().expect("two bindings per Alarms");
@@ -505,22 +474,13 @@ impl<W: InputWake> Param<W> for Records {
     type Out = Arc<Records>;
     type Item<'a> = &'a Records;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        _defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, _cx: &DefCx<'_>, _defs: &mut Defs) -> Result<(), DefError> {
         Ok(())
     }
 
     fn bind_in(_views: &mut Views<W>) {}
 
-    fn bind_out(
-        names: &mut ParamNames<'_>,
-        writers: &mut Writers,
-    ) -> Result<Arc<Records>, MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, writers: &mut Writers) -> Result<Arc<Records>, MakeError> {
         Ok(writers.instance.records.clone())
     }
 
@@ -538,19 +498,14 @@ impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Output<T> {
     type Out = Output<T>;
     type Item<'a> = &'a mut Output<T>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        defs.outputs.push(Output::<T>::def(cx, param_name(names)));
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+        defs.outputs.push(Output::<T>::def(cx, at.to_name()));
         Ok(())
     }
 
     fn bind_in(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
         // PANIC Safety: the coordinator binds one writer per declared output;
         // a mismatch is a coordinator bug.
         let binding = writers
@@ -574,12 +529,7 @@ impl<W: InputWake> Param<W> for DynInputs<W> {
     type Out = ();
     type Item<'a> = &'a mut DynInputs<W>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         let ports = cx.dyn_input_defs(&defs.declared_inputs)?;
         defs.inputs.extend(ports);
         defs.takes_inputs = true;
@@ -590,8 +540,7 @@ impl<W: InputWake> Param<W> for DynInputs<W> {
         DynInputs::new(views.bindings.take())
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         Ok(())
     }
 
@@ -609,12 +558,7 @@ impl<W: InputWake> Param<W> for DynOutputs {
     type Out = DynOutputs;
     type Item<'a> = &'a mut DynOutputs;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         let ports = cx.dyn_output_defs(&defs.declared_outputs)?;
         defs.outputs.extend(ports);
         defs.takes_outputs = true;
@@ -623,8 +567,7 @@ impl<W: InputWake> Param<W> for DynOutputs {
 
     fn bind_in(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
         Ok(DynOutputs::new(writers.bindings.take(), &writers.dropped))
     }
 
@@ -642,19 +585,13 @@ impl<W: InputWake> Param<W> for Timestamp {
     type Out = ();
     type Item<'a> = Timestamp;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        _defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, _cx: &DefCx<'_>, _defs: &mut Defs) -> Result<(), DefError> {
         Ok(())
     }
 
     fn bind_in(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         Ok(())
     }
 
@@ -669,12 +606,7 @@ impl<W: InputWake> Param<W> for Abort<W> {
     type Out = ();
     type Item<'a> = &'a mut Abort<W>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         defs.inputs.push(Input::<AbortRequest>::def(cx, ABORT_PORT));
         Ok(())
     }
@@ -683,8 +615,7 @@ impl<W: InputWake> Param<W> for Abort<W> {
         Abort::new(bind_input(views))
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         Ok(())
     }
 
@@ -702,19 +633,13 @@ impl Param<NoWake> for Seq<'static> {
     type Out = ();
     type Item<'a> = &'a Seq<'a>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        _defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, _cx: &DefCx<'_>, _defs: &mut Defs) -> Result<(), DefError> {
         Ok(())
     }
 
     fn bind_in(_views: &mut Views<NoWake>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         Ok(())
     }
 
@@ -728,19 +653,13 @@ impl<W: InputWake> Param<W> for Log {
     type Out = Log;
     type Item<'a> = &'a mut Log;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        _defs: &mut Defs,
-    ) -> Result<(), DefError> {
-        param_name(names);
+    fn append_defs(_at: &ParamPath<'_>, _cx: &DefCx<'_>, _defs: &mut Defs) -> Result<(), DefError> {
         Ok(())
     }
 
     fn bind_in(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<Log, MakeError> {
-        param_name(names);
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<Log, MakeError> {
         Ok(Log)
     }
 
@@ -752,7 +671,7 @@ impl<W: InputWake> Param<W> for Log {
 /// Implements `Param` for a tuple of `Param`s.
 ///
 /// Each associated type is the tuple of the elements' types, and each method
-/// calls the elements in order.
+/// calls the elements in order. Element `i` is the fn's argument `i`.
 macro_rules! impl_param_for_tuple {
     ($($P:ident $i:tt),*) => {
         impl<W: InputWake, $($P: Param<W>),*> Param<W> for ($($P,)*) {
@@ -761,8 +680,8 @@ macro_rules! impl_param_for_tuple {
             type Item<'a> = ($($P::Item<'a>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn append_defs(names: &mut ParamNames<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
-                $( $P::append_defs(names, cx, defs)?; )*
+            fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+                $( $P::append_defs(&at.arg($i, $P::FLATTEN), cx, defs)?; )*
                 Ok(())
             }
 
@@ -772,8 +691,8 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
-                Ok(($( $P::bind_out(names, writers)?, )*))
+            fn bind_out(at: &ParamPath<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
+                Ok(($( $P::bind_out(&at.arg($i, $P::FLATTEN), writers)?, )*))
             }
 
             #[allow(unused_variables, clippy::unused_unit)]

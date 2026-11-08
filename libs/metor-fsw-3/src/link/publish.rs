@@ -7,7 +7,7 @@ use metor_proto::types::{PacketId, table_id};
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
+use crate::fn_system::{Cycle, Defs, Param, ParamPath, Views, Writers};
 use crate::io::{Buf, Cap, Endpoint, IoInit};
 use crate::log::Log;
 use crate::port::{DynInputs, InputWake, Output};
@@ -96,13 +96,9 @@ impl<W: InputWake> Param<W> for PublishInputs<W> {
     type Out = ();
     type Item<'a> = &'a mut PublishInputs<W>;
 
-    fn append_defs(
-        names: &mut ParamNames<'_>,
-        cx: &DefCx<'_>,
-        defs: &mut Defs,
-    ) -> Result<(), DefError> {
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         let first = defs.inputs.len();
-        <DynInputs<W> as Param<W>>::append_defs(names, cx, defs)?;
+        <DynInputs<W> as Param<W>>::append_defs(at, cx, defs)?;
         check_table_ids(&defs.inputs[first..])?;
         check_conn_cap(cx, &defs.inputs[first..])
     }
@@ -111,8 +107,8 @@ impl<W: InputWake> Param<W> for PublishInputs<W> {
         PublishInputs(<DynInputs<W> as Param<W>>::bind_in(views))
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<(), MakeError> {
-        <DynInputs<W> as Param<W>>::bind_out(names, writers)
+    fn bind_out(at: &ParamPath<'_>, writers: &mut Writers) -> Result<(), MakeError> {
+        <DynInputs<W> as Param<W>>::bind_out(at, writers)
     }
 
     fn get<'a>(

@@ -14,6 +14,7 @@ use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, SystemD
 
 use super::FnSignature;
 use super::param::{Defs, Param, Views, Writers};
+use super::path::ParamPath;
 
 /// The output that every fn system writes its log events to.
 pub const LOG_PORT: &str = "log";
@@ -60,7 +61,7 @@ impl<S: FnSignature> OutSet<S> {
     /// # Errors
     /// Fails if a parameter's output does not bind.
     pub(crate) fn from_writers(mut writers: Writers) -> Result<Self, MakeError> {
-        let outs = S::Params::bind_out(&mut S::NAMES.iter(), &mut writers)?;
+        let outs = S::Params::bind_out(&ParamPath::Args(S::NAMES), &mut writers)?;
         // PANIC Safety: `defs` always appends the log as the last output.
         let log = writers
             .bindings

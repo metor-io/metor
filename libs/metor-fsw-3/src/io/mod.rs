@@ -81,7 +81,7 @@ pub struct GrantDef {
 
 impl GrantDef {
     /// The definition of a `Cap<K>` parameter called `param`.
-    pub fn new<K: Interface>(param: &'static str) -> Self {
+    pub fn new<K: Interface>(param: impl Into<Cow<'static, str>>) -> Self {
         Self {
             param: param.into(),
             interface: K::NAME.into(),

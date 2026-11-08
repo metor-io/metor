@@ -1,0 +1,5 @@
+error: a `#[system]` parameter is no tuple; group parameters in a `#[derive(SystemParams)]` struct
+  --> tests/ui/system_tuple_param.rs:13:14
+   |
+13 | fn relay(io: (&mut Input<Imu>, &mut Output<Imu>)) {
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

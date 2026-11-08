@@ -131,7 +131,26 @@ impl Sig {
                 Shape::Sequence
             }
         };
-        Ok(Self { shape, args, state })
+        let sig = Self { shape, args, state };
+        sig.check_no_tuples(kind)?;
+        Ok(sig)
+    }
+
+    /// Rejects a tuple port; its elements would share one name.
+    fn check_no_tuples(&self, kind: Kind) -> syn::Result<()> {
+        match self
+            .ports()
+            .find(|arg| matches!(key_type(&arg.ty), Type::Tuple(_)))
+        {
+            Some(arg) => Err(syn::Error::new_spanned(
+                &arg.ty,
+                format!(
+                    "a `{}` parameter is no tuple; group parameters in a `#[derive(SystemParams)]` struct",
+                    kind.attr()
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Returns the parameters that are ports, in order.
