@@ -21,6 +21,7 @@ use crate::tests::utils::{Control, Imu, Nav, NoParams, input, output, pair, ring
 use crate::{Frame, Payload, Record};
 
 mod alarms;
+mod arrays;
 
 /// Doubles the newest sample, stamping it with the cycle time.
 struct Doubler;

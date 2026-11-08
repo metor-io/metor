@@ -6,7 +6,17 @@ import dataclasses
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, Sequence, TypeAlias, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Generic,
+    Iterable,
+    Sequence,
+    TypeAlias,
+    TypeVar,
+    Union,
+)
 
 from ._config import ConfigError
 from ._fields import Field, signature
@@ -185,6 +195,11 @@ class System:
     output to its record. `_caps` names each `Cap` parameter; the subclass
     passes the granted resources as ``grants``.
 
+    A port named ``fss.0`` is element 0 of the list ``fss``. A subclass whose
+    inputs sit in lists sets `_input_ports`, every input by its dotted name,
+    and takes one keyword per list. Reading a list of outputs from a handle
+    gives a tuple of its ports.
+
     Some system types take a list of ports from their config instead of
     declaring them. Those set `_takes_inputs` or `_takes_outputs`, and pass
     `items` or `records` through.
@@ -193,6 +208,8 @@ class System:
     _pack: Pack
     _ty: str
     _ports: dict[str, type[Record]] = {}
+    _input_ports: dict[str, type[Record]] = {}
+    """Every input by its dotted name, when any sits in a list."""
     _caps: tuple[str, ...] = ()
     """The name of each `Cap` parameter."""
     _record_packs: tuple[Pack, ...] = ()
@@ -210,7 +227,7 @@ class System:
 
     def __init__(
         self,
-        inputs: dict[str, Sources[Any]],
+        inputs: dict[str, Any],
         params: dict[str, Any],
         outputs: list[dict[str, Any]] | None = None,
         items: Sequence[Item] = (),
@@ -219,7 +236,8 @@ class System:
     ) -> None:
         self._location = _location(self)
         self._grants = dict(grants or {})
-        self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
+        flat = _flatten_inputs(type(self)._input_ports, inputs)
+        self._inputs = {port: _sources(port, src) for port, src in flat.items()}
         self._inputs.update(_edges(_item_ports(items)))
         self._params = {name: _json(value) for name, value in params.items()}
         names = _unique([_record_name(record) for record in records], "a system takes record")
@@ -315,6 +333,63 @@ def _record_name(record: type[Record]) -> str:
     if not record._name:
         raise ConfigError(f"record class `{record.__name__}` names no record")
     return record._name
+
+
+def _children(names: Iterable[str], path: str) -> list[str]:
+    """The distinct segments right under ``path`` in ``names``, in order."""
+    prefix = path + "."
+    found: dict[str, None] = {}
+    for name in names:
+        if name.startswith(prefix):
+            found.setdefault(name[len(prefix) :].split(".", 1)[0])
+    return list(found)
+
+
+def _is_index_run(children: list[str]) -> bool:
+    return children == [str(i) for i in range(len(children))]
+
+
+def _flatten_inputs(ports: dict[str, type[Record]], given: dict[str, Any]) -> dict[str, Any]:
+    """Maps each keyword's value to the dotted inputs under it."""
+    flat: dict[str, Any] = {}
+    for name, value in given.items():
+        _flatten_input(ports, name, value, flat)
+    return flat
+
+
+def _flatten_input(
+    ports: dict[str, type[Record]], path: str, value: Any, flat: dict[str, Any]
+) -> None:
+    children = _children(ports, path)
+    if not children:
+        flat[path] = value
+    elif value is None:
+        return
+    elif _is_index_run(children):
+        for i, item in enumerate(_list_of(path, value, len(children))):
+            _flatten_input(ports, f"{path}.{i}", item, flat)
+    else:
+        raise ConfigError(f"input `{path}` is a group, which this module cannot wire")
+
+
+def _list_of(path: str, value: Any, length: int) -> Sequence[Any]:
+    """Returns ``value`` if it is a list of ``length``."""
+    if isinstance(value, (OutPort, Loop, str)) or not isinstance(value, Sequence):
+        raise ConfigError(f"input `{path}` takes a list of {length}, got {value!r}")
+    if len(value) != length:
+        raise ConfigError(f"input `{path}` takes a list of {length}, got {len(value)}")
+    return value
+
+
+def _out_node(ports: dict[str, type[Record]], path: str, leaf: Callable[[str], Any]) -> Any:
+    """Returns the output at ``path``: ``leaf(path)`` for a port, or a tuple
+    for a list. Returns ``None`` when nothing sits at ``path``."""
+    if path in ports:
+        return leaf(path)
+    children = _children(ports, path)
+    if not children or not _is_index_run(children):
+        return None
+    return tuple(_out_node(ports, f"{path}.{child}", leaf) for child in children)
 
 
 def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:

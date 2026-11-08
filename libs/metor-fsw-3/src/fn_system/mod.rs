@@ -4,6 +4,7 @@
 //! each cycle, such as the cycle time. [`FnSystem`] turns the fn into a
 //! [`System`] or an [`AsyncSystem`].
 
+mod array;
 mod ctor;
 mod param;
 mod path;
@@ -23,6 +24,7 @@ use crate::{
     system::{System, SystemDef},
 };
 
+pub use array::ArrayParam;
 pub use ctor::{Bound, Ctor, WithDef, WithIo};
 pub use param::{Cycle, Param, Refresh, Views, Writers};
 pub(crate) use param::{Defs, Instance};

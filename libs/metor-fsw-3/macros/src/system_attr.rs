@@ -622,10 +622,16 @@ fn extract_doc(attrs: &[Attribute]) -> String {
 /// Returns the type used to look up a parameter's `Param` impl.
 ///
 /// One outer reference is stripped, so `&mut Input<T>` and `Input<T>` get the
-/// same key. `Seq` is keyed as `Seq<'static>`.
+/// same key. An array is keyed by its element's key, so `[&mut Input<T>; N]`
+/// is `[Input<T>; N]`. `Seq` is keyed as `Seq<'static>`.
 fn key_type(ty: &Type) -> Type {
     let key = match ty {
         Type::Reference(r) => (*r.elem).clone(),
+        Type::Array(array) => {
+            let mut array = array.clone();
+            *array.elem = key_type(&array.elem);
+            return Type::Array(array);
+        }
         other => other.clone(),
     };
     match &key {

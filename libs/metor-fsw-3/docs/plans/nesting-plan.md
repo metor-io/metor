@@ -116,7 +116,11 @@ structured ports.
    `key_type` into a module shared with the `SystemParams` derive.
 4. `check_kinds`' list stays name-based; arrays of non-`ArrayParam`s fail on
    the trait bound. Add `#[diagnostic::on_unimplemented]` to `ArrayParam`.
-5. Stubs and Python for lists (see E1–E3 for inputs and outputs).
+5. Stubs and Python for lists (see E1–E3 for inputs and outputs). A list
+   keyword defaults to `None`, which wires nothing; `()` stays the leaf
+   default. A system with dotted inputs sets `_input_ports`, every input by
+   name, which `System.__init__` flattens against. `get_sampled` collects the
+   elements' `Refresh`es in a `Vec`, built when the sequence starts.
 6. Tests: unit tests in `fn_system/tests` for `[Input; 3]`, `[Sample; 2]`,
    `[Output; 2]`, `N = 0`, a mixed system; defs named `fss.0` … `fss.2`; records
    reach the right element. trybuild: `[Timestamp; 2]`, `[Log; 2]`.

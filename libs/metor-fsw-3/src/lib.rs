@@ -194,8 +194,8 @@ pub use def::{DefCx, DefError, Records};
 #[cfg(feature = "host")]
 pub use dl::{DlPack, DlStep, Pack, PackError};
 pub use fn_system::{
-    AsyncSystemFn, Bound, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamPath,
-    SystemFn, WithDef,
+    ArrayParam, AsyncSystemFn, Bound, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param,
+    ParamPath, SystemFn, WithDef,
 };
 pub use frame::Frame;
 pub use frame_map::{FrameRef, FrameWriteError, FrameWriter, MapRef, MapWriter};

@@ -14,6 +14,7 @@ use metor_proto_wkt::{LogEvent, SequenceCommand};
 
 use super::pack_dev::PackDevError;
 use super::port_class::Accessors;
+use super::port_tree::{PortNode, ShapeError, port_tree};
 use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelMessage, ChannelStatus};
 use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
 use crate::def::DefCx;
@@ -82,6 +83,8 @@ struct Module {
     systems: Vec<Entry>,
     /// Whether any system takes a port list from its config.
     takes_ports: bool,
+    /// Whether the module names `Sequence`.
+    takes_sequences: bool,
     /// Whether any system takes a `Cap`, so the module imports `ResourceHandle`.
     takes_caps: bool,
 }
@@ -199,13 +202,19 @@ struct Entry {
     takes_inputs: bool,
     /// Whether the type takes a `records` list.
     takes_outputs: bool,
-    inputs: Vec<Port>,
+    /// One keyword per input, list, or group of inputs.
+    inputs: Vec<Field>,
+    /// Every wired input with its record class, when any is in a list or
+    /// group.
+    input_ports: Vec<Port>,
     params: Vec<Field>,
     /// The name of each `Cap` parameter.
     caps: Vec<String>,
     /// Every output port with its record class. The framework's ports come
     /// last.
     ports: Vec<Port>,
+    /// One attribute per output, list, or group of outputs.
+    attrs: Vec<Port>,
 }
 
 #[derive(Serialize)]
@@ -327,6 +336,13 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
             .iter()
             .any(|entry| entry.takes_inputs || entry.takes_outputs),
         takes_caps: systems.iter().any(|entry| !entry.caps.is_empty()),
+        takes_sequences: systems.iter().any(|entry| {
+            let lists = entry
+                .inputs
+                .iter()
+                .any(|k| k.annotation.starts_with("Sequence"));
+            lists || entry.takes_inputs || entry.takes_outputs
+        }),
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
@@ -494,7 +510,13 @@ fn entry(
         .iter()
         .map(|g| g.param.to_string())
         .collect();
-    let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
+    let shape = |source: ShapeError| PackDevError::PortShape {
+        system: system.ty.to_string(),
+        port: source.port,
+    };
+    let inputs = input_keywords(system).map_err(shape)?;
+    let attrs = output_attrs(system).map_err(shape)?;
+    let input = |name: &str| inputs.iter().any(|keyword| keyword.name == name);
     let param = |name: &str| params.iter().any(|field| field.name == name);
     let clash = params.iter().map(|f| &f.name).find(|name| input(name));
     let taken = |name: &str| input(name) || param(name) || RESERVED_KEYWORDS.contains(&name);
@@ -512,11 +534,100 @@ fn entry(
         args_doc: args_doc(&params),
         takes_inputs: system.takes_inputs,
         takes_outputs: system.takes_outputs,
-        inputs: wired_inputs(system).map(Port::from_def).collect(),
+        input_ports: input_ports(system),
+        inputs,
         params,
         caps,
         ports: output_ports(system),
+        attrs,
     })
+}
+
+/// The `__init__` keyword for each top-level input node.
+fn input_keywords(system: &PackSystemDef) -> Result<Vec<Field>, ShapeError> {
+    let tree = port_tree(wired_inputs(system))?;
+    tree.iter()
+        .map(|(name, node)| {
+            let annotation = input_annotation(node, name)?;
+            let (annotation, default) = match node {
+                PortNode::Leaf(_) => (annotation, " = ()"),
+                _ => (format!("{annotation} | None"), " = None"),
+            };
+            Ok(Field {
+                name: (*name).to_string(),
+                annotation,
+                default: default.to_string(),
+                doc: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// The wired inputs, listed when one sits in a list or a group.
+fn input_ports(system: &PackSystemDef) -> Vec<Port> {
+    if wired_inputs(system).any(|port| port.name.contains('.')) {
+        wired_inputs(system).map(Port::from_def).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The attribute for each top-level output node. The framework's ports come
+/// last.
+fn output_attrs(system: &PackSystemDef) -> Result<Vec<Port>, ShapeError> {
+    let declared = exposed_outputs(system).filter(|p| !is_framework(&p.name));
+    let tree = port_tree(declared)?;
+    let attrs = tree.iter().map(|(name, node)| {
+        Ok(Port {
+            name: (*name).to_string(),
+            record: String::new(),
+            annotation: output_annotation(node, name)?,
+        })
+    });
+    let framework = framework_ports().into_iter().map(|port| Ok(Port::of(port)));
+    attrs.chain(framework).collect()
+}
+
+/// The type of an input keyword: `Sources[T]` for a leaf, a `Sequence` for
+/// a list.
+fn input_annotation(node: &PortNode<'_>, path: &str) -> Result<String, ShapeError> {
+    match node {
+        PortNode::Leaf(port) => Ok(format!("Sources[{}]", class_of(&port.record))),
+        PortNode::List(items) => Ok(format!(
+            "Sequence[{}]",
+            element(items, path, input_annotation)?
+        )),
+        PortNode::Group(_) => Err(ShapeError {
+            port: path.to_string(),
+        }),
+    }
+}
+
+/// The type of an output attribute: the leaf's port type, or a `tuple` for
+/// a list.
+fn output_annotation(node: &PortNode<'_>, path: &str) -> Result<String, ShapeError> {
+    match node {
+        PortNode::Leaf(port) => Ok(Port::from_def(port).annotation),
+        PortNode::List(items) => Ok(format!(
+            "tuple[{}, ...]",
+            element(items, path, output_annotation)?
+        )),
+        PortNode::Group(_) => Err(ShapeError {
+            port: path.to_string(),
+        }),
+    }
+}
+
+/// The annotation of a list's elements, which share one shape.
+fn element(
+    items: &[PortNode<'_>],
+    path: &str,
+    annotation: fn(&PortNode<'_>, &str) -> Result<String, ShapeError>,
+) -> Result<String, ShapeError> {
+    match items.first() {
+        Some(first) => annotation(first, &format!("{path}.0")),
+        None => Ok("object".to_string()),
+    }
 }
 
 fn description(schema: &Value) -> String {
@@ -759,6 +870,67 @@ mod tests {
                 "_ports = {\"cmd\": MotorCmd, \"log\": LogEvent, \"status\": SystemStatus}"
             )
         );
+    }
+
+    #[test]
+    fn test_list_ports_render_as_sequences() {
+        let inputs = vec![
+            port("fss.0", "fss"),
+            port("fss.1", "fss"),
+            port("gain", "est"),
+        ];
+        let outputs = vec![
+            port("est.0", "est"),
+            port("est.1", "est"),
+            port("grid.0.0", "est"),
+            port("grid.0.1", "est"),
+            port("log", "log"),
+        ];
+        let text = rendered(vec![system("sun", inputs, outputs, None)]).expect("renders");
+        assert!(
+            text.contains("from typing import Literal, Sequence\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    _input_ports = {\"fss.0\": Fss, \"fss.1\": Fss, \"gain\": Est}\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "def __init__(self, *, fss: Sequence[Sources[Fss]] | None = None, gain: Sources[Est] = ()) -> None:"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("super().__init__({\"fss\": fss, \"gain\": gain}, {})"));
+        assert!(text.contains("_ports = {\"est.0\": Est, \"est.1\": Est, \"grid.0.0\": Est"));
+        assert!(
+            text.contains("    est: tuple[OutPort[Est], ...]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    grid: tuple[tuple[OutPort[Est], ...], ...]\n    log: OutPort[LogEvent]\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_flat_inputs_list_no_input_ports() {
+        let text =
+            rendered(vec![system("nav", vec![port("est", "est")], vec![], None)]).expect("renders");
+        assert!(!text.contains("_input_ports"), "{text}");
+        assert!(!text.contains("Sequence"), "{text}");
+    }
+
+    #[test]
+    fn test_reject_port_beside_its_children() {
+        let inputs = vec![port("fss", "fss"), port("fss.0", "fss")];
+        let clash = rendered(vec![system("sun", inputs, vec![], None)]);
+        let Err(PackDevError::PortShape { system, port }) = clash else {
+            panic!("the clash is reported")
+        };
+        assert_eq!((system.as_str(), port.as_str()), ("sun", "fss"));
     }
 
     #[test]

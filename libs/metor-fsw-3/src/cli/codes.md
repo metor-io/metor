@@ -914,6 +914,16 @@ Code that is compiled only for one target, such as behind `#[cfg(target_arch
 = "wasm32")]`, is the usual cause. Make the pack's systems the same on both
 targets.
 
+## M0409
+
+**A port is also a group**
+
+A pack module rebuilds lists and groups of ports from their dotted names, so
+`fss.0` is element 0 of the list `fss`. The system has a port named like a
+list or group that other ports sit under, such as `a` beside `a.b`.
+
+Rename the port, or the field or array that names the ports under it.
+
 ## M0410
 
 **cargo could not be started**

@@ -9,7 +9,7 @@ from ._composite import Composite, Scope
 from ._config import ConfigError, simulated_clock, wall_clock
 from ._generated import CHANNEL_PORTS, COMMANDS_PORT, Io, ResourceStatus
 from ._io import Kind, ResourceHandle, SimKind
-from ._model import Loop, OutPort, Pack, Record, Source, System, _json, _sources
+from ._model import Loop, OutPort, Pack, Record, Source, System, _json, _out_node, _sources
 
 IO_SUBMIT = "io_submit"
 IO_COMPLETE = "io_complete"
@@ -67,9 +67,13 @@ class SystemHandle:
         self._system = system
 
     def __getattr__(self, port: str) -> Any:
-        record = self._port_map().get(port)
-        if record is None:
+        ports = self._port_map()
+        found = _out_node(ports, port, lambda path: self._out_port(path, ports[path]))
+        if found is None:
             raise AttributeError(f"system `{self._name}` has no output port `{port}`")
+        return found
+
+    def _out_port(self, port: str, record: type[Record]) -> OutPort[Any]:
         return record._port(self._name, port, record, self._target)
 
     def _port_map(self) -> dict[str, type[Record]]:
