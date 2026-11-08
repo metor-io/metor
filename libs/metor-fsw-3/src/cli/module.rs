@@ -523,6 +523,7 @@ fn entry(
     let shape = |source: ShapeError| PackDevError::PortShape {
         system: system.ty.to_string(),
         port: source.port,
+        other: source.other,
     };
     let stubs = port_stubs(system).map_err(shape)?;
     let input = |name: &str| stubs.inputs.iter().any(|keyword| keyword.name == name);
@@ -935,6 +936,52 @@ mod tests {
         assert_eq!(port, "a.1");
     }
 
+    /// The paths a rendered `PortShape` error names.
+    fn shape_error(inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> (String, Option<String>) {
+        match rendered(vec![system("adcs", inputs, outputs, None)]) {
+            Err(PackDevError::PortShape { port, other, .. }) => (port, other),
+            other => panic!("the shape is reported: {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_groups_of_one_class_name_must_match() {
+        let same = vec![port("wheels.0.cmd.a", "imu"), port("wheels_cmd.a", "imu")];
+        let text = rendered(vec![system("adcs", same, vec![], None)]).expect("renders");
+        assert_eq!(
+            text.matches("class WheelsCmd(PortGroup)").count(),
+            1,
+            "{text}"
+        );
+        let apart = vec![port("wheels.0.cmd.a", "imu"), port("wheels_cmd.b", "imu")];
+        let (port, other) = shape_error(apart, vec![]);
+        assert_eq!(
+            (port.as_str(), other.as_deref()),
+            ("wheels_cmd", Some("wheels.0.cmd"))
+        );
+    }
+
+    #[test]
+    fn test_input_and_output_groups_of_one_class_name_clash() {
+        let inputs = vec![port("motor_out.a", "imu")];
+        let outputs = vec![port("motor.a", "imu")];
+        let (port, other) = shape_error(inputs, outputs);
+        assert_eq!(
+            (port.as_str(), other.as_deref()),
+            ("motor", Some("motor_out"))
+        );
+    }
+
+    #[test]
+    fn test_reject_python_keywords() {
+        assert_eq!(shape_error(vec![port("in", "imu")], vec![]).0, "in");
+        assert_eq!(
+            shape_error(vec![], vec![port("a.class", "imu")]).0,
+            "a.class"
+        );
+        assert_eq!(shape_error(vec![port("b.self", "imu")], vec![]).0, "b.self");
+    }
+
     #[test]
     fn test_flat_inputs_list_no_input_ports() {
         let text =
@@ -947,7 +994,7 @@ mod tests {
     fn test_reject_port_beside_its_children() {
         let inputs = vec![port("fss", "fss"), port("fss.0", "fss")];
         let clash = rendered(vec![system("sun", inputs, vec![], None)]);
-        let Err(PackDevError::PortShape { system, port }) = clash else {
+        let Err(PackDevError::PortShape { system, port, .. }) = clash else {
             panic!("the clash is reported")
         };
         assert_eq!((system.as_str(), port.as_str()), ("sun", "fss"));

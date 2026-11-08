@@ -931,9 +931,15 @@ targets.
 
 A pack module rebuilds lists and groups of ports from their dotted names, so
 `fss.0` is element 0 of the list `fss`, and `wheels.0.cmd` is the `cmd` port
-of a group. Either the system has a port that other ports sit under, such as
-`a` beside `a.b`, or a group holds a child Python cannot name, such as `1`
-in a group whose children are not `0` … `N-1`.
+of a group. One of these holds:
+
+- the system has a port that other ports sit under, such as `a` beside
+  `a.b`;
+- a port segment is no Python name: `1` in a group whose children are not
+  `0` … `N-1`, a keyword such as `in` or `class`, or `self`;
+- two different groups share a class name, such as `wheels.0.cmd` and
+  `wheels_cmd` (both `WheelsCmd`), or the inputs `motor_out` and the outputs
+  `motor` (both `MotorOut`).
 
 Rename the port, or the field or array that names the ports under it.
 

@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::port_tree::{PortNode, ShapeError};
 
 /// An `__init__` keyword.
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub(super) struct Keyword {
     pub(super) name: String,
     pub(super) annotation: String,
@@ -15,14 +15,14 @@ pub(super) struct Keyword {
 }
 
 /// A class attribute.
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub(super) struct Attr {
     pub(super) name: String,
     pub(super) annotation: String,
 }
 
 /// An input port by its dotted path, with its record class.
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub(super) struct Leaf {
     pub(super) name: String,
     pub(super) record: String,
@@ -38,6 +38,18 @@ pub(super) struct GroupClass {
     /// The group's inputs, by their path under the group.
     pub(super) input_ports: Vec<Leaf>,
     pub(super) attrs: Vec<Attr>,
+    /// The port path the class was first built for.
+    #[serde(skip)]
+    pub(super) path: String,
+}
+
+impl GroupClass {
+    /// Whether `other` renders the same class.
+    fn same_as(&self, other: &Self) -> bool {
+        (self.name == other.name && self.base == other.base)
+            && (self.keywords == other.keywords && self.input_ports == other.input_ports)
+            && self.attrs == other.attrs
+    }
 }
 
 /// Renders one system's port tree, collecting its group classes.
@@ -111,18 +123,15 @@ impl<'s> Stubs<'s> {
             PortNode::Leaf(port) => Ok(format!("Sources[{}]", (self.record)(&port.record))),
             PortNode::List(items) => Ok(format!("Sequence[{}]", self.input_element(items, path)?)),
             PortNode::Group(children) => {
-                let name = group_name(path);
-                if !self.has_group(&name) {
-                    let class = GroupClass {
-                        keywords: self.keywords(children, path)?,
-                        input_ports: leaves(children, "", self.record),
-                        attrs: Vec::new(),
-                        name: name.clone(),
-                        base: "PortGroup",
-                    };
-                    self.groups.push(class);
-                }
-                Ok(format!("{}.{name}", self.system))
+                let class = GroupClass {
+                    keywords: self.keywords(children, path)?,
+                    input_ports: leaves(children, "", self.record),
+                    attrs: Vec::new(),
+                    name: group_name(path),
+                    base: "PortGroup",
+                    path: path.to_string(),
+                };
+                self.add_group(class)
             }
         }
     }
@@ -135,18 +144,15 @@ impl<'s> Stubs<'s> {
                 Ok(format!("tuple[{}, ...]", self.output_element(items, path)?))
             }
             PortNode::Group(children) => {
-                let name = format!("{}Out", group_name(path));
-                if !self.has_group(&name) {
-                    let class = GroupClass {
-                        attrs: self.attrs(children, path)?,
-                        keywords: Vec::new(),
-                        input_ports: Vec::new(),
-                        name: name.clone(),
-                        base: "OutGroup",
-                    };
-                    self.groups.push(class);
-                }
-                Ok(format!("{}.{name}", self.system))
+                let class = GroupClass {
+                    attrs: self.attrs(children, path)?,
+                    keywords: Vec::new(),
+                    input_ports: Vec::new(),
+                    name: format!("{}Out", group_name(path)),
+                    base: "OutGroup",
+                    path: path.to_string(),
+                };
+                self.add_group(class)
             }
         }
     }
@@ -165,8 +171,22 @@ impl<'s> Stubs<'s> {
         }
     }
 
-    fn has_group(&self, name: &str) -> bool {
-        self.groups.iter().any(|group| group.name == name)
+    /// Keeps `class` once, and returns how the system's stub names it.
+    ///
+    /// Fails when another group already took the class name.
+    fn add_group(&mut self, class: GroupClass) -> Result<String, ShapeError> {
+        let named = format!("{}.{}", self.system, class.name);
+        match self.groups.iter().find(|group| group.name == class.name) {
+            Some(known) if known.same_as(&class) => {}
+            Some(known) => {
+                return Err(ShapeError {
+                    port: class.path,
+                    other: Some(known.path.clone()),
+                });
+            }
+            None => self.groups.push(class),
+        }
+        Ok(named)
     }
 }
 
@@ -224,14 +244,21 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
+/// Python's keywords, and `self`, which `__init__` takes first.
+const PYTHON_KEYWORDS: [&str; 36] = [
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield", "self",
+];
+
 /// Refuses a keyword or attribute that Python cannot spell.
 fn check_identifier(name: &str, path: &str) -> Result<(), ShapeError> {
     let mut chars = name.chars();
     let first = chars.next().is_some_and(|c| c == '_' || c.is_alphabetic());
-    match first && chars.all(|c| c == '_' || c.is_alphanumeric()) {
+    let spelled = first && chars.all(|c| c == '_' || c.is_alphanumeric());
+    match spelled && !PYTHON_KEYWORDS.contains(&name) {
         true => Ok(()),
-        false => Err(ShapeError {
-            port: path.to_string(),
-        }),
+        false => Err(ShapeError::at(path)),
     }
 }

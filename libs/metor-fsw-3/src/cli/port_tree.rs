@@ -15,11 +15,21 @@ pub(super) enum PortNode<'a> {
     Group(Vec<(&'a str, PortNode<'a>)>),
 }
 
-/// Two ports that cannot share a tree: `port` is a leaf, and another port
-/// sits under it.
+/// Ports that cannot share a tree or a stub: `port` is a leaf with another
+/// port under it, or a group whose class `other` already names.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ShapeError {
     pub(super) port: String,
+    pub(super) other: Option<String>,
+}
+
+impl ShapeError {
+    pub(super) fn at(port: impl Into<String>) -> Self {
+        Self {
+            port: port.into(),
+            other: None,
+        }
+    }
 }
 
 /// A node while ports are still being added.
@@ -55,9 +65,7 @@ fn insert<'a>(
         None => (rest, None),
     };
     let found = branch.iter().position(|(known, _)| *known == segment);
-    let conflict = || ShapeError {
-        port: name[..at + segment.len()].to_string(),
-    };
+    let conflict = || ShapeError::at(&name[..at + segment.len()]);
     match (found, tail) {
         (None, None) => branch.push((segment, Draft::Leaf(port))),
         (None, Some(next)) => {
@@ -190,7 +198,7 @@ mod tests {
     fn test_leaf_with_children_is_refused() {
         let under = ports(&["a", "a.b"]);
         let over = ports(&["a.b.c", "a.b"]);
-        assert_eq!(port_tree(&under), Err(ShapeError { port: "a".into() }));
-        assert_eq!(port_tree(&over), Err(ShapeError { port: "a.b".into() }));
+        assert_eq!(port_tree(&under), Err(ShapeError::at("a")));
+        assert_eq!(port_tree(&over), Err(ShapeError::at("a.b")));
     }
 }

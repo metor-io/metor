@@ -177,7 +177,8 @@ structured ports.
    raises `ConfigError` on an unknown keyword. A group of outputs is an
    `OutGroup` subclass of annotations; the handle returns a plain `OutGroup`,
    whose `__getattr__` is hidden from type checkers. A port beside its own
-   children, or a group child Python cannot name, fails stubgen with
+   children, a segment Python cannot name (a keyword or `self` included), or
+   two different groups of one class name fail stubgen with
    `PackDevError::PortShape` (M0409). The pyright fixture and a wiring check
    live in `tests/port_stubs.rs`, apart from `tests/module.rs`, which F
    touches.
