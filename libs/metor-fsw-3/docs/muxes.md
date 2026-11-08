@@ -84,7 +84,8 @@ BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})  # dst paths open.0, open.1
 - An output never emits before every input it maps has delivered once.
 - `max_age`: an output does not emit while an input it maps is older than
   `max_age`. Age is the cycle time minus the input's last stamp, or minus the
-  cycle it arrived in when the frame has no stamp.
+  cycle it arrived in when the frame has no stamp. Stamps are cycle times;
+  a driver puts device time in a field, not the stamp.
 
 | `on=` | Emits | Stamp default |
 |---|---|---|

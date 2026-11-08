@@ -310,6 +310,17 @@ loop {
 Every op goes through a `fsw.io` step once per cycle. A sim resource is a
 wire: each end connects at once and its ops never reach the OS.
 
+A target may hold real and sim resources at once. Such a mixed target runs
+on a wall clock: real devices see real time, and models run between
+`io_submit` and `io_complete` once per cycle and read the cycle time. A
+model may hold a real resource, such as a rig model driving a real UART.
+A simulated clock does not pace a real device: cycles run as fast as the
+CPU allows, and timeouts fire on cycle time. A run that holds a real
+resource is not deterministic. Neither is refused at build.
+
+Drivers stamp records with the cycle time, so every stamp in a target
+shares one clock. Device time, such as GNSS time, goes in a field.
+
 ## Links and gateways
 
 `Publish` serves the records wired into it over metor-proto. `Subscribe`

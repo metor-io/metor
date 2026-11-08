@@ -270,6 +270,13 @@ class SimTests(unittest.TestCase):
         self.assertNotIn("grants", b)
         self.assertEqual(len(config["resources"]), 2)
 
+    def test_model_may_hold_a_real_resource(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        fsw.sim("rig", Gps(uart=fsw.resource("p", Tty("/dev/ttyS0"))))
+        systems = coordinator(fsw)["systems"]
+        self.assertEqual([s["id"] for s in systems], ["io_submit", "rig", "io_complete"])
+        self.assertEqual(systems[1]["grants"], {"uart": "p"})
+
     def test_real_resource_has_no_device_end(self) -> None:
         fsw = Target(cycle_rate=10.0)
         port = fsw.resource("port", Tty("/dev/ttyS0"))
