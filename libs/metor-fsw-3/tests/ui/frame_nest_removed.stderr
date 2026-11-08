@@ -1,0 +1,5 @@
+error: Unknown field: `nest`
+  --> tests/ui/frame_nest_removed.rs:15:13
+   |
+15 |     #[frame(nest)]
+   |             ^^^^

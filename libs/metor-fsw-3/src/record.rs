@@ -119,11 +119,17 @@ pub enum MsgCodec {
 impl RecordSchema {
     /// Creates the schema for frame `T`.
     ///
-    /// Each field is announced at `{root}.{field}`, tagged with the frame's
-    /// name and root so the ground can gather every instance of `T`.
+    /// Each field is announced at `{root}.{field}`, stamped from
+    /// [`Frame::STAMP`], and tagged with the frame's name and root so the
+    /// ground can gather every instance of `T`.
     pub fn frame<T: Frame>(root: &str) -> Self {
+        let (offset, len) = T::STAMP;
+        let stamp = metor_proto::vtable::builder::raw_table(offset, len);
+        let fields = T::vtable_fields(root.to_string())
+            .map(move |field| field.with_timestamp(stamp.clone()))
+            .map(|field| field.with_frame(T::ID));
         Self::Frame {
-            vtable: metor_proto::vtable::builder::vtable(T::vtable_fields(root.to_string())),
+            vtable: metor_proto::vtable::builder::vtable(fields),
             metadata: T::metadata(root.to_string())
                 .map(|m| m.with_frame(T::NAME, root))
                 .collect(),

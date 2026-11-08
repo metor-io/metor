@@ -223,18 +223,7 @@ pub struct PairB {
 
 /// A struct nested in a frame.
 #[derive(
-    metor_component::AsVTable,
-    metor_component::Metadatatize,
-    metor_component::Componentize,
-    metor_component::Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
+    crate::Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq,
 )]
 #[repr(C)]
 pub struct Inner {
@@ -249,7 +238,6 @@ pub struct Inner {
 pub struct Nested {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    #[frame(nest)]
     pub inner: Inner,
     pub z: f64,
 }

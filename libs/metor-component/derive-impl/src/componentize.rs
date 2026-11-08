@@ -17,7 +17,7 @@ pub fn componentize_impl(input: &StructInput, crate_name: &TokenStream2) -> Toke
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
 
-    // Scalar fields emit one component apiece. Nested and dynamic fields
+    // Scalar fields emit one component apiece. Dynamic fields
     // recurse through their own `sink_columns`; a `FrameList`/`FrameMap` slot
     // holds no in-struct value, so its call is a no-op. The timestamp field
     // supplies the frame's time and is never emitted as a component.
@@ -26,7 +26,7 @@ pub fn componentize_impl(input: &StructInput, crate_name: &TokenStream2) -> Toke
         .filter(|f| !f.timestamp && !f.skipped())
         .map(|field| {
             let ident = field.ident.as_ref().expect("only named fields allowed");
-            if field.is_nested() {
+            if field.is_dynamic() {
                 quote! { self.#ident.sink_columns(output); }
             } else {
                 let component_id = field.qualified_component_name(parent.as_deref());

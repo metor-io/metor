@@ -1,39 +1,33 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 
+use crate::Field;
 use crate::input::{EnumInput, Input, StructInput};
+
+/// What a struct's `timestamp` field does in its vtable.
+///
+/// The field never becomes a component of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    /// Every other field reads its time from the marked field.
+    Attach,
+    /// The field is left out; the caller attaches a time.
+    Omit,
+}
 
 /// Generates an `AsVTable` impl.
 ///
-/// `frame_id` is `None` for the standalone `#[derive(AsVTable)]` and
-/// `Some(<ComponentId expr>)` for `#[derive(Frame)]`, which wraps every
-/// member's op chain in a `with_frame` op so each realized component
-/// inherits the frame id. `crate_name` is the path prefix the generated code
-/// uses to reach the framework's re-exports.
-///
-/// A struct field marked `#[fsw(timestamp)]` never becomes a component of
-/// its own. It is captured as a raw table and attached to every other field
-/// as the shared timestamp source.
-pub fn as_vtable_impl(
-    input: &Input,
-    frame_id: Option<TokenStream2>,
-    crate_name: &TokenStream2,
-) -> TokenStream2 {
+/// `crate_name` is the path prefix the generated code uses to reach the
+/// framework's re-exports.
+pub fn as_vtable_impl(input: &Input, stamp: Stamp, crate_name: &TokenStream2) -> TokenStream2 {
     match input {
-        Input::Enum(input) => enum_as_vtable_impl(input, frame_id, crate_name),
-        Input::Struct(input) => struct_as_vtable_impl(input, frame_id, crate_name),
+        Input::Enum(input) => enum_as_vtable_impl(input, crate_name),
+        Input::Struct(input) => struct_as_vtable_impl(input, stamp, crate_name),
     }
 }
 
 /// Generates an `AsVTable` impl for an enum. See [`as_vtable_impl`].
-pub fn enum_as_vtable_impl(
-    input: &EnumInput,
-    frame_id: Option<TokenStream2>,
-    crate_name: &TokenStream2,
-) -> TokenStream2 {
-    let frame_map = frame_id.as_ref().map(|fid| {
-        quote! { .map(move |field| field.with_frame(#fid)) }
-    });
+pub fn enum_as_vtable_impl(input: &EnumInput, crate_name: &TokenStream2) -> TokenStream2 {
     let impeller = quote! { #crate_name::metor_proto };
     let EnumInput {
         ident,
@@ -62,7 +56,6 @@ pub fn enum_as_vtable_impl(
                         component
                     ))
                 ].into_iter()
-                #frame_map
             }
         }
     }
@@ -71,12 +64,9 @@ pub fn enum_as_vtable_impl(
 /// Generates an `AsVTable` impl for a struct. See [`as_vtable_impl`].
 pub fn struct_as_vtable_impl(
     input: &StructInput,
-    frame_id: Option<TokenStream2>,
+    stamp: Stamp,
     crate_name: &TokenStream2,
 ) -> TokenStream2 {
-    let frame_map = frame_id.as_ref().map(|fid| {
-        quote! { .map(move |field| field.with_frame(#fid)) }
-    });
     let impeller = quote! { #crate_name::metor_proto };
     let StructInput {
         ident,
@@ -86,62 +76,43 @@ pub fn struct_as_vtable_impl(
         ..
     } = input;
     let where_clause = &generics.where_clause;
-    let mut timestamp_fields = fields.iter().filter(|field| field.timestamp);
-    let timestamp_field = timestamp_fields.next();
-    if let Some(extra) = timestamp_fields.next() {
-        return syn::Error::new_spanned(
-            &extra.ident,
-            "only one field can be marked #[metor_fsw(timestamp)]",
-        )
-        .to_compile_error();
-    }
-    let timestamp_source = timestamp_field.map(|field| {
-        let ident = &field.ident;
+    let (timestamp_source, timestamp_map) = match stamp {
+        Stamp::Attach => match stamp_source(fields, &impeller) {
+            Ok(source) => source,
+            Err(e) => return e.to_compile_error(),
+        },
+        Stamp::Omit => (None, None),
+    };
+    let members = || fields.iter().filter(|f| f.is_member());
+    let vtable_items = members().map(|field| {
         let ty = &field.ty;
+        let ident = &field.ident;
+        let path = match field.segment(parent.as_deref()) {
+            Some(name) => quote! { path.chain(#name) },
+            None => quote! { path.clone() },
+        };
         quote! {
-            let timestamp_source = #impeller::vtable::builder::raw_table(
-                core::mem::offset_of!(Self, #ident) as u32,
-                core::mem::size_of::<#ty>() as u32,
-            );
+            .chain(<#ty as #crate_name::AsVTable>::vtable_fields(#path)
+                .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
+            )
         }
     });
-    let timestamp_map = timestamp_field.map(|_| {
+    // `element_fields` names members relative to a plain string prefix
+    // instead of a component path, so a dynamic container can stamp out
+    // copies under names chosen at runtime.
+    let element_items = members().map(|field| {
+        let ty = &field.ty;
+        let ident = &field.ident;
+        let prefix = match field.segment(None) {
+            Some(name) => quote! { child(#name) },
+            None => quote! { prefix.clone() },
+        };
         quote! {
-            .map(move |field| field.with_timestamp(timestamp_source.clone()))
+            .chain(<#ty as #crate_name::AsVTable>::element_fields(#prefix)
+                .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
+            )
         }
     });
-    // The timestamp field feeds the source above and is filtered out
-    // of the component fields, as are `skip`ped fields.
-    let vtable_items = fields
-        .iter()
-        .filter(|f| !f.timestamp && !f.skipped())
-        .map(|field| {
-            let ty = &field.ty;
-            let name = field.qualified_component_name(parent.as_deref());
-            let ident = &field.ident;
-            quote! {
-                .chain(<#ty as #crate_name::AsVTable>::vtable_fields(path.chain(#name))
-                    .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
-                )
-            }
-        });
-    // `element_fields` names members relative to a plain string
-    // prefix instead of a component path, so a dynamic container can
-    // stamp out copies under names chosen at runtime.
-    let element_items = fields
-        .iter()
-        .filter(|f| !f.timestamp && !f.skipped())
-        .map(|field| {
-            let ty = &field.ty;
-            let name = field.component_name();
-            let ident = &field.ident;
-            quote! {
-                .chain(<#ty as #crate_name::AsVTable>::element_fields(child(#name))
-                    .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
-                )
-            }
-        });
-    let members = || fields.iter().filter(|f| !f.timestamp && !f.skipped());
     let dynamic_items = members().map(|field| {
         let ty = &field.ty;
         quote! { || <#ty as #crate_name::AsVTable>::DYNAMIC }
@@ -161,7 +132,6 @@ pub fn struct_as_vtable_impl(
                 std::iter::empty()
                 #(#vtable_items)*
                 #timestamp_map
-                #frame_map
             }
 
             fn element_fields(prefix: String) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
@@ -175,4 +145,32 @@ pub fn struct_as_vtable_impl(
             }
         }
     }
+}
+
+/// The statement that captures the `timestamp` field as a raw table, and the
+/// map that attaches it to every member.
+fn stamp_source(
+    fields: &[Field],
+    impeller: &TokenStream2,
+) -> syn::Result<(Option<TokenStream2>, Option<TokenStream2>)> {
+    let mut stamps = fields.iter().filter(|field| field.timestamp);
+    let Some(field) = stamps.next() else {
+        return Ok((None, None));
+    };
+    if let Some(extra) = stamps.next() {
+        let message = "only one field can be marked #[fsw(timestamp)]";
+        return Err(syn::Error::new_spanned(&extra.ident, message));
+    }
+    let ident = &field.ident;
+    let ty = &field.ty;
+    let source = quote! {
+        let timestamp_source = #impeller::vtable::builder::raw_table(
+            core::mem::offset_of!(Self, #ident) as u32,
+            core::mem::size_of::<#ty>() as u32,
+        );
+    };
+    let map = quote! {
+        .map(move |field| field.with_timestamp(timestamp_source.clone()))
+    };
+    Ok((Some(source), Some(map)))
 }

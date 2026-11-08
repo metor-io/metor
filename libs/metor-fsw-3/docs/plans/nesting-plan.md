@@ -199,6 +199,9 @@ structured ports.
    to `Field` (`rename` is the existing `component_id`; keep it as an alias).
    `flatten` chains no segment. Detect duplicate leaf names at derive time
    among a struct's own fields.
+   `struct_as_vtable_impl` takes a `Stamp`: `Omit` for `Fields` and `Frame`,
+   `Attach` for the standalone `#[derive(AsVTable)]`, which keeps its
+   behavior.
 6. Accept `#[fsw(..)]` on `Frame` with `#[frame(..)]` as an alias.
 7. Migrate the five `nest` users and the standalone-derive users to `Fields`.
 8. Tests:
@@ -207,7 +210,7 @@ structured ports.
      Record the ids on the branch before step F starts.
    - A frame used as a field announces the outer stamp and frame id only.
    - `flatten`, `rename`, `skip` on `Fields`.
-   - trybuild: `timestamp` in `Fields`, a flatten collision.
+   - trybuild: `timestamp` in `Fields`, a `rename` collision, `nest`.
 
 ## G. Integration and docs
 

@@ -64,4 +64,3 @@ pub(crate) fn metor_component_crate_name() -> proc_macro2::TokenStream {
         Err(e) => panic!("the component derives require `metor-component` in [dependencies]: {e}"),
     }
 }
-

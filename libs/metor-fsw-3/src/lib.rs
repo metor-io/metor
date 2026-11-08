@@ -203,7 +203,7 @@ pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 #[cfg(feature = "host")]
 pub use link::{LinkParams, LinkStatus};
 pub use log::{Log, LogLayer};
-pub use metor_fsw_3_macros::{Frame, Record, SystemParams, sequence, system};
+pub use metor_fsw_3_macros::{Fields, Frame, Record, SystemParams, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
 pub use pack::{ABI_VERSION, Status};

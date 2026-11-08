@@ -6,6 +6,7 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
 
+mod fields;
 mod frame;
 mod key;
 mod record;
@@ -14,16 +15,39 @@ mod system_params;
 
 /// Derives `Frame` for a struct sent as its raw bytes.
 ///
-/// The derive also implements `Payload`, `Record`, and the four metor component
-/// traits.
-/// Mark one field `#[frame(timestamp)]`.
-/// `#[frame(name = "..")]` sets the record name, which defaults to the struct
-/// name in snake_case. `#[frame(depth = N)]` sets `Record::DEPTH`.
-/// `#[frame(max_len = N)]` bounds a frame holding a `FrameMap`; a fixed
+/// `Frame` is [`Fields`](macro@Fields) plus `Payload`, `Record`, a timestamp,
+/// and the frame-id tag. Mark one field `#[fsw(timestamp)]`.
+/// `#[fsw(name = "..")]` sets the record name, which defaults to the struct
+/// name in snake_case. `#[fsw(depth = N)]` sets `Record::DEPTH`.
+/// `#[fsw(max_len = N)]` bounds a frame holding a `FrameMap`; a fixed
 /// frame's length is its size, and the attribute fails its build.
-#[proc_macro_derive(Frame, attributes(frame))]
+/// `#[frame(..)]` is an alias of `#[fsw(..)]`.
+///
+/// A frame used as a field of another frame is a plain group: the outer
+/// frame's timestamp and frame id apply to its leaves.
+#[proc_macro_derive(Frame, attributes(fsw, frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
+}
+
+/// Derives `AsVTable` and `Metadatatize` for a group of components nested in
+/// a frame.
+///
+/// Each field adds a path segment named after it. Field attributes:
+/// `#[fsw(flatten)]` adds no segment, `#[fsw(rename = "y")]` names the
+/// segment `y`, `#[fsw(skip)]` leaves the field out, and `#[fsw(unit = "..")]`
+/// and `#[fsw(metadata(..))]` label its components. A field named `_x` is
+/// skipped unless marked `#[fsw(skip = false)]`. `#[fsw(group)]` on the
+/// struct emits a metadata entry for the group itself.
+///
+/// ```ignore
+/// #[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
+/// #[repr(C)]
+/// pub struct Inner { pub x: f64, pub y: f64 }
+/// ```
+#[proc_macro_derive(Fields, attributes(fsw))]
+pub fn fields_derive(input: TokenStream) -> TokenStream {
+    fields::fields(input)
 }
 
 /// Derives `Payload` and `Record` for a type encoded with postcard.

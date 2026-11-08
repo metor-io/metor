@@ -149,19 +149,7 @@ pub struct BodyState {
 ///
 /// `ang_momentum` is the wheel's own momentum. The motor spins the wheel
 /// against the commanded body torque, and the body receives the reaction `−ḣ`.
-#[derive(
-    metor_component::AsVTable,
-    metor_component::Metadatatize,
-    metor_component::Componentize,
-    metor_component::Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Clone,
-    Copy,
-    Debug,
-)]
+#[derive(metor_fsw_3::Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct ReactionWheel {
     /// Spin axis, a unit vector in the body frame.
@@ -209,7 +197,6 @@ impl ReactionWheel {
 pub struct Wheels {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    #[frame(nest)]
     pub wheels: [ReactionWheel; 3],
 }
 

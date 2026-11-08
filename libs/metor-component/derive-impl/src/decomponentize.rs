@@ -22,9 +22,9 @@ pub fn decomponentize_impl(input: &StructInput, crate_name: &TokenStream2) -> To
     let if_arms = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ty = &field.ty;
         let ident = &field.ident;
-        // Nested and dynamic fields have no single id to match, so every value
+        // Dynamic fields have no single id to match, so every value
         // is forwarded and the field's own `apply_value` decides what applies.
-        if field.is_nested() {
+        if field.is_dynamic() {
             return quote! {
                 self.#ident.apply_value(component_id, view.clone(), timestamp)?;
             };
