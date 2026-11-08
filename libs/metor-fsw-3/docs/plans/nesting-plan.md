@@ -169,6 +169,18 @@ structured ports.
    groups, and the matching outputs; Python unit tests for flattening, length
    errors, and unknown keywords; pyright on a fixture using the stubs.
 
+   As built: `cli/port_tree.rs` rebuilds the tree, `cli/port_stub.rs` renders
+   keywords, attributes, and group classes. A group of inputs is a
+   `PortGroup` subclass with `_input_ports` (paths under the group) and an
+   `__init__` declared under `TYPE_CHECKING`, so the runtime constructor
+   raises `ConfigError` on an unknown keyword. A group of outputs is an
+   `OutGroup` subclass of annotations; the handle returns a plain `OutGroup`,
+   whose `__getattr__` is hidden from type checkers. A port beside its own
+   children, or a group child Python cannot name, fails stubgen with
+   `PackDevError::PortShape` (M0409). The pyright fixture and a wiring check
+   live in `tests/port_stubs.rs`, apart from `tests/module.rs`, which F
+   touches.
+
 ## F. `#[derive(Fields)]` and frame changes
 
 1. `Frame` gains `const STAMP: (u32, u32)`, the stamp field's offset and size.

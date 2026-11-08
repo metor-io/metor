@@ -1,14 +1,14 @@
-"""Tests for lists of ports: flattening inputs and reading outputs."""
+"""Tests for lists and groups of ports: flattening inputs and reading outputs."""
 
 from __future__ import annotations
 
 import unittest
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from adcs_stub import PACK, Est, Imu, LogEvent, Plant, SystemStatus
 from test_target import reset
 
-from metor_config import ConfigError, OutPort, Sources, System, Target
+from metor_config import ConfigError, OutGroup, OutPort, PortGroup, Sources, System, Target
 
 
 class Sun(System):
@@ -113,6 +113,95 @@ class ListTest(unittest.TestCase):
         sun = self.target.add("sun", Sun())
         with self.assertRaises(AttributeError):
             sun.missing  # pyright: ignore[reportAttributeAccessIssue]
+
+
+class Adcs(System):
+    _pack = PACK
+    _ty = "adcs"
+
+    class Wheels(PortGroup):
+        _input_ports = {"speed": Imu, "pair.0": Est, "pair.1": Est}
+        if TYPE_CHECKING:
+
+            def __init__(
+                self, *, speed: Sources[Imu] = (), pair: Sequence[Sources[Est]] | None = None
+            ) -> None: ...
+
+    class WheelsOut(OutGroup):
+        cmd: OutPort[Est]
+
+    _input_ports = {
+        "wheels.0.speed": Imu,
+        "wheels.0.pair.0": Est,
+        "wheels.0.pair.1": Est,
+        "wheels.1.speed": Imu,
+        "wheels.1.pair.0": Est,
+        "wheels.1.pair.1": Est,
+        "mag": Imu,
+    }
+    _ports = {"wheels.0.cmd": Est, "wheels.1.cmd": Est, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(
+        self,
+        *,
+        wheels: Sequence[Adcs.Wheels] | None = None,
+        mag: Sources[Imu] = (),
+    ) -> None:
+        super().__init__({"wheels": wheels, "mag": mag}, {})
+
+    wheels: tuple[Adcs.WheelsOut, ...]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class GroupTest(unittest.TestCase):
+    def setUp(self) -> None:
+        reset()
+        self.target = Target(10.0)
+        self.a = self.target.add("a", Plant())
+
+    def tearDown(self) -> None:
+        reset()
+
+    def test_groups_flatten_to_their_ports(self) -> None:
+        wheel = Adcs.Wheels(speed=self.a.imu)
+        self.target.add("adcs", Adcs(wheels=[wheel, Adcs.Wheels()]))
+        self.assertEqual(
+            inputs(self.target, "adcs"),
+            {"wheels.0.speed": ["a.imu"], "mag": []},
+        )
+
+    def test_group_holds_a_list(self) -> None:
+        sun = self.target.add("sun", Sun())
+        wheel = Adcs.Wheels(pair=[sun.est[0], [sun.est[1], sun.est[0]]])
+        self.target.add("adcs", Adcs(wheels=[wheel, Adcs.Wheels()]))
+        wired = inputs(self.target, "adcs")
+        self.assertEqual(wired["wheels.0.pair.1"], ["sun.est.1", "sun.est.0"])
+        with self.assertRaisesRegex(ConfigError, "`pair` takes a list of 2, got 1"):
+            Adcs.Wheels(pair=[sun.est[0]])
+
+    def test_unknown_keyword_is_refused(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "`Adcs.Wheels` has no input `torque`"):
+            Adcs.Wheels(torque=self.a.imu)  # pyright: ignore[reportCallIssue]
+
+    def test_mismatched_record_is_refused(self) -> None:
+        sun = self.target.add("sun", Sun())
+        port: Any = sun.est[0]
+        with self.assertRaisesRegex(ConfigError, "`Adcs.Wheels.speed` takes `Imu`, got `Est`"):
+            Adcs.Wheels(speed=port)
+
+    def test_port_for_a_group_is_refused(self) -> None:
+        port: Any = self.a.imu
+        with self.assertRaisesRegex(ConfigError, "`wheels.0` takes a port group"):
+            Adcs(wheels=[port, Adcs.Wheels()])
+
+    def test_output_groups_read_as_attributes(self) -> None:
+        adcs = self.target.add("adcs", Adcs())
+        self.assertEqual(adcs.wheels[1].cmd.name, "adcs.wheels.1.cmd")
+        self.target.add("sun", Sun(gain=adcs.wheels[0].cmd))
+        self.assertEqual(inputs(self.target, "sun")["gain"], ["adcs.wheels.0.cmd"])
+        with self.assertRaises(AttributeError):
+            adcs.wheels[0].speed  # pyright: ignore[reportAttributeAccessIssue]
 
 
 if __name__ == "__main__":

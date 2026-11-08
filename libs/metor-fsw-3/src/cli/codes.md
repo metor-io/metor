@@ -916,11 +916,13 @@ targets.
 
 ## M0409
 
-**A port is also a group**
+**Ports do not form lists and groups**
 
 A pack module rebuilds lists and groups of ports from their dotted names, so
-`fss.0` is element 0 of the list `fss`. The system has a port named like a
-list or group that other ports sit under, such as `a` beside `a.b`.
+`fss.0` is element 0 of the list `fss`, and `wheels.0.cmd` is the `cmd` port
+of a group. Either the system has a port that other ports sit under, such as
+`a` beside `a.b`, or a group holds a child Python cannot name, such as `1`
+in a group whose children are not `0` … `N-1`.
 
 Rename the port, or the field or array that names the ports under it.
 

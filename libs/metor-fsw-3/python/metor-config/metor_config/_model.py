@@ -7,6 +7,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
@@ -195,10 +196,12 @@ class System:
     output to its record. `_caps` names each `Cap` parameter; the subclass
     passes the granted resources as ``grants``.
 
-    A port named ``fss.0`` is element 0 of the list ``fss``. A subclass whose
-    inputs sit in lists sets `_input_ports`, every input by its dotted name,
-    and takes one keyword per list. Reading a list of outputs from a handle
-    gives a tuple of its ports.
+    A port named ``fss.0`` is element 0 of the list ``fss``, and
+    ``wheels.0.cmd`` is the ``cmd`` port of the first `PortGroup` in the list
+    ``wheels``. A subclass whose inputs sit in lists or groups sets
+    `_input_ports`, every input by its dotted name, and takes one keyword per
+    list or group. Reading a list of outputs from a handle gives a tuple, and
+    a group gives an `OutGroup`.
 
     Some system types take a list of ports from their config instead of
     declaring them. Those set `_takes_inputs` or `_takes_outputs`, and pass
@@ -209,7 +212,7 @@ class System:
     _ty: str
     _ports: dict[str, type[Record]] = {}
     _input_ports: dict[str, type[Record]] = {}
-    """Every input by its dotted name, when any sits in a list."""
+    """Every input by its dotted name, when any sits in a list or group."""
     _caps: tuple[str, ...] = ()
     """The name of each `Cap` parameter."""
     _record_packs: tuple[Pack, ...] = ()
@@ -368,8 +371,10 @@ def _flatten_input(
     elif _is_index_run(children):
         for i, item in enumerate(_list_of(path, value, len(children))):
             _flatten_input(ports, f"{path}.{i}", item, flat)
+    elif isinstance(value, PortGroup):
+        flat.update({f"{path}.{child}": item for child, item in value._flat.items()})
     else:
-        raise ConfigError(f"input `{path}` is a group, which this module cannot wire")
+        raise ConfigError(f"input `{path}` takes a port group, got {value!r}")
 
 
 def _list_of(path: str, value: Any, length: int) -> Sequence[Any]:
@@ -387,9 +392,67 @@ def _out_node(ports: dict[str, type[Record]], path: str, leaf: Callable[[str], A
     if path in ports:
         return leaf(path)
     children = _children(ports, path)
-    if not children or not _is_index_run(children):
+    if not children:
         return None
-    return tuple(_out_node(ports, f"{path}.{child}", leaf) for child in children)
+    nodes = {child: _out_node(ports, f"{path}.{child}", leaf) for child in children}
+    if _is_index_run(children):
+        return tuple(nodes.values())
+    return OutGroup(path, nodes)
+
+
+class PortGroup:
+    """A group of a system's inputs, passed as one keyword.
+
+    A pack module generates one subclass per group, nested on the system's
+    class. `_input_ports` maps each input under the group, by its dotted path
+    from the group, to its record. The constructor raises `ConfigError` on an
+    unknown keyword or a source whose record differs from its input's.
+    """
+
+    _input_ports: ClassVar[dict[str, type[Record]]] = {}
+
+    def __init__(self, **children: Any) -> None:
+        cls = type(self)
+        known = {name.split(".", 1)[0] for name in cls._input_ports}
+        for name in children:
+            if name not in known:
+                raise ConfigError(f"`{cls.__qualname__}` has no input `{name}`")
+        self._flat = _flatten_inputs(cls._input_ports, children)
+        for path, value in self._flat.items():
+            _check_records(cls, path, _sources(path, value))
+
+
+def _check_records(group: type[PortGroup], path: str, sources: list[Source[Any]]) -> None:
+    expected = group._input_ports[path]
+    for source in sources:
+        got = source.record
+        if got is not None and got._name != expected._name:
+            raise ConfigError(
+                f"`{group.__qualname__}.{path}` takes `{expected.__name__}`, got `{got.__name__}`"
+            )
+
+
+class OutGroup:
+    """A group of a system's outputs, read from its handle.
+
+    Each output under the group is an attribute. A pack module generates one
+    subclass per group to type them.
+    """
+
+    def __init__(self, path: str, children: dict[str, Any]) -> None:
+        self._path = path
+        self._children = children
+
+    if not TYPE_CHECKING:
+        # Hidden from type checkers, so a subclass names only its outputs.
+        def __getattr__(self, name: str) -> Any:
+            children = self.__dict__.get("_children", {})
+            if name not in children:
+                raise AttributeError(f"output group `{self._path}` has no output `{name}`")
+            return children[name]
+
+    def __repr__(self) -> str:
+        return f"OutGroup({self._path!r}, {list(self._children)})"
 
 
 def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:
