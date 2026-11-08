@@ -1,0 +1,5 @@
+error: `Timestamp` is a fn argument, not a `SystemParams` field
+ --> tests/ui/system_params_timestamp_field.rs:5:10
+  |
+5 |     now: Timestamp,
+  |          ^^^^^^^^^

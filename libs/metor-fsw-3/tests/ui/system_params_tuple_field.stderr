@@ -1,0 +1,5 @@
+error: a `SystemParams` field is no tuple; use a nested struct
+ --> tests/ui/system_params_tuple_field.rs:5:11
+  |
+5 |     pair: (&'a mut Log, &'a Records),
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -6,22 +6,24 @@ use core::time::Duration;
 use std::rc::Rc;
 use std::time::Instant;
 
-use metor_fsw_3_ring::Notifier;
+use metor_fsw_3_ring::{NoWake, Notifier};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 use serde_json::json;
 
+use crate::Rng;
 use crate::SystemParams;
 use crate::async_system::Stop;
 use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, MakeCx, Params, StepCx, SystemConfig, SystemTable,
 };
-use crate::def::DefCx;
+use crate::def::{DefCx, DefError};
+use crate::io::{Cap, Uart};
 use crate::port::{Input, Output, Sample};
 use crate::tests::utils::{Control, Imu, Nav, input, output, ring};
 use crate::thread::Threads;
 
-use super::{async_def_in, def_of};
+use super::{async_def_in, def_in, def_of};
 
 fn names(ports: &[crate::PortDef]) -> Vec<String> {
     ports.iter().map(|port| port.name.to_string()).collect()
@@ -83,7 +85,6 @@ struct Tagged<'a> {
     _note: PhantomData<&'a ()>,
     #[fsw(skip = false)]
     _kept: &'a mut Output<Nav>,
-    now: Timestamp,
 }
 
 #[crate::system]
@@ -263,4 +264,92 @@ fn test_async_struct_wakes_on_a_record() {
         std::thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(estimate, 4.0);
+}
+
+type ImuIn = Input<Imu>;
+
+/// Flattens a leaf the derive cannot see through.
+#[allow(dead_code)]
+#[derive(SystemParams)]
+struct Unnamed<'a> {
+    #[fsw(flatten)]
+    imu: &'a mut ImuIn,
+}
+
+#[crate::system]
+fn unnamed(u: Unnamed<'_>) {
+    let _ = u;
+}
+
+#[test]
+fn test_flattened_leaf_is_refused_at_def() {
+    let err = def_in(unnamed(), &DefCx::empty()).err();
+    assert!(matches!(err, Some(DefError::EmptyName)), "{err:?}");
+}
+
+/// Names one param of two.
+struct ShortNames;
+
+impl crate::FnSignature for ShortNames {
+    type State = ();
+    type Wake = NoWake;
+    type Params = (Input<Imu>, Output<Nav>);
+    const NAME: &'static str = "short";
+    const NAMES: &'static [&'static str] = &["imu"];
+}
+
+impl crate::SystemFn for ShortNames {
+    fn call(_: &mut (), _: <Self::Params as crate::Param<NoWake>>::Item<'_>) {}
+}
+
+#[test]
+fn test_unnamed_argument_is_refused_at_def() {
+    let err = def_in(ShortNames, &DefCx::empty()).err();
+    assert!(matches!(err, Some(DefError::EmptyName)), "{err:?}");
+}
+
+/// Read only for its params' names.
+#[allow(dead_code)]
+#[derive(SystemParams)]
+struct Noise<'a> {
+    rng: &'a mut Rng,
+}
+
+/// Read only for its params' names.
+#[allow(dead_code)]
+#[derive(SystemParams)]
+struct Port<'a> {
+    uart: &'a Cap<Uart>,
+}
+
+#[crate::system]
+fn two_rngs(a: Noise<'_>, b: Noise<'_>) {
+    let _ = (a, b);
+}
+
+#[crate::system]
+fn two_caps(a: Port<'_>, b: Port<'_>) {
+    let _ = (a, b);
+}
+
+#[crate::system]
+fn named_apart(a: [Noise<'_>; 2], b: [Port<'_>; 2]) {
+    let _ = (a, b);
+}
+
+#[test]
+fn test_flattened_params_of_one_name_are_refused() {
+    let err = def_in(two_rngs(), &DefCx::empty()).err();
+    let rng = matches!(&err, Some(DefError::DuplicateParam { kind, name }) if kind == "Rng" && name == "rng");
+    assert!(rng, "{err:?}");
+    let err = def_in(two_caps(), &DefCx::empty()).err();
+    let cap = matches!(&err, Some(DefError::DuplicateParam { kind, name }) if kind == "Cap" && name == "uart");
+    assert!(cap, "{err:?}");
+}
+
+#[test]
+fn test_params_in_arrays_are_named_apart() {
+    let def = def_in(named_apart(), &DefCx::empty()).expect("distinct names");
+    let grants: Vec<_> = def.grants.iter().map(|g| g.param.to_string()).collect();
+    assert_eq!(grants, ["b.0.uart", "b.1.uart"]);
 }

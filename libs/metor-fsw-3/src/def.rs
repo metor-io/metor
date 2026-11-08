@@ -178,6 +178,12 @@ pub enum DefError {
 
     #[error("output `{port}` cannot carry its frame under its own path: {message}")]
     Reroot { port: String, message: String },
+
+    #[error("a port or parameter has an empty name; only a struct of params is flattened")]
+    EmptyName,
+
+    #[error("two `{kind}` parameters are named `{name}`")]
+    DuplicateParam { kind: String, name: String },
 }
 
 /// The smallest whole-MiB `conn_cap` whose packets carry a `max_len`-byte

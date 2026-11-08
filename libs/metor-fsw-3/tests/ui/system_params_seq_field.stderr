@@ -1,0 +1,5 @@
+error: `Seq` is a fn argument, not a `SystemParams` field
+ --> tests/ui/system_params_seq_field.rs:5:10
+  |
+5 |     seq: &'a Seq<'a>,
+  |          ^^^^^^^^^^^

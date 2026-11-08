@@ -145,6 +145,8 @@ pub struct Defs {
     pub(crate) declared_outputs: Vec<Cow<'static, str>>,
     /// The `Cap` parameters, in order.
     pub(crate) grants: Vec<GrantDef>,
+    /// The `Rng` parameters' names, in order.
+    pub(crate) rngs: Vec<Cow<'static, str>>,
     /// Where `append_io` put the queue pair's ports.
     pub(crate) io: Option<IoPorts>,
     /// Whether a parameter takes the inputs a config lists.
@@ -157,12 +159,36 @@ impl Defs {
     /// Returns every port `S`'s parameters take under the config in `cx`.
     pub(crate) fn of<S: crate::fn_system::FnSignature>(cx: &DefCx<'_>) -> Result<Self, DefError> {
         let declared = Self::declared::<S>();
-        Self {
+        let defs = Self {
             declared_inputs: names(&declared.inputs),
             declared_outputs: names(&declared.outputs),
             ..Self::default()
         }
-        .walk::<S>(cx)
+        .walk::<S>(cx)?;
+        defs.check_names()?;
+        Ok(defs)
+    }
+
+    /// Refuses an empty name, and two `Cap`s or two `Rng`s of one name.
+    fn check_names(&self) -> Result<(), DefError> {
+        let grants: Vec<&str> = self.grants.iter().map(|g| &*g.param).collect();
+        let rngs: Vec<&str> = self.rngs.iter().map(|r| &**r).collect();
+        let ports = self.inputs.iter().chain(&self.outputs);
+        let mut all = ports
+            .map(|p| &*p.name)
+            .chain(grants.iter().chain(&rngs).copied());
+        if all.any(str::is_empty) {
+            return Err(DefError::EmptyName);
+        }
+        for (kind, names) in [("Cap", grants), ("Rng", rngs)] {
+            if let Some(name) = duplicate(names) {
+                return Err(DefError::DuplicateParam {
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Returns the ports `S`'s parameters take regardless of config.
@@ -207,6 +233,12 @@ impl Defs {
     }
 }
 
+/// A name `names` holds twice.
+fn duplicate(mut names: Vec<&str>) -> Option<&str> {
+    names.sort_unstable();
+    names.windows(2).find(|w| w[0] == w[1]).map(|w| w[0])
+}
+
 fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
     ports.iter().map(|port| port.name.clone()).collect()
 }
@@ -239,8 +271,9 @@ impl<'a> Cycle<'a> {
     ///
     /// Watches linked through it may only borrow what outlives `'a`.
     pub fn seq(&self) -> &'a Seq<'a> {
-        // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
-        // sequence, whose step builds its cycle `with_seq`, reaches this.
+        // PANIC Safety: `#[system]` rejects a `Seq` argument and
+        // `#[derive(SystemParams)]` a `Seq` field, so through the macros only
+        // a sequence, whose step builds its cycle `with_seq`, reaches this.
         let seq = self
             .seq
             .expect("a `Seq` parameter only on a `#[sequence]` fn");
@@ -421,7 +454,8 @@ impl Param<NoWake> for Rng {
     type Out = Rng;
     type Item<'a> = &'a mut Rng;
 
-    fn append_defs(_at: &ParamPath<'_>, _cx: &DefCx<'_>, _defs: &mut Defs) -> Result<(), DefError> {
+    fn append_defs(at: &ParamPath<'_>, _cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+        defs.rngs.push(at.to_name());
         Ok(())
     }
 

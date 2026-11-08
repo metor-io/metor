@@ -2,7 +2,7 @@
 
 use proc_macro2::Span;
 use syn::visit_mut::{self, VisitMut};
-use syn::{GenericArgument, Lifetime, PathArguments, Type, TypePath};
+use syn::{GenericArgument, Ident, Lifetime, PathArguments, Type, TypePath};
 
 /// Returns the type used to look up a parameter's `Param` impl.
 ///
@@ -22,6 +22,24 @@ pub(crate) fn key_type(ty: &Type) -> Type {
     };
     Static.visit_type_mut(&mut key);
     key
+}
+
+/// The innermost type under references and arrays.
+pub(crate) fn element(ty: &Type) -> &Type {
+    match ty {
+        Type::Reference(r) => element(&r.elem),
+        Type::Array(array) => element(&array.elem),
+        Type::Paren(paren) => element(&paren.elem),
+        other => other,
+    }
+}
+
+/// The last path segment of [`element`]`(ty)`, if it is a path.
+pub(crate) fn element_name(ty: &Type) -> Option<&Ident> {
+    match element(ty) {
+        Type::Path(path) => path.path.segments.last().map(|s| &s.ident),
+        _ => None,
+    }
 }
 
 /// Names every lifetime `'static`.

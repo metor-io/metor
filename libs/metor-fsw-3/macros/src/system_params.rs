@@ -9,7 +9,7 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, GenericParam, Ident, Lifetime, LitBool, LitStr, Type};
 
-use crate::key::key_type;
+use crate::key::{element, element_name, key_type};
 
 /// Expands `#[derive(SystemParams)]`.
 pub fn system_params(input: TokenStream) -> TokenStream {
@@ -250,7 +250,50 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             Ok(())
         })?;
     }
+    if !parsed.skip {
+        check_field(field, parsed.segment.is_none())?;
+    }
     Ok(parsed)
+}
+
+/// Params that only a fn argument may be.
+const ARGUMENT_ONLY: [&str; 3] = ["Seq", "Timestamp", "Abort"];
+
+/// Params a struct flattens into nothing: each would take its parent's path.
+const LEAVES: [&str; 13] = [
+    "Input",
+    "Output",
+    "Sample",
+    "Rng",
+    "Cap",
+    "Alarms",
+    "Log",
+    "Records",
+    "DynInputs",
+    "DynOutputs",
+    "Timestamp",
+    "Abort",
+    "Seq",
+];
+
+/// Refuses a field type that a `SystemParams` struct cannot hold.
+fn check_field(field: &syn::Field, flatten: bool) -> syn::Result<()> {
+    let ty = &field.ty;
+    let name = element_name(ty);
+    let error = |message: String| Err(syn::Error::new_spanned(ty, message));
+    if let Some(name) = name.filter(|name| ARGUMENT_ONLY.iter().any(|n| *name == n)) {
+        return error(format!(
+            "`{name}` is a fn argument, not a `SystemParams` field"
+        ));
+    }
+    if matches!(element(ty), Type::Tuple(_)) {
+        return error("a `SystemParams` field is no tuple; use a nested struct".into());
+    }
+    let leaf = name.is_some_and(|name| LEAVES.iter().any(|n| *name == n));
+    if flatten && (leaf || matches!(key_type(ty), Type::Array(_))) {
+        return error("`flatten` goes on a field holding a `SystemParams` struct".into());
+    }
+    Ok(())
 }
 
 /// `name<'lt>`, or `name` for a struct without a lifetime.
@@ -329,6 +372,20 @@ mod tests {
     }
 
     #[test]
+    fn test_flatten_takes_a_struct() {
+        let text = expanded(quote! {
+            struct S<'a> { #[fsw(flatten)] inner: Inner<'a>, #[fsw(skip, flatten)] _x: u8 }
+        });
+        assert!(text.is_ok(), "{text:?}");
+    }
+
+    #[test]
+    fn test_skipped_fields_are_not_checked() {
+        let text = expanded(quote! { struct S { #[fsw(skip)] now: Timestamp } });
+        assert!(text.is_ok(), "{text:?}");
+    }
+
+    #[test]
     fn test_rejects_bad_structs() {
         let cases = [
             quote! { struct S<'a, 'b> { x: &'a Input<A>, y: &'b Input<B> } },
@@ -337,6 +394,13 @@ mod tests {
             quote! { enum S { A } },
             quote! { #[system_params(sync)] struct S { x: Timestamp } },
             quote! { struct S { #[fsw(nest)] x: Timestamp } },
+            quote! { struct S<'a> { seq: &'a Seq } },
+            quote! { struct S<'a> { seq: &'a Seq<'a> } },
+            quote! { struct S { now: Timestamp } },
+            quote! { struct S<'a> { abort: [&'a mut Abort; 2] } },
+            quote! { struct S<'a> { pair: (&'a mut Input<A>, &'a mut Input<B>) } },
+            quote! { struct S<'a> { #[fsw(flatten)] imu: &'a mut Input<Imu> } },
+            quote! { struct S<'a> { #[fsw(flatten)] all: [Inner<'a>; 2] } },
         ];
         for case in cases {
             assert!(expanded(case.clone()).is_err(), "{case}");
