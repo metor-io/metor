@@ -17,6 +17,17 @@ struct Swapped {
     inner: Inner,
 }
 
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "quad")]
+#[repr(C)]
+struct Quad {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    s: f64,
+    v: crate::FrameArray<f64, 4>,
+    b: crate::FrameArray<f64, 3>,
+}
+
 pub(crate) fn def<T: Record>(port: &str) -> PortDef {
     PortDef {
         name: port.to_string().into(),
@@ -32,6 +43,7 @@ pub(crate) fn records() -> Records {
         def::<Nested>(Nested::NAME),
         def::<Swapped>(Swapped::NAME),
         def::<Note>(Note::NAME),
+        def::<Quad>(Quad::NAME),
     ];
     Records::from_port_defs(defs.iter())
 }
@@ -253,4 +265,62 @@ fn test_triggers_drain_last() {
     params.outputs[0].on = TriggerParam::Input("idle".into());
     let plan = resolve(&params, &bound).expect("resolves");
     assert_eq!(plan.order, [1, 0]);
+}
+
+/// `src.pair` into a `quad` output, mapped by `fields`.
+fn into_quad(fields: Vec<FieldMap>) -> Result<Plan, MuxError> {
+    let params = MuxParams {
+        inputs: vec!["src.pair".into()],
+        outputs: vec![output("q", fields)],
+    };
+    let def = system(vec![def::<Pair>("src.pair")], vec![def::<Quad>("q")]);
+    resolve(&params, &def)
+}
+
+#[test]
+fn test_element_paths() {
+    let (mut params, def) = split();
+    params.outputs[0].fields = vec![map("a", "src.pair", "b.1")];
+    params.outputs[1].fields = vec![map("b.0", "src.pair", "a")];
+    let plan = resolve(&params, &def).expect("resolves");
+    assert_eq!(plan.outs[0].copies, [copy(24, 8, 8)]);
+    assert_eq!(plan.outs[1].copies, [copy(8, 8, 8)]);
+}
+
+#[test]
+fn test_whole_leaf_and_element_in_one_output() {
+    let plan = into_quad(vec![
+        map("b", "src.pair", "b"),
+        map("s", "src.pair", "b.2"),
+        map("v.3", "src.pair", "a"),
+    ])
+    .expect("resolves");
+    let copies = [copy(16, 48, 24), copy(32, 8, 8), copy(8, 40, 8)];
+    assert_eq!(plan.outs[0].copies, copies);
+}
+
+#[test]
+fn test_element_path_refusals() {
+    let index = |port: &str, path: &str| MuxError::Index {
+        port: port.into(),
+        path: path.into(),
+        len: 3,
+    };
+    let fields = |dst: &str, src: &str| vec![map(dst, "src.pair", src)];
+    assert_eq!(into_quad(fields("s", "b.3")), Err(index("src.pair", "b.3")));
+    assert_eq!(into_quad(fields("b.3", "a")), Err(index("q", "b.3")));
+    assert!(matches!(
+        into_quad(fields("s", "b.one")),
+        Err(MuxError::UnknownField { port, path }) if port == "src.pair" && path == "b.one"
+    ));
+    assert!(matches!(
+        into_quad(fields("s", "a.0")),
+        Err(MuxError::UnknownField { .. })
+    ));
+    assert!(matches!(
+        into_quad(fields("b", "b.0")),
+        Err(MuxError::Mismatch { .. })
+    ));
+    let message = index("q", "b.3").to_string();
+    assert_eq!(message, "`q.b.3`: index past a dimension of 3");
 }

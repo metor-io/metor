@@ -50,6 +50,11 @@ the same checks at runtime.
 - A destination path takes a source `(input, path)`. Type and shape must
   match exactly. A path naming a nested struct maps each leaf under it by
   relative name. Unmapped fields stay zero.
+- A path may name one element of a shaped leaf, such as `v.5` or `p.1.2`.
+  An element of `ty[d0, d1, ..]` is `ty[d1, ..]`; each index drops one
+  dimension, so `p.1.2` of `f64[6,6]` is `f64`. Elements use the separator
+  that struct arrays use, so a path names the same element whether a plain
+  `[T; N]` is split into leaves or a `FrameArray` or tensor is one leaf.
 - Inputs that are not the trigger are latest-only: each record overwrites
   its fields in the output's staging.
 - An output never emits before every input it maps has delivered once.
@@ -87,6 +92,13 @@ resolves each path against the registry's schema for the port's record into
 `(input, src, dst, len)` byte copies, checks that the bound port's layout is
 the registry's, and allocates one staging buffer per output. A mux takes at
 most 64 inputs, one bit each in its masks.
+
+A path with no leaf under it falls back to an element: the leaf that is a
+proper prefix of the path, with the rest parsed as canonical decimal indices,
+at most one per dimension. The element lowers to one byte copy at
+`offset + flat(indices) * stride`. An index past its dimension fails make
+with `MuxError::Index`; any other unresolved path is `UnknownField`. Make
+checks bounds itself, since a hand-written config skips Python.
 
 A frame output is re-rooted at `{ns}.{id}.{port}`, so two systems emitting
 one record announce distinct components.

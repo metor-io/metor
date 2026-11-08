@@ -1,7 +1,9 @@
 //! Resolves a mux's params against its bound ports into byte copies.
 
+use std::borrow::Cow;
+
 use crate::fn_system::Bound;
-use crate::frame_fields::{FieldError, FieldTable, Leaf};
+use crate::frame_fields::{ElementError, FieldError, FieldTable, Leaf};
 use crate::system::PortDef;
 
 use super::params::{FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
@@ -86,6 +88,12 @@ pub enum MuxError {
     UnknownField { port: String, path: String },
     #[error("`{dst}` does not match `{src}` leaf for leaf")]
     Mismatch { dst: String, src: String },
+    #[error("`{port}.{path}`: index past a dimension of {len}")]
+    Index {
+        port: String,
+        path: String,
+        len: usize,
+    },
 }
 
 impl Plan {
@@ -225,14 +233,36 @@ fn micros(duration: core::time::Duration) -> i64 {
     i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
 }
 
-/// The leaves under `path`, by their path relative to it, sorted.
-fn relative<'a>(table: &'a FieldTable, path: &'a str) -> Vec<(&'a str, &'a Leaf)> {
-    let mut leaves: Vec<_> = table
+/// A leaf of a mapping, by its path relative to the mapped path.
+type Rel<'a> = (&'a str, Cow<'a, Leaf>);
+
+/// The leaves under `path`, by their path relative to it, sorted; or the
+/// element at `path` alone, at relative path `""`.
+fn relative<'a>(table: &'a FieldTable, path: &'a str) -> Result<Vec<Rel<'a>>, ElementError> {
+    let mut leaves: Vec<Rel<'a>> = table
         .under(path)
-        .map(|leaf| (&leaf.path[path.len()..], leaf))
+        .map(|leaf| (&leaf.path[path.len()..], Cow::Borrowed(leaf)))
         .collect();
+    if leaves.is_empty() {
+        return Ok(vec![("", Cow::Owned(table.element(path)?))]);
+    }
     leaves.sort_unstable_by_key(|(rel, _)| *rel);
-    leaves
+    Ok(leaves)
+}
+
+/// `relative`, with its error named for `port`.
+fn side<'a>(table: &'a FieldTable, path: &'a str, port: &str) -> Result<Vec<Rel<'a>>, MuxError> {
+    relative(table, path).map_err(|e| match e {
+        ElementError::Unknown => MuxError::UnknownField {
+            port: port.to_string(),
+            path: path.to_string(),
+        },
+        ElementError::Index { len } => MuxError::Index {
+            port: port.to_string(),
+            path: path.to_string(),
+            len,
+        },
+    })
 }
 
 /// One copy per leaf of `map`, pairing leaves by relative path.
@@ -243,28 +273,17 @@ fn field_copies(
     dst: &FieldTable,
     port: &str,
 ) -> Result<Vec<Copy>, MuxError> {
-    let dsts = relative(dst, &map.dst);
-    let srcs = relative(src, &map.src);
-    let unknown = |port: &str, path: &str| MuxError::UnknownField {
-        port: port.to_string(),
-        path: path.to_string(),
-    };
-    if dsts.is_empty() {
-        return Err(unknown(port, &map.dst));
-    }
-    if srcs.is_empty() {
-        return Err(unknown(&map.input, &map.src));
-    }
-    let same = |(d, s): (&(&str, &Leaf), &(&str, &Leaf))| {
-        d.0 == s.0 && d.1.ty == s.1.ty && d.1.shape == s.1.shape
-    };
+    let dsts = side(dst, &map.dst, port)?;
+    let srcs = side(src, &map.src, &map.input)?;
+    let same =
+        |(d, s): (&Rel<'_>, &Rel<'_>)| d.0 == s.0 && d.1.ty == s.1.ty && d.1.shape == s.1.shape;
     if dsts.len() != srcs.len() || !dsts.iter().zip(&srcs).all(same) {
         return Err(MuxError::Mismatch {
             dst: format!("{port}.{}", map.dst),
             src: format!("{}.{}", map.input, map.src),
         });
     }
-    let copy = |((_, d), (_, s)): (&(&str, &Leaf), &(&str, &Leaf))| Copy {
+    let copy = |((_, d), (_, s)): (&Rel<'_>, &Rel<'_>)| Copy {
         input: to_u16(input),
         src: s.offset,
         dst: d.offset,
