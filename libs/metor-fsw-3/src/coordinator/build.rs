@@ -561,14 +561,14 @@ impl SystemDef {
         Ok(())
     }
 
-    /// Checks that no output frame names a leaf twice.
+    /// Checks that no port's frame names a leaf twice.
     fn check_leaves(&self, system: &str) -> Result<(), BuildError> {
-        for port in &self.outputs {
+        for port in self.inputs.iter().chain(&self.outputs) {
             if let Some(leaf) = port.schema.duplicate_leaf() {
                 return Err(BuildError::DuplicateLeaf {
                     system: system.to_string(),
                     port: port.name.to_string(),
-                    leaf: leaf.to_string(),
+                    leaf,
                 });
             }
         }
@@ -1059,7 +1059,20 @@ mod tests {
             port: "collide".into(),
             leaf: "collide.x".into(),
         };
-        assert_eq!(def(collide).check_leaves("instance"), Err(expected));
+        assert_eq!(
+            def(collide.clone()).check_leaves("instance"),
+            Err(expected.clone())
+        );
+        let input = crate::SystemDef {
+            inputs: vec![collide],
+            outputs: Vec::new(),
+            ..def(imu_def())
+        };
+        assert_eq!(input.check_leaves("instance"), Err(expected));
+    }
+
+    fn imu_def() -> PortDef {
+        Output::<utils::Imu>::def(&DefCx::empty(), "imu")
     }
 
     #[test]

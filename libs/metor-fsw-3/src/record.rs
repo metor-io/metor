@@ -158,14 +158,18 @@ impl RecordSchema {
         }
     }
 
-    /// Returns a leaf name that a frame announces twice.
-    pub fn duplicate_leaf(&self) -> Option<&str> {
-        let Self::Frame { metadata, .. } = self else {
+    /// Returns the name of a component that a frame's fields hold twice.
+    ///
+    /// Metadata entries that no field holds, such as a group's, are ignored.
+    pub fn duplicate_leaf(&self) -> Option<String> {
+        let Self::Frame { vtable, metadata } = self else {
             return None;
         };
-        let mut names: Vec<&str> = metadata.iter().map(|m| m.name.as_str()).collect();
-        names.sort_unstable();
-        names.windows(2).find(|w| w[0] == w[1]).map(|w| w[0])
+        let mut ids: Vec<ComponentId> = component_ids(vtable).collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        let id = ids.windows(2).find(|w| w[0] == w[1])?[0];
+        let name = metadata.iter().find(|m| m.component_id == id);
+        Some(name.map_or_else(|| format!("{id:?}"), |m| m.name.clone()))
     }
 
     /// Returns the packet ID the ground uses to recognize this record.
@@ -280,6 +284,17 @@ fn reroot_ids(
         moves.push((range, new[index].component_id));
     }
     Ok(moves)
+}
+
+/// The id of each `Component` op in `vtable`, skipping malformed ones.
+fn component_ids(vtable: &VTable) -> impl Iterator<Item = ComponentId> + '_ {
+    vtable.ops.iter().filter_map(|op| {
+        let Op::Component { component_id } = op else {
+            return None;
+        };
+        let bytes = vtable.data.get(data_range(vtable, *component_id)?)?;
+        Some(ComponentId(u64::from_le_bytes(bytes.try_into().ok()?)))
+    })
 }
 
 /// The data bytes the `Data` op at `op` holds.

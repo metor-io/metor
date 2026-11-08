@@ -52,7 +52,7 @@ pub enum BuildError {
     #[cfg_attr(feature = "host", diagnostic(code(M0306)))]
     DuplicateOutput { system: String, port: String },
 
-    #[error("output `{port}` of system `{system}` names leaf `{leaf}` more than once")]
+    #[error("port `{port}` of system `{system}` names leaf `{leaf}` more than once")]
     #[cfg_attr(
         feature = "host",
         diagnostic(

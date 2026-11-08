@@ -42,6 +42,38 @@ struct Grouped {
     top: Pos,
 }
 
+/// A group of components with its own metadata entry.
+#[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[fsw(group)]
+#[repr(C)]
+struct Labeled {
+    x: f64,
+}
+
+/// A group frame that flattens a group into its own path.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[fsw(name = "grouped_twice", group)]
+#[repr(C)]
+struct GroupedTwice {
+    #[fsw(timestamp)]
+    timestamp: Timestamp,
+    #[fsw(flatten)]
+    labeled: Labeled,
+    y: f64,
+}
+
+/// A group frame whose own field and flattened group share a leaf.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[fsw(name = "grouped_collide", group)]
+#[repr(C)]
+struct GroupedCollide {
+    #[fsw(timestamp)]
+    timestamp: Timestamp,
+    x: f64,
+    #[fsw(flatten)]
+    labeled: Labeled,
+}
+
 /// A frame holding another frame.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[fsw(name = "outer")]
@@ -184,7 +216,17 @@ fn test_fields_have_no_stamp_or_frame() {
 
 #[test]
 fn test_duplicate_leaf() {
-    assert_eq!(Collide::schema().duplicate_leaf(), Some("collide.x"));
+    assert_eq!(
+        Collide::schema().duplicate_leaf().as_deref(),
+        Some("collide.x")
+    );
     assert_eq!(Grouped::schema().duplicate_leaf(), None);
+    let groups = names::<GroupedTwice>();
+    assert_eq!(groups.iter().filter(|n| *n == "grouped_twice").count(), 2);
+    assert_eq!(GroupedTwice::schema().duplicate_leaf(), None);
+    assert_eq!(
+        GroupedCollide::schema().duplicate_leaf().as_deref(),
+        Some("grouped_collide.x")
+    );
     assert_eq!(Note::schema().duplicate_leaf(), None);
 }

@@ -823,7 +823,7 @@ fsw.wasm(seqs, memory=16 << 20)
 
 **A frame names a leaf twice**
 
-An output's frame has two leaves at the same path. A `#[fsw(flatten)]`
+A port's frame has two leaves at the same path. A `#[fsw(flatten)]`
 field puts its leaves at the struct's own path, so they can collide with a
 sibling field or with another flattened field.
 
