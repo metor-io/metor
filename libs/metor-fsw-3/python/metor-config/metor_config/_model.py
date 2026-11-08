@@ -482,6 +482,8 @@ class OutGroup:
 def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:
     if isinstance(sources, (OutPort, Loop)):
         return [sources]
+    if sources is None:
+        raise ConfigError(f"input `{port}` takes ports and loops, got None")
     listed = list(sources)
     for source in listed:
         if not isinstance(source, (OutPort, Loop)):

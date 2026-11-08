@@ -42,6 +42,13 @@ def pair(s: Scope, *, imu: Sources[Imu]) -> tuple[Gnc, Gnc]:
     return s.add("a", gnc(imu=imu, gain=1.0)), s.add("b", gnc(imu=imu, gain=2.0))
 
 
+@composite
+def sensing(s: Scope, *, truth: Sources[Imu] | None = None) -> Mode:
+    if truth is not None:
+        s.sim("model", Nav(imu=truth))
+    return s.add("mode", Mode())
+
+
 def steps(target: Target) -> dict[str, dict]:
     return {step["id"]: step for step in target.to_config()["coordinator"]["systems"]}
 
@@ -79,6 +86,17 @@ class CompositeTest(unittest.TestCase):
             next(i["from"] for i in systems["y.b.ctrl"]["inputs"] if i["port"] == "est"),
             [{"system": "y.b.nav", "port": "est"}],
         )
+
+    def test_optional_input_adds_its_model_only_when_given(self) -> None:
+        self.fsw.add("g", sensing(truth=self.imu))
+        self.fsw.add("h", sensing())
+        systems = steps(self.fsw)
+        self.assertEqual(
+            next(i["from"] for i in systems["g.model"]["inputs"] if i["port"] == "imu"),
+            [self.imu.ref.to_json()],
+        )
+        self.assertNotIn("h.model", systems)
+        self.assertIn("h.mode", systems)
 
     def test_channel_registry_tells_reused_instances_apart(self) -> None:
         shared = Mode()
@@ -185,6 +203,14 @@ class FailureTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             gnc(bogus=1)  # pyright: ignore[reportCallIssue]
         self.assertEqual(list(inspect.signature(gnc).parameters), ["imu", "gain"])
+
+    def test_system_input_given_none_is_refused(self) -> None:
+        @composite
+        def careless(s: Scope, *, truth: Sources[Imu] | None = None) -> Nav:
+            return s.add("nav", Nav(imu=truth))  # pyright: ignore[reportArgumentType]
+
+        with self.assertRaisesRegex(ConfigError, "input `imu` takes ports and loops, got None"):
+            self.fsw.add("g", careless())
 
     def test_nested_result_is_not_a_port_list(self) -> None:
         out = self.fsw.add("p", pair(imu=self.imu))
