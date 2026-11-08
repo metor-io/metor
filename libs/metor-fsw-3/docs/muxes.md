@@ -34,16 +34,40 @@ class with one property per field:
 ```python
 class Sensors(Record):
     _fields = {"gyro_b": "f64[3]", "css": "f64[6]", ..}
-    def __init__(self, *, gyro_b: Field[Literal["f64[3]"]] | None = None, ..): ..
+    def __init__(
+        self, *,
+        gyro_b: Field[Literal["f64[3]"]] | Mapping[int, Field[Literal["f64"]]] | None = None,
+        ..
+    ): ..
 
 class SensorsPort(OutPort[Sensors]):
     @property
-    def gyro_b(self) -> Field[Literal["f64[3]"]]: ..
+    def gyro_b(self) -> ArrayField[Literal["f64[3]"], Field[Literal["f64"]]]: ..
 ```
 
 System outputs are typed as their port class, so pyright checks field names
 and signatures. `Record.__init__` and `OutPort.field` raise `ConfigError` on
 the same checks at runtime.
+
+A source indexes a field; a destination maps elements with a mapping from
+index to field:
+
+```python
+raw.v[5]                                   # Field(daq0.raw.v.5: f64)
+cov.p[1][2]                                # f64[6,6] -> f64[6] -> f64
+raw.field("v.5")                           # the same, by path
+BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})  # dst paths open.0, open.1
+```
+
+- `Field[i]` returns `port.field("{path}.{i}")`: the element of a shaped
+  leaf, or child `i` of a split array. A negative or non-`int` index, an
+  index past the end, a scalar, or a group without child `i` raises
+  `ConfigError`. Indexing does not make a field iterable.
+- A shaped leaf's property returns an `ArrayField[Literal[sig], E]`, whose
+  `[i]` is typed `E`. A split array whose children are exactly `0..N` with
+  one signature gets the same base class. Bounds are checked at runtime.
+- A record that maps a path and anything under it, such as a leaf and one
+  of its elements, or one element twice, raises `ConfigError`.
 
 ## Semantics
 

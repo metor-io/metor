@@ -37,7 +37,14 @@ class Est(Record):
     _kind = "frame"
     _name = "est"
     _pack = PACK
-    _fields = {"q": "f64[4]", "bias.a": "f64", "bias.b": "f64[3]"}
+    _fields = {
+        "q": "f64[4]",
+        "bias.a": "f64",
+        "bias.b": "f64[3]",
+        "p": "f64[6,6]",
+        "gains.0": "f64",
+        "gains.1": "f64",
+    }
 
 
 class ModeCmd(Record):

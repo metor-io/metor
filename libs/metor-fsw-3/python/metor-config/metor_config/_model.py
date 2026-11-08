@@ -13,6 +13,7 @@ from typing import (
     ClassVar,
     Generic,
     Iterable,
+    Mapping,
     Sequence,
     TypeAlias,
     TypeVar,
@@ -20,7 +21,7 @@ from typing import (
 )
 
 from ._config import ConfigError
-from ._fields import Field, signature
+from ._fields import Field, index, signature
 
 T = TypeVar("T", bound="Record")
 
@@ -43,18 +44,37 @@ class Record:
     _port: ClassVar[type[OutPort[Any]]]
     """The class of a port that carries this record."""
 
-    def __init__(self, **fields: Field[Any]) -> None:
+    def __init__(self, **fields: Field[Any] | Mapping[int, Field[Any]]) -> None:
         """Maps each destination path to a source `Field`, for a `Mux` output.
 
+        A `Mapping` from index to `Field` maps elements of the destination.
         Raises `ConfigError` for a message record, an unknown path, a value
-        that is not a `Field`, or a signature that differs from the source's.
+        that is not a `Field`, a signature that differs from the source's, or
+        two destinations that overlap.
         """
         cls = type(self)
         if cls._kind != "frame":
             raise ConfigError(f"`{cls.__name__}` is a message; only a frame maps fields")
-        for path, source in fields.items():
+        pairs = [pair for path, value in fields.items() for pair in _expand(cls, path, value)]
+        for path, source in pairs:
             _check_mapping(cls, path, source)
-        self._mapping = dict(fields)
+        _check_overlap(cls, [path for path, _ in pairs])
+        self._mapping = dict(pairs)
+
+
+def _expand(record: type[Record], path: str, value: Any) -> list[tuple[str, Any]]:
+    """``value`` by destination path; a `Mapping` gives one path per index."""
+    if not isinstance(value, Mapping):
+        return [(path, value)]
+    where = f"{record.__name__}.{path}"
+    return [(f"{path}.{index(i, where)}", source) for i, source in value.items()]
+
+
+def _check_overlap(record: type[Record], paths: list[str]) -> None:
+    for i, a in enumerate(paths):
+        for b in paths[i + 1 :]:
+            if a == b or b.startswith(f"{a}.") or a.startswith(f"{b}."):
+                raise ConfigError(f"`{record.__name__}` maps `{a}` and `{b}`")
 
 
 def _check_mapping(record: type[Record], path: str, source: Any) -> None:

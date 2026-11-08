@@ -22,7 +22,7 @@ from ._builtins import (
 from ._composite import Composite, Scope, composite
 from ._config import ConfigError
 from ._deployment import Deployment, emit, gateway
-from ._fields import Field
+from ._fields import ArrayField, Field
 from ._generated import (
     CONFIG_VERSION,
     ChannelMessage,
@@ -99,6 +99,7 @@ __all__ = [
     "ConfigError",
     "Connect",
     "Deployment",
+    "ArrayField",
     "Field",
     "Item",
     "Listen",

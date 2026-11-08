@@ -93,6 +93,19 @@ class MuxTest(unittest.TestCase):
             with self.subTest(message), self.assertRaisesRegex(ConfigError, message):
                 make()
 
+    def test_element_paths(self) -> None:
+        gyro = self.plant.imu.field("gyro")
+        cmd = MotorCmd(torque={0: gyro[1]}, **{"trim.a": self.nav.est.field("p")[2][3]})
+        self.target.add("mix", Mux(cmd=cmd, on="cycle"))
+        fields = entry(self.target, "mix")["params"]["outputs"][0]["fields"]
+        self.assertEqual(
+            fields,
+            [
+                {"dst": "torque.0", "input": "plant.imu", "src": "gyro.1"},
+                {"dst": "trim.a", "input": "nav.est", "src": "p.2.3"},
+            ],
+        )
+
     def test_port_on_another_target(self) -> None:
         other = Target(10.0)
         plant = other.add("plant", Plant())

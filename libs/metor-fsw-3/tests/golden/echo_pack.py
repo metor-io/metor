@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
-from metor_config import Field, Item, OutGroup, OutPort, Pack, PortGroup, Record, ResourceHandle, Sources, System
+from metor_config import ArrayField, Field, Item, OutGroup, OutPort, Pack, PortGroup, Record, ResourceHandle, Sources, System
 from metor_config._fields import _given
 
 PACK = Pack(

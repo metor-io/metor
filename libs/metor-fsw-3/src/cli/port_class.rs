@@ -78,7 +78,7 @@ impl Accessors {
             .filter_map(|segment| {
                 Some(Keyword {
                     name: py_name(&segment)?,
-                    annotation: field_type(&tree.signature(&segment)),
+                    annotation: tree.keyword_type(&segment),
                     key: segment,
                 })
             })
@@ -121,14 +121,18 @@ impl Tree<'_> {
         };
         let signature = self.signature(path);
         if self.is_leaf(path) {
-            return Accessor {
-                name: py.to_string(),
-                returns: field_type(&signature),
-                body: format!("{port}.field({})", quoted(path)),
-            };
+            return leaf_accessor(py, port, path, &signature);
         }
         let group = format!("{parent}_{py}");
-        self.collect(&group, &field_type(&signature), path, out);
+        let base = match self.index_run(path) {
+            Some(child) => format!(
+                "ArrayField[Literal[{}], {}]",
+                quoted(&signature),
+                value_type(&child)
+            ),
+            None => field_type(&signature),
+        };
+        self.collect(&group, &base, path, out);
         Accessor {
             name: py.to_string(),
             body: format!("{group}({port}, {}, {})", quoted(path), quoted(&signature)),
@@ -149,6 +153,35 @@ impl Tree<'_> {
             }
         }
         segments
+    }
+
+    /// A keyword's annotation: a field, or for an array a mapping from index
+    /// to a field of its element.
+    fn keyword_type(&self, path: &str) -> String {
+        let whole = field_type(&self.signature(path));
+        let element = match self.leaves.iter().find(|(leaf, _)| leaf == path) {
+            Some((_, signature)) => element_signature(signature),
+            None => self.index_run(path),
+        };
+        match element {
+            Some(element) => format!("{whole} | Mapping[int, {}]", field_type(&element)),
+            None => whole,
+        }
+    }
+
+    /// The one signature of a group's children when they are exactly
+    /// `0..N` in order.
+    fn index_run(&self, path: &str) -> Option<String> {
+        let children = self.children(path);
+        let indexed = children
+            .iter()
+            .enumerate()
+            .all(|(i, child)| *child == i.to_string());
+        let first = self.signature(&join(path, children.first()?));
+        let shared = children
+            .iter()
+            .all(|child| self.signature(&join(path, child)) == first);
+        (indexed && shared).then_some(first)
     }
 
     fn is_leaf(&self, path: &str) -> bool {
@@ -202,6 +235,53 @@ pub(crate) fn py_name(segment: &str) -> Option<String> {
         return Some(format!("{segment}_"));
     }
     Some(segment.to_string())
+}
+
+fn leaf_accessor(py: &str, port: &str, path: &str, signature: &str) -> Accessor {
+    let (returns, body) = match array_type(signature) {
+        Some(array) => (
+            array,
+            format!(
+                "ArrayField({port}, {}, {})",
+                quoted(path),
+                quoted(signature)
+            ),
+        ),
+        None => (
+            field_type(signature),
+            format!("{port}.field({})", quoted(path)),
+        ),
+    };
+    Accessor {
+        name: py.to_string(),
+        returns,
+        body,
+    }
+}
+
+/// `"f64[6]"` for `"f64[6,6]"`, `"f64"` for `"f64[6]"`, `None` for a scalar
+/// or a group.
+fn element_signature(signature: &str) -> Option<String> {
+    let (ty, dims) = signature.strip_suffix(']')?.split_once('[')?;
+    Some(match dims.split_once(',') {
+        Some((_, rest)) => format!("{ty}[{rest}]"),
+        None => ty.to_string(),
+    })
+}
+
+/// The `ArrayField` type of a shaped leaf, typed down to its scalars.
+fn array_type(signature: &str) -> Option<String> {
+    let element = element_signature(signature)?;
+    Some(format!(
+        "ArrayField[Literal[{}], {}]",
+        quoted(signature),
+        value_type(&element)
+    ))
+}
+
+/// The type of a field of `signature`: an `ArrayField` when shaped.
+fn value_type(signature: &str) -> String {
+    array_type(signature).unwrap_or_else(|| field_type(signature))
 }
 
 fn field_type(signature: &str) -> String {
@@ -262,14 +342,77 @@ mod tests {
     #[test]
     fn test_numeric_segments_get_no_property() {
         let a = Accessors::of("C", &leaves(&[("css.0", "f64"), ("css.1", "f64")]));
-        assert_eq!(
-            a.keywords[0].annotation,
-            "Field[Literal[\"{0:f64,1:f64}\"]]"
+        assert!(
+            a.keywords[0]
+                .annotation
+                .starts_with("Field[Literal[\"{0:f64,1:f64}\"]] | Mapping")
         );
         assert_eq!(a.classes.len(), 2);
         assert!(a.classes[1].accessors.is_empty());
         assert_eq!(py_name("0"), None);
         assert_eq!(py_name(""), None);
         assert_eq!(py_name("a-b"), None);
+    }
+
+    #[test]
+    fn test_shaped_leaf_is_an_array_field() {
+        let a = Accessors::of("A", &leaves(&[("v", "f64[4]"), ("s", "f64")]));
+        let v = &a.classes[0].accessors[0];
+        assert_eq!(
+            v.returns,
+            "ArrayField[Literal[\"f64[4]\"], Field[Literal[\"f64\"]]]"
+        );
+        assert_eq!(v.body, "ArrayField(self, \"v\", \"f64[4]\")");
+        assert_eq!(
+            a.keywords[0].annotation,
+            "Field[Literal[\"f64[4]\"]] | Mapping[int, Field[Literal[\"f64\"]]]"
+        );
+        assert_eq!(a.classes[0].accessors[1].returns, "Field[Literal[\"f64\"]]");
+        assert_eq!(a.keywords[1].annotation, "Field[Literal[\"f64\"]]");
+    }
+
+    #[test]
+    fn test_matrix_nests() {
+        let a = Accessors::of("M", &leaves(&[("p", "f64[6,6]")]));
+        assert_eq!(
+            a.classes[0].accessors[0].returns,
+            "ArrayField[Literal[\"f64[6,6]\"], \
+             ArrayField[Literal[\"f64[6]\"], Field[Literal[\"f64\"]]]]"
+        );
+        assert_eq!(
+            a.keywords[0].annotation,
+            "Field[Literal[\"f64[6,6]\"]] | Mapping[int, Field[Literal[\"f64[6]\"]]]"
+        );
+    }
+
+    #[test]
+    fn test_index_run_group_is_an_array_field() {
+        let a = Accessors::of("B", &leaves(&[("open.0", "bool"), ("open.1", "bool")]));
+        let sig = "Literal[\"{0:bool,1:bool}\"]";
+        assert_eq!(
+            a.classes[1].base,
+            format!("ArrayField[{sig}, Field[Literal[\"bool\"]]]")
+        );
+        assert_eq!(
+            a.keywords[0].annotation,
+            format!("Field[{sig}] | Mapping[int, Field[Literal[\"bool\"]]]")
+        );
+    }
+
+    #[test]
+    fn test_groups_that_are_not_index_runs() {
+        let gap = Accessors::of("G", &leaves(&[("g.0", "f64"), ("g.2", "f64")]));
+        let mixed = Accessors::of("H", &leaves(&[("h.0", "f64"), ("h.1", "u8")]));
+        let named = Accessors::of("N", &leaves(&[("n.a", "f64"), ("n.b", "f64")]));
+        for a in [gap, mixed, named] {
+            assert!(
+                a.classes[1].base.starts_with("Field["),
+                "{}",
+                a.classes[1].base
+            );
+            assert!(!a.keywords[0].annotation.contains("Mapping"));
+        }
+        assert_eq!(element_signature("{a:f64}"), None);
+        assert_eq!(element_signature("f64"), None);
     }
 }
