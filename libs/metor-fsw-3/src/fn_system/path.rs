@@ -1,6 +1,5 @@
 //! [`ParamPath`], the dotted name of a parameter inside a system fn.
 
-use core::fmt::Write;
 use std::borrow::Cow;
 
 /// Where a parameter sits among a system fn's parameters.
@@ -75,11 +74,18 @@ impl<'a> ParamPath<'a> {
         }
         match self {
             Self::Name(_, name) => out.push_str(name),
-            // PANIC Safety: writing to a `String` cannot fail.
-            Self::Index(_, i) => write!(out, "{i}").expect("a String takes any write"),
+            Self::Index(_, i) => push_index(out, *i),
             Self::Root | Self::Args(_) => {}
         }
     }
+}
+
+/// Appends `i` in decimal.
+fn push_index(out: &mut String, i: usize) {
+    if i >= 10 {
+        push_index(out, i / 10);
+    }
+    out.push(char::from_digit((i % 10) as u32, 10).unwrap_or('?'));
 }
 
 #[cfg(test)]
@@ -98,6 +104,7 @@ mod tests {
         let two = wheels.index(2);
         assert_eq!(two.child("cmd").to_name(), "wheels.2.cmd");
         assert_eq!(ROOT.index(0).index(1).to_name(), "0.1");
+        assert_eq!(ROOT.child("x").index(1207).to_name(), "x.1207");
     }
 
     #[test]
@@ -132,8 +139,11 @@ mod proofs {
                 (parent.child(name), name.to_string())
             }
             _ => {
-                let i = usize::from(pick - 3);
-                (parent.index(i), i.to_string())
+                let i = pick - 3;
+                (
+                    parent.index(usize::from(i)),
+                    char::from(b'0' + i).to_string(),
+                )
             }
         }
     }
