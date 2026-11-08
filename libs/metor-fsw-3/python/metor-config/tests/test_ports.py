@@ -86,6 +86,14 @@ class ListTest(unittest.TestCase):
         self.target.add("sun", Sun())
         self.assertEqual(inputs(self.target, "sun"), {"gain": []})
 
+    def test_none_leaf_takes_no_input(self) -> None:
+        none: Any = None
+        self.target.add("sun", Sun(fss=[self.a.imu, none, ()], gain=none))
+        self.assertEqual(inputs(self.target, "sun"), {"fss.0": ["a.imu"], "fss.2": []})
+        wheel = Adcs.Wheels(speed=none)
+        self.target.add("adcs", Adcs(wheels=[wheel, Adcs.Wheels()], mag=none))
+        self.assertEqual(inputs(self.target, "adcs"), {})
+
     def test_list_of_wrong_length_is_refused(self) -> None:
         with self.assertRaisesRegex(ConfigError, "`fss` takes a list of 3, got 2"):
             Sun(fss=[self.a.imu, self.b.imu])

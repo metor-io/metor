@@ -364,10 +364,10 @@ def _flatten_input(
     ports: dict[str, type[Record]], path: str, value: Any, flat: dict[str, Any]
 ) -> None:
     children = _children(ports, path)
+    if value is None:
+        return
     if not children:
         flat[path] = value
-    elif value is None:
-        return
     elif _is_index_run(children):
         for i, item in enumerate(_list_of(path, value, len(children))):
             _flatten_input(ports, f"{path}.{i}", item, flat)
