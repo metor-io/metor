@@ -521,3 +521,33 @@ fn test_new_target_checks() {
     assert_eq!(again.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&again.stderr).contains("M0108"));
 }
+
+/// Runs the fixture's `nest.py` for 30 cycles, with `env` set.
+fn run_nest(env: &[(&str, &str)]) -> std::process::Output {
+    metor()
+        .args(["run", "nest.py", "--cycles", "30"])
+        .envs(env.iter().copied())
+        .current_dir(fixture_dir())
+        .output()
+        .expect("metor runs")
+}
+
+/// Producers at different rates reach their own elements of an array and of
+/// an array of `SystemParams` structs, wired from Python.
+#[test]
+fn test_nested_inputs_reach_their_elements() {
+    let output = run_nest(&[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+}
+
+/// Swapping two elements' producers latches `gather` off, so the test above
+/// would see a miswired element.
+#[test]
+fn test_swapped_elements_are_caught() {
+    let output = run_nest(&[("METOR_NEST_SWAP", "1")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("an input heard another tag"), "{stderr}");
+    assert!(stderr.contains("latched off: gather"), "{stderr}");
+}

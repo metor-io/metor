@@ -2,6 +2,7 @@
 
 mod chatter;
 mod gps;
+mod nest;
 
 use std::cell::RefCell;
 
@@ -416,6 +417,12 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register_sequence("burn", burn(), Default::default)
+        .expect("valid records");
+    table
+        .register("tag", nest::tag(), nest::Tag::new)
+        .expect("valid records");
+    table
+        .register("gather", nest::gather(), Default::default)
         .expect("valid records");
     table
 }

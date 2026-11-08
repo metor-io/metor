@@ -223,6 +223,13 @@ structured ports.
 1. `tests/`: a pack with eight `Fss` producers at different rates feeding one
    `[Input<Fss>; 8]` cyclic system, wired from Python; the same through an
    async `#[system_params(async)]` struct.
+
+   As built: the echo-pack fixture's `gather` takes `[&mut Input<Ping>; 3]`
+   and `[Pair<'_>; 2]`, a `SystemParams` struct, fed by seven `tag`
+   producers at different rates from `nest.py`. `gather` latches off when an
+   input hears another tag or none by cycle 20; `tests/run.rs` runs it as
+   wired and with two elements swapped. The async variant is left to the
+   unit test `test_async_struct_wakes_on_a_record`.
 2. Update `lib.rs` crate docs, the `#[system]` doc in `macros/src/lib.rs`, and
    `DESIGN.md` where they describe params or nesting.
 3. Adversarial review by another agent.

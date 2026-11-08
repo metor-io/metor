@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
-from metor_config import Field, Item, OutPort, Pack, Record, ResourceHandle, Sources, System
+from metor_config import Field, Item, OutGroup, OutPort, Pack, PortGroup, Record, ResourceHandle, Sources, System
 from metor_config._fields import _given
 
 PACK = Pack(
@@ -468,5 +468,46 @@ class Burn(System):
 
     alarm_raised: OutPort[AlarmRaised]
     alarm_cleared: OutPort[AlarmCleared]
+    log: OutPort[LogEvent]
+    status: SystemStatusPort
+
+
+class Tag(System):
+    "Pings its tag every `every` cycles."
+
+    _pack = PACK
+    _ty = "tag"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, every: int, tag: int) -> None:
+        """
+        Args:
+            every: Cycles between pings.
+            tag: The count every ping carries.
+        """
+        super().__init__({}, {"every": every, "tag": tag})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: SystemStatusPort
+
+
+class Gather(System):
+    "Checks that `tags.i` hears only tag `i`, and `pairs.i.left` and\n`pairs.i.right` only tags `10 * (i + 1)` and one more. Fails if an input\nhears another tag, or nothing by cycle 20."
+
+    _pack = PACK
+    _ty = "gather"
+    _input_ports = {"tags.0": Ping, "tags.1": Ping, "tags.2": Ping, "pairs.0.left": Ping, "pairs.0.right": Ping, "pairs.1.left": Ping, "pairs.1.right": Ping}
+    _ports = {"log": LogEvent, "status": SystemStatus}
+
+    class Pairs(PortGroup):
+        _input_ports = {"left": Ping, "right": Ping}
+        if TYPE_CHECKING:
+
+            def __init__(self, *, left: Sources[Ping] = (), right: Sources[Ping] = ()) -> None: ...
+
+    def __init__(self, *, tags: Sequence[Sources[Ping]] | None = None, pairs: Sequence[Gather.Pairs] | None = None) -> None:
+        super().__init__({"tags": tags, "pairs": pairs}, {})
+
     log: OutPort[LogEvent]
     status: SystemStatusPort
