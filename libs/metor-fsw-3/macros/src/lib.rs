@@ -24,7 +24,8 @@ mod system_params;
 /// `#[frame(..)]` is an alias of `#[fsw(..)]`.
 ///
 /// A frame used as a field of another frame is a plain group: the outer
-/// frame's timestamp and frame id apply to its leaves.
+/// frame's timestamp and frame id apply to its leaves. `Frame::STAMP` is the
+/// timestamp field's offset and size.
 #[proc_macro_derive(Frame, attributes(fsw, frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
@@ -33,12 +34,16 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
 /// Derives `AsVTable` and `Metadatatize` for a group of components nested in
 /// a frame.
 ///
-/// Each field adds a path segment named after it. Field attributes:
+/// The group has no name, id, or timestamp; the frame that holds it stamps
+/// its leaves. Each field adds a path segment named after it, and an array
+/// adds `0` … `N-1`. A field marked `timestamp` is a compile error. Field attributes:
 /// `#[fsw(flatten)]` adds no segment, `#[fsw(rename = "y")]` names the
 /// segment `y`, `#[fsw(skip)]` leaves the field out, and `#[fsw(unit = "..")]`
 /// and `#[fsw(metadata(..))]` label its components. A field named `_x` is
 /// skipped unless marked `#[fsw(skip = false)]`. `#[fsw(group)]` on the
-/// struct emits a metadata entry for the group itself.
+/// struct emits a metadata entry for the group itself. Two leaves at one path
+/// fail the derive where it sees them, and otherwise the build
+/// (`BuildError::DuplicateLeaf`).
 ///
 /// ```ignore
 /// #[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -61,16 +66,23 @@ pub fn record_derive(input: TokenStream) -> TokenStream {
     record::record(input)
 }
 
-/// Derives `Param` for a struct of system params.
+/// Derives `Param` and `ArrayParam` for a struct of system params.
 ///
 /// Each field is a param, as a `#[system]` fn argument would be, and names
-/// its ports under the field name. `#[fsw(rename = "..")]` renames that
-/// segment, `#[fsw(flatten)]` drops it, and `#[fsw(skip)]` or a leading `_`
-/// leaves the field out, filled by `Default`. A struct passed as a fn
-/// argument adds no segment of its own.
+/// its ports under the field name; an array field names element `i` under
+/// `{field}.{i}`. `#[fsw(rename = "..")]` renames that segment,
+/// `#[fsw(flatten)]` on a field holding another struct drops it, and
+/// `#[fsw(skip)]` or a leading `_` leaves the field out, filled by
+/// `Default`. A struct passed as a fn argument adds no segment of its own.
+///
+/// `Seq`, `Timestamp`, and `Abort` are fn arguments only, and a tuple is no
+/// field; the derive refuses them, and `flatten` on a field it can tell is a
+/// leaf. An empty name, or two `Cap`s or `Rng`s of one name, fail the
+/// system's definition.
 ///
 /// The struct takes at most one lifetime. It is a param of cyclic fns and
-/// sequences, or of async fns under `#[system_params(async)]`.
+/// sequences, or of async fns under `#[system_params(async)]`, whose inputs
+/// are `Input<T, Notifier>`.
 ///
 /// ```ignore
 /// #[derive(SystemParams)]
@@ -91,6 +103,9 @@ pub fn system_params_derive(input: TokenStream) -> TokenStream {
 ///
 /// `#[system] fn nav(..)` becomes `fn nav() -> impl SystemFn`, which you
 /// register with a table. Each parameter is a port, named after the parameter.
+/// An array parameter `[P; N]` names element `i` `{name}.{i}`, and a
+/// [`SystemParams`](macro@SystemParams) struct names its fields' ports
+/// without the parameter's name. A tuple parameter is refused.
 /// Mark one `&mut S` parameter `#[state]` to give the system state. Without
 /// one, the state is `()`. The value `nav()` returns derefs to a fn pointer to
 /// the original body, so tests can call it directly. The fn's doc comment

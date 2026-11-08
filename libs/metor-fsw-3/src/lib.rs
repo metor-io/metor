@@ -47,6 +47,42 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
+//! Params nest. An array `[P; N]` of `Input`s, `Sample`s, `Output`s, or
+//! [`SystemParams`] structs names element `i` `{name}.{i}`. A `SystemParams`
+//! struct groups params: each field names its ports under the field name, and
+//! the struct passed as a fn argument adds no segment. `Timestamp`, `Abort`,
+//! and `Seq` stay fn arguments. A frame groups components the same way with
+//! [`Fields`].
+//!
+//! ```
+//! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//! # use metor_fsw_3::{Frame, Timestamp};
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! # #[repr(C)]
+//! # struct Gps {
+//! #     #[frame(timestamp)]
+//! #     timestamp: Timestamp,
+//! #     pos: [f64; 3],
+//! # }
+//! use metor_fsw_3::{Input, Output, SystemParams, SystemTable, system};
+//!
+//! #[derive(SystemParams)]
+//! struct Relay<'a> {
+//!     fix: &'a mut Input<Gps>,
+//!     out: &'a mut Output<Gps>,
+//! }
+//!
+//! /// Ports `fixes.0`, `fixes.1`, `relays.0.fix`, `relays.0.out`, ….
+//! #[system]
+//! fn fuse(fixes: [&mut Input<Gps>; 2], relays: [Relay<'_>; 3]) {
+//!     let _ = (fixes, relays);
+//! }
+//!
+//! let mut table = SystemTable::new();
+//! table.register("fuse", fuse(), Default::default)?;
+//! # Ok::<(), metor_fsw_3::BuildError>(())
+//! ```
+//!
 //! A failed write, for example into a full ring, returns an error. The
 //! failure is also counted. After the cycle, the system's `log` gets one
 //! `publish_dropped` fault covering every failed write.

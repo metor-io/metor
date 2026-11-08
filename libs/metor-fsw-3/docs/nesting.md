@@ -52,8 +52,12 @@ One set of rules for frame fields and for params.
 | `#[fsw(skip)] x: T` | skipped |
 
 Two leaves with the same path are an error. Frames report it at compile time
-where the derive can see it, and otherwise when the schema is built. Params
-report it as `BuildError::DuplicateInput` or `DuplicateOutput`.
+where the derive can see it, and otherwise as `BuildError::DuplicateLeaf`
+when a port's frame holds one component id twice. Params report it as
+`BuildError::DuplicateInput` or `DuplicateOutput`, and two `Cap`s or `Rng`s
+of one name as `DefError::DuplicateParam`. An empty port or param name, from
+flattening a leaf or a `FnSignature` with too few `NAMES`, is
+`DefError::EmptyName`.
 
 A frame's leaf path is `{port_path}.{field path}`. A param's port name is its
 path, so its port path is `{namespace}.{id}.{param path}`, and a frame on that
@@ -261,7 +265,10 @@ struct Feeds<'a> {
 ```
 
 A field that does not implement the struct's `Param<W>`, such as a `Sample` in
-an async struct, is a compile error.
+an async struct, is a compile error. The derive also refuses a `Seq`,
+`Timestamp`, or `Abort` field, even inside an array: these stay fn arguments,
+where `#[system]` and `#[sequence]` check them. It refuses a tuple field, and
+`flatten` on a field it can tell is a leaf or an array.
 
 ## Config and stubs
 
@@ -296,7 +303,9 @@ fsw.add("wheel_2", WheelSim(cmd=adcs.wheels[2].cmd))
 ```
 
 A group class's constructor raises `ConfigError` on an unknown keyword or a
-mismatched record. The config flattens groups and lists back to dotted port
+mismatched record. `None` leaves a leaf, list, or group unwired. Two groups
+share a class only when they render the same class; otherwise, as for a
+segment that is a Python keyword or `self`, stubgen fails with M0409. The config flattens groups and lists back to dotted port
 names before it writes the target.
 
 ## Testing

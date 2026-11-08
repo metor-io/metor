@@ -50,6 +50,18 @@ struct Arm {
 }
 ```
 
+A struct reused inside frames derives `Fields`: a group of components with
+no name, id, or timestamp. Each field adds a path segment; `[T; N]` adds
+`0` … `N-1`; `#[fsw(flatten)]` adds none and `#[fsw(rename = "..")]` renames
+it. A frame used as a field is a plain group. The outer frame stamps every
+leaf, and a port whose frame holds one leaf twice fails the build.
+
+```rust
+#[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[repr(C)]
+struct Vec3 { x: f64, y: f64, z: f64 }
+```
+
 Frames and messages share one delivery rule: every reader reads every
 record. `Output<T>` writes, `Input<T>` reads with `latest`, `drain`, or, on
 an async system, `next`. An input fed by several producers holds one view
@@ -92,6 +104,29 @@ Other parameters a system may take:
   and publishes `AlarmRaised` or `AlarmCleared` on an edge. Dropping `Alarms`,
   as a `Reset` or `Load` does, clears every alarm still active. A cyclic
   system takes at most one; an async system or a sequence takes none.
+
+Params nest. `[P; N]` takes `N` of an `Input`, `Sample`, `Output`, or
+`SystemParams` struct, named `x.0` … `x.{N-1}`. A `#[derive(SystemParams)]`
+struct groups params; each field names its ports under the field name, and
+the struct passed as a fn argument adds no segment. Fields follow the frame
+rules (`flatten`, `rename`, `skip`, a leading `_`). `Timestamp`, `Abort`,
+and `Seq` stay fn arguments, and a tuple is never a param.
+
+```rust
+#[derive(SystemParams)]
+struct WheelIo<'a> {
+    speed: &'a mut Input<WheelSpeed>,
+    cmd: &'a mut Output<WheelCmd>,
+}
+
+/// Ports: `fss.0` … `fss.7`, `wheels.0.speed`, `wheels.0.cmd`, … `wheels.3.cmd`.
+#[system]
+fn adcs(fss: [&mut Input<Fss>; 8], wheels: [WheelIo<'_>; 4]) { .. }
+```
+
+Two ports, `Cap`s, or `Rng`s of one name, or an empty name, fail the
+definition or the build. An async system's struct is
+`#[system_params(async)]` and holds `Input<T, Notifier>`.
 
 A failed write returns its error. It also counts toward one
 `publish_dropped` fault on the system's `log` that cycle, so a caller that
@@ -257,6 +292,13 @@ torque.connect(ctrl.torque_cmd)
 
 Add order is step order, so a system names only ports of systems already
 added, or a loop.
+
+Port names stay flat dotted strings in the config. Stubgen rebuilds lists
+and groups from them: inputs `fss.0` … `fss.7` become a
+`Sequence[Sources[Fss]]` keyword, and `wheels.N.*` a list of the nested
+class `Adcs.Wheels`. Outputs read back as tuples and `OutGroup`s, so
+`adcs.wheels[2].cmd` is the port `adcs.wheels.2.cmd`. `None` leaves a
+keyword unwired.
 
 A file emits one envelope, config version 2: every target's packs and
 `CoordinatorConfig`, and a map of where each target runs. A file with one
