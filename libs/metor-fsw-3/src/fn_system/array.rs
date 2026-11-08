@@ -69,21 +69,22 @@ impl<W: InputWake, P: Param<W> + ArrayParam, const N: usize> Param<W> for [P; N]
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
     ) -> (Self::Item<'a>, impl Refresh + use<'a, W, P, N>) {
-        let mut refreshes = Vec::with_capacity(N);
+        let mut refreshes: [_; N] = core::array::from_fn(|_| None);
         let mut pairs = input.iter_mut().zip(output.iter_mut());
-        let items = core::array::from_fn(|_| {
+        let items = core::array::from_fn(|i| {
             // PANIC Safety: both arrays hold `N` elements.
             let (input, output) = pairs.next().expect("one pair per element");
             let (item, refresh) = P::get_sampled(input, output, cx);
-            refreshes.push(refresh);
+            refreshes[i] = Some(refresh);
             item
         });
         (items, refreshes)
     }
 }
 
-impl<R: Refresh> Refresh for Vec<R> {
+/// Each element's refresh, filled as its item is built.
+impl<R: Refresh, const N: usize> Refresh for [Option<R>; N] {
     fn refresh(&mut self) {
-        self.iter_mut().for_each(R::refresh);
+        self.iter_mut().flatten().for_each(R::refresh);
     }
 }

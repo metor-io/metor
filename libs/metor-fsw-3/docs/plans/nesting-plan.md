@@ -111,7 +111,8 @@ structured ports.
    - `bind_in`: `core::array::from_fn(|_| P::bind_in(views))`.
    - `bind_out`: collect into a `Vec`, then `try_into` the array (make time).
    - `get`: `input.each_mut()` zipped with `output.each_mut()`, mapped through
-     `P::get`. `refresh` and `get_sampled` the same.
+     `P::get`. `refresh` and `get_sampled` the same; `get_sampled` allocates
+     nothing.
 3. `key_type`: `[X; N]` maps to `[key_type(X); N]`, recursively. Move
    `key_type` into a module shared with the `SystemParams` derive.
 4. `check_kinds`' list stays name-based; arrays of non-`ArrayParam`s fail on
@@ -119,8 +120,8 @@ structured ports.
 5. Stubs and Python for lists (see E1–E3 for inputs and outputs). A list
    keyword defaults to `None`, which wires nothing; `()` stays the leaf
    default. A system with dotted inputs sets `_input_ports`, every input by
-   name, which `System.__init__` flattens against. `get_sampled` collects the
-   elements' `Refresh`es in a `Vec`, built when the sequence starts.
+   name, which `System.__init__` flattens against. `get_sampled` fills an
+   `[Option<R>; N]` of the elements' `Refresh`es as it builds the items.
 6. Tests: unit tests in `fn_system/tests` for `[Input; 3]`, `[Sample; 2]`,
    `[Output; 2]`, `N = 0`, a mixed system; defs named `fss.0` … `fss.2`; records
    reach the right element. trybuild: `[Timestamp; 2]`, `[Log; 2]`.
