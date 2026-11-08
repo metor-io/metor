@@ -174,7 +174,7 @@ macro_rules! alarm {
 /// `#[sequence]` implements this trait. The fn's parameters are its ports
 /// and, optionally, its [`Seq`].
 #[allow(async_fn_in_trait)]
-pub trait SequenceFn: FnSignature {
+pub trait SequenceFn: FnSignature<Wake = NoWake> {
     /// Runs the sequence to its end.
     ///
     /// `state` and `items` share the lifetime `'a`, and the [`Seq`] in
@@ -182,7 +182,7 @@ pub trait SequenceFn: FnSignature {
     /// `'a`, so it may borrow from `state` or from the other items.
     async fn call<'a>(
         state: &'a mut Self::State,
-        items: <Self::Params as Param>::Item<'a, NoWake>,
+        items: <Self::Params as Param<NoWake>>::Item<'a>,
     ) -> Result<(), SeqError>;
 }
 

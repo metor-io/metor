@@ -16,6 +16,7 @@ use metor_fsw_3_ring::{NoWake, Notifier};
 
 use crate::async_system::{AsyncSystem, Stop};
 use crate::def::{DefCx, DefError};
+use crate::port::InputWake;
 use crate::{
     log,
     system::{System, SystemDef},
@@ -30,7 +31,10 @@ pub use set::{InSet, LOG_PORT, OutSet};
 pub trait FnSignature: Sized + 'static {
     /// The type of the `#[state]` parameter, or `()` if there is none.
     type State: 'static;
-    type Params: Param;
+    /// The wake sink the fn's inputs use: `NoWake` for a cyclic fn or a
+    /// sequence, `Notifier` for an async fn.
+    type Wake: InputWake;
+    type Params: Param<Self::Wake>;
     const NAME: &'static str;
     /// The name of each parameter, in order.
     const NAMES: &'static [&'static str];
@@ -39,30 +43,30 @@ pub trait FnSignature: Sized + 'static {
 }
 
 /// A cyclic system written as a fn.
-pub trait SystemFn: FnSignature {
+pub trait SystemFn: FnSignature<Wake = NoWake> {
     /// Runs one cycle.
-    fn call(state: &mut Self::State, items: <Self::Params as Param>::Item<'_, NoWake>);
+    fn call(state: &mut Self::State, items: <Self::Params as Param<NoWake>>::Item<'_>);
 }
 
 /// An async system written as a fn.
 ///
 /// Besides its ports, the fn receives a [`Stop`] that tells it when to end.
 #[allow(async_fn_in_trait)]
-pub trait AsyncSystemFn: FnSignature {
+pub trait AsyncSystemFn: FnSignature<Wake = Notifier> {
     /// Runs the system until `stop` resolves.
     async fn call(
         state: &mut Self::State,
-        items: <Self::Params as Param>::Item<'_, Notifier>,
+        items: <Self::Params as Param<Notifier>>::Item<'_>,
         stop: Stop,
     );
 }
 
-/// Fails to compile unless `P` implements [`Param`].
+/// Fails to compile unless `P` implements [`Param<W>`].
 ///
 /// `#[system]` calls this once per parameter.
 #[doc(hidden)]
 #[inline(always)]
-pub fn assert_param<P: Param>() {}
+pub fn assert_param<P: Param<W>, W: InputWake>() {}
 
 /// Runs a fn system as a [`System`] or an [`AsyncSystem`].
 ///
@@ -78,32 +82,10 @@ impl<S> Default for FnSystem<S> {
 
 impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
     type State = S::State;
-    type Inputs = InSet<S, Notifier>;
+    type Inputs = InSet<S>;
     type Outputs = OutSet<S>;
 
-    /// Returns the system's definition.
-    ///
-    /// # Errors
-    /// Refuses a [`Sample`](crate::port::Sample) parameter, because async
-    /// systems have no step to take samples each cycle.
-    ///
-    /// Refuses a `Cap` parameter too: async systems keep
-    /// stellarator's own IO.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        let defs = Defs::of::<S>(cx)?;
-        let system = S::NAME.into();
-        if defs.sampled {
-            return Err(DefError::SampleOnAsync { system });
-        }
-        if !defs.grants.is_empty() {
-            return Err(DefError::IoOnAsync { system });
-        }
-        if defs.rng {
-            return Err(DefError::RngOnAsync { system });
-        }
-        if defs.alarms {
-            return Err(DefError::AlarmsOnAsync { system });
-        }
         set::system_def::<S>(cx)
     }
 
@@ -111,12 +93,12 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
     async fn run(
         &self,
         state: &mut S::State,
-        inputs: &mut InSet<S, Notifier>,
+        inputs: &mut InSet<S>,
         outputs: &mut OutSet<S>,
         stop: Stop,
     ) {
         let mut cx = Cycle::new(Timestamp::now());
-        let items = S::Params::get::<Notifier>(&mut inputs.ins, &mut outputs.outs, &mut cx);
+        let items = S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx);
         let call = core::pin::pin!(S::call(state, items, stop));
         log::with_logs(&mut outputs.log, call).await;
     }

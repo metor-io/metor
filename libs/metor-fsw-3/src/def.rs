@@ -151,15 +151,6 @@ pub enum DefError {
     #[error("slot: {message}")]
     Slot { message: String },
 
-    #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
-    SampleOnAsync { system: String },
-
-    #[error("async system `{system}` takes a `Cap`, which only a stepped system takes")]
-    IoOnAsync { system: String },
-
-    #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
-    RngOnAsync { system: String },
-
     #[error("the type sets an op budget but takes no `Cap`")]
     NoIo,
 
@@ -184,9 +175,6 @@ pub enum DefError {
         max_len: usize,
         conn_cap: usize,
     },
-
-    #[error("async system `{system}` takes `Alarms`, which only a stepped system takes")]
-    AlarmsOnAsync { system: String },
 
     #[error("output `{port}` cannot carry its frame under its own path: {message}")]
     Reroot { port: String, message: String },

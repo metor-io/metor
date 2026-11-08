@@ -78,12 +78,12 @@ impl SequenceStep {
 /// the samples, unless the sequence is aborted, then advances the body.
 async fn run<S: SequenceFn>(
     mut state: S::State,
-    mut ins: <S::Params as Param>::In<NoWake>,
-    mut outs: <S::Params as Param>::Out,
+    mut ins: <S::Params as Param<NoWake>>::In,
+    mut outs: <S::Params as Param<NoWake>>::Out,
     seq: Rc<Seq<'static>>,
 ) -> Result<(), SeqError> {
     let mut cx = Cycle::with_seq(seq.now(), &seq);
-    let (items, mut samples) = S::Params::get_sampled::<NoWake>(&mut ins, &mut outs, &mut cx);
+    let (items, mut samples) = S::Params::get_sampled(&mut ins, &mut outs, &mut cx);
     let mut body = pin!(S::call(&mut state, items));
     poll_fn(|cx| {
         if !seq.aborted() {

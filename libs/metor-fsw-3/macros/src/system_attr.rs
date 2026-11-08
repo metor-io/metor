@@ -92,6 +92,16 @@ enum Shape {
     Sequence,
 }
 
+impl Shape {
+    /// The wake sink the fn's inputs use.
+    fn wake(&self, fsw: &TokenStream2) -> TokenStream2 {
+        match self {
+            Self::Async { .. } => quote!(#fsw::ring::Notifier),
+            Self::Cyclic | Self::Sequence => quote!(#fsw::ring::NoWake),
+        }
+    }
+}
+
 /// A checked `#[system]` or `#[sequence]` fn signature.
 struct Sig {
     shape: Shape,
@@ -436,9 +446,11 @@ fn ports_impl(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let keys = sig.ports().map(|arg| key_type(&arg.ty));
     let names = sig.ports().map(|arg| arg.ident.to_string());
+    let wake = sig.shape.wake(fsw);
     quote! {
         impl #impl_generics #fsw::FnSignature for __MetorSystem #ty_generics #where_clause {
             type State = #state_ty;
+            type Wake = #wake;
             type Params = (#(#keys,)*);
             const NAME: &'static str = #name;
             const NAMES: &'static [&'static str] = &[#(#names),*];
@@ -462,11 +474,12 @@ fn call_parts(
         None => quote!(_),
     };
     let idents = sig.ports().map(|arg| &arg.ident);
-    let items = quote!((#(#idents,)*): <Self::Params as #fsw::Param>::Item);
+    let wake = sig.shape.wake(fsw);
+    let items = quote!((#(#idents,)*): <Self::Params as #fsw::Param<#wake>>::Item);
     // Spanned at each parameter type, so a type that is no `Param` errors there.
     let asserts = sig.ports().map(|arg| {
         let key = key_type(&arg.ty);
-        quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key>(); }
+        quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key, #wake>(); }
     });
     let args = sig.args.iter().map(|arg| &arg.ident);
     let turbofish = generics.split_for_impl().1.as_turbofish().to_token_stream();
@@ -500,7 +513,7 @@ fn sequence_call(
     let call = quote! {
         async fn call<#lifetime>(
             #state: &#lifetime mut #state_ty,
-            #items<#lifetime, #fsw::ring::NoWake>,
+            #items<#lifetime>,
         ) -> ::core::result::Result<(), #fsw::SeqError> {
             #body.await
         }
@@ -522,7 +535,7 @@ fn async_call(
     let call = quote! {
         async fn call(
             #state: &mut #state_ty,
-            #items<'_, #fsw::ring::Notifier>,
+            #items<'_>,
             #stop: #fsw::Stop,
         ) {
             #body.await
@@ -547,7 +560,7 @@ fn cyclic_call(
     let tys = sig.args.iter().map(|arg| &arg.ty);
     let fn_ptr = quote!(fn(#(#tys),*));
     let call = quote! {
-        fn call(#state: &mut #state_ty, #items<'_, #fsw::ring::NoWake>) {
+        fn call(#state: &mut #state_ty, #items<'_>) {
             #body
         }
     };

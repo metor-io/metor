@@ -118,10 +118,10 @@ impl DerefMut for SubscribeOutputs {
     }
 }
 
-impl Param for SubscribeOutputs {
-    type In<W: InputWake> = ();
+impl<W: InputWake> Param<W> for SubscribeOutputs {
+    type In = ();
     type Out = SubscribeOutputs;
-    type Item<'a, W: InputWake> = &'a mut SubscribeOutputs;
+    type Item<'a> = &'a mut SubscribeOutputs;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -129,21 +129,21 @@ impl Param for SubscribeOutputs {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         let first = defs.outputs.len();
-        <DynOutputs as Param>::append_defs(names, cx, defs)?;
+        <DynOutputs as Param<W>>::append_defs(names, cx, defs)?;
         check_route_keys(&defs.outputs[first..])?;
         check_conn_cap(cx, &defs.outputs[first..])
     }
 
-    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
+    fn bind_in(_views: &mut Views<W>) {}
 
     fn bind_out(
         names: &mut ParamNames<'_>,
         writers: &mut Writers,
     ) -> Result<SubscribeOutputs, MakeError> {
-        <DynOutputs as Param>::bind_out(names, writers).map(SubscribeOutputs)
+        <DynOutputs as Param<W>>::bind_out(names, writers).map(SubscribeOutputs)
     }
 
-    fn get<'a, W: InputWake>(
+    fn get<'a>(
         _input: &'a mut (),
         output: &'a mut SubscribeOutputs,
         _cx: &mut Cycle<'a>,

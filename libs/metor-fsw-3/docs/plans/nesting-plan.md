@@ -64,10 +64,13 @@ structured ports.
      `Seq<'static>`.
    - The tuple macro: `impl<W, $($P: Param<W>),*> Param<W> for (..)`.
    - `Refresh` and `SampleRefresh` are unchanged.
-3. `FnSignature::Params` loses its bound. `SystemFn` and the sequence trait
-   add `Params: Param<NoWake>`; `AsyncSystemFn` adds `Params: Param<Notifier>`.
-   `InSet<S, W>` and `OutSet<S>` take `S::Params: Param<W>` where they need it.
-   `OutSet` names `Out` through the wake its system uses.
+3. `FnSignature` gains `type Wake: InputWake` and bounds
+   `Params: Param<Self::Wake>`. `SystemFn` and `SequenceFn` require
+   `FnSignature<Wake = NoWake>`; `AsyncSystemFn` requires
+   `FnSignature<Wake = Notifier>`. `InSet<S>` and `OutSet<S>` read
+   `Param<S::Wake>`, so `InSet` drops its `W` parameter. (Deviation: an
+   unbounded `Params` would need `S::Params: Param<W>` on every set, def, and
+   `Ports` impl.)
 4. `#[system]`/`#[sequence]`: `assert_param::<P, W>()` with `NoWake` for cyclic
    fns and sequences, `Notifier` for async.
 5. Remove the four `*OnAsync` errors and their checks in `FnSystem::def`, and

@@ -6,12 +6,10 @@ use std::sync::Arc;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 
-use metor_fsw_3_ring::NoWake;
-
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
-use crate::port::{InputWake, Output};
+use crate::port::Output;
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
 use super::FnSignature;
@@ -21,8 +19,8 @@ use super::param::{Defs, Param, Views, Writers};
 pub const LOG_PORT: &str = "log";
 
 /// The bound inputs of a fn system's parameters.
-pub struct InSet<S: FnSignature, W: InputWake = NoWake> {
-    pub(crate) ins: <S::Params as Param>::In<W>,
+pub struct InSet<S: FnSignature> {
+    pub(crate) ins: <S::Params as Param<S::Wake>>::In,
 }
 
 /// The bound outputs of a fn system's parameters, plus its `log` output.
@@ -30,15 +28,15 @@ pub struct InSet<S: FnSignature, W: InputWake = NoWake> {
 /// Failed writes on any of the outputs are counted and reported together on
 /// `log`.
 pub struct OutSet<S: FnSignature> {
-    pub(crate) outs: <S::Params as Param>::Out,
+    pub(crate) outs: <S::Params as Param<S::Wake>>::Out,
     pub(crate) log: LogPort,
     pub(crate) dropped: Arc<AtomicU32>,
 }
 
-impl<S: FnSignature, W: InputWake> InSet<S, W> {
+impl<S: FnSignature> InSet<S> {
     /// Hands `views` to the parameters, in order.
-    pub(crate) fn from_views(mut views: Views<W>) -> Self {
-        let ins = S::Params::bind_in::<W>(&mut views);
+    pub(crate) fn from_views(mut views: Views<S::Wake>) -> Self {
+        let ins = S::Params::bind_in(&mut views);
         // PANIC Safety: the coordinator binds one list per port of the
         // definition these parameters produced.
         assert!(views.bindings.is_empty(), "more bindings than input params");
@@ -87,12 +85,12 @@ impl<S: FnSignature> OutSet<S> {
     }
 }
 
-impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
+impl<S: FnSignature> Ports<InputBinding<S::Wake>> for InSet<S> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
 
-    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
+    fn bind(inputs: Vec<InputBinding<S::Wake>>, _cx: &BindCx) -> Result<Self, MakeError> {
         let defs = Defs::declared::<S>();
         Ok(Self::from_views(Views::new(inputs, defs.param_inputs())))
     }
