@@ -7,8 +7,10 @@ use quote::quote;
 use syn::Ident;
 
 mod frame;
+mod key;
 mod record;
 mod system_attr;
+mod system_params;
 
 /// Derives `Frame` for a struct sent as its raw bytes.
 ///
@@ -33,6 +35,32 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Record, attributes(record))]
 pub fn record_derive(input: TokenStream) -> TokenStream {
     record::record(input)
+}
+
+/// Derives `Param` for a struct of system params.
+///
+/// Each field is a param, as a `#[system]` fn argument would be, and names
+/// its ports under the field name. `#[fsw(rename = "..")]` renames that
+/// segment, `#[fsw(flatten)]` drops it, and `#[fsw(skip)]` or a leading `_`
+/// leaves the field out, filled by `Default`. A struct passed as a fn
+/// argument adds no segment of its own.
+///
+/// The struct takes at most one lifetime. It is a param of cyclic fns and
+/// sequences, or of async fns under `#[system_params(async)]`.
+///
+/// ```ignore
+/// #[derive(SystemParams)]
+/// struct Sensors<'a> {
+///     fss: [&'a mut Input<Fss>; 8],
+///     gyro: &'a Sample<Gyro>,
+/// }
+///
+/// #[system]
+/// fn sun(sensors: Sensors<'_>, est: &mut Output<SunVec>) { .. }
+/// ```
+#[proc_macro_derive(SystemParams, attributes(fsw, system_params))]
+pub fn system_params_derive(input: TokenStream) -> TokenStream {
+    system_params::system_params(input)
 }
 
 /// Turns a free fn into a system.

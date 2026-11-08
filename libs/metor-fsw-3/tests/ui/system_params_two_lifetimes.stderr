@@ -1,0 +1,5 @@
+error: a `SystemParams` struct takes one lifetime and no other generics
+ --> tests/ui/system_params_two_lifetimes.rs:4:16
+  |
+4 | struct Two<'a, 'b> {
+  |                ^^

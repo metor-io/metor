@@ -4,7 +4,7 @@ error[E0277]: `Cap<metor_fsw_3::io::Uart>` is not a parameter of a system whose 
 4 | #[system]
   | ^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
       but trait `Param<NoWake>` is implemented for it
  --> src/io/param.rs
@@ -26,7 +26,7 @@ error[E0277]: `Cap<metor_fsw_3::io::Uart>` is not a parameter of a system whose 
 4 | #[system]
   |          ^ the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
       but trait `Param<NoWake>` is implemented for it
  --> src/io/param.rs
@@ -43,7 +43,7 @@ error[E0277]: `Cap<metor_fsw_3::io::Uart>` is not a parameter of a system whose 
   |         items: <Self::Params as Param<Notifier>>::Item<'_>,
   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
       but trait `Param<NoWake>` is implemented for it
  --> src/io/param.rs
@@ -59,7 +59,7 @@ error[E0277]: `Cap<metor_fsw_3::io::Uart>` is not a parameter of a system whose 
 4 | #[system]
   | ^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
       but trait `Param<NoWake>` is implemented for it
  --> src/io/param.rs
@@ -76,7 +76,7 @@ error[E0277]: `Cap<metor_fsw_3::io::Uart>` is not a parameter of a system whose 
 5 | async fn serial(uart: &Cap<Uart>, stop: Stop) {
   |                        ^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Cap<metor_fsw_3::io::Uart>`
       but trait `Param<NoWake>` is implemented for it
  --> src/io/param.rs

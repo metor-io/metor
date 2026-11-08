@@ -26,8 +26,8 @@ use crate::{
 
 pub use array::ArrayParam;
 pub use ctor::{Bound, Ctor, WithDef, WithIo};
-pub use param::{Cycle, Param, Refresh, Views, Writers};
-pub(crate) use param::{Defs, Instance};
+pub(crate) use param::Instance;
+pub use param::{Cycle, Defs, Param, Refresh, Views, Writers};
 pub use path::ParamPath;
 pub use set::{InSet, LOG_PORT, OutSet};
 

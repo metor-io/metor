@@ -267,7 +267,7 @@ impl<'a> Cycle<'a> {
 /// can take implements `Param<NoWake>` alone.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a parameter of a system whose inputs wake `{W}`",
-    note = "an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`"
+    note = "a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`"
 )]
 pub trait Param<W: InputWake> {
     /// The bound input, or `()` if the parameter has none.

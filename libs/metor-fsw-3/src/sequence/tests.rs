@@ -488,6 +488,38 @@ async fn pair_watcher(
     Ok(())
 }
 
+/// Two samples, one never wired.
+#[derive(crate::SystemParams)]
+struct Imus<'a> {
+    unwired: &'a Sample<Imu>,
+    imu: &'a Sample<Imu>,
+}
+
+/// Keeps the sample its struct holds across each of three cycles.
+#[crate::sequence]
+async fn struct_watcher(
+    #[state] seen: &mut Seen,
+    seq: &Seq,
+    imus: Imus<'_>,
+) -> Result<(), SeqError> {
+    for _ in 0..3 {
+        assert!(imus.unwired.get().is_none());
+        seen.0
+            .borrow_mut()
+            .push(imus.imu.get().map(|imu| imu.sample));
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_struct_samples_held_across_cycles() {
+    assert_eq!(
+        imu_into(struct_watcher()),
+        [Some(1.0), Some(2.0), Some(3.0)]
+    );
+}
+
 #[test]
 fn test_sample_array_held_across_cycles() {
     let seen = Seen::default();

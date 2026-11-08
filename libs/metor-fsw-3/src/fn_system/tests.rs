@@ -22,6 +22,7 @@ use crate::{Frame, Payload, Record};
 
 mod alarms;
 mod arrays;
+mod system_params;
 
 /// Doubles the newest sample, stamping it with the cycle time.
 struct Doubler;

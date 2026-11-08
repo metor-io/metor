@@ -4,7 +4,7 @@ error[E0277]: `u32` is not a parameter of a system whose inputs wake `NoWake`
 5 | #[system]
   | ^^^^^^^^^ the trait `Param<NoWake>` is not implemented for `u32`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
   = help: the following other types implement trait `Param<W>`:
             Alarms
             Cap<K>
@@ -25,7 +25,7 @@ error[E0277]: `u32` is not a parameter of a system whose inputs wake `NoWake`
 5 | #[system]
   | ^^^^^^^^^ the trait `Param<NoWake>` is not implemented for `u32`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
   = help: the following other types implement trait `Param<W>`:
             Alarms
             Cap<K>
@@ -41,7 +41,7 @@ error[E0277]: `u32` is not a parameter of a system whose inputs wake `NoWake`
 6 | fn counter(#[state] s: &mut Counter, now: Timestamp, step: u32) {
   |                                                            ^^^ the trait `Param<NoWake>` is not implemented for `u32`
   |
-  = note: an async fn's inputs are `Input<T, Notifier>`, and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
   = help: the following other types implement trait `Param<W>`:
             Alarms
             Cap<K>

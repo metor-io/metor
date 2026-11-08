@@ -19,9 +19,11 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
-    Attribute, Expr, ExprLit, FnArg, GenericArgument, Generics, Ident, Item, ItemFn, Lifetime, Lit,
-    Meta, Pat, PathArguments, ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
+    Attribute, Expr, ExprLit, FnArg, Generics, Ident, Item, ItemFn, Lifetime, Lit, Meta, Pat,
+    ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
 };
+
+use crate::key::{is_seq, key_type, set_seq_lifetime};
 
 /// Which attribute is expanding.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -619,31 +621,6 @@ fn extract_doc(attrs: &[Attribute]) -> String {
         .join("\n")
 }
 
-/// Returns the type used to look up a parameter's `Param` impl.
-///
-/// One outer reference is stripped, so `&mut Input<T>` and `Input<T>` get the
-/// same key. An array is keyed by its element's key, so `[&mut Input<T>; N]`
-/// is `[Input<T>; N]`. `Seq` is keyed as `Seq<'static>`.
-fn key_type(ty: &Type) -> Type {
-    let key = match ty {
-        Type::Reference(r) => (*r.elem).clone(),
-        Type::Array(array) => {
-            let mut array = array.clone();
-            *array.elem = key_type(&array.elem);
-            return Type::Array(array);
-        }
-        other => other.clone(),
-    };
-    match &key {
-        Type::Path(path) if is_seq(path) => {
-            let mut path = path.clone();
-            set_seq_lifetime(&mut path, &Lifetime::new("'static", Span::call_site()));
-            Type::Path(path)
-        }
-        _ => key,
-    }
-}
-
 /// Returns `'__seq`, the lifetime shared by a sequence's parameters.
 fn seq_lifetime() -> Lifetime {
     Lifetime::new("'__seq", Span::call_site())
@@ -689,32 +666,6 @@ impl VisitMut for ElidedLifetimes {
             set_seq_lifetime(path, &self.0);
         }
         visit_mut::visit_type_path_mut(self, path);
-    }
-}
-
-/// Returns whether `path` is `Seq` or `Seq<'_>`.
-///
-/// The macro fills in the lifetime of those two forms.
-fn is_seq(path: &TypePath) -> bool {
-    let Some(last) = path.path.segments.last() else {
-        return false;
-    };
-    if path.qself.is_some() || last.ident != "Seq" {
-        return false;
-    }
-    match &last.arguments {
-        PathArguments::None => true,
-        PathArguments::AngleBracketed(args) => {
-            args.args.len() == 1
-                && matches!(args.args.first(), Some(GenericArgument::Lifetime(lt)) if lt.ident == "_")
-        }
-        PathArguments::Parenthesized(_) => false,
-    }
-}
-
-fn set_seq_lifetime(path: &mut TypePath, lifetime: &Lifetime) {
-    if let Some(last) = path.path.segments.last_mut() {
-        last.arguments = PathArguments::AngleBracketed(syn::parse_quote!(<#lifetime>));
     }
 }
 
