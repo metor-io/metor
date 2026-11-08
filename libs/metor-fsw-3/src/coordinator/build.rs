@@ -503,6 +503,7 @@ impl SystemDef {
             Ok(ring.map(|ring| plan.rings[ring].port.clone()))
         })?;
         def.check_port_names(system)?;
+        def.check_leaves(&system.id)?;
         def.check_alignment(&system.id)?;
         def.check_outputs(system)?;
         Ok(def)
@@ -556,6 +557,20 @@ impl SystemDef {
         }
         if let Some((system, port)) = find_duplicate(&self.outputs).map(port) {
             return Err(BuildError::DuplicateOutput { system, port });
+        }
+        Ok(())
+    }
+
+    /// Checks that no output frame names a leaf twice.
+    fn check_leaves(&self, system: &str) -> Result<(), BuildError> {
+        for port in &self.outputs {
+            if let Some(leaf) = port.schema.duplicate_leaf() {
+                return Err(BuildError::DuplicateLeaf {
+                    system: system.to_string(),
+                    port: port.name.to_string(),
+                    leaf: leaf.to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -1024,6 +1039,27 @@ mod tests {
             };
             assert_eq!(def.check_port_names(&instance), Err(expected));
         }
+    }
+
+    #[test]
+    fn test_reject_duplicate_leaves() {
+        let def = |port: PortDef| crate::SystemDef {
+            name: "test".into(),
+            inputs: Vec::new(),
+            outputs: vec![port],
+            log: None,
+            grants: Vec::new(),
+            io: None,
+        };
+        let imu = Output::<utils::Imu>::def(&DefCx::empty(), "imu");
+        assert_eq!(def(imu).check_leaves("instance"), Ok(()));
+        let collide = Output::<utils::Collide>::def(&DefCx::empty(), "collide");
+        let expected = BuildError::DuplicateLeaf {
+            system: "instance".into(),
+            port: "collide".into(),
+            leaf: "collide.x".into(),
+        };
+        assert_eq!(def(collide).check_leaves("instance"), Err(expected));
     }
 
     #[test]

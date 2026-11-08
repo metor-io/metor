@@ -819,6 +819,17 @@ the system and the reason. Common ones:
 fsw.wasm(seqs, memory=16 << 20)
 ```
 
+## M0338
+
+**A frame names a leaf twice**
+
+An output's frame has two leaves at the same path. A `#[fsw(flatten)]`
+field puts its leaves at the struct's own path, so they can collide with a
+sibling field or with another flattened field.
+
+Rename one of the fields with `#[fsw(rename = "..")]`, or stop flattening
+it.
+
 ## M0401
 
 **A pack file could not be read**

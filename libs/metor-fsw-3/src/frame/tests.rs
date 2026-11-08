@@ -181,3 +181,10 @@ fn test_fields_have_no_stamp_or_frame() {
         .filter(|op| matches!(op, Op::Frame { .. } | Op::Timestamp { .. }));
     assert_eq!(tagged.count(), 0);
 }
+
+#[test]
+fn test_duplicate_leaf() {
+    assert_eq!(Collide::schema().duplicate_leaf(), Some("collide.x"));
+    assert_eq!(Grouped::schema().duplicate_leaf(), None);
+    assert_eq!(Note::schema().duplicate_leaf(), None);
+}

@@ -52,6 +52,20 @@ pub enum BuildError {
     #[cfg_attr(feature = "host", diagnostic(code(M0306)))]
     DuplicateOutput { system: String, port: String },
 
+    #[error("output `{port}` of system `{system}` names leaf `{leaf}` more than once")]
+    #[cfg_attr(
+        feature = "host",
+        diagnostic(
+            code(M0338),
+            help("rename or stop flattening one of the fields that share the name")
+        )
+    )]
+    DuplicateLeaf {
+        system: String,
+        port: String,
+        leaf: String,
+    },
+
     #[error("system `{id}` has unregistered type `{ty}`")]
     #[cfg_attr(
         feature = "host",

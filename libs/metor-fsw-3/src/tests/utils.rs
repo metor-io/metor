@@ -242,6 +242,18 @@ pub struct Nested {
     pub z: f64,
 }
 
+/// A frame whose flattened field puts `x` beside its own `x`.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[fsw(name = "collide")]
+#[repr(C)]
+pub struct Collide {
+    #[fsw(timestamp)]
+    pub timestamp: Timestamp,
+    pub x: f64,
+    #[fsw(flatten)]
+    pub inner: Inner,
+}
+
 /// Declares an output under the coordinator's reserved name.
 #[crate::system]
 pub fn reserved(status: &mut Output<Imu>, now: Timestamp) {

@@ -198,7 +198,9 @@ structured ports.
    bounds from `Frame`. Remove `nest` from `Field`. Add `flatten` and `rename`
    to `Field` (`rename` is the existing `component_id`; keep it as an alias).
    `flatten` chains no segment. Detect duplicate leaf names at derive time
-   among a struct's own fields.
+   among a struct's own fields. The derive cannot see a flattened field's
+   leaves, so the coordinator build also refuses an output frame whose
+   metadata names a leaf twice: `BuildError::DuplicateLeaf` (M0338).
    `struct_as_vtable_impl` takes a `Stamp`: `Omit` for `Fields` and `Frame`,
    `Attach` for the standalone `#[derive(AsVTable)]`, which keeps its
    behavior.
@@ -211,6 +213,7 @@ structured ports.
    - A frame used as a field announces the outer stamp and frame id only.
    - `flatten`, `rename`, `skip` on `Fields`.
    - trybuild: `timestamp` in `Fields`, a `rename` collision, `nest`.
+   - A flatten collision fails the build with `DuplicateLeaf`.
 
 ## G. Integration and docs
 

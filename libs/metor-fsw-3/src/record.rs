@@ -158,6 +158,16 @@ impl RecordSchema {
         }
     }
 
+    /// Returns a leaf name that a frame announces twice.
+    pub fn duplicate_leaf(&self) -> Option<&str> {
+        let Self::Frame { metadata, .. } = self else {
+            return None;
+        };
+        let mut names: Vec<&str> = metadata.iter().map(|m| m.name.as_str()).collect();
+        names.sort_unstable();
+        names.windows(2).find(|w| w[0] == w[1]).map(|w| w[0])
+    }
+
     /// Returns the packet ID the ground uses to recognize this record.
     pub fn packet_id(&self) -> PacketId {
         match self {
