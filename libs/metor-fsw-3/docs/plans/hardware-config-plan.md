@@ -553,10 +553,10 @@ cargo test -p metor-fsw-3 --test io
 METOR_BLESS=1 cargo test -p metor-fsw-3 --test module    # regenerate _generated.py
 cargo test -p metor-fsw-3                                 # default features: host, db
 cargo clippy -p metor-fsw-3 --all-targets
-cargo kani -p metor-fsw-3 --no-default-features --harness locate_in_bounds
-cargo kani -p metor-fsw-3 --no-default-features --harness poly_never_panics
-cargo kani -p metor-fsw-3 --no-default-features --harness table_never_panics
-cargo kani -p metor-fsw-3 --no-default-features --harness read_f64_in_bounds
+cargo kani -p metor-fsw-3 --lib --no-default-features --harness locate_in_bounds
+cargo kani -p metor-fsw-3 --lib --no-default-features --harness poly_never_panics
+cargo kani -p metor-fsw-3 --lib --no-default-features --harness table_never_panics
+cargo kani -p metor-fsw-3 --lib --no-default-features --harness read_f64_in_bounds
 (cd python/metor-config && python -m pytest tests)
 ```
 
