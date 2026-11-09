@@ -69,6 +69,36 @@ BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})  # dst paths open.0, open.1
 - A record that maps a path and anything under it, such as a leaf and one
   of its elements, or one element twice, raises `ConfigError`.
 
+A mapping value may be `Calibrated(source, cal)`, a scalar `f64` source
+through a calibration, to a scalar `f64` destination or an element of an
+`f64` array:
+
+```python
+from metor_config import Cal, Calibrated
+
+Mux(out=FeedPressures(
+    pt101=Calibrated(volts.v[5], Cal.two_point(volts=(0.5, 4.5), eng=(0, 1000))),
+    tc=Calibrated(volts.v[7], Cal.thermocouple("K")),
+    pt102=other.p,                                   # a plain copy
+))
+```
+
+| Constructor | Writes |
+|---|---|
+| `Cal.poly([c0, c1, ..])` | `{"poly": [..]}`, ascending |
+| `Cal.linear(gain=, offset=)` | `{"poly": [offset, gain]}` |
+| `Cal.two_point(volts=, eng=)` | the poly through both points |
+| `Cal.table([(x, y), ..])` | `{"table": [[x, y], ..]}`, sorted by `x` |
+| `Cal.thermocouple("K")` | `{"thermocouple": {"kind": "k"}}`; K, J, T, or E |
+| `Cal.ratiometric(excitation=, span=, eng=)` | `{"ratiometric": ..}`, `excitation` a scalar `f64` field |
+
+Constructors refuse NaN and inf, an empty poly or table, a repeated `x`,
+equal `two_point` volts, a zero-width span, and an unknown thermocouple.
+`Record.__init__` refuses a `Calibrated` whose source or destination is not
+a scalar `f64`, and a ratiometric excitation on another port than the
+source. Stubgen types a scalar `f64` keyword, and an `f64` array's mapping
+value, as `Field[Literal["f64"]] | Calibrated`.
+
 ## Semantics
 
 - A destination path takes a source `(input, path)`. Type and shape must

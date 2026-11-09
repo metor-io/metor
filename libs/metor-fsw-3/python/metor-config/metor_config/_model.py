@@ -20,6 +20,7 @@ from typing import (
     Union,
 )
 
+from ._cal import Calibrated
 from ._config import ConfigError
 from ._fields import Field, index, signature
 
@@ -40,17 +41,20 @@ class Record:
     _kind: str = "msg"
     _pack: Pack | None = None
     _fields: dict[str, str] = {}
-    _mapping: dict[str, Field[Any]]
+    _mapping: dict[str, Field[Any] | Calibrated]
     _port: ClassVar[type[OutPort[Any]]]
     """The class of a port that carries this record."""
 
-    def __init__(self, **fields: Field[Any] | Mapping[int, Field[Any]]) -> None:
+    def __init__(
+        self, **fields: Field[Any] | Calibrated | Mapping[int, Field[Any] | Calibrated]
+    ) -> None:
         """Maps each destination path to a source `Field`, for a `Mux` output.
 
-        A `Mapping` from index to `Field` maps elements of the destination.
+        A `Mapping` from index to `Field` maps elements of the destination. A
+        `Calibrated` source maps a scalar ``f64`` through its calibration.
         Raises `ConfigError` for a message record, an unknown path, a value
-        that is not a `Field`, a signature that differs from the source's, or
-        two destinations that overlap.
+        that is not a `Field` or `Calibrated`, a signature that differs from
+        the source's, or two destinations that overlap.
         """
         cls = type(self)
         if cls._kind != "frame":
@@ -78,15 +82,43 @@ def _check_overlap(record: type[Record], paths: list[str]) -> None:
 
 
 def _check_mapping(record: type[Record], path: str, source: Any) -> None:
+    if isinstance(source, Calibrated):
+        _check_calibrated(record, path, source)
+        return
     if not isinstance(source, Field):
         raise ConfigError(f"`{record.__name__}.{path}` takes a port field, got {source!r}")
-    expected = signature(record._fields, path)
-    if expected is None:
-        raise ConfigError(f"`{record.__name__}` has no field `{path}`")
+    expected = _destination(record, path)
     if expected != source.signature:
         raise ConfigError(
             f"`{record.__name__}.{path}` is `{expected}`, but "
             f"`{source.port.name}.{source.path}` is `{source.signature}`"
+        )
+
+
+def _destination(record: type[Record], path: str) -> str:
+    found = signature(record._fields, path)
+    if found is None:
+        raise ConfigError(f"`{record.__name__}` has no field `{path}`")
+    return found
+
+
+def _check_calibrated(record: type[Record], path: str, value: Calibrated) -> None:
+    """A scalar ``f64`` to a scalar ``f64``, with any excitation on the source's port."""
+    where = f"`{record.__name__}.{path}`"
+    source = value.source
+    if not isinstance(source, Field):
+        raise ConfigError(f"{where} calibrates a port field, got {source!r}")
+    dst = _destination(record, path)
+    if dst != "f64" or source.signature != "f64":
+        raise ConfigError(
+            f"{where} calibrates f64 to f64, but `{source.port.name}.{source.path}` "
+            f"is `{source.signature}` and {where} is `{dst}`"
+        )
+    excitation = value.cal.excitation
+    if excitation is not None and excitation.port.name != source.port.name:
+        raise ConfigError(
+            f"{where}: the excitation `{excitation.port.name}.{excitation.path}` "
+            f"is not on `{source.port.name}`"
         )
 
 

@@ -19,6 +19,7 @@ from ._builtins import (
     Subscribe,
     Transport,
 )
+from ._cal import Cal, Calibrated
 from ._composite import Composite, Scope, composite
 from ._config import ConfigError
 from ._deployment import Deployment, emit, gateway
@@ -100,6 +101,8 @@ __all__ = [
     "Connect",
     "Deployment",
     "ArrayField",
+    "Cal",
+    "Calibrated",
     "Field",
     "Item",
     "Listen",

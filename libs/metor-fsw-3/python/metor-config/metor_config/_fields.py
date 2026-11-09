@@ -107,6 +107,6 @@ def _canonical(segment: str) -> bool:
     return segment.isascii() and segment.isdigit() and (segment == "0" or segment[0] != "0")
 
 
-def _given(fields: dict[str, Field[Any] | None]) -> dict[str, Field[Any]]:
+def _given(fields: dict[str, Any]) -> dict[str, Any]:
     """Drops the keywords a generated ``__init__`` was not given."""
     return {key: value for key, value in fields.items() if value is not None}

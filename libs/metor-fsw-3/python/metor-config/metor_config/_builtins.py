@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Sequence, TypeVar
 
 from . import _generated
+from ._cal import Calibrated
 from ._config import NANOS_PER_SEC, ConfigError
+from ._fields import Field
 from ._generated import IO_RECORDS, SequenceRegistry
 from ._io import Kind, PeerDial, TcpDial, TcpListen
 from ._model import (
@@ -532,7 +534,7 @@ class Mux(_generated.Mux):
 def _mux_inputs(outputs: dict[str, Record], on: Any, timestamp: Any) -> list[OutPort[Any]]:
     """The distinct frame ports the mappings, ``on``, and ``timestamp`` read, in order."""
     ports: list[OutPort[Any]] = []
-    sources = [f.port for r in outputs.values() for f in r._mapping.values()]
+    sources = [_source(f).port for r in outputs.values() for f in r._mapping.values()]
     for port in sources + [on, timestamp]:
         if isinstance(port, OutPort) and all(port.name != p.name for p in ports):
             if port.record is None or port.record._kind != "frame":
@@ -571,5 +573,18 @@ def _duration(seconds: float) -> dict[str, int]:
     return {"secs": nanos // NANOS_PER_SEC, "nanos": nanos % NANOS_PER_SEC}
 
 
-def _fields(record: Record) -> list[dict[str, str]]:
-    return [{"dst": dst, "input": f.port.name, "src": f.path} for dst, f in record._mapping.items()]
+def _source(value: Field[Any] | Calibrated) -> Field[Any]:
+    return value.source if isinstance(value, Calibrated) else value
+
+
+def _fields(record: Record) -> list[dict[str, Any]]:
+    return [_field(dst, value) for dst, value in record._mapping.items()]
+
+
+def _field(dst: str, value: Field[Any] | Calibrated) -> dict[str, Any]:
+    """One mapping; a `Calibrated` one carries ``cal``."""
+    source = _source(value)
+    out: dict[str, Any] = {"dst": dst, "input": source.port.name, "src": source.path}
+    if isinstance(value, Calibrated):
+        out["cal"] = value.cal.to_json()
+    return out

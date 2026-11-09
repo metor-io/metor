@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Literal, Mapping
 
+from ._cal import Calibrated
 from ._fields import ArrayField, Field, _given
 from ._model import OutPort, Pack, Record, System
 
@@ -56,7 +57,7 @@ class ChannelStatus(Record):
     _pack = PACK
     _fields = {"state": "u32", "loaded": "u32", "artifact": "u8[64]", "hash": "u8[32]", "elapsed": "f64", "abort_elapsed": "f64", "accepts": "u32"}
 
-    def __init__(self, *, state: Field[Literal["u32"]] | None = None, loaded: Field[Literal["u32"]] | None = None, artifact: Field[Literal["u8[64]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, hash: Field[Literal["u8[32]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, elapsed: Field[Literal["f64"]] | None = None, abort_elapsed: Field[Literal["f64"]] | None = None, accepts: Field[Literal["u32"]] | None = None) -> None:
+    def __init__(self, *, state: Field[Literal["u32"]] | None = None, loaded: Field[Literal["u32"]] | None = None, artifact: Field[Literal["u8[64]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, hash: Field[Literal["u8[32]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, elapsed: Field[Literal["f64"]] | Calibrated | None = None, abort_elapsed: Field[Literal["f64"]] | Calibrated | None = None, accepts: Field[Literal["u32"]] | None = None) -> None:
         super().__init__(**_given({"state": state, "loaded": loaded, "artifact": artifact, "hash": hash, "elapsed": elapsed, "abort_elapsed": abort_elapsed, "accepts": accepts}))
 
 

@@ -156,15 +156,15 @@ impl Tree<'_> {
     }
 
     /// A keyword's annotation: a field, or for an array a mapping from index
-    /// to a field of its element.
+    /// to a field of its element. A scalar `f64` also takes a `Calibrated`.
     fn keyword_type(&self, path: &str) -> String {
-        let whole = field_type(&self.signature(path));
+        let whole = mapped_type(&self.signature(path));
         let element = match self.leaves.iter().find(|(leaf, _)| leaf == path) {
             Some((_, signature)) => element_signature(signature),
             None => self.index_run(path),
         };
         match element {
-            Some(element) => format!("{whole} | Mapping[int, {}]", field_type(&element)),
+            Some(element) => format!("{whole} | Mapping[int, {}]", mapped_type(&element)),
             None => whole,
         }
     }
@@ -284,6 +284,15 @@ fn value_type(signature: &str) -> String {
     array_type(signature).unwrap_or_else(|| field_type(signature))
 }
 
+/// What a mapping of `signature` takes: a field, or for a scalar `f64` also
+/// a `Calibrated`.
+fn mapped_type(signature: &str) -> String {
+    match signature {
+        "f64" => format!("{} | Calibrated", field_type(signature)),
+        _ => field_type(signature),
+    }
+}
+
 fn field_type(signature: &str) -> String {
     format!("Field[Literal[{}]]", quoted(signature))
 }
@@ -365,10 +374,13 @@ mod tests {
         assert_eq!(v.body, "ArrayField(self, \"v\", \"f64[4]\")");
         assert_eq!(
             a.keywords[0].annotation,
-            "Field[Literal[\"f64[4]\"]] | Mapping[int, Field[Literal[\"f64\"]]]"
+            "Field[Literal[\"f64[4]\"]] | Mapping[int, Field[Literal[\"f64\"]] | Calibrated]"
         );
         assert_eq!(a.classes[0].accessors[1].returns, "Field[Literal[\"f64\"]]");
-        assert_eq!(a.keywords[1].annotation, "Field[Literal[\"f64\"]]");
+        assert_eq!(
+            a.keywords[1].annotation,
+            "Field[Literal[\"f64\"]] | Calibrated"
+        );
     }
 
     #[test]
@@ -414,5 +426,21 @@ mod tests {
         }
         assert_eq!(element_signature("{a:f64}"), None);
         assert_eq!(element_signature("f64"), None);
+    }
+
+    #[test]
+    fn test_only_scalar_f64_takes_calibrated() {
+        let a = Accessors::of(
+            "F",
+            &leaves(&[("x", "f32"), ("n", "i32"), ("g.0", "f64"), ("g.1", "f64")]),
+        );
+        assert_eq!(a.keywords[0].annotation, "Field[Literal[\"f32\"]]");
+        assert_eq!(a.keywords[1].annotation, "Field[Literal[\"i32\"]]");
+        assert_eq!(
+            a.keywords[2].annotation,
+            "Field[Literal[\"{0:f64,1:f64}\"]] | Mapping[int, Field[Literal[\"f64\"]] | Calibrated]"
+        );
+        let matrix = Accessors::of("M", &leaves(&[("p", "f64[6,6]")]));
+        assert!(!matrix.keywords[0].annotation.contains("Calibrated"));
     }
 }

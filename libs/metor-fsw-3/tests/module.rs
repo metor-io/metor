@@ -369,6 +369,7 @@ struct Body {
     omega_b: FrameArray<f64, 3>,
     sun: FrameArray<f64, 6>,
     wheel: Wheel,
+    rate: f64,
 }
 
 /// The `sensors_stub` module the typing files import: a `plant` system that
