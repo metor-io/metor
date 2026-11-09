@@ -5,6 +5,8 @@ use core::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use super::cal::TcKind;
+
 /// Every input port and output of one mux.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct MuxParams {
@@ -49,10 +51,38 @@ pub enum StampParam {
     Now,
 }
 
-/// Copies input `input`'s field `src` to the output's field `dst`.
+/// Copies input `input`'s field `src` to the output's field `dst`, through
+/// `cal` when set.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct FieldMap {
     pub dst: String,
+    pub input: String,
+    pub src: String,
+    #[serde(default)]
+    pub cal: Option<CalParam>,
+}
+
+/// A calibration from a scalar `f64` to a scalar `f64`.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CalParam {
+    /// Ascending coefficients.
+    Poly(Vec<f64>),
+    /// `(x, y)` points in strictly increasing `x`.
+    Table(Vec<(f64, f64)>),
+    /// Cold-junction-compensated volts to °C.
+    Thermocouple { kind: TcKind },
+    /// `src / excitation` scaled from `span` to `eng`.
+    Ratiometric {
+        excitation: SourceParam,
+        span: (f64, f64),
+        eng: (f64, f64),
+    },
+}
+
+/// One field of one input.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct SourceParam {
     pub input: String,
     pub src: String,
 }

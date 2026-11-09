@@ -7734,6 +7734,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
+ "smallvec 1.16.0",
  "stellarator",
  "strsim 0.11.1",
  "supports-color",

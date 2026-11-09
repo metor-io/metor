@@ -1,5 +1,7 @@
 use super::*;
 use crate::def::{DefCx, Records};
+use crate::mux::cal::TcKind;
+use crate::mux::params::SourceParam;
 use crate::port::Output;
 use crate::record::Record;
 use crate::system::SystemDef;
@@ -28,6 +30,18 @@ struct Quad {
     b: crate::FrameArray<f64, 3>,
 }
 
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "gauge")]
+#[repr(C)]
+struct Gauge {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    s: f64,
+    v: crate::FrameArray<f64, 4>,
+    n: i32,
+    m: i32,
+}
+
 pub(crate) fn def<T: Record>(port: &str) -> PortDef {
     PortDef {
         name: port.to_string().into(),
@@ -44,6 +58,7 @@ pub(crate) fn records() -> Records {
         def::<Swapped>(Swapped::NAME),
         def::<Note>(Note::NAME),
         def::<Quad>(Quad::NAME),
+        def::<Gauge>(Gauge::NAME),
     ];
     Records::from_port_defs(defs.iter())
 }
@@ -64,6 +79,7 @@ pub(crate) fn map(dst: &str, input: &str, src: &str) -> FieldMap {
         dst: dst.into(),
         input: input.into(),
         src: src.into(),
+        cal: None,
     }
 }
 
@@ -110,6 +126,7 @@ fn copy(src: u32, dst: u32, len: u32) -> Copy {
         src,
         dst,
         len,
+        cal: None,
     }
 }
 
@@ -247,11 +264,11 @@ fn test_unbound_port() {
 fn test_apply() {
     let src = [1u8, 2, 3, 4];
     let mut dst = [0u8; 4];
-    assert!(apply(&copy(1, 2, 2), &src, &mut dst));
+    assert!(apply(&copy(1, 2, 2), &[], &src, &mut dst));
     assert_eq!(dst, [0, 0, 2, 3]);
-    assert!(!apply(&copy(3, 0, 2), &src, &mut dst));
-    assert!(!apply(&copy(0, 3, 2), &src, &mut dst));
-    assert!(!apply(&copy(u32::MAX, 0, 2), &src, &mut dst));
+    assert!(!apply(&copy(3, 0, 2), &[], &src, &mut dst));
+    assert!(!apply(&copy(0, 3, 2), &[], &src, &mut dst));
+    assert!(!apply(&copy(u32::MAX, 0, 2), &[], &src, &mut dst));
 }
 
 #[test]
@@ -323,4 +340,164 @@ fn test_element_path_refusals() {
     ));
     let message = index("q", "b.3").to_string();
     assert_eq!(message, "`q.b.3`: index past a dimension of 3");
+}
+
+/// `g` and `src.pair` into a `gauge` output `o` and a `quad` output `q`.
+fn calibrated(fields: Vec<FieldMap>, quad: Vec<FieldMap>) -> Result<Plan, MuxError> {
+    let params = MuxParams {
+        inputs: vec!["g".into(), "src.pair".into()],
+        outputs: vec![output("o", fields), output("q", quad)],
+    };
+    let def = system(
+        vec![def::<Gauge>("g"), def::<Pair>("src.pair")],
+        vec![def::<Gauge>("o"), def::<Quad>("q")],
+    );
+    resolve(&params, &def)
+}
+
+fn cal_map(dst: &str, src: &str, cal: CalParam) -> FieldMap {
+    FieldMap {
+        cal: Some(cal),
+        ..map(dst, "g", src)
+    }
+}
+
+fn linear() -> CalParam {
+    CalParam::Poly(vec![1.0, 2.0])
+}
+
+fn ratio(input: &str, src: &str, span: (f64, f64)) -> CalParam {
+    CalParam::Ratiometric {
+        excitation: SourceParam {
+            input: input.into(),
+            src: src.into(),
+        },
+        span,
+        eng: (0.0, 100.0),
+    }
+}
+
+fn cal_type(port: &str, path: &str) -> MuxError {
+    MuxError::CalType {
+        port: port.into(),
+        path: path.into(),
+    }
+}
+
+fn cal_table() -> MuxError {
+    MuxError::CalTable { dst: "o.s".into() }
+}
+
+#[test]
+fn test_calibrated_element() {
+    let plan = calibrated(vec![cal_map("s", "v.1", linear())], Vec::new()).expect("resolves");
+    let want = Copy {
+        cal: Some(0),
+        ..copy(24, 8, 8)
+    };
+    assert_eq!(plan.outs[0].copies, [want]);
+    assert_eq!(plan.cals, [Cal::poly(&[1.0, 2.0]).expect("finite")]);
+}
+
+#[test]
+fn test_calibrated_and_plain_in_one_output() {
+    let fields = vec![map("v", "g", "v"), cal_map("s", "s", linear())];
+    let quad = vec![FieldMap {
+        cal: Some(CalParam::Thermocouple { kind: TcKind::K }),
+        ..map("s", "src.pair", "a")
+    }];
+    let plan = calibrated(fields, quad).expect("resolves");
+    let cal = |input, src, at| Copy {
+        input,
+        cal: Some(at),
+        ..copy(src, 8, 8)
+    };
+    assert_eq!(plan.outs[0].copies, [copy(16, 16, 32), cal(0, 8, 0)]);
+    assert_eq!(plan.outs[1].copies, [cal(1, 8, 1)]);
+    assert_eq!(plan.cals[1], Cal::Thermocouple { kind: TcKind::K });
+}
+
+#[test]
+fn test_ratiometric_excitation_in_the_same_input() {
+    let plan = calibrated(
+        vec![cal_map("s", "v.0", ratio("g", "v.3", (0.0, 1.0)))],
+        Vec::new(),
+    );
+    let want = Cal::ratiometric(40, (0.0, 1.0), (0.0, 100.0)).expect("finite");
+    assert_eq!(plan.expect("resolves").cals, [want]);
+}
+
+#[test]
+fn test_apply_calibrates() {
+    let plan = calibrated(vec![cal_map("s", "v.1", linear())], Vec::new()).expect("resolves");
+    let c = plan.outs[0].copies[0];
+    let mut src = [0u8; 56];
+    src[24..32].copy_from_slice(&3.0f64.to_le_bytes());
+    let mut dst = [0u8; 56];
+    assert!(apply(&c, &plan.cals, &src, &mut dst));
+    assert_eq!(dst[8..16], 7.0f64.to_le_bytes());
+    assert!(!apply(&c, &[], &src, &mut dst), "a cal index past `cals`");
+    assert!(
+        !apply(&c, &plan.cals, &src[..30], &mut dst),
+        "a short source"
+    );
+    assert!(
+        !apply(&c, &plan.cals, &src, &mut dst[..12]),
+        "a short staging"
+    );
+}
+
+#[test]
+fn test_calibration_types_refused() {
+    let one = |dst: &str, src: &str| calibrated(vec![cal_map(dst, src, linear())], Vec::new());
+    assert_eq!(one("n", "s"), Err(cal_type("o", "n")));
+    assert_eq!(one("s", "n"), Err(cal_type("g", "n")));
+    assert_eq!(one("v", "s"), Err(cal_type("o", "v")));
+    assert_eq!(one("s", "v"), Err(cal_type("g", "v")));
+    let quad = vec![FieldMap {
+        cal: Some(linear()),
+        ..map("b", "src.pair", "a")
+    }];
+    assert_eq!(calibrated(Vec::new(), quad), Err(cal_type("q", "b")));
+    assert!(matches!(one("s", "w"), Err(MuxError::UnknownField { .. })));
+    assert!(matches!(one("s", "v.4"), Err(MuxError::Index { .. })));
+}
+
+#[test]
+fn test_excitation_refusals() {
+    let one = |cal| calibrated(vec![cal_map("s", "s", cal)], Vec::new());
+    let other = MuxError::CalInput {
+        dst: "o.s".into(),
+        input: "src.pair".into(),
+    };
+    assert_eq!(one(ratio("src.pair", "a", (0.0, 1.0))), Err(other));
+    assert_eq!(one(ratio("g", "v", (0.0, 1.0))), Err(cal_type("g", "v")));
+    assert_eq!(one(ratio("g", "n", (0.0, 1.0))), Err(cal_type("g", "n")));
+}
+
+#[test]
+fn test_calibration_table_refusals() {
+    let one = |cal| calibrated(vec![cal_map("s", "s", cal)], Vec::new());
+    assert_eq!(one(CalParam::Poly(Vec::new())), Err(cal_table()));
+    let unsorted = CalParam::Table(vec![(1.0, 0.0), (0.0, 1.0)]);
+    assert_eq!(one(unsorted), Err(cal_table()));
+    let flat = ratio("g", "v.0", (1.0, 1.0));
+    assert_eq!(one(flat), Err(cal_table()));
+    let message = cal_table().to_string();
+    assert_eq!(
+        message,
+        "`o.s`'s calibration is empty, unsorted, or has a zero-width span"
+    );
+}
+
+#[test]
+fn test_too_many_cals() {
+    let cal = || Cal::Thermocouple { kind: TcKind::K };
+    let mut cals = vec![cal(); MAX_CALS - 1];
+    assert_eq!(push_cal(&mut cals, cal()), Ok(u16::MAX));
+    assert_eq!(
+        push_cal(&mut cals, cal()),
+        Err(MuxError::TooManyCals(MAX_CALS + 1))
+    );
+    assert_eq!(cals.len(), MAX_CALS);
 }

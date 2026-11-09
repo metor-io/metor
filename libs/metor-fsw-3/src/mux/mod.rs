@@ -3,11 +3,13 @@
 //! Each output is a list of field copies from the mux's inputs, resolved at
 //! make against the record registry. See `docs/muxes.md`.
 
+pub mod cal;
 pub mod params;
 pub mod plan;
 mod step;
 
-pub use params::{FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
+pub use cal::{Cal, TcKind};
+pub use params::{CalParam, FieldMap, MuxParams, OutParam, SourceParam, StampParam, TriggerParam};
 pub use plan::{MuxError, Plan};
 pub use step::Mux;
 

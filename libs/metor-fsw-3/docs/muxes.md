@@ -79,6 +79,26 @@ BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})  # dst paths open.0, open.1
   dimension, so `p.1.2` of `f64[6,6]` is `f64`. Elements use the separator
   that struct arrays use, so a path names the same element whether a plain
   `[T; N]` is split into leaves or a `FrameArray` or tensor is one leaf.
+- A mapping is a byte copy or a calibration. A calibration maps a scalar
+  `f64` source to a scalar `f64` destination, either a scalar leaf or an
+  element such as `v.5`; anything else fails make with `CalType`.
+- Calibration kinds:
+
+  | Kind | Evaluates |
+  |---|---|
+  | `poly` | `c0 + c1·x + ..`, by Horner |
+  | `table` | linear between `(x, y)` points, clamped to the end points |
+  | `thermocouple` | the NIST ITS-90 inverse for type K, J, T, or E: cold-junction-compensated volts to °C; NaN outside the NIST ranges |
+  | `ratiometric` | `x / excitation` mapped from `span` to `eng` |
+
+  A ratiometric `excitation` is a scalar `f64` of the mapping's own input,
+  since `take` applies one record at a time; another input fails make with
+  `CalInput`. An empty poly, an empty or unsorted table, or a zero-width
+  span fails make with `CalTable`.
+- A NaN source gives a NaN destination in every kind. Nothing panics: a zero
+  excitation gives a non-finite value.
+- Drivers emit volts, and volts stay in telemetry. A calibration writes the
+  engineering value to the mux's output alongside them.
 - Inputs that are not the trigger are latest-only: each record overwrites
   its fields in the output's staging.
 - An output never emits before every input it maps has delivered once.
@@ -125,13 +145,20 @@ at most one per dimension. The element lowers to one byte copy at
 with `MuxError::Index`; any other unresolved path is `UnknownField`. Make
 checks bounds itself, since a hand-written config skips Python.
 
+A calibrated mapping lowers to one 8-byte copy with `cal: Some(i)`, an index
+into the plan's `cals`, which are built at make: a poly's coefficients past
+two spill to the heap, a table is a boxed slice, and an excitation is its
+byte offset in the source record. `apply` reads the `f64` at `src`,
+evaluates, and writes the `f64` at `dst`. A mux holds at most 65 536
+calibrations (`TooManyCals`).
+
 A frame output is re-rooted at `{ns}.{id}.{port}`, so two systems emitting
 one record announce distinct components.
 
 ## Allocation and failure
 
 Everything is allocated at make. Steady state borrows input records from the
-ring, copies into fixed staging, and writes the staging. A full output ring
+ring, copies or calibrates into fixed staging, and writes the staging. A full output ring
 counts toward `publish_dropped`. A record shorter than its frame is skipped
 with a fault. A record the ring cannot read is skipped; a cycle with any
 logs one `mux` fault.

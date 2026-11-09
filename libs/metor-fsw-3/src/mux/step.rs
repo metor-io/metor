@@ -114,7 +114,7 @@ impl Mux {
         for (out, state) in self.plan.outs.iter().zip(&mut self.outs) {
             let mine = out.copies.iter().filter(|c| usize::from(c.input) == input);
             for copy in mine {
-                apply(copy, record, &mut state.staging);
+                apply(copy, &self.plan.cals, record, &mut state.staging);
             }
             state.fresh |= bit(input);
         }

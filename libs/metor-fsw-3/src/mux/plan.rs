@@ -2,23 +2,28 @@
 
 use std::borrow::Cow;
 
+use metor_proto::types::PrimType;
+
 use crate::fn_system::Bound;
 use crate::frame_fields::{ElementError, FieldError, FieldTable, Leaf};
 use crate::system::PortDef;
 
-use super::params::{FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
+use super::cal::{Cal, read_f64};
+use super::params::{CalParam, FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
 
 /// The most inputs a mux takes; each is one bit of a `u64` mask.
 pub const MAX_INPUTS: usize = 64;
 
 /// Copies `len` bytes from offset `src` of input `input`'s record to offset
-/// `dst` of an output's staging.
+/// `dst` of an output's staging, or writes `Plan::cals[cal]` of the `f64` at
+/// `src` as an `f64` at `dst`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Copy {
     pub input: u16,
     pub src: u32,
     pub dst: u32,
     pub len: u32,
+    pub cal: Option<u16>,
 }
 
 /// When an output emits.
@@ -61,12 +66,14 @@ pub struct OutSpec {
 }
 
 /// A mux's resolved inputs and outputs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub ins: Vec<InSpec>,
     pub outs: Vec<OutSpec>,
     /// The order inputs drain in: inputs that trigger no output first.
     pub order: Vec<usize>,
+    /// The calibrations copies index.
+    pub cals: Vec<Cal>,
 }
 
 /// Why a mux's params do not fit its bound ports.
@@ -94,7 +101,18 @@ pub enum MuxError {
         path: String,
         len: usize,
     },
+    #[error("`{port}.{path}` is not a scalar f64; a calibration maps f64 to f64")]
+    CalType { port: String, path: String },
+    #[error("`{dst}`'s excitation is in `{input}`, not the mapping's input")]
+    CalInput { dst: String, input: String },
+    #[error("`{dst}`'s calibration is empty, unsorted, or has a zero-width span")]
+    CalTable { dst: String },
+    #[error("a mux takes at most {MAX_CALS} calibrations, got {0}")]
+    TooManyCals(usize),
 }
+
+/// The most calibrations a mux holds; each `Copy` indexes one by `u16`.
+pub const MAX_CALS: usize = u16::MAX as usize + 1;
 
 impl Plan {
     /// Resolves `params` against the ports and records in `bound`.
@@ -107,10 +125,11 @@ impl Plan {
             .iter()
             .map(|port| port_table(&bound.def.inputs, bound, port))
             .collect::<Result<_, _>>()?;
+        let mut cals = Vec::new();
         let outs: Vec<OutSpec> = params
             .outputs
             .iter()
-            .map(|output| out_spec(output, &params.inputs, &ins, bound))
+            .map(|output| out_spec(output, &params.inputs, &ins, bound, &mut cals))
             .collect::<Result<_, _>>()?;
         let ins = ins
             .iter()
@@ -121,7 +140,12 @@ impl Plan {
             })
             .collect();
         let order = drain_order(&outs, params.inputs.len());
-        Ok(Self { ins, outs, order })
+        Ok(Self {
+            ins,
+            outs,
+            order,
+            cals,
+        })
     }
 }
 
@@ -130,6 +154,7 @@ fn out_spec(
     names: &[String],
     ins: &[(usize, FieldTable)],
     bound: &Bound<'_>,
+    cals: &mut Vec<Cal>,
 ) -> Result<OutSpec, MuxError> {
     let (port, table) = port_table(&bound.def.outputs, bound, &output.port)?;
     let mut copies = Vec::new();
@@ -137,13 +162,19 @@ fn out_spec(
     for map in &output.fields {
         let input = input_index(names, &map.input)?;
         deps |= 1 << input;
-        copies.extend(field_copies(
-            map,
-            input,
-            &ins[input].1,
-            &table,
-            &output.port,
-        )?);
+        let (src, dst) = (&ins[input].1, &table);
+        match &map.cal {
+            Some(cal) => copies.push(calibrated_copy(
+                cal,
+                map,
+                input,
+                src,
+                dst,
+                &output.port,
+                cals,
+            )?),
+            None => copies.extend(field_copies(map, input, src, dst, &output.port)?),
+        }
     }
     Ok(OutSpec {
         port,
@@ -288,12 +319,92 @@ fn field_copies(
         src: s.offset,
         dst: d.offset,
         len: d.len,
+        cal: None,
     };
     Ok(dsts.iter().zip(&srcs).map(copy).collect())
 }
 
-/// Copies `c` from `src` into `dst`; `false` when out of range.
-pub fn apply(c: &Copy, src: &[u8], dst: &mut [u8]) -> bool {
+/// One copy from a scalar `f64` through `param` to a scalar `f64`, its
+/// calibration pushed onto `cals`.
+fn calibrated_copy(
+    param: &CalParam,
+    map: &FieldMap,
+    input: usize,
+    src: &FieldTable,
+    dst: &FieldTable,
+    port: &str,
+    cals: &mut Vec<Cal>,
+) -> Result<Copy, MuxError> {
+    let dst_at = scalar_f64(dst, &map.dst, port)?;
+    let src_at = scalar_f64(src, &map.src, &map.input)?;
+    let cal = lower(param, map, src, port)?;
+    Ok(Copy {
+        input: to_u16(input),
+        src: src_at,
+        dst: dst_at,
+        len: F64_LEN,
+        cal: Some(push_cal(cals, cal)?),
+    })
+}
+
+const F64_LEN: u32 = 8;
+
+/// The offset of the scalar `f64` leaf at `path`.
+fn scalar_f64(table: &FieldTable, path: &str, port: &str) -> Result<u32, MuxError> {
+    match side(table, path, port)?.as_slice() {
+        [("", leaf)] if leaf.ty == PrimType::F64 && leaf.shape.is_empty() => Ok(leaf.offset),
+        _ => Err(MuxError::CalType {
+            port: port.to_string(),
+            path: path.to_string(),
+        }),
+    }
+}
+
+/// Builds `param` for `map`, resolving an excitation in `src`.
+fn lower(param: &CalParam, map: &FieldMap, src: &FieldTable, port: &str) -> Result<Cal, MuxError> {
+    let bad = || MuxError::CalTable {
+        dst: format!("{port}.{}", map.dst),
+    };
+    match param {
+        CalParam::Poly(coeffs) => Cal::poly(coeffs).ok_or_else(bad),
+        CalParam::Table(points) => Cal::table(points).ok_or_else(bad),
+        CalParam::Thermocouple { kind } => Ok(Cal::Thermocouple { kind: *kind }),
+        CalParam::Ratiometric {
+            excitation,
+            span,
+            eng,
+        } => {
+            if excitation.input != map.input {
+                return Err(MuxError::CalInput {
+                    dst: format!("{port}.{}", map.dst),
+                    input: excitation.input.clone(),
+                });
+            }
+            let at = scalar_f64(src, &excitation.src, &map.input)?;
+            Cal::ratiometric(at, *span, *eng).ok_or_else(bad)
+        }
+    }
+}
+
+/// Pushes `cal` and returns its index.
+fn push_cal(cals: &mut Vec<Cal>, cal: Cal) -> Result<u16, MuxError> {
+    let index = u16::try_from(cals.len()).map_err(|_| MuxError::TooManyCals(cals.len() + 1))?;
+    cals.push(cal);
+    Ok(index)
+}
+
+/// Applies `c` from `src` into `dst`; `false` when out of range or `c`'s
+/// calibration is not in `cals`.
+pub fn apply(c: &Copy, cals: &[Cal], src: &[u8], dst: &mut [u8]) -> bool {
+    match c.cal {
+        None => copy_bytes(c, src, dst),
+        Some(i) => cals
+            .get(usize::from(i))
+            .is_some_and(|cal| calibrate(cal, c, src, dst)),
+    }
+}
+
+fn copy_bytes(c: &Copy, src: &[u8], dst: &mut [u8]) -> bool {
     let range = |at: u32| {
         let start = usize::try_from(at).ok()?;
         Some(start..start.checked_add(usize::try_from(c.len).ok()?)?)
@@ -308,6 +419,21 @@ pub fn apply(c: &Copy, src: &[u8], dst: &mut [u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Writes `cal` of the `f64` at `c.src` as an `f64` at `c.dst`.
+fn calibrate(cal: &Cal, c: &Copy, src: &[u8], dst: &mut [u8]) -> bool {
+    let Some(x) = read_f64(src, c.src) else {
+        return false;
+    };
+    let to = usize::try_from(c.dst)
+        .ok()
+        .and_then(|at| dst.get_mut(at..at.checked_add(8)?));
+    let Some(to) = to else {
+        return false;
+    };
+    to.copy_from_slice(&cal.eval(x, src).to_le_bytes());
+    true
 }
 
 #[cfg(all(test, feature = "host"))]

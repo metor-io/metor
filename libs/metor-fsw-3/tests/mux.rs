@@ -110,8 +110,12 @@ fn host(sink: &Sink) -> SystemTable {
 
 /// Steps cycles 1 to 12, one millisecond each.
 fn run() -> (Vec<Half>, Vec<Both>) {
+    run_config(config())
+}
+
+fn run_config(config: CoordinatorConfig) -> (Vec<Half>, Vec<Both>) {
     let sink = Sink::default();
-    let mut coordinator = config().build(&host(&sink)).expect("builds");
+    let mut coordinator = config.build(&host(&sink)).expect("builds");
     for ms in 1..=12 {
         coordinator.step(Timestamp(ms * 1000));
     }
@@ -145,4 +149,20 @@ fn test_split_and_combine() {
         [5, 6, 7, 10, 11, 12],
         "max_age withholds while stale"
     );
+}
+
+#[test]
+fn test_calibrated_mapping() {
+    let mut config = config();
+    let split = config
+        .systems
+        .iter_mut()
+        .find(|system| system.id == "split")
+        .expect("the split mux");
+    split.params["outputs"][0]["fields"][0]["cal"] = serde_json::json!({"poly": [1.0, 0.5]});
+    let (halves, _) = run_config(config);
+    assert_eq!(halves.len(), 12);
+    for half in halves {
+        assert_eq!(half.a, 1.0 + 0.5 * half.timestamp.0 as f64);
+    }
 }

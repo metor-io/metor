@@ -38,6 +38,7 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
+smallvec = { version = "1.11.2", features = ["const_generics", "union"] }
 strsim = { version = "0.11", optional = true }
 supports-color = { version = "3", optional = true }
 terminal-colorsaurus = { version = "1", optional = true }
