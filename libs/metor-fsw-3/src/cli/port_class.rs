@@ -351,10 +351,9 @@ mod tests {
     #[test]
     fn test_numeric_segments_get_no_property() {
         let a = Accessors::of("C", &leaves(&[("css.0", "f64"), ("css.1", "f64")]));
-        assert!(
-            a.keywords[0]
-                .annotation
-                .starts_with("Field[Literal[\"{0:f64,1:f64}\"]] | Mapping")
+        assert_eq!(
+            a.keywords[0].annotation,
+            "Field[Literal[\"{0:f64,1:f64}\"]] | Mapping[int, Field[Literal[\"f64\"]] | Calibrated]"
         );
         assert_eq!(a.classes.len(), 2);
         assert!(a.classes[1].accessors.is_empty());

@@ -159,15 +159,15 @@ composites. The hardware conventions themselves (leaves, parts, slots,
      decimal segments, at most rank many. An index at or past its dimension
      raises `ConfigError("`{path}`: index {i} is past dimension {d}")`; any
      other miss returns `None`.
-   - `Field.__getitem__(self, i: int) -> Field[Any]`: refuses a non-`int`, a
-     `bool`, and a negative index with `ConfigError`, then returns
-     `self.port.field(f"{self.path}.{i}")`. Scalars and groups without that
-     child raise through `OutPort.field`.
-   - `Field.__iter__ = None`, so `__getitem__` does not make a field
-     iterable (`list(field)` raises `TypeError` as today).
    - `class ArrayField(Field[S], Generic[S, E])` with
-     `def __getitem__(self, i: int) -> E`, a typed view over the base method.
+     `def __getitem__(self, i: int) -> E`: refuses a non-`int`, a `bool`,
+     and a negative index with `ConfigError`, then returns
+     `self.port.field(f"{self.path}.{i}")`. `Field` has no `__getitem__`.
      Hand-written, not generated; stubgen only writes its type arguments.
+   - `ArrayField.__iter__ = None`, so `__getitem__` does not make a field
+     iterable (`list(field)` raises `TypeError` as today).
+   - `OutPort.field` returns an `ArrayField` for a shaped leaf or element,
+     or a group whose children are `0..N`.
 2. `OutPort.field` and `Record.__init__` accept element paths through
    `signature` with no further change.
 3. Destination mappings in `Record.__init__` (`_model.py:35`):
@@ -368,7 +368,8 @@ leaves already.
 9. `tests/mux.rs`: a calibrated mapping through a built coordinator: a
    source emits volts, the output holds engineering values each cycle.
 10. Kani in `cal.rs`:
-    - `poly_never_panics`: any `[f64; 3]`, any length `0..=3`, any `x`.
+    - `poly_bounded_is_finite`: any `[f64; 3]`, any length `0..=3`, any
+      `x`, all within `±1e3`; the result is finite.
     - `table_never_panics`: any `[(f64, f64); 3]` with strictly increasing
       finite `x`, any length `1..=3`, any `x`; when `x <= x0` the result is
       `y0`, when `x >= xn` it is `yn`.
@@ -454,13 +455,15 @@ documented, not refused.
 1. Tests:
    - `tests/io.rs` (`through_the_io_steps`, next to
      `datagram_to_itself_completes_a_recv`, `:345`):
-     - `mixed_target_runs_on_a_wall_clock`: the UDP `pinger` on a real
+     - `mixed_target_delivers_real_and_sim`: the UDP `pinger` on a real
        loopback socket and the echo-pack `gps` driver with a model over a
        `SimUart` in one config, `Clock::Wall`, run with
        `common::after_cycles` until both a ping and a fix arrive, bounded
        by `common::within`;
      - `model_holding_a_real_resource_runs`: the `pinger` placed between
        `io_submit` and `io_complete`; its datagram completes.
+     - `simulated_clock_with_a_real_resource_builds`: the `pinger` on a
+       real socket under `Clock::Simulated` is not refused at build.
    - `python/metor-config/tests/test_io.py`: next to
      `test_real_and_sim_resources_mix` (`:261`),
      `test_model_may_hold_a_real_resource`: `fsw.sim("rig", Gps(uart=fsw.resource("p", Tty(..))))`
@@ -554,7 +557,7 @@ METOR_BLESS=1 cargo test -p metor-fsw-3 --test module    # regenerate _generated
 cargo test -p metor-fsw-3                                 # default features: host, db
 cargo clippy -p metor-fsw-3 --all-targets
 cargo kani -p metor-fsw-3 --lib --no-default-features --harness locate_in_bounds
-cargo kani -p metor-fsw-3 --lib --no-default-features --harness poly_never_panics
+cargo kani -p metor-fsw-3 --lib --no-default-features --harness poly_bounded_is_finite
 cargo kani -p metor-fsw-3 --lib --no-default-features --harness table_never_panics
 cargo kani -p metor-fsw-3 --lib --no-default-features --harness read_f64_in_bounds
 (cd python/metor-config && python -m pytest tests)

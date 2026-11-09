@@ -20,3 +20,4 @@ Body(rate=Calibrated(plant.sensors.gyro_b, linear))  # expect-error
 Body(omega_b=Calibrated(plant.sensors.gyro_b[0], linear))  # expect-error
 Body(rate=Calibrated(plant.sensors.wheel.speed, linear))
 Cal.thermocouple("S")  # expect-error
+plant.sensors.wheel.speed[0]  # expect-error

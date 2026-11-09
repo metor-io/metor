@@ -28,20 +28,26 @@ class Field(Generic[S]):
     def __repr__(self) -> str:
         return f"Field({self.port.name}.{self.path}: {self.signature})"
 
-    def __getitem__(self, i: int) -> Field[Any]:
+
+class ArrayField(Field[S], Generic[S, E]):
+    """A shaped leaf, or a split array, whose elements are ``E``."""
+
+    def __getitem__(self, i: int) -> E:
         """Element ``i`` of a shaped leaf, or child ``i`` of a split array."""
         where = f"{self.port.name}.{self.path}"
-        return self.port.field(f"{self.path}.{index(i, where)}")
+        return cast(E, self.port.field(f"{self.path}.{index(i, where)}"))
 
     __iter__ = None
     """Indexing does not make a field iterable."""
 
 
-class ArrayField(Field[S], Generic[S, E]):
-    """A field whose elements are ``E``."""
-
-    def __getitem__(self, i: int) -> E:
-        return cast(E, super().__getitem__(i))
+def indexable(fields: dict[str, str], path: str, sig: str) -> bool:
+    """Whether ``path`` is shaped, or a group whose children are ``0..N``."""
+    if not sig.startswith("{"):
+        return bool(parse(sig)[1])
+    prefix = f"{path}."
+    children = {leaf[len(prefix) :].split(".")[0] for leaf in fields if leaf.startswith(prefix)}
+    return children == {str(i) for i in range(len(children))}
 
 
 def index(i: object, where: str) -> int:

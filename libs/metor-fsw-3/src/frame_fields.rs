@@ -111,9 +111,8 @@ impl FieldTable {
     /// The element of a shaped leaf at `path`, as its own leaf.
     pub fn element(&self, path: &str) -> Result<Leaf, ElementError> {
         let (leaf, rest) = self.prefix_of(path).ok_or(ElementError::Unknown)?;
-        let indices = indices(rest, &leaf.shape)?;
-        let (off, len) =
-            locate(&leaf.shape, leaf.ty.size(), &indices).ok_or(ElementError::Unknown)?;
+        let indices = indices(rest).ok_or(ElementError::Unknown)?;
+        let (off, len) = locate(&leaf.shape, leaf.ty.size(), &indices)?;
         let shape = leaf
             .shape
             .get(indices.len()..)
@@ -149,37 +148,36 @@ pub enum ElementError {
     Index { len: usize },
 }
 
-/// `rest`'s segments as indices into `shape`.
-fn indices(rest: &str, shape: &[usize]) -> Result<Vec<usize>, ElementError> {
-    let indices: Vec<usize> = rest
-        .split('.')
-        .map(index)
-        .collect::<Option<_>>()
-        .ok_or(ElementError::Unknown)?;
-    if indices.len() > shape.len() {
-        return Err(ElementError::Unknown);
-    }
-    match indices.iter().zip(shape).find(|(i, d)| i >= d) {
-        Some((_, &len)) => Err(ElementError::Index { len }),
-        None => Ok(indices),
-    }
+/// `rest`'s segments as indices.
+fn indices(rest: &str) -> Option<Vec<usize>> {
+    rest.split('.').map(index).collect()
 }
 
 /// `(offset, len)` in bytes of the element at `indices` of a `shape` of
-/// `size`-byte elements, relative to the leaf; `None` past a dimension.
-fn locate(shape: &[usize], size: usize, indices: &[usize]) -> Option<(usize, usize)> {
-    let (head, tail) = (shape.get(..indices.len())?, shape.get(indices.len()..)?);
-    let len = tail.iter().try_fold(size, |acc, &d| acc.checked_mul(d))?;
+/// `size`-byte elements, relative to the leaf.
+fn locate(shape: &[usize], size: usize, indices: &[usize]) -> Result<(usize, usize), ElementError> {
+    let unknown = ElementError::Unknown;
+    let (head, tail) = (
+        shape.get(..indices.len()).ok_or(unknown)?,
+        shape.get(indices.len()..).ok_or(unknown)?,
+    );
+    if let Some((_, &len)) = indices.iter().zip(head).find(|(i, d)| i >= d) {
+        return Err(ElementError::Index { len });
+    }
+    let len = tail
+        .iter()
+        .try_fold(size, |acc, &d| acc.checked_mul(d))
+        .ok_or(unknown)?;
     let mut stride = len;
     let mut off = 0usize;
     for (&i, &d) in indices.iter().zip(head).rev() {
-        if i >= d {
-            return None;
-        }
-        off = off.checked_add(i.checked_mul(stride)?)?;
-        stride = stride.checked_mul(d)?;
+        off = i
+            .checked_mul(stride)
+            .and_then(|step| off.checked_add(step))
+            .ok_or(unknown)?;
+        stride = stride.checked_mul(d).ok_or(unknown)?;
     }
-    Some((off, len))
+    Ok((off, len))
 }
 
 /// A canonical decimal index: digits only, no leading zero but "0".
@@ -269,11 +267,11 @@ mod proofs {
         let (shape, indices) = (&dims[..rank], &idx[..count]);
         let inside = indices.iter().zip(shape).all(|(i, d)| i < d);
         match locate(shape, size, indices) {
-            Some((off, len)) => {
+            Ok((off, len)) => {
                 assert!(inside);
                 assert!(off + len <= size * shape.iter().product::<usize>());
             }
-            None => assert!(!inside),
+            Err(e) => assert!(!inside && matches!(e, ElementError::Index { .. })),
         }
     }
 }

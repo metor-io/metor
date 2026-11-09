@@ -23,6 +23,7 @@ class Cal:
     """
 
     _param: Any
+    __hash__ = None  # type: ignore[assignment]
 
     @staticmethod
     def poly(coeffs: Sequence[float]) -> Cal:
@@ -104,15 +105,17 @@ class Calibrated:
 
     source: Field[Literal["f64"]]
     cal: Cal
+    __hash__ = None  # type: ignore[assignment]
 
 
 def _finite(name: str, values: Sequence[float], count: int | None = None) -> list[float]:
     """``values`` as floats; refuses a non-number, a NaN or inf, and a wrong count."""
     if not isinstance(values, (list, tuple)):
         raise ConfigError(f"`Cal.{name}` takes a list of numbers, got {values!r}")
+    if count is not None and len(values) != count:
+        raise ConfigError(f"`Cal.{name}` takes {count} numbers, got {values!r}")
     numbers = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
     out = [float(v) for v in numbers]
-    counted = count is None or len(out) == count
-    if len(numbers) != len(values) or not counted or not all(math.isfinite(v) for v in out):
+    if len(numbers) != len(values) or not all(math.isfinite(v) for v in out):
         raise ConfigError(f"`Cal.{name}` takes finite numbers, got {values!r}")
     return out

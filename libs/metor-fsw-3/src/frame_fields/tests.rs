@@ -191,11 +191,17 @@ fn test_element_refusals() {
 
 #[test]
 fn test_locate() {
-    assert_eq!(locate(&[6, 6], 8, &[]), Some((0, 288)));
-    assert_eq!(locate(&[6, 6], 8, &[2, 3]), Some((120, 8)));
-    assert_eq!(locate(&[6, 6], 8, &[6]), None);
-    assert_eq!(locate(&[2], 1, &[0, 0]), None);
-    assert_eq!(locate(&[2, usize::MAX], 8, &[1]), None);
+    assert_eq!(locate(&[6, 6], 8, &[]), Ok((0, 288)));
+    assert_eq!(locate(&[6, 6], 8, &[2, 3]), Ok((120, 8)));
+    assert_eq!(
+        locate(&[6, 6], 8, &[6]),
+        Err(ElementError::Index { len: 6 })
+    );
+    assert_eq!(locate(&[2], 1, &[0, 0]), Err(ElementError::Unknown));
+    assert_eq!(
+        locate(&[2, usize::MAX], 8, &[1]),
+        Err(ElementError::Unknown)
+    );
 }
 
 #[test]

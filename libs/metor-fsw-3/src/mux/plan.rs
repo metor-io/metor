@@ -8,7 +8,7 @@ use crate::fn_system::Bound;
 use crate::frame_fields::{ElementError, FieldError, FieldTable, Leaf};
 use crate::system::PortDef;
 
-use super::cal::{Cal, read_f64};
+use super::cal::{Cal, F64_LEN, f64_at, read_f64};
 use super::params::{CalParam, FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
 
 /// The most inputs a mux takes; each is one bit of a `u64` mask.
@@ -109,6 +109,8 @@ pub enum MuxError {
     CalTable { dst: String },
     #[error("a mux takes at most {MAX_CALS} calibrations, got {0}")]
     TooManyCals(usize),
+    #[error("`{port}.{a}` and `{port}.{b}` overlap")]
+    Overlap { port: String, a: String, b: String },
 }
 
 /// The most calibrations a mux holds; each `Copy` indexes one by `u16`.
@@ -158,24 +160,20 @@ fn out_spec(
 ) -> Result<OutSpec, MuxError> {
     let (port, table) = port_table(&bound.def.outputs, bound, &output.port)?;
     let mut copies = Vec::new();
+    let mut dsts = Vec::new();
     let mut deps = 0u64;
     for map in &output.fields {
         let input = input_index(names, &map.input)?;
         deps |= 1 << input;
-        let (src, dst) = (&ins[input].1, &table);
-        match &map.cal {
-            Some(cal) => copies.push(calibrated_copy(
-                cal,
-                map,
-                input,
-                src,
-                dst,
-                &output.port,
-                cals,
-            )?),
-            None => copies.extend(field_copies(map, input, src, dst, &output.port)?),
-        }
+        let mapped = map_copies(map, input, &ins[input].1, &table, &output.port, cals)?;
+        dsts.extend(
+            mapped
+                .iter()
+                .map(|c| (c.dst, c.dst.saturating_add(c.len), &*map.dst)),
+        );
+        copies.extend(mapped);
     }
+    disjoint(dsts, &output.port)?;
     Ok(OutSpec {
         port,
         copies,
@@ -186,6 +184,37 @@ fn out_spec(
         max_age: output.max_age.map(micros),
         len: table.len,
     })
+}
+
+/// The copies of `map`, one per leaf, or one calibrated copy.
+fn map_copies(
+    map: &FieldMap,
+    input: usize,
+    src: &FieldTable,
+    dst: &FieldTable,
+    port: &str,
+    cals: &mut Vec<Cal>,
+) -> Result<Vec<Copy>, MuxError> {
+    match &map.cal {
+        Some(cal) => Ok(vec![calibrated_copy(
+            cal, map, input, src, dst, port, cals,
+        )?]),
+        None => field_copies(map, input, src, dst, port),
+    }
+}
+
+/// Refuses two mappings writing a byte in common, given each copy's
+/// `(start, end, dst path)`.
+fn disjoint(mut dsts: Vec<(u32, u32, &str)>, port: &str) -> Result<(), MuxError> {
+    dsts.sort_by_key(|&(start, ..)| start);
+    match dsts.windows(2).find(|w| w[1].0 < w[0].1) {
+        Some([a, b]) => Err(MuxError::Overlap {
+            port: port.to_string(),
+            a: a.2.to_string(),
+            b: b.2.to_string(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Finds `port` in `ports` and reads the registry's table for its record.
@@ -283,7 +312,11 @@ fn relative<'a>(table: &'a FieldTable, path: &'a str) -> Result<Vec<Rel<'a>>, El
 
 /// `relative`, with its error named for `port`.
 fn side<'a>(table: &'a FieldTable, path: &'a str, port: &str) -> Result<Vec<Rel<'a>>, MuxError> {
-    relative(table, path).map_err(|e| match e {
+    relative(table, path).map_err(|e| named(e, port, path))
+}
+
+fn named(e: ElementError, port: &str, path: &str) -> MuxError {
+    match e {
         ElementError::Unknown => MuxError::UnknownField {
             port: port.to_string(),
             path: path.to_string(),
@@ -293,7 +326,7 @@ fn side<'a>(table: &'a FieldTable, path: &'a str, port: &str) -> Result<Vec<Rel<
             path: path.to_string(),
             len,
         },
-    })
+    }
 }
 
 /// One copy per leaf of `map`, pairing leaves by relative path.
@@ -347,16 +380,21 @@ fn calibrated_copy(
     })
 }
 
-const F64_LEN: u32 = 8;
-
-/// The offset of the scalar `f64` leaf at `path`.
+/// The offset of the scalar `f64` leaf or element at `path`.
 fn scalar_f64(table: &FieldTable, path: &str, port: &str) -> Result<u32, MuxError> {
-    match side(table, path, port)?.as_slice() {
-        [("", leaf)] if leaf.ty == PrimType::F64 && leaf.shape.is_empty() => Ok(leaf.offset),
-        _ => Err(MuxError::CalType {
-            port: port.to_string(),
-            path: path.to_string(),
-        }),
+    let cal_type = || MuxError::CalType {
+        port: port.to_string(),
+        path: path.to_string(),
+    };
+    let leaf = match table.leaves.iter().find(|leaf| leaf.path == path) {
+        Some(leaf) => Cow::Borrowed(leaf),
+        None if table.under(path).next().is_some() => return Err(cal_type()),
+        None => Cow::Owned(table.element(path).map_err(|e| named(e, port, path))?),
+    };
+    if leaf.ty == PrimType::F64 && leaf.shape.is_empty() {
+        Ok(leaf.offset)
+    } else {
+        Err(cal_type())
     }
 }
 
@@ -426,10 +464,7 @@ fn calibrate(cal: &Cal, c: &Copy, src: &[u8], dst: &mut [u8]) -> bool {
     let Some(x) = read_f64(src, c.src) else {
         return false;
     };
-    let to = usize::try_from(c.dst)
-        .ok()
-        .and_then(|at| dst.get_mut(at..at.checked_add(8)?));
-    let Some(to) = to else {
+    let Some(to) = f64_at(c.dst).and_then(|range| dst.get_mut(range)) else {
         return false;
     };
     to.copy_from_slice(&cal.eval(x, src).to_le_bytes());

@@ -525,10 +525,12 @@ A destination names elements with a mapping from index to field:
 BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})   # dst paths open.0, open.1
 ```
 
-- `Field.__getitem__(i)` takes an `int` and returns `port.field("{path}.{i}")`:
-  the element of a shaped leaf, whose signature drops the first dimension,
-  or child `i` of a split array. A negative index, an index past the end, a
-  scalar, or a group whose children are not `0..N` raises `ConfigError`.
+- `ArrayField.__getitem__(i)` takes an `int` and returns
+  `port.field("{path}.{i}")`: the element of a shaped leaf, whose signature
+  drops the first dimension, or child `i` of a split array. A negative
+  index or an index past the end raises `ConfigError`. A scalar or a group
+  whose children are not `0..N` is a plain `Field`, which has no
+  `__getitem__`; `OutPort.field` returns an `ArrayField` for the others.
 - `signature` (`metor_config/_fields.py:28`) resolves element paths, so
   `OutPort.field` and `Record.__init__` accept them.
 - Stubgen types elements. An array port property returns a generated
@@ -538,7 +540,9 @@ BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})   # dst paths open.0, open.1
   `Field[Literal["bool[16]"]] | Mapping[int, Field[Literal["bool"]]] | None`.
   Bounds are checked at runtime.
 - A record that maps a leaf whole and one of its elements, or one element
-  twice, raises `ConfigError`.
+  twice, raises `ConfigError`. Make refuses the same in a hand-written
+  config: two copies of one output whose destination bytes intersect fail
+  with `MuxError::Overlap { port, a, b }`.
 
 ### Semantics
 
@@ -568,7 +572,9 @@ relative path `""`. `field_copies` is unchanged, and so is `Copy`: an
 element lowers to one `(input, src, dst, len)` byte copy. `step.rs` and
 `apply` (`src/mux/plan.rs:277`) are unchanged.
 
-`MuxError` gains `Index { port, path, len }` for an index past a dimension.
+`MuxError` gains `Index { port, path, len }` for an index past a dimension,
+and `Overlap { port, a, b }` for two mappings whose destination bytes
+intersect.
 A segment that is not a decimal index stays `UnknownField`. Make checks
 bounds again, since a hand-written config skips Python.
 

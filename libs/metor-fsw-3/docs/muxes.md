@@ -59,13 +59,18 @@ raw.field("v.5")                           # the same, by path
 BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})  # dst paths open.0, open.1
 ```
 
-- `Field[i]` returns `port.field("{path}.{i}")`: the element of a shaped
-  leaf, or child `i` of a split array. A negative or non-`int` index, an
-  index past the end, a scalar, or a group without child `i` raises
-  `ConfigError`. Indexing does not make a field iterable.
+- Only an `ArrayField` indexes: `field[i]` returns
+  `port.field("{path}.{i}")`, the element of a shaped leaf or child `i` of
+  a split array. A negative or non-`int` index, or an index past the end,
+  raises `ConfigError`. A scalar or a group is a plain `Field`; indexing
+  one is a `TypeError`, and pyright refuses it. Indexing does not make a
+  field iterable.
 - A shaped leaf's property returns an `ArrayField[Literal[sig], E]`, whose
   `[i]` is typed `E`. A split array whose children are exactly `0..N` with
   one signature gets the same base class. Bounds are checked at runtime.
+- `port.field(path)` returns an `ArrayField` for a shaped leaf or element,
+  or a group whose children are `0..N`, but is typed `Field[Any]`; narrow
+  it with `isinstance`, or name the element as `field("x.1")`.
 - A record that maps a path and anything under it, such as a leaf and one
   of its elements, or one element twice, raises `ConfigError`.
 
@@ -174,6 +179,11 @@ at most one per dimension. The element lowers to one byte copy at
 `offset + flat(indices) * stride`. An index past its dimension fails make
 with `MuxError::Index`; any other unresolved path is `UnknownField`. Make
 checks bounds itself, since a hand-written config skips Python.
+
+Make also refuses two mappings of one output whose destination bytes
+intersect, calibrated or not, with `MuxError::Overlap` naming both paths:
+a leaf and one of its elements, or one path twice. Adjacent elements are
+disjoint.
 
 A calibrated mapping lowers to one 8-byte copy with `cal: Some(i)`, an index
 into the plan's `cals`, which are built at make: a poly's coefficients past

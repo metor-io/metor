@@ -6,6 +6,7 @@ import dataclasses
 import os
 import sys
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,7 +23,7 @@ from typing import (
 
 from ._cal import Calibrated
 from ._config import ConfigError
-from ._fields import Field, index, signature
+from ._fields import ArrayField, Field, index, indexable, signature
 
 T = TypeVar("T", bound="Record")
 
@@ -75,10 +76,13 @@ def _expand(record: type[Record], path: str, value: Any) -> list[tuple[str, Any]
 
 
 def _check_overlap(record: type[Record], paths: list[str]) -> None:
-    for i, a in enumerate(paths):
-        for b in paths[i + 1 :]:
-            if a == b or b.startswith(f"{a}.") or a.startswith(f"{b}."):
-                raise ConfigError(f"`{record.__name__}` maps `{a}` and `{b}`")
+    """Refuses a path twice, or a path and one under it.
+
+    Sorted by segments, the paths under a path follow it directly.
+    """
+    for a, b in pairwise(sorted(paths, key=lambda path: path.split("."))):
+        if a == b or b.startswith(f"{a}."):
+            raise ConfigError(f"`{record.__name__}` maps `{a}` and `{b}`")
 
 
 def _check_mapping(record: type[Record], path: str, source: Any) -> None:
@@ -168,6 +172,8 @@ class OutPort(Generic[T]):
         found = signature(self.record._fields, path)
         if found is None:
             raise ConfigError(f"`{self.name}` has no field `{path}`")
+        if indexable(self.record._fields, path, found):
+            return ArrayField(self, path, found)
         return Field(self, path, found)
 
 

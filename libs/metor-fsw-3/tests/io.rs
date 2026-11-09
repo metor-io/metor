@@ -460,9 +460,9 @@ mod through_the_io_steps {
         assert_eq!((last.bytes_out, last.bytes_in), (4, 4));
     }
 
-    /// A real UDP socket and a sim UART in one target, on a wall clock.
+    /// A real UDP socket and a sim UART in one target, both delivering.
     #[test]
-    fn mixed_target_runs_on_a_wall_clock() {
+    fn mixed_target_delivers_real_and_sim() {
         let (got, seen) = (Got::default(), Rc::<RefCell<usize>>::default());
         let mut table = table(&got);
         let s = seen.clone();
@@ -487,11 +487,30 @@ mod through_the_io_steps {
             ],
             ..CoordinatorConfig::default()
         };
-        assert!(matches!(config.clock, Clock::Wall { .. }));
         let mut c = config.build(&table).unwrap();
         let both = || !got.borrow().is_empty() && *seen.borrow() > 0;
         assert!(run_until(&mut c, both), "a ping and a fix arrive");
         assert_eq!(got.borrow().as_slice(), [b"ping".to_vec()]);
+    }
+
+    /// A simulated clock with a real resource is not refused at build.
+    #[test]
+    fn simulated_clock_with_a_real_resource_builds() {
+        let got = Got::default();
+        let config = CoordinatorConfig {
+            clock: Clock::Simulated {
+                dt: Duration::from_millis(10),
+                epoch: None,
+            },
+            resources: [("loop".to_string(), udp_loop())].into_iter().collect(),
+            systems: vec![
+                pinger_on("loop"),
+                SystemConfig::new("io_submit", IO_TYPE),
+                SystemConfig::new("io_complete", IO_TYPE),
+            ],
+            ..CoordinatorConfig::default()
+        };
+        assert!(config.build(&table(&got)).is_ok());
     }
 
     /// A system between the io steps may hold a real resource.

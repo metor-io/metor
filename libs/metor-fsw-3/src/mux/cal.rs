@@ -136,10 +136,18 @@ pub(crate) fn ratiometric(v: f64, excitation: f64, span: (f64, f64), eng: (f64, 
     eng.0 + t * (eng.1 - eng.0)
 }
 
+/// The size of an `f64`, which a calibration reads and writes.
+pub(crate) const F64_LEN: u32 = 8;
+
+/// The byte range of an `f64` at `at`.
+pub(crate) fn f64_at(at: u32) -> Option<core::ops::Range<usize>> {
+    let start = usize::try_from(at).ok()?;
+    Some(start..start.checked_add(usize::try_from(F64_LEN).ok()?)?)
+}
+
 /// An `f64` at `at`, little-endian.
 pub(crate) fn read_f64(record: &[u8], at: u32) -> Option<f64> {
-    let start = usize::try_from(at).ok()?;
-    let bytes = record.get(start..start.checked_add(8)?)?;
+    let bytes = record.get(f64_at(at)?)?;
     Some(f64::from_le_bytes(bytes.try_into().ok()?))
 }
 
@@ -152,7 +160,7 @@ mod proofs {
 
     #[kani::proof]
     #[kani::unwind(4)]
-    fn poly_never_panics() {
+    fn poly_bounded_is_finite() {
         let coeffs: [f64; 3] = kani::any();
         let (len, x): (usize, f64) = (kani::any(), kani::any());
         kani::assume(len <= 3);
@@ -186,6 +194,9 @@ mod proofs {
     fn read_f64_in_bounds() {
         let record: [u8; 16] = kani::any();
         let at: u32 = kani::any();
-        assert_eq!(read_f64(&record, at).is_some(), u64::from(at) + 8 <= 16);
+        assert_eq!(
+            read_f64(&record, at).is_some(),
+            u64::from(at) + u64::from(F64_LEN) <= 16
+        );
     }
 }

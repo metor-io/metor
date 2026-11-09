@@ -8,7 +8,7 @@ from typing import Any
 
 from adcs_stub import Nav, Plant
 
-from metor_config import Cal, ConfigError, Target
+from metor_config import Cal, Calibrated, ConfigError, Target
 
 
 class CalTest(unittest.TestCase):
@@ -56,6 +56,13 @@ class CalTest(unittest.TestCase):
             },
         )
 
+    def test_not_hashable(self) -> None:
+        linear = Cal.linear(gain=2.0, offset=0.0)
+        self.assertEqual(linear, Cal.linear(gain=2.0, offset=0.0))
+        for value in (linear, Calibrated(self.nav.est.field("bias.a"), linear)):
+            with self.assertRaises(TypeError):
+                hash(value)
+
     def test_refusals(self) -> None:
         excitation = self.nav.est.field("bias.a")
         cases: list[tuple[str, Any]] = [
@@ -67,11 +74,16 @@ class CalTest(unittest.TestCase):
             ("list", lambda: Cal.poly(1.0)),
             ("finite", lambda: Cal.linear(gain=math.nan, offset=0)),
             ("distinct", lambda: Cal.two_point(volts=(1, 1), eng=(0, 1))),
-            ("finite", lambda: Cal.two_point(volts=(0, 1, 2), eng=(0, 1))),
+            ("takes 2 numbers", lambda: Cal.two_point(volts=(0, 1, 2), eng=(0, 1))),
+            (
+                "takes 2 numbers",
+                lambda: Cal.ratiometric(excitation=excitation, span=(0,), eng=(0, 1)),
+            ),
             ("at least one", lambda: Cal.table([])),
             ("two points at x = 1.0", lambda: Cal.table([(1, 0), (1, 2)])),
             ("finite", lambda: Cal.table([(0, math.nan)])),
-            ("finite", lambda: Cal.table([(0, 1, 2)])),
+            ("takes 2 numbers", lambda: Cal.table([(0, 1, 2)])),
+            ("finite", lambda: Cal.table([(0, "1")])),
             ("one of", lambda: Cal.thermocouple("k")),
             ("one of", lambda: Cal.thermocouple("S")),
             (

@@ -501,3 +501,52 @@ fn test_too_many_cals() {
     );
     assert_eq!(cals.len(), MAX_CALS);
 }
+
+fn overlap(a: &str, b: &str) -> MuxError {
+    MuxError::Overlap {
+        port: "o".into(),
+        a: a.into(),
+        b: b.into(),
+    }
+}
+
+#[test]
+fn test_adjacent_destinations() {
+    let fields = vec![
+        map("v.0", "g", "s"),
+        map("v.1", "g", "v.3"),
+        map("s", "g", "v.0"),
+        map("v.2", "g", "v.2"),
+    ];
+    let plan = calibrated(fields, Vec::new()).expect("resolves");
+    assert_eq!(plan.outs[0].copies.len(), 4);
+}
+
+#[test]
+fn test_destination_edges() {
+    let fields = vec![map("v", "g", "v"), map("s", "g", "v.3"), map("n", "g", "m")];
+    assert!(
+        calibrated(fields, Vec::new()).is_ok(),
+        "neighbors of a whole leaf"
+    );
+    let quad = vec![map("v.3", "src.pair", "a"), map("b.0", "src.pair", "a")];
+    assert!(
+        calibrated(Vec::new(), quad).is_ok(),
+        "last and first elements"
+    );
+}
+
+#[test]
+fn test_overlapping_destinations() {
+    let one = |fields| calibrated(fields, Vec::new());
+    let leaf_and_element = vec![map("v", "g", "v"), map("v.2", "g", "s")];
+    assert_eq!(one(leaf_and_element), Err(overlap("v", "v.2")));
+    let element_twice = vec![map("v.1", "g", "s"), map("v.1", "g", "v.0")];
+    assert_eq!(one(element_twice), Err(overlap("v.1", "v.1")));
+    let leaf_twice = vec![map("s", "g", "s"), map("s", "g", "s")];
+    assert_eq!(one(leaf_twice), Err(overlap("s", "s")));
+    let calibrated_and_plain = vec![map("v.0", "g", "s"), cal_map("v.0", "s", linear())];
+    assert_eq!(one(calibrated_and_plain), Err(overlap("v.0", "v.0")));
+    let message = overlap("v", "v.2").to_string();
+    assert_eq!(message, "`o.v` and `o.v.2` overlap");
+}
