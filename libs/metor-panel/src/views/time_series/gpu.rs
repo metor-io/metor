@@ -641,7 +641,7 @@ impl PlotGpu {
             if plan.spans.is_empty() || i >= MAX_TRACES {
                 continue;
             }
-            let rgba = trace.color.to_rgb();
+            let rgba = gpui::hsla_to_rgba(trace.color);
             let lw = match trace.style {
                 PlotStyle::Bar => {
                     let visible_count = plan
@@ -656,7 +656,7 @@ impl PlotGpu {
                 PlotStyle::Line => trace.stroke_width * scale,
             };
             let uniform = LineUniform {
-                color: [rgba.r, rgba.g, rgba.b, rgba.a],
+                color: [rgba.red, rgba.green, rgba.blue, rgba.alpha],
                 line_width: lw,
                 _pad: [0.0; 3],
             };
@@ -2296,12 +2296,7 @@ mod tests {
                 y_min: -1.0,
                 y_max: 1.0,
                 style: PlotStyle::Line,
-                color: Hsla {
-                    h: 0.0,
-                    s: 0.0,
-                    l: 1.0,
-                    a: 1.0,
-                },
+                color: gpui::hsla(0.0, 0.0, 1.0, 1.0),
                 stroke_width: 1.0,
                 x_clip: None,
                 time_clip: None,
@@ -2418,7 +2413,7 @@ mod tests {
             y_min: -1.0,
             y_max: 1.0,
             style: PlotStyle::Line,
-            color: Hsla::white(),
+            color: gpui::white(),
             stroke_width: 1.0,
             x_clip: None,
             time_clip: None,
@@ -2490,7 +2485,7 @@ mod tests {
                     y_min: -1.0,
                     y_max: 1.0,
                     style: PlotStyle::Line,
-                    color: Hsla::white(),
+                    color: gpui::white(),
                     stroke_width: 1.0,
                     x_clip: None,
                     time_clip: None,

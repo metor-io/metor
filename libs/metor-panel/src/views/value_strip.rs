@@ -1,3 +1,4 @@
+use gpui::ColorExt;
 use std::sync::Arc;
 
 use gpui::{

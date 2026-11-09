@@ -10,6 +10,8 @@ tar-core = "0.1.0"
 sha2 = "0.10"
 gpui.workspace = true
 gpui_platform.workspace = true
+# gpui-ce's colour types are palette's; this must be the version it uses.
+palette = { version = "0.7.6", default-features = false, features = ["std"] }
 hifitime.version = "4.0"
 nucleo-matcher = "0.3"
 regex = "1"

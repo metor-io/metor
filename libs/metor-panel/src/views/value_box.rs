@@ -166,10 +166,11 @@ fn painted_text(
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                letter_spacing: None,
             };
             window
                 .text_system()
-                .shape_line(text.clone(), font_size, &[run], None)
+                .shape_line(text.clone(), font_size, &[run])
         },
         move |bounds, shaped, window, cx| {
             let x = match align_end {
@@ -177,16 +178,22 @@ fn painted_text(
                 false => bounds.origin.x + (bounds.size.width - shaped.width) / 2.0,
             };
             let origin = point(x.max(bounds.origin.x), bounds.origin.y);
-            window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                let _ = shaped.paint(
-                    origin,
-                    bounds.size.height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-            });
+            window.with_content_mask(
+                Some(ContentMask {
+                    bounds,
+                    fade_out: Default::default(),
+                }),
+                |window| {
+                    let _ = shaped.paint(
+                        origin,
+                        bounds.size.height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                },
+            );
         },
     )
     .size_full()

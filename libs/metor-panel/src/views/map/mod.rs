@@ -529,6 +529,7 @@ fn paint_tile(draw: &TileDraw, origin: Point<Pixels>, window: &mut Window) {
         bounds,
         bounds,
         Corners::default(),
+        0.,
         draw.image.clone(),
         0,
         false,
@@ -559,65 +560,72 @@ impl Render for Map {
                 }
             },
             move |bounds: Bounds<Pixels>, _, window, cx| {
-                window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    window.paint_quad(gpui::fill(bounds, backdrop));
-                    let size = (f64::from(bounds.size.width), f64::from(bounds.size.height));
-                    let origin = bounds.origin;
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds,
+                        fade_out: Default::default(),
+                    }),
+                    |window| {
+                        window.paint_quad(gpui::fill(bounds, backdrop));
+                        let size = (f64::from(bounds.size.width), f64::from(bounds.size.height));
+                        let origin = bounds.origin;
 
-                    if let Some(store) = tiles::try_global(cx) {
-                        let bias = source.zoom_bias(f64::from(window.scale_factor()));
-                        let (orphans, exact, fallback) = store.update(cx, |store, _| {
-                            resolve_tiles(store, &camera, size, bias, &source)
-                        });
-                        for image in orphans {
-                            crate::atlas::release_image(window, cx, image);
-                        }
-                        // Stand-ins first so every exact tile wins where
-                        // both cover a cell.
-                        for draw in fallback.iter().chain(exact.iter()) {
-                            paint_tile(draw, origin, window);
-                        }
-                    }
-
-                    if trail.len() >= 2 {
-                        let mut path = PathBuilder::stroke(px(1.5));
-                        let mut last: Option<Mercator> = None;
-                        for m in trail.iter().map(|m| wrap_toward(*m, camera.center)) {
-                            let (x, y) = camera.to_screen(m, size);
-                            let p = point(origin.x + px(x as f32), origin.y + px(y as f32));
-                            // A jump of half the world is the trail crossing
-                            // the antimeridian, not the vehicle teleporting.
-                            let jumped = last.map(|l| (l.x - m.x).abs() > 0.5).unwrap_or(true);
-                            if jumped {
-                                path.move_to(p);
-                            } else {
-                                path.line_to(p);
+                        if let Some(store) = tiles::try_global(cx) {
+                            let bias = source.zoom_bias(f64::from(window.scale_factor()));
+                            let (orphans, exact, fallback) = store.update(cx, |store, _| {
+                                resolve_tiles(store, &camera, size, bias, &source)
+                            });
+                            for image in orphans {
+                                crate::atlas::release_image(window, cx, image);
                             }
-                            last = Some(m);
+                            // Stand-ins first so every exact tile wins where
+                            // both cover a cell.
+                            for draw in fallback.iter().chain(exact.iter()) {
+                                paint_tile(draw, origin, window);
+                            }
                         }
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, trail_color);
-                        }
-                    }
 
-                    if let Some((lat, lon)) = position {
-                        let m = wrap_toward(project(lat, lon), camera.center);
-                        let (x, y) = camera.to_screen(m, size);
-                        let center = point(origin.x + px(x as f32), origin.y + px(y as f32));
-                        let r = px(MARKER_PX * ui_scale(window));
-                        let dot = Bounds::new(
-                            point(center.x - r, center.y - r),
-                            gpui::size(r * 2.0, r * 2.0),
-                        );
-                        // The house pill treatment: the hue washed out
-                        // inside, full strength around the edge.
-                        let mut quad = gpui::fill(dot, Theme::dim(marker_color, MARKER_FILL_ALPHA));
-                        quad.corner_radii = Corners::all(r);
-                        quad.border_widths = Edges::all(px(1.5));
-                        quad.border_color = marker_color;
-                        window.paint_quad(quad);
-                    }
-                });
+                        if trail.len() >= 2 {
+                            let mut path = PathBuilder::stroke(px(1.5));
+                            let mut last: Option<Mercator> = None;
+                            for m in trail.iter().map(|m| wrap_toward(*m, camera.center)) {
+                                let (x, y) = camera.to_screen(m, size);
+                                let p = point(origin.x + px(x as f32), origin.y + px(y as f32));
+                                // A jump of half the world is the trail crossing
+                                // the antimeridian, not the vehicle teleporting.
+                                let jumped = last.map(|l| (l.x - m.x).abs() > 0.5).unwrap_or(true);
+                                if jumped {
+                                    path.move_to(p);
+                                } else {
+                                    path.line_to(p);
+                                }
+                                last = Some(m);
+                            }
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, trail_color);
+                            }
+                        }
+
+                        if let Some((lat, lon)) = position {
+                            let m = wrap_toward(project(lat, lon), camera.center);
+                            let (x, y) = camera.to_screen(m, size);
+                            let center = point(origin.x + px(x as f32), origin.y + px(y as f32));
+                            let r = px(MARKER_PX * ui_scale(window));
+                            let dot = Bounds::new(
+                                point(center.x - r, center.y - r),
+                                gpui::size(r * 2.0, r * 2.0),
+                            );
+                            // The house pill treatment: the hue washed out
+                            // inside, full strength around the edge.
+                            let mut quad =
+                                gpui::fill(dot, Theme::dim(marker_color, MARKER_FILL_ALPHA));
+                            quad.corner_radii = Corners::all(r);
+                            quad.border_widths = Edges::all(px(1.5));
+                            quad.border_color = marker_color.into();
+                            window.paint_quad(quad);
+                        }
+                    },
+                );
             },
         );
 

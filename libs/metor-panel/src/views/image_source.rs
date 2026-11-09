@@ -126,6 +126,7 @@ pub(crate) fn image_canvas(image: Arc<RenderImage>, grayscale: bool) -> impl Int
                 bounds,
                 bounds,
                 Corners::default(),
+                0.,
                 image.clone(),
                 0,
                 grayscale,

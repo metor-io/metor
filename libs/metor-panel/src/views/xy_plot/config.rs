@@ -29,6 +29,7 @@ pub struct XyTraceConfig {
     pub x_element_index: usize,
     pub y_component_id: ComponentId,
     pub y_element_index: usize,
+    #[serde(with = "crate::color_serde")]
     pub color: Hsla,
     pub style: PlotStyle,
     pub visible: bool,

@@ -57,6 +57,7 @@ pub struct AnnunciatorConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<String>,
     pub pattern: String,
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
     pub source: AnnunciatorSource,
     pub alarm_when: AlarmWhen,

@@ -105,10 +105,9 @@ impl Render for AsciiLogo {
                             background_color: None,
                             underline: None,
                             strikethrough: None,
+                            letter_spacing: None,
                         };
-                        window
-                            .text_system()
-                            .shape_line(text, font_size, &[run], None)
+                        window.text_system().shape_line(text, font_size, &[run])
                     });
                     // Position each glyph on the terminal grid even if font fallback
                     // gives one of the Unicode circles a different advance width.

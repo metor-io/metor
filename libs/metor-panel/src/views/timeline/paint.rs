@@ -423,10 +423,9 @@ fn paint_table_label(
         background_color: None,
         underline: None,
         strikethrough: None,
+        letter_spacing: None,
     };
-    let shaped = window
-        .text_system()
-        .shape_line(text, font_size, &[run], None);
+    let shaped = window.text_system().shape_line(text, font_size, &[run]);
     let _ = shaped.paint(
         origin(shaped.width, font_size),
         font_size,

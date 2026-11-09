@@ -27,6 +27,7 @@ pub struct ListPlotPanelConfig {
 pub struct ListTraceConfig {
     pub component_id: ComponentId,
     pub len: usize,
+    #[serde(with = "crate::color_serde")]
     pub color: Hsla,
     pub style: PlotStyle,
     pub visible: bool,

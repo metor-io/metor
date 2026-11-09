@@ -19,6 +19,7 @@ pub mod app;
 pub(crate) mod atlas;
 pub mod backfill;
 pub(crate) mod background_tasks;
+pub(crate) mod color_serde;
 pub(crate) mod commands;
 pub mod config;
 pub mod connections;

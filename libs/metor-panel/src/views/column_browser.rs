@@ -548,7 +548,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
         let bg: Hsla = if is_selected {
             theme.selection_bg
         } else {
-            Hsla::transparent_black()
+            gpui::transparent_black()
         };
         let hover_bg = theme.selection_bg;
         let text_color = theme.text_primary;

@@ -51,7 +51,10 @@ pub(crate) fn mix(bg: Hsla, fg: Hsla, t: f32) -> Hsla {
 /// Exact-equality check for two colors — [`Hsla`] has no `PartialEq`, and a
 /// cluster only needs to know whether every event shares one resolved color.
 fn hsla_eq(a: Hsla, b: Hsla) -> bool {
-    a.h == b.h && a.s == b.s && a.l == b.l && a.a == b.a
+    crate::theme::hue(a) == crate::theme::hue(b)
+        && a.saturation == b.saturation
+        && a.lightness == b.lightness
+        && a.alpha == b.alpha
 }
 
 /// One flag: a screen x plus the events that merged into it, ascending by
@@ -198,12 +201,12 @@ pub(crate) fn paint_event_flags(
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: None,
                 };
                 let shaped = window.text_system().shape_line(
                     SharedString::from(text),
                     chip_font_size,
                     &[run],
-                    None,
                 );
                 let chip = Bounds::new(
                     point(x, chip_y),
@@ -322,18 +325,8 @@ mod tests {
     #[test]
     fn cluster_color_is_shared_or_secondary() {
         let theme = crate::theme::DARK.clone();
-        let red = Hsla {
-            h: 0.0,
-            s: 1.0,
-            l: 0.5,
-            a: 1.0,
-        };
-        let blue = Hsla {
-            h: 0.6,
-            s: 1.0,
-            l: 0.5,
-            a: 1.0,
-        };
+        let red = gpui::hsla(0.0, 1.0, 0.5, 1.0);
+        let blue = gpui::hsla(0.6, 1.0, 0.5, 1.0);
         let uniform = cluster_events(vec![(px(0.0), colored(0, red)), (px(2.0), colored(1, red))]);
         assert!(hsla_eq(uniform[0].color(&theme), red));
 

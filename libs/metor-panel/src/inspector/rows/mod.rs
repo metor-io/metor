@@ -319,14 +319,15 @@ pub fn measure(text: &str, size: Pixels, window: &Window) -> Pixels {
     let run = gpui::TextRun {
         len: text.len(),
         font: window.text_style().font(),
-        color: Hsla::transparent_black(),
+        color: gpui::transparent_black(),
         background_color: None,
         underline: None,
         strikethrough: None,
+        letter_spacing: None,
     };
     window
         .text_system()
-        .shape_line(SharedString::from(text.to_string()), size, &[run], None)
+        .shape_line(SharedString::from(text.to_string()), size, &[run])
         .width
 }
 
@@ -511,7 +512,7 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
     let pill_bg = if selected {
         theme.selection_bg
     } else {
-        Hsla::transparent_black()
+        gpui::transparent_black()
     };
     div()
         .id(("inspector-row", row_ix))

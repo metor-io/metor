@@ -16,6 +16,7 @@ use crate::theme::{Theme, theme, ui_px};
 #[serde(default)]
 pub struct TrafficLightConfig {
     pub component: String,
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
 }
 

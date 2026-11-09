@@ -1524,6 +1524,6 @@ impl Render for ConnectionPicker {
             .child(panel)
             .shadow_sm();
 
-        deferred(centered).with_priority(1).into_any_element()
+        deferred(centered).priority(1).into_any_element()
     }
 }

@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use super::slider::SliderRow;
 use super::{InspectorRow, RowAction, row_base, row_label, row_value};
 use crate::icons::Icon;
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, hue, set_hue, theme};
 
 /// Row for colour fields.
 ///
@@ -28,12 +28,15 @@ pub struct AutoColor {
     pub reset: Arc<dyn Fn(&mut Window, &mut App)>,
 }
 
+/// A channel's reader and writer, each in 0..1.
+type Channel = (fn(Hsla) -> f32, fn(&mut Hsla, f32));
+
 /// The four sliders' labels and the channel each one edits.
-const CHANNELS: [(&str, fn(&mut Hsla) -> &mut f32); 4] = [
-    ("Hue", |c| &mut c.h),
-    ("Saturation", |c| &mut c.s),
-    ("Lightness", |c| &mut c.l),
-    ("Alpha", |c| &mut c.a),
+const CHANNELS: [(&str, Channel); 4] = [
+    ("Hue", (hue, set_hue)),
+    ("Saturation", (|c| c.saturation, |c, v| c.saturation = v)),
+    ("Lightness", (|c| c.lightness, |c, v| c.lightness = v)),
+    ("Alpha", (|c| c.alpha, |c, v| c.alpha = v)),
 ];
 
 const SWATCH: f32 = 16.0;
@@ -83,19 +86,19 @@ impl InspectorRow for ColorRow {
             on_change: self.on_change.clone(),
             auto: self.auto.clone(),
         })];
-        rows.extend(CHANNELS.into_iter().map(|(label, channel)| {
+        rows.extend(CHANNELS.into_iter().map(|(label, (get, set))| {
             let read = self.read_color.clone();
             let write = self.read_color.clone();
             let on_change = self.on_change.clone();
             Box::new(SliderRow {
                 label: label.into(),
-                read_value: Arc::new(move |cx| *channel(&mut read(cx)) as f64),
+                read_value: Arc::new(move |cx| get(read(cx)) as f64),
                 min: 0.0,
                 max: 1.0,
                 integer: false,
                 on_change: Arc::new(move |v, w, cx| {
                     let mut color = write(cx);
-                    *channel(&mut color) = v as f32;
+                    set(&mut color, v as f32);
                     on_change(color, w, cx);
                 }),
             }) as Box<dyn InspectorRow>
@@ -124,9 +127,14 @@ fn presets(theme: &Theme) -> SmallVec<[Hsla; 10]> {
 /// Whether two colours are the same preset, allowing for the float drift a
 /// round trip through a saved layout picks up.
 fn same_color(a: Hsla, b: Hsla) -> bool {
-    [a.h - b.h, a.s - b.s, a.l - b.l, a.a - b.a]
-        .iter()
-        .all(|d| d.abs() < 1e-3)
+    [
+        hue(a) - hue(b),
+        a.saturation - b.saturation,
+        a.lightness - b.lightness,
+        a.alpha - b.alpha,
+    ]
+    .iter()
+    .all(|d| d.abs() < 1e-3)
 }
 
 /// The preset strip: one row of swatches, clicked to apply. Enter cycles
@@ -193,7 +201,7 @@ impl InspectorRow for SwatchRow {
                 .border_color(if chosen {
                     theme.text_primary
                 } else {
-                    Hsla::transparent_black()
+                    gpui::transparent_black()
                 });
             let cell = match swatch {
                 Swatch::Color(color) => cell.bg(color),

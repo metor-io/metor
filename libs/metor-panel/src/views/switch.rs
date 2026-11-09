@@ -255,16 +255,15 @@ impl Switch {
 
 /// `a` moved `t` of the way to `b`.
 fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    let a = gpui::Rgba::from(a);
-    let b = gpui::Rgba::from(b);
+    let a = gpui::hsla_to_rgba(a);
+    let b = gpui::hsla_to_rgba(b);
     let t = t.clamp(0.0, 1.0);
-    gpui::Rgba {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
-    .into()
+    gpui::rgb_to_hsla(gpui::Rgba::new(
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+        a.alpha + (b.alpha - a.alpha) * t,
+    ))
 }
 
 #[cfg(test)]
@@ -413,20 +412,20 @@ mod tests {
     #[gpui::test]
     fn the_knob_takes_each_positions_colour_and_blends_between(cx: &mut gpui::TestAppContext) {
         let theme = crate::theme::DARK.clone();
-        let red = gpui::Hsla::from(gpui::rgb(0xff0000));
-        let green = gpui::Hsla::from(gpui::rgb(0x00ff00));
+        let red = gpui::rgb_to_hsla(gpui::rgb(0xff0000));
+        let green = gpui::rgb_to_hsla(gpui::rgb(0x00ff00));
         cx.update(|cx| {
             let switch =
                 Switch::choice(vec!["A".into(), "B".into(), "C".into()], Some(0), 24.0, cx)
                     .colors(vec![Some(red), None, Some(green)]);
-            let rgb = |c: gpui::Hsla| gpui::Rgba::from(c);
+            let rgb = |c: gpui::Hsla| gpui::hsla_to_rgba(c);
             assert_eq!(rgb(switch.knob_fill(0.0, &theme)), rgb(red));
             assert_eq!(rgb(switch.knob_fill(1.0, &theme)), rgb(theme.text_primary));
             assert_eq!(rgb(switch.knob_fill(2.0, &theme)), rgb(green));
             let halfway = rgb(switch.knob_fill(1.5, &theme));
             let light = rgb(theme.text_primary);
             assert!(
-                (halfway.g - (light.g + 1.0) / 2.0).abs() < 0.01,
+                (halfway.green - (light.green + 1.0) / 2.0).abs() < 0.01,
                 "blends on the way"
             );
         });

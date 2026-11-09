@@ -1,3 +1,4 @@
+use gpui::ColorExt;
 use gpui::{Axis, IntoElement, div, prelude::*, px};
 
 use crate::theme::theme;

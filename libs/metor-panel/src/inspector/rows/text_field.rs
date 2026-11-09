@@ -544,6 +544,7 @@ impl TextField {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        letter_spacing: None,
                     };
                     shaped.push((
                         start,
@@ -552,84 +553,93 @@ impl TextField {
                             SharedString::from(line.to_string()),
                             font_size,
                             &[run],
-                            None,
                         ),
                     ));
                 }
                 (bounds, shaped, showing_placeholder)
             },
             move |_, (bounds, shaped, showing_placeholder), window, cx| {
-                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                    for (row, (start, len, line)) in shaped.iter().enumerate() {
-                        let y = bounds.origin.y + line_height * row as f32;
-                        let origin = point(bounds.origin.x, y);
-                        let x_at = |offset: usize| {
-                            line.x_for_index(offset.saturating_sub(*start).min(*len))
-                        };
-                        let overlaps = |range: &std::ops::Range<usize>| {
-                            range.start <= start + len && range.end >= *start
-                        };
+                window.with_content_mask(
+                    Some(gpui::ContentMask {
+                        bounds,
+                        fade_out: Default::default(),
+                    }),
+                    |window| {
+                        for (row, (start, len, line)) in shaped.iter().enumerate() {
+                            let y = bounds.origin.y + line_height * row as f32;
+                            let origin = point(bounds.origin.x, y);
+                            let x_at = |offset: usize| {
+                                x_for_index(
+                                    line,
+                                    offset.saturating_sub(*start).min(*len),
+                                    line_height,
+                                )
+                            };
+                            let overlaps = |range: &std::ops::Range<usize>| {
+                                range.start <= start + len && range.end >= *start
+                            };
 
-                        if !showing_placeholder && mark != cursor {
-                            let selection = mark.min(cursor)..mark.max(cursor);
-                            if overlaps(&selection) {
-                                // A selection running past this line's end
-                                // shows the newline it swallowed, so a
-                                // multi-line drag reads as one region.
-                                let to = match selection.end > start + len {
-                                    true => line.width + px(4.0),
-                                    false => x_at(selection.end),
-                                };
-                                let from = x_at(selection.start);
+                            if !showing_placeholder && mark != cursor {
+                                let selection = mark.min(cursor)..mark.max(cursor);
+                                if overlaps(&selection) {
+                                    // A selection running past this line's end
+                                    // shows the newline it swallowed, so a
+                                    // multi-line drag reads as one region.
+                                    let to = match selection.end > start + len {
+                                        true => line.width + px(4.0),
+                                        false => x_at(selection.end),
+                                    };
+                                    let from = x_at(selection.start);
+                                    window.paint_quad(fill(
+                                        gpui::Bounds::new(
+                                            point(origin.x + from, y),
+                                            size(to - from, line_height),
+                                        ),
+                                        selection_color,
+                                    ));
+                                }
+                            }
+
+                            for (range, color) in &marks {
+                                if !overlaps(range) || range.start == range.end {
+                                    continue;
+                                }
+                                let from = x_at(range.start);
+                                let to = x_at(range.end).max(from + px(2.0));
                                 window.paint_quad(fill(
                                     gpui::Bounds::new(
-                                        point(origin.x + from, y),
-                                        size(to - from, line_height),
+                                        point(origin.x + from, y + line_height - px(2.0)),
+                                        size(to - from, px(1.5)),
                                     ),
-                                    selection_color,
+                                    *color,
+                                ));
+                            }
+
+                            let _ = line.paint(
+                                origin,
+                                line_height,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+
+                            if !showing_placeholder && (*start..=start + len).contains(&cursor) {
+                                let caret_x = origin.x + x_at(cursor);
+                                let packed = ((f32::from(caret_x).to_bits() as u64) << 32)
+                                    | f32::from(y + line_height).to_bits() as u64;
+                                caret_seen.store(packed, Ordering::Relaxed);
+                                window.paint_quad(fill(
+                                    gpui::Bounds::new(
+                                        point(caret_x - cursor_width() / 2.0, y),
+                                        size(cursor_width(), line_height),
+                                    ),
+                                    cursor_color,
                                 ));
                             }
                         }
-
-                        for (range, color) in &marks {
-                            if !overlaps(range) || range.start == range.end {
-                                continue;
-                            }
-                            let from = x_at(range.start);
-                            let to = x_at(range.end).max(from + px(2.0));
-                            window.paint_quad(fill(
-                                gpui::Bounds::new(
-                                    point(origin.x + from, y + line_height - px(2.0)),
-                                    size(to - from, px(1.5)),
-                                ),
-                                *color,
-                            ));
-                        }
-
-                        let _ = line.paint(
-                            origin,
-                            line_height,
-                            gpui::TextAlign::Left,
-                            None,
-                            window,
-                            cx,
-                        );
-
-                        if !showing_placeholder && (*start..=start + len).contains(&cursor) {
-                            let caret_x = origin.x + x_at(cursor);
-                            let packed = ((f32::from(caret_x).to_bits() as u64) << 32)
-                                | f32::from(y + line_height).to_bits() as u64;
-                            caret_seen.store(packed, Ordering::Relaxed);
-                            window.paint_quad(fill(
-                                gpui::Bounds::new(
-                                    point(caret_x - cursor_width() / 2.0, y),
-                                    size(cursor_width(), line_height),
-                                ),
-                                cursor_color,
-                            ));
-                        }
-                    }
-                });
+                    },
+                );
             },
         )
         .size_full()
@@ -666,13 +676,13 @@ impl TextField {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: None,
                 };
 
                 let shaped = window.text_system().shape_line(
                     SharedString::from(display_text),
                     font_size,
                     &[run],
-                    None,
                 );
 
                 (bounds, shaped, is_placeholder)
@@ -684,7 +694,7 @@ impl TextField {
                 let cursor_x = if is_placeholder {
                     px(0.0)
                 } else {
-                    shaped.x_for_index(cursor)
+                    x_for_index(&shaped, cursor, line_height)
                 };
 
                 // Horizontal scroll follows the cursor so long values stay
@@ -708,44 +718,61 @@ impl TextField {
 
                 let text_origin = point(bounds.origin.x + align_offset - scroll_offset, base_y);
 
-                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                    if !is_placeholder && mark != cursor {
-                        let sel_start = mark.min(cursor);
-                        let sel_end = mark.max(cursor);
-                        let sel_x_start = shaped.x_for_index(sel_start);
-                        let sel_x_end = shaped.x_for_index(sel_end);
+                window.with_content_mask(
+                    Some(gpui::ContentMask {
+                        bounds,
+                        fade_out: Default::default(),
+                    }),
+                    |window| {
+                        if !is_placeholder && mark != cursor {
+                            let sel_start = mark.min(cursor);
+                            let sel_end = mark.max(cursor);
+                            let sel_x_start = x_for_index(&shaped, sel_start, line_height);
+                            let sel_x_end = x_for_index(&shaped, sel_end, line_height);
 
-                        let sel_bounds = gpui::Bounds::new(
-                            point(
-                                bounds.origin.x + align_offset + sel_x_start - scroll_offset,
-                                base_y,
-                            ),
-                            size(sel_x_end - sel_x_start, line_height),
+                            let sel_bounds = gpui::Bounds::new(
+                                point(
+                                    bounds.origin.x + align_offset + sel_x_start - scroll_offset,
+                                    base_y,
+                                ),
+                                size(sel_x_end - sel_x_start, line_height),
+                            );
+                            window.paint_quad(fill(sel_bounds, selection_color));
+                        }
+
+                        let _ = shaped.paint(
+                            text_origin,
+                            line_height,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            _cx,
                         );
-                        window.paint_quad(fill(sel_bounds, selection_color));
-                    }
 
-                    let _ = shaped.paint(
-                        text_origin,
-                        line_height,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        _cx,
-                    );
-
-                    let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
-                        - scroll_offset
-                        - cursor_width() / 2.0;
-                    let cursor_bounds = gpui::Bounds::new(
-                        point(cursor_screen_x, base_y),
-                        size(cursor_width(), line_height),
-                    );
-                    window.paint_quad(fill(cursor_bounds, cursor_color));
-                });
+                        let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
+                            - scroll_offset
+                            - cursor_width() / 2.0;
+                        let cursor_bounds = gpui::Bounds::new(
+                            point(cursor_screen_x, base_y),
+                            size(cursor_width(), line_height),
+                        );
+                        window.paint_quad(fill(cursor_bounds, cursor_color));
+                    },
+                );
             },
         )
         .w_full()
         .h(line_height)
     }
+}
+
+/// How far along a single shaped line byte `ix` sits: the left edge of the
+/// caret there, or the line's end past its last cluster.
+fn x_for_index(line: &gpui::ShapedLine, ix: usize, line_height: Pixels) -> Pixels {
+    line.platform_layout
+        .caret_bounds(
+            gpui::CaretPosition::attached_to_next_cluster(ix),
+            line_height,
+        )
+        .map_or(line.width, |bounds| bounds.origin.x)
 }

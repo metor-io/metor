@@ -69,6 +69,7 @@ impl StateEntry {
 pub struct StateEntryConfig {
     pub value: f64,
     pub label: String,
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
 }
 

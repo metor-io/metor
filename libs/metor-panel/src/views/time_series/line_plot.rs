@@ -854,7 +854,7 @@ impl Render for LinePlot {
                     // bucket.
                     let raw_clip = if let Some(lod) = tracking.lod.selected() {
                         let mut color = config.color;
-                        color.a *= ENVELOPE_ALPHA;
+                        color.alpha *= ENVELOPE_ALPHA;
                         draws.push(LineDraw {
                             x: AxisSource::Timestamps,
                             y: AxisSource::MinMax {

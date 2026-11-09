@@ -16,7 +16,7 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Bounds, BoxShadow, CursorStyle, Decorations, Div, Global, HitboxBehavior,
+    App, AppContext, Bounds, BoxShadow, CursorStyle, Decorations, Div, Global, HitboxBehavior,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, ResizeEdge, Size,
     Stateful, Styled, Tiling, Window, WindowControlArea, canvas, div, point, px, size,
     transparent_black,
@@ -239,7 +239,7 @@ pub(crate) fn client_side_decorations(
                         .when(!tiling.right, |div| div.border_r(CSD_BORDER))
                         .when(!tiling.is_tiled(), |div| {
                             div.shadow(vec![BoxShadow {
-                                color: theme.window_shadow(),
+                                color: theme.window_shadow().into(),
                                 blur_radius: CSD_SHADOW / 2.,
                                 spread_radius: px(0.),
                                 offset: point(px(0.0), px(0.0)),

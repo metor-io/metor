@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::inspector::rows::tag_pill;
 use crate::motion::{self, Fade};
-use crate::theme::theme;
+use crate::theme::{OVERLAY_BLUR, theme};
 use node::{ChordAction, ChordNode};
 
 /// One level of the navigation stack: the rows to show, plus the crumb label of
@@ -232,7 +232,8 @@ impl Render for Transient {
             .flex()
             .flex_col()
             .gap(px(3.0))
-            .bg(theme.bg_elevated)
+            .bg(theme.overlay_bg())
+            .backdrop_blur(px(OVERLAY_BLUR))
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
@@ -242,6 +243,6 @@ impl Render for Transient {
             .child(crumbs)
             .child(grid);
 
-        deferred(panel).with_priority(1).into_any_element()
+        deferred(panel).priority(1).into_any_element()
     }
 }

@@ -56,11 +56,8 @@ pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
             cx,
         ))),
         is_resizable: false,
-        window_background: if cfg!(target_os = "macos") {
-            gpui::WindowBackgroundAppearance::Transparent
-        } else {
-            gpui::WindowBackgroundAppearance::Opaque
-        },
+        #[cfg(target_os = "macos")]
+        macos_window_background: gpui::MacosWindowBackground::Transparent,
         titlebar: Some(TitlebarOptions {
             appears_transparent: true,
             traffic_light_position: Some(point(px(12.), px(8.))),

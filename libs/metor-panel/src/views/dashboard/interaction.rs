@@ -2,6 +2,7 @@
 //!
 //! Houses the drag payload types and the per-widget chrome that renders
 //! move/resize zones when the dashboard is editable.
+use gpui::ColorExt;
 use gpui::{
     AnyElement, App, Context, DragMoveEvent, Empty, Entity, IntoElement, Render, Window, div,
     point, prelude::*, px,

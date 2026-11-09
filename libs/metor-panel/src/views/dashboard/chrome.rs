@@ -1,4 +1,5 @@
 //! Canvas chrome rendered atop dashboard widgets in edit mode.
+use gpui::ColorExt;
 use gpui::{Bounds, Context, IntoElement, canvas, fill, point, prelude::*, px, size};
 
 use crate::theme::theme;

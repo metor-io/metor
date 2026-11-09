@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use gpui::{App, Global, Hsla, Rems, SharedString, Window, px, rems};
 use metor_proto_wkt::SequenceChannelState;
+use palette::WithAlpha;
 
 use crate::config::{self, FontConfig, PanelConfig};
 use crate::views::gradient::Palette;
@@ -56,7 +57,7 @@ pub const fn hex(rgb: u32, a: f32) -> Hsla {
         ((r - g) / delta + 4.0) / 6.0
     };
 
-    Hsla { h, s, l, a }
+    gpui::hsla(h, s, l, a)
 }
 
 /// Complete color and typography palette for the panel UI.
@@ -142,34 +143,35 @@ impl Theme {
     /// The logo's ember ramp, fading into the current splash surface.
     pub(crate) fn logo_color(&self, level: f32) -> Hsla {
         let stops: [gpui::Rgba; 3] = [
-            self.bg_elevated.into(),
-            hex(0x8c360e, 1.).into(),
-            hex(0xff4f00, 1.).into(),
+            gpui::hsla_to_rgba(self.bg_elevated),
+            gpui::hsla_to_rgba(hex(0x8c360e, 1.)),
+            gpui::hsla_to_rgba(hex(0xff4f00, 1.)),
         ];
         let value = level.clamp(0., 1.) * 2.;
         let i = (value as usize).min(1);
         let fraction = value - i as f32;
         let a = stops[i];
         let b = stops[i + 1];
-        gpui::Rgba {
-            r: a.r + (b.r - a.r) * fraction,
-            g: a.g + (b.g - a.g) * fraction,
-            b: a.b + (b.b - a.b) * fraction,
-            a: 1.,
-        }
-        .into()
+        gpui::rgb_to_hsla(gpui::Rgba::new(
+            a.red + (b.red - a.red) * fraction,
+            a.green + (b.green - a.green) * fraction,
+            a.blue + (b.blue - a.blue) * fraction,
+            1.,
+        ))
+    }
+
+    /// Surface of a floating overlay (the inspector, command palette and
+    /// key hints): `bg_elevated` let partly through, so the frosted content
+    /// behind it shows. Pair with [`OVERLAY_BLUR`].
+    pub fn overlay_bg(&self) -> Hsla {
+        Self::dim(self.bg_elevated, 0.45)
     }
 
     /// Drop shadow behind the window when Linux client-side decorations are
     /// active. Derived rather than per-palette: translucent black reads
     /// correctly over any compositor wallpaper.
     pub fn window_shadow(&self) -> Hsla {
-        Hsla {
-            h: 0.,
-            s: 0.,
-            l: 0.,
-            a: 0.4,
-        }
+        gpui::hsla(0., 0., 0., 0.4)
     }
 
     /// Translucent band over plot regions whose data is remote-only or
@@ -181,10 +183,7 @@ impl Theme {
     /// Outline around the selected widget on a dashboard: the theme's accent
     /// (the hue `drop_target` tints with) at full strength.
     pub fn selection_ring(&self) -> Hsla {
-        Hsla {
-            a: 1.0,
-            ..self.drop_target
-        }
+        self.drop_target.with_alpha(1.0)
     }
 
     /// Track behind a checked switch knob: `control_active` with less presence.
@@ -204,10 +203,7 @@ impl Theme {
     /// background and the axis fills that mask GPU-frame edges straying into
     /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
     pub fn plot_chrome_bg(&self) -> Hsla {
-        Hsla {
-            a: 0.5,
-            ..self.bg_secondary
-        }
+        self.bg_secondary.with_alpha(0.5)
     }
 
     /// Text of a value cell once its stream has gone quiet — the theme's
@@ -220,10 +216,7 @@ impl Theme {
     /// the weight the sequence run-state chips use, so the two read as one
     /// family of "status" tints.
     pub fn stale_bg(&self) -> Hsla {
-        Hsla {
-            a: 0.12,
-            ..self.stale_text()
-        }
+        self.stale_text().with_alpha(0.12)
     }
 
     /// Tint for a component-frame edge in the system graph — the blue family,
@@ -281,10 +274,7 @@ impl Theme {
 
     /// Low-alpha [`alarm_color`](Self::alarm_color) for out-of-bounds plot tinting.
     pub fn alarm_tint(&self, severity_index: usize) -> Hsla {
-        Hsla {
-            a: 0.10,
-            ..self.alarm_color(severity_index)
-        }
+        self.alarm_color(severity_index).with_alpha(0.10)
     }
 
     /// A box fill for a gradient position `t` in -1..=1: the plain box at
@@ -321,7 +311,7 @@ impl Theme {
     /// A theme token at reduced alpha, for tints and dimmed borders derived
     /// from accent colors without introducing new literals at call sites.
     pub fn dim(color: Hsla, alpha: f32) -> Hsla {
-        Hsla { a: alpha, ..color }
+        color.with_alpha(alpha)
     }
 
     /// Solid color for a sequence channel's state; `None` is a channel with
@@ -348,10 +338,7 @@ impl Theme {
 
     /// Low-alpha [`run_state_color`](Self::run_state_color) for swatch/row backgrounds.
     pub fn run_state_tint(&self, state: Option<SequenceChannelState>) -> Hsla {
-        Hsla {
-            a: 0.12,
-            ..self.run_state_color(state)
-        }
+        self.run_state_color(state).with_alpha(0.12)
     }
 
     /// Solid color for a cyclic slot's run state, indexed by the FSW's
@@ -374,10 +361,7 @@ impl Theme {
     /// Low-alpha [`slot_state_color`](Self::slot_state_color) for lane
     /// backgrounds and summarized strips.
     pub fn slot_state_tint(&self, state_code: usize) -> Hsla {
-        Hsla {
-            a: 0.12,
-            ..self.slot_state_color(state_code)
-        }
+        self.slot_state_color(state_code).with_alpha(0.12)
     }
 
     /// Sample the [`density_stops`](Self::density_stops) ramp at `t`, clamped
@@ -395,18 +379,31 @@ impl Theme {
     }
 }
 
+/// How far a floating overlay blurs what is behind it.
+pub const OVERLAY_BLUR: f32 = 20.0;
+
+/// A colour's hue as a fraction of the circle, the unit the panel's colour
+/// maths, sliders and saved presets use; palette stores it in degrees.
+pub(crate) fn hue(color: Hsla) -> f32 {
+    color.hue.into_positive_degrees() / 360.0
+}
+
+/// Set a colour's hue from a fraction of the circle; see [`hue`].
+pub(crate) fn set_hue(color: &mut Hsla, hue: f32) {
+    color.hue = palette::RgbHue::from_degrees(hue * 360.0);
+}
+
 /// Component-wise RGB blend of `a` into `b` by `t`, keeping `a`'s alpha.
 pub(crate) fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    let x = gpui::Rgba::from(a);
-    let y = gpui::Rgba::from(b);
+    let x = gpui::hsla_to_rgba(a);
+    let y = gpui::hsla_to_rgba(b);
     let lerp = |p: f32, q: f32| p + (q - p) * t;
-    gpui::Rgba {
-        r: lerp(x.r, y.r),
-        g: lerp(x.g, y.g),
-        b: lerp(x.b, y.b),
-        a: x.a,
-    }
-    .into()
+    gpui::rgb_to_hsla(gpui::Rgba::new(
+        lerp(x.red, y.red),
+        lerp(x.green, y.green),
+        lerp(x.blue, y.blue),
+        x.alpha,
+    ))
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -1279,10 +1276,10 @@ mod tests {
     use super::*;
 
     fn approx(a: Hsla, b: Hsla) -> bool {
-        (a.h - b.h).abs() < 1e-5
-            && (a.s - b.s).abs() < 1e-5
-            && (a.l - b.l).abs() < 1e-5
-            && (a.a - b.a).abs() < 1e-5
+        (hue(a) - hue(b)).abs() < 1e-5
+            && (a.saturation - b.saturation).abs() < 1e-5
+            && (a.lightness - b.lightness).abs() < 1e-5
+            && (a.alpha - b.alpha).abs() < 1e-5
     }
 
     /// The ramp's ends are the tables' end stops: a colorbar labelled with the
@@ -1388,7 +1385,7 @@ mod tests {
     #[test]
     fn density_stops_are_monotonic_in_lightness() {
         for theme in builtin_themes() {
-            let l: Vec<f32> = theme.density_stops.iter().map(|c| c.l).collect();
+            let l: Vec<f32> = theme.density_stops.iter().map(|c| c.lightness).collect();
             let rising = l.windows(2).all(|w| w[0] < w[1]);
             let falling = l.windows(2).all(|w| w[0] > w[1]);
             assert!(rising || falling, "{} stops: {l:?}", theme.name);

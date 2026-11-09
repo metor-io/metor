@@ -81,6 +81,7 @@ pub struct MeasurementCursorConfig {
 pub struct TraceConfig {
     pub component_id: ComponentId,
     pub element_index: usize,
+    #[serde(with = "crate::color_serde")]
     pub color: Hsla,
     pub style: PlotStyle,
     pub visible: bool,
@@ -156,6 +157,7 @@ pub struct YAxisConfig {
     pub label: String,
     pub y_min_override: Override<f64>,
     pub y_max_override: Override<f64>,
+    #[serde(with = "crate::color_serde::overridden")]
     pub color: Override<Hsla>,
 }
 

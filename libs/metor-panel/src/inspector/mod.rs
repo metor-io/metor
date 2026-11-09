@@ -28,7 +28,7 @@ pub mod target;
 pub mod trace_picker;
 
 use crate::motion::{self, Fade};
-use crate::theme::theme;
+use crate::theme::{OVERLAY_BLUR, theme};
 use rows::text_field::TextAlign;
 use rows::{InspectorRow, PreviewSpec, ROW_HEIGHT, RowAction, TextField, tag_pill};
 
@@ -990,12 +990,17 @@ impl Inspector {
                         cx.notify();
                     }))
             })
-            .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
-            .when(!matches!(self.mode, InspectorMode::Inline), |frame| {
-                frame.shadow_sm()
+            // Floating, it frosts what it covers; inline, it is part of the
+            // page and stays solid.
+            .map(|frame| match self.mode {
+                InspectorMode::Inline => frame.bg(theme.bg_elevated),
+                _ => frame
+                    .bg(theme.overlay_bg())
+                    .backdrop_blur(px(OVERLAY_BLUR))
+                    .shadow_sm(),
             })
             .child(bounds_tracker);
 
@@ -1385,7 +1390,7 @@ impl Render for Inspector {
                     .opacity(opacity)
                     .child(panel),
             )
-            .with_priority(1)
+            .priority(1)
             .into_any_element();
         }
         let panel = panel.opacity(opacity);
@@ -1427,7 +1432,7 @@ impl Render for Inspector {
                         .child(panel)
                         .into_any_element()
                 };
-                deferred(element).with_priority(1).into_any_element()
+                deferred(element).priority(1).into_any_element()
             }
             InspectorMode::Centered => {
                 let panel = panel.on_mouse_down_out(cx.listener(
@@ -1450,7 +1455,7 @@ impl Render for Inspector {
                     .pt(px(80.0))
                     .child(panel);
 
-                deferred(centered).with_priority(1).into_any_element()
+                deferred(centered).priority(1).into_any_element()
             }
             // No overlay at all: the host places the panel in its own tree.
             InspectorMode::Inline => panel.into_any_element(),

@@ -194,11 +194,10 @@ fn shape_label(text: SharedString, color: Hsla, window: &mut Window) -> gpui::Sh
         background_color: None,
         underline: None,
         strikethrough: None,
+        letter_spacing: None,
     };
     let font_size = label_font_size(window);
-    window
-        .text_system()
-        .shape_line(text, font_size, &[run], None)
+    window.text_system().shape_line(text, font_size, &[run])
 }
 
 fn paint_shaped(
@@ -304,7 +303,7 @@ pub(crate) fn gpu_frame<T: 'static>(
          window,
          _cx| {
             if let Some((img, rect)) = frame {
-                let _ = window.paint_image(bounds, rect, Corners::default(), img, 0, false);
+                let _ = window.paint_image(bounds, rect, Corners::default(), 0., img, 0, false);
             }
         },
     )

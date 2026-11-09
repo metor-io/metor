@@ -27,8 +27,10 @@ use crate::theme::{Theme, theme, ui_px};
 #[serde(default)]
 pub struct LabelConfig {
     pub text: String,
+    #[serde(default, with = "crate::color_serde::option")]
     pub text_color: Option<Hsla>,
     /// Tints the box and its edge, as a state's colour tints its chip.
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
     pub text_size: f32,
     pub align: StripAlign,

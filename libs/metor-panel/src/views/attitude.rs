@@ -64,6 +64,7 @@ const LADDER_ALPHA: f32 = 0.55;
 pub struct VectorMarkerConfig {
     pub component: String,
     pub label: String,
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
 }
 
@@ -523,7 +524,7 @@ impl Render for AttitudeIndicator {
                         let mut quad = gpui::fill(dot, gpui::transparent_black());
                         quad.corner_radii = gpui::Corners::all(r);
                         quad.border_widths = gpui::Edges::all(px(1.5));
-                        quad.border_color = color;
+                        quad.border_color = color.into();
                         window.paint_quad(quad);
                     }
                 }

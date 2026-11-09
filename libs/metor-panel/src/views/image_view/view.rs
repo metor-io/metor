@@ -694,7 +694,7 @@ impl ImageView {
             size(device(dw), device(dh)),
         );
         let clip = bounds.intersect(&rect);
-        let _ = window.paint_image(clip, rect, Corners::default(), image, 0, false);
+        let _ = window.paint_image(clip, rect, Corners::default(), 0., image, 0, false);
         self.paint_annotations(window, cx);
     }
 
@@ -836,9 +836,9 @@ fn spawn_jobs(job: Job, cx: &mut Context<ImageView>) -> Task<()> {
 
 /// The theme's saturation colour as BGRA.
 fn saturated(cx: &gpui::App) -> [u8; 4] {
-    let c = gpui::Rgba::from(theme(cx).image_saturated());
+    let c = gpui::hsla_to_rgba(theme(cx).image_saturated());
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    [byte(c.b), byte(c.g), byte(c.r), byte(c.a)]
+    [byte(c.blue), byte(c.green), byte(c.red), byte(c.alpha)]
 }
 
 impl Render for ImageView {

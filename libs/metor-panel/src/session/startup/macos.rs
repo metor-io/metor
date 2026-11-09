@@ -32,7 +32,7 @@ pub(super) fn install_sidebar_blur(
     // The panel's theme can differ from the system appearance inherited
     // by AppKit, which otherwise gives a dark panel a pale sidebar.
     let appearance_name = unsafe {
-        if theme.bg_elevated.l < 0.5 {
+        if theme.bg_elevated.lightness < 0.5 {
             NSAppearanceNameDarkAqua
         } else {
             NSAppearanceNameAqua

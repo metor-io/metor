@@ -101,6 +101,7 @@ pub struct MeterConfig {
     pub unit: Option<String>,
     pub orientation: Orientation,
     pub shape: MeterShape,
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
     pub hide_value: bool,
     pub hide_limits: bool,
@@ -315,15 +316,23 @@ impl Render for Meter {
                     && end > start
                 {
                     let mask = slice(outline.scale, start, end, vertical);
-                    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-                        outline.paint(color, window)
-                    });
+                    window.with_content_mask(
+                        Some(ContentMask {
+                            bounds: mask,
+                            fade_out: Default::default(),
+                        }),
+                        |window| outline.paint(color, window),
+                    );
                 }
                 for (t, mark_color) in &marks {
                     let band = tick(outline.scale, *t, vertical);
-                    window.with_content_mask(Some(ContentMask { bounds: band }), |window| {
-                        outline.paint(*mark_color, window)
-                    });
+                    window.with_content_mask(
+                        Some(ContentMask {
+                            bounds: band,
+                            fade_out: Default::default(),
+                        }),
+                        |window| outline.paint(*mark_color, window),
+                    );
                 }
                 outline.paint_rim(rim_color, window);
             },

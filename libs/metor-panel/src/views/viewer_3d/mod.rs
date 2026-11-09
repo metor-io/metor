@@ -923,6 +923,7 @@ impl Render for Viewer3d {
                                 bounds,
                                 bounds,
                                 Corners::default(),
+                                0.,
                                 img,
                                 0,
                                 false,

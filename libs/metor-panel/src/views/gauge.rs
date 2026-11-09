@@ -135,6 +135,7 @@ pub struct GaugeConfig {
     /// Dropped where they would crowd together.
     pub minor_ticks: usize,
     pub style: GaugeStyle,
+    #[serde(default, with = "crate::color_serde::option")]
     pub color: Option<Hsla>,
     pub hide_value: bool,
     pub hide_limits: bool,
@@ -382,18 +383,19 @@ fn paint_centered(
         background_color: None,
         underline: None,
         strikethrough: None,
+        letter_spacing: None,
     };
     let mut size = fit.size;
     let mut shaped =
         window
             .text_system()
-            .shape_line(text.clone(), px(size), std::slice::from_ref(&run), None);
+            .shape_line(text.clone(), px(size), std::slice::from_ref(&run));
     let width = f32::from(shaped.width);
     if width > fit.max_width && size > fit.min_size {
         size = (size * fit.max_width / width).max(fit.min_size);
         shaped = window
             .text_system()
-            .shape_line(text.clone(), px(size), &[run], None);
+            .shape_line(text.clone(), px(size), &[run]);
     }
     let origin = point(center.x - shaped.width / 2.0, center.y - px(size / 2.0));
     let _ = shaped.paint(origin, px(size), TextAlign::Left, None, window, cx);
@@ -792,7 +794,7 @@ impl Render for Gauge {
         // alarm: the scale stays put, and only the lit span — the part that
         // means "the value" — changes, so raising an alarm doesn't repaint
         // the whole ring.
-        let track_color = Theme::dim(self.color, TRACK_ALPHA * self.color.a);
+        let track_color = Theme::dim(self.color, TRACK_ALPHA * self.color.alpha);
         let dash_color = Theme::dim(theme.text_secondary, DASH_ALPHA);
         let hub_color = theme.text_primary;
         let text_color = theme.text_primary;

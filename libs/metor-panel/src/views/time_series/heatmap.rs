@@ -70,10 +70,11 @@ impl Colormap {
         match self {
             Colormap::TraceColor => Theme::dim(trace_color, t),
             Colormap::Heat => theme.density_color(t),
-            Colormap::Mono => Hsla {
-                s: 0.0,
-                ..theme.density_color(t)
-            },
+            Colormap::Mono => {
+                let mut color = theme.density_color(t);
+                color.saturation = 0.0;
+                color
+            }
         }
     }
 }
@@ -235,10 +236,10 @@ struct LutKey {
 
 fn color_bits(color: Hsla) -> [u32; 4] {
     [
-        color.h.to_bits(),
-        color.s.to_bits(),
-        color.l.to_bits(),
-        color.a.to_bits(),
+        crate::theme::hue(color).to_bits(),
+        color.saturation.to_bits(),
+        color.lightness.to_bits(),
+        color.alpha.to_bits(),
     ]
 }
 
@@ -253,18 +254,18 @@ impl ColormapLut {
         let mut texels = Vec::with_capacity(LUT_SIZE as usize * 4);
         for i in 0..LUT_SIZE {
             let t = i as f32 / (LUT_SIZE - 1) as f32;
-            let trace_color = Hsla {
-                h: f32::from_bits(key.color[0]),
-                s: f32::from_bits(key.color[1]),
-                l: f32::from_bits(key.color[2]),
-                a: f32::from_bits(key.color[3]),
-            };
-            let rgba = gpui::Rgba::from(key.colormap.sample(theme, trace_color, t));
+            let trace_color = gpui::hsla(
+                f32::from_bits(key.color[0]),
+                f32::from_bits(key.color[1]),
+                f32::from_bits(key.color[2]),
+                f32::from_bits(key.color[3]),
+            );
+            let rgba = gpui::hsla_to_rgba(key.colormap.sample(theme, trace_color, t));
             texels.extend_from_slice(&[
-                (rgba.r.clamp(0.0, 1.0) * 255.0) as u8,
-                (rgba.g.clamp(0.0, 1.0) * 255.0) as u8,
-                (rgba.b.clamp(0.0, 1.0) * 255.0) as u8,
-                (rgba.a.clamp(0.0, 1.0) * 255.0) as u8,
+                (rgba.red.clamp(0.0, 1.0) * 255.0) as u8,
+                (rgba.green.clamp(0.0, 1.0) * 255.0) as u8,
+                (rgba.blue.clamp(0.0, 1.0) * 255.0) as u8,
+                (rgba.alpha.clamp(0.0, 1.0) * 255.0) as u8,
             ]);
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
