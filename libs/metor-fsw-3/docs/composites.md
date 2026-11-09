@@ -34,8 +34,8 @@ checker sees and keeps the rest, so each call is checked. At runtime, arguments
 that do not fit raise `TypeError` at the call.
 
 An input may be optional, `Sources[T] | None`. The body decides what `None`
-means, such as adding a model only when given truth. A system input never
-takes `None`: passing it one raises `ConfigError`.
+means, such as adding a model only when given truth. Passing `None` on to a
+system input leaves that input unwired.
 
 Calling `gnc(..)` stores the arguments. The body runs when the result is
 added, because a port needs its system's final name and target when it is

@@ -857,7 +857,7 @@ mod tests {
         ];
         let text = rendered(vec![system("sun", inputs, outputs, None)]).expect("renders");
         assert!(
-            text.contains("from typing import Literal, Sequence\n"),
+            text.contains("from typing import Literal, Mapping, Sequence\n"),
             "{text}"
         );
         assert!(
@@ -903,7 +903,7 @@ mod tests {
     fn test_group_ports_render_classes() {
         let text = rendered(vec![adcs()]).expect("renders");
         assert!(
-            text.contains("from typing import TYPE_CHECKING, Literal, Sequence\n"),
+            text.contains("from typing import TYPE_CHECKING, Literal, Mapping, Sequence\n"),
             "{text}"
         );
         assert!(

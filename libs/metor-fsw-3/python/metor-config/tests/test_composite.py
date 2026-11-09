@@ -98,6 +98,14 @@ class CompositeTest(unittest.TestCase):
         self.assertNotIn("h.model", systems)
         self.assertIn("h.mode", systems)
 
+    def test_system_input_given_none_is_unwired(self) -> None:
+        @composite
+        def passthrough(s: Scope, *, truth: Sources[Imu] | None = None) -> Nav:
+            return s.add("nav", Nav(imu=truth))  # pyright: ignore[reportArgumentType]
+
+        self.fsw.add("g", passthrough())
+        self.assertEqual(steps(self.fsw)["g.nav"]["inputs"], [])
+
     def test_channel_registry_tells_reused_instances_apart(self) -> None:
         shared = Mode()
 
@@ -203,14 +211,6 @@ class FailureTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             gnc(bogus=1)  # pyright: ignore[reportCallIssue]
         self.assertEqual(list(inspect.signature(gnc).parameters), ["imu", "gain"])
-
-    def test_system_input_given_none_is_refused(self) -> None:
-        @composite
-        def careless(s: Scope, *, truth: Sources[Imu] | None = None) -> Nav:
-            return s.add("nav", Nav(imu=truth))  # pyright: ignore[reportArgumentType]
-
-        with self.assertRaisesRegex(ConfigError, "input `imu` takes ports and loops, got None"):
-            self.fsw.add("g", careless())
 
     def test_nested_result_is_not_a_port_list(self) -> None:
         out = self.fsw.add("p", pair(imu=self.imu))
