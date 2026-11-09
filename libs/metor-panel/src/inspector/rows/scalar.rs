@@ -1,9 +1,10 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use gpui::{AnyElement, App, SharedString, Window, prelude::*};
+use gpui::{AnyElement, App, SharedString, Window};
 
-use super::{InspectorRow, RowAction, value_row};
+use super::{InspectorRow, RowAction, box_slot, boxed_row, value_box};
 use crate::dynamic::tensor::TypedScalar;
+use crate::theme::theme;
 
 /// Numeric editor that preserves the field's type and rejects out-of-range input.
 pub struct ScalarRow {
@@ -86,15 +87,23 @@ impl InspectorRow for ScalarRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        value_row(
-            row_ix,
-            selected,
-            self.label.clone(),
-            format_scalar(self.current(cx)).into(),
-            false,
-            cx,
-        )
-        .into_any_element()
+        let value_box =
+            value_box(row_ix, format_scalar(self.current(cx)), cx).apply(box_slot(), &theme(cx));
+        boxed_row(row_ix, selected, self.label.clone(), value_box, cx)
+    }
+
+    fn render_editing(
+        &self,
+        row_ix: usize,
+        selected: bool,
+        field: AnyElement,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let value_box = value_box(row_ix, format_scalar(self.current(cx)), cx)
+            .editing(field)
+            .apply(box_slot(), &theme(cx));
+        boxed_row(row_ix, selected, self.label.clone(), value_box, cx)
     }
 
     fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {

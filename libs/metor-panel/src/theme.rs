@@ -192,6 +192,14 @@ impl Theme {
         Self::dim(self.control_active, 0.7)
     }
 
+    /// The filled part of a scrubber, over its `bg_secondary` box. Derived
+    /// from the text colour so it reads against the box and against the
+    /// surfaces around it (an inspector's `bg_elevated`, a selected row's
+    /// `selection_bg`) in light themes and dark.
+    pub fn scrub_fill(&self) -> Hsla {
+        Self::dim(self.text_primary, 0.2)
+    }
+
     /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
     /// background and the axis fills that mask GPU-frame edges straying into
     /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.

@@ -58,6 +58,14 @@ pub struct EditInspectorQuery {
     pub text: String,
 }
 
+/// A row's own control asks for the selected row to be activated as Enter
+/// would. A scrubber keeps its press from the row, since the press may
+/// become a drag, and only once it is released as a click does it ask
+/// this; the press already selected the row.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct ActivateSelectedRow;
+
 /// Where the inspector draws itself relative to the window.
 #[derive(Clone, Copy)]
 pub enum InspectorMode {
@@ -803,6 +811,20 @@ impl Inspector {
                 cx.notify();
                 return;
             }
+            "left" | "right" if self.search.text.is_empty() => {
+                let direction = if key == "right" { 1.0 } else { -1.0 };
+                let fine = event.keystroke.modifiers.shift;
+                let indices = self.filtered_indices();
+                if let Some(&row_idx) = indices.get(self.selected_index)
+                    && let Some(row) = self
+                        .current_rows_mut()
+                        .and_then(|rows| rows.get_mut(row_idx))
+                    && row.nudge(direction, fine, window, cx)
+                {
+                    cx.notify();
+                    return;
+                }
+            }
             "enter" | "return" => {
                 self.confirm(window, cx);
                 cx.notify();
@@ -991,15 +1013,21 @@ impl Inspector {
             .flex_col()
             .when(self.persistent, |group| group.size_full())
             .when(!self.dismissed, |group| {
-                group.on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
-                    this.search.set_text(action.text.clone());
-                    this.search.cursor = this.search.text.len();
-                    this.search.mark = this.search.cursor;
-                    this.query_edited(cx);
-                    this.selected_index = this.first_selectable_index();
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
+                group
+                    .on_action(cx.listener(|this, _: &ActivateSelectedRow, window, cx| {
+                        this.confirm(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
+                        this.search.set_text(action.text.clone());
+                        this.search.cursor = this.search.text.len();
+                        this.search.mark = this.search.cursor;
+                        this.query_edited(cx);
+                        this.selected_index = this.first_selectable_index();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
             })
             .child(panel);
         if matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
@@ -1136,7 +1164,6 @@ impl Inspector {
                               range: Range<usize>,
                               window: &mut Window,
                               cx: &mut Context<Self>| {
-                            let theme = crate::theme::theme(cx);
                             let indices = this.filtered_indices();
                             let mut out = Vec::with_capacity(range.len());
                             for vis_ix in range {
@@ -1153,17 +1180,13 @@ impl Inspector {
 
                                 let element = if is_editing {
                                     let edit = this.editing.as_ref().unwrap();
-                                    let label =
-                                        SharedString::from(rows[row_idx].label().to_string());
-                                    crate::inspector::rows::row_base(vis_ix, selected, cx)
-                                        .child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .text_color(theme.text_primary)
-                                                .child(label),
-                                        )
-                                        .child(div().flex_1().min_w_0().child(edit.field.element()))
-                                        .into_any_element()
+                                    rows[row_idx].render_editing(
+                                        vis_ix,
+                                        selected,
+                                        edit.field.element().into_any_element(),
+                                        window,
+                                        cx,
+                                    )
                                 } else if rows[row_idx].is_header() {
                                     // Headers are inert: no click-to-select, no
                                     // selection highlight.
@@ -1173,6 +1196,19 @@ impl Inspector {
                                         rows[row_idx].render_row(vis_ix, selected, window, cx);
                                     let row_idx_click = row_idx;
                                     div()
+                                        // Before any control in the row can
+                                        // keep the press to itself: the row
+                                        // it lands on is selected and the
+                                        // inspector takes the keys.
+                                        .capture_any_mouse_down(cx.listener(
+                                            move |this, _, window, cx| {
+                                                if this.dismissed {
+                                                    return;
+                                                }
+                                                this.selected_index = vis_ix;
+                                                this.focus_handle.focus(window, cx);
+                                            },
+                                        ))
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
                                             cx.listener(move |this, _, window, cx| {
@@ -1609,5 +1645,152 @@ mod temporal_tests {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod scrubber_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+    use gpui::Entity;
+
+    use crate::inspector::rows::SliderRow;
+
+    fn open(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Rc<Cell<f64>>,
+        Entity<Inspector>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
+        });
+        let value = Rc::new(Cell::new(0.5));
+        let (inspector, cx) = cx.add_window_view({
+            let value = value.clone();
+            move |_, cx| {
+                let read = value.clone();
+                let row = SliderRow {
+                    label: "Opacity".into(),
+                    read_value: Arc::new(move |_| read.get()),
+                    min: 0.0,
+                    max: 1.0,
+                    integer: false,
+                    on_change: Arc::new(move |v, _, _| value.set(v)),
+                };
+                Inspector::new(
+                    vec![Box::new(row)],
+                    InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
+                    cx,
+                )
+            }
+        });
+        cx.refresh().unwrap();
+        (value, inspector, cx)
+    }
+
+    fn scrubber(cx: &mut gpui::VisualTestContext) -> Bounds<Pixels> {
+        cx.refresh().unwrap();
+        cx.debug_bounds("scrubber")
+            .expect("the row draws a scrubber")
+    }
+
+    #[gpui::test]
+    fn dragging_a_slider_row_scrubs_without_opening_an_edit(cx: &mut gpui::TestAppContext) {
+        let (value, inspector, cx) = open(cx);
+        let start = scrubber(cx).origin + gpui::point(px(10.0), px(10.0));
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
+        cx.simulate_mouse_move(
+            start + gpui::point(px(4.0), px(0.0)),
+            gpui::MouseButton::Left,
+            none,
+        );
+        cx.simulate_mouse_move(
+            start + gpui::point(px(30.0), px(0.0)),
+            gpui::MouseButton::Left,
+            none,
+        );
+        cx.simulate_mouse_up(
+            start + gpui::point(px(30.0), px(0.0)),
+            gpui::MouseButton::Left,
+            none,
+        );
+        assert!(
+            value.get() > 0.6,
+            "moved right from the middle: {}",
+            value.get()
+        );
+        assert!(cx.read(|cx| inspector.read(cx).editing.is_none()));
+    }
+
+    #[gpui::test]
+    fn clicking_a_slider_row_types_into_its_box(cx: &mut gpui::TestAppContext) {
+        let (value, inspector, cx) = open(cx);
+        let center = scrubber(cx).center();
+        cx.simulate_click(center, gpui::Modifiers::default());
+        assert!(cx.read(|cx| inspector.read(cx).editing.is_some()));
+        scrubber(cx);
+
+        cx.update(|_, cx| {
+            inspector.update(cx, |i, _| {
+                i.editing.as_mut().unwrap().field.set_text("0.25")
+            })
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(value.get(), 0.25);
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(value.get(), 0.26, "arrows step the selected slider");
+        cx.simulate_keystrokes("shift-left");
+        assert_eq!(value.get(), 0.259);
+    }
+
+    #[gpui::test]
+    fn clicking_a_text_row_types_into_its_box(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
+        });
+        let text = Rc::new(std::cell::RefCell::new(String::from("hello")));
+        let (inspector, cx) = cx.add_window_view({
+            let text = text.clone();
+            move |_, cx| {
+                let row = crate::inspector::rows::TextRow::new(
+                    "Title".into(),
+                    "hello".into(),
+                    Arc::new(move |value, _, _| *text.borrow_mut() = value),
+                );
+                Inspector::new(
+                    vec![Box::new(row)],
+                    InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
+                    cx,
+                )
+            }
+        });
+        cx.refresh().unwrap();
+        let center = cx.debug_bounds("value-box").expect("a text box").center();
+        cx.simulate_click(center, gpui::Modifiers::default());
+        assert!(cx.read(|cx| inspector.read(cx).editing.is_some()));
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("value-box").is_some(), "edited in its box");
+
+        cx.update(|_, cx| {
+            inspector.update(cx, |i, _| {
+                i.editing.as_mut().unwrap().field.set_text("world")
+            })
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(*text.borrow(), "world");
     }
 }

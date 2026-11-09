@@ -8,7 +8,11 @@ use gpui::{
     AnyElement, AnyView, App, Global, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px,
 };
 
+use std::rc::Rc;
+
+use crate::inspector::ActivateSelectedRow;
 use crate::theme::theme;
+use crate::views::value_box::{OnEdit, ValueBox};
 
 pub mod bool;
 pub mod color;
@@ -82,6 +86,36 @@ pub trait InspectorRow: 'static {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement;
+
+    /// Paint the row while the inspector edits it as text, `field` being
+    /// the edit field. By default the field takes the value's place beside
+    /// the label; a row whose value sits in a box draws the field there.
+    fn render_editing(
+        &self,
+        row_ix: usize,
+        selected: bool,
+        field: AnyElement,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        row_base(row_ix, selected, cx)
+            .child(
+                div()
+                    .text_size(LABEL_SIZE)
+                    .text_color(theme(cx).text_primary)
+                    .child(SharedString::from(self.label().to_owned())),
+            )
+            .child(div().flex_1().min_w_0().child(field))
+            .into_any_element()
+    }
+
+    /// Step the value one notch, up for a positive `direction`, a finer
+    /// notch with `fine`, on Left and Right while the row is selected and
+    /// the search is empty. Returns whether the row took the key; rows
+    /// without a steppable value leave the arrows to the search field.
+    fn nudge(&mut self, _direction: f64, _fine: bool, _window: &mut Window, _cx: &mut App) -> bool {
+        false
+    }
 
     /// Respond to Enter or a click. Returning a [`RowAction`] lets the row
     /// mutate its bound data directly while delegating navigation and
@@ -413,6 +447,56 @@ pub fn value_row(
         .gap(px(2.))
         .child(row_label(label, label_color))
         .child(row_value(value, value_color))
+}
+
+/// Height of an inspector value box. A row is 28px with its selection pill
+/// inset 2px each side; the box sits inside the pill with room to spare
+/// and matches the edit field's 20px line.
+pub(crate) const BOX_HEIGHT: f32 = 20.0;
+/// Width of every value box, so sliders, numbers and text line up in one
+/// column whatever the row holds.
+const BOX_WIDTH: f32 = 140.0;
+
+/// The element a row styles as its value box: the column's fixed width.
+pub(crate) fn box_slot() -> gpui::Div {
+    div().flex_none().w(px(BOX_WIDTH))
+}
+
+/// What a click on a row's value box does: activate the row as Enter
+/// would. The box keeps its press from the row, which acts on mouse-down,
+/// so it asks only once the press is released as a click.
+pub(crate) fn edit_on_click() -> OnEdit {
+    Rc::new(|window, cx| window.dispatch_action(Box::new(ActivateSelectedRow), cx))
+}
+
+/// The box an editable row shows its value in: the inspector's size and
+/// text, right-aligned like the column, and editable on click unless the
+/// inspector is passive.
+pub(crate) fn value_box(row_ix: usize, text: impl Into<SharedString>, cx: &App) -> ValueBox {
+    let value_box = ValueBox::new(("value-box", row_ix), text, BOX_HEIGHT)
+        .text_size(f32::from(LABEL_SIZE))
+        .align_end();
+    match passive(cx) {
+        true => value_box,
+        false => value_box.on_edit(edit_on_click()),
+    }
+}
+
+/// A label and a value box: how editable text, number and slider rows
+/// show themselves, at rest and while typed into. The label keeps its
+/// width and the box sits in the column against the row's right edge.
+pub(crate) fn boxed_row(
+    row_ix: usize,
+    selected: bool,
+    label: SharedString,
+    value_box: gpui::Stateful<gpui::Div>,
+    cx: &App,
+) -> AnyElement {
+    row_base(row_ix, selected, cx)
+        .gap(px(12.0))
+        .child(row_label(label, theme(cx).text_primary).flex_none())
+        .child(value_box)
+        .into_any_element()
 }
 
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.
