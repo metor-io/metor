@@ -126,16 +126,46 @@ fn test_default_frame_name() {
 #[test]
 fn test_packet_ids_are_pinned() {
     let ids: [(PacketId, PacketId); 10] = [
-        (Imu::schema().packet_id(), [7, 178]),
-        (Image::schema().packet_id(), [221, 43]),
-        (ImuPair::schema().packet_id(), [202, 40]),
-        (BareName::schema().packet_id(), [165, 36]),
-        (Nav::schema().packet_id(), [208, 254]),
-        (Control::schema().packet_id(), [214, 25]),
-        (Pair::schema().packet_id(), [80, 170]),
-        (PairA::schema().packet_id(), [108, 58]),
-        (PairB::schema().packet_id(), [30, 137]),
-        (Nested::schema().packet_id(), [123, 77]),
+        (
+            Imu::schema().packet_id(),
+            [203, 135, 227, 47, 139, 56, 204, 138],
+        ),
+        (
+            Image::schema().packet_id(),
+            [66, 148, 119, 0, 2, 51, 244, 78],
+        ),
+        (
+            ImuPair::schema().packet_id(),
+            [138, 64, 20, 229, 10, 5, 217, 24],
+        ),
+        (
+            BareName::schema().packet_id(),
+            [20, 60, 135, 139, 100, 141, 45, 25],
+        ),
+        (
+            Nav::schema().packet_id(),
+            [151, 2, 69, 202, 56, 147, 36, 102],
+        ),
+        (
+            Control::schema().packet_id(),
+            [252, 133, 251, 180, 162, 125, 37, 165],
+        ),
+        (
+            Pair::schema().packet_id(),
+            [96, 82, 13, 129, 195, 152, 190, 246],
+        ),
+        (
+            PairA::schema().packet_id(),
+            [81, 210, 20, 74, 9, 49, 127, 169],
+        ),
+        (
+            PairB::schema().packet_id(),
+            [94, 102, 3, 169, 187, 233, 36, 72],
+        ),
+        (
+            Nested::schema().packet_id(),
+            [218, 118, 245, 68, 174, 171, 203, 150],
+        ),
     ];
     for (id, pinned) in ids {
         assert_eq!(id, pinned);
