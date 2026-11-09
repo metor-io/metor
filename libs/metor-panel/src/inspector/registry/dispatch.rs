@@ -82,6 +82,7 @@ impl InspectorRegistry {
                     }),
                     min,
                     max,
+                    integer: !matches!(val, TypedScalar::F32(_) | TypedScalar::F64(_)),
                     on_change: Arc::new(move |v, _w, cx| {
                         let value = if matches!(val, TypedScalar::F32(_) | TypedScalar::F64(_)) {
                             v

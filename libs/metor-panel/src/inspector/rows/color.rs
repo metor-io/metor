@@ -92,6 +92,7 @@ impl InspectorRow for ColorRow {
                 read_value: Arc::new(move |cx| *channel(&mut read(cx)) as f64),
                 min: 0.0,
                 max: 1.0,
+                integer: false,
                 on_change: Arc::new(move |v, w, cx| {
                     let mut color = write(cx);
                     *channel(&mut color) = v as f32;
