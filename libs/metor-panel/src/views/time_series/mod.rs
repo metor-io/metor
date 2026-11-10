@@ -1648,7 +1648,7 @@ impl TimeSeriesPlot {
         let (x_data, samples) = self.hover_samples(cx)?;
         let header = format_time_label(
             x_data as i64,
-            lp.data_start().unwrap_or(0.0) as i64,
+            lp.time_origin(cx).unwrap_or(0.0) as i64,
             lp.x_time_format,
             view.x_bounds().width(),
         );

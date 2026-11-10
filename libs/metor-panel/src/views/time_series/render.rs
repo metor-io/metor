@@ -167,7 +167,7 @@ impl TimeSeriesPlot {
                     let lp = underlay_lp.read(cx);
                     let axis_count = lp.axes.len();
                     let view = lp.effective_view(cx);
-                    let data_start = lp.data_start().unwrap_or(0.0);
+                    let data_start = lp.time_origin(cx).unwrap_or(0.0);
                     let fmt = lp.x_time_format;
                     let tint = alarm_plot_tint(lp, cx);
                     let _ = this.update(cx, |this, _| {
@@ -219,7 +219,7 @@ impl TimeSeriesPlot {
                     colors,
                     markers,
                     limit_lines,
-                    lp.data_start().unwrap_or(0.0),
+                    lp.time_origin(cx).unwrap_or(0.0),
                     lp.x_time_format,
                 )
             },
