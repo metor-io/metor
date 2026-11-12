@@ -338,7 +338,10 @@ mod tests {
 
     #[test]
     fn test_missing_bits_is_element_width() {
-        for (format, bits) in [(ImageFormat::Mono8, 8), (ImageFormat::Mono16, 16)] {
+        for (format, bits) in [
+            (ImageFormat::Mono8, 8),
+            (ImageFormat::Mono16, 16),
+        ] {
             let mut meta = ComponentMetadata::from("cam");
             meta.set(IMAGE_FORMAT_KEY, format.as_str());
             let image = meta.image().expect("valid").expect("an image");

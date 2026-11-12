@@ -2,13 +2,14 @@
 mod tests {
     use metor_proto::types::short_id;
 
+
     use arrow::{array::AsArray, datatypes::Float64Type};
-    use metor_db::{DB, Error, Server};
     use metor_proto::{
         types::{ComponentId, IntoLenPacket, LenPacket, Msg, PrimType, Timestamp},
         vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable},
     };
     use metor_proto_stellar::Client;
+    use metor_db::{DB, Error, Server};
     use postcard_schema::{Schema, schema::owned::OwnedNamedType};
     use std::{net::SocketAddr, sync::Arc, time::Duration};
     use stellarator::{net::TcpListener, sleep, spawn, struc_con::stellar, test};
@@ -94,8 +95,8 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         let component_id = ComponentId(4242);
         let node_dir = scratch.join("1000");
-        let node =
-            metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(1_000), 8).unwrap();
+        let node = metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(1_000), 8)
+            .unwrap();
         for i in 0..64i64 {
             node.data.write(&(1_000 + i).to_le_bytes()).unwrap();
             node.index
@@ -189,16 +190,12 @@ mod tests {
                 metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(start), 8)
                     .unwrap();
             for i in 0..64i64 {
-                node.data
-                    .write(&((start + i) as u64).to_le_bytes())
-                    .unwrap();
+                node.data.write(&((start + i) as u64).to_le_bytes()).unwrap();
                 node.index
                     .write(&Timestamp(start + i).to_le_bytes())
                     .unwrap();
             }
-            let seal = metor_db::seal::seal_node(&node, &node_dir)
-                .unwrap()
-                .unwrap();
+            let seal = metor_db::seal::seal_node(&node, &node_dir).unwrap().unwrap();
             store
                 .put(
                     NodeKey {
@@ -251,11 +248,7 @@ mod tests {
                 .filter_map(|id| {
                     let meta = state.get_component_metadata(*id)?;
                     assert!(meta.is_hidden(), "lod companions must be hidden");
-                    let ratio = meta
-                        .metadata
-                        .get(metor_db::lod::LOD_RATIO_KEY)?
-                        .parse()
-                        .ok()?;
+                    let ratio = meta.metadata.get(metor_db::lod::LOD_RATIO_KEY)?.parse().ok()?;
                     let bucket = meta
                         .metadata
                         .get(metor_db::lod::LOD_BUCKET_US_KEY)?
@@ -337,7 +330,8 @@ mod tests {
             .0
             .unwrap();
 
-        let local_dir = std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
         let local_db = Arc::new(DB::create(local_dir).unwrap());
         metor_db::remote::RemoteDb::new(addr).spawn(local_db.clone());
         // Let the mirror connect and subscribe before data flows.
@@ -427,9 +421,7 @@ mod tests {
                 )
             })
             .unwrap();
-        src_db
-            .push_msg(Timestamp(100), MIRROR_LOG, b"seed")
-            .unwrap();
+        src_db.push_msg(Timestamp(100), MIRROR_LOG, b"seed").unwrap();
 
         let local_db = mirror_db(addr);
         let probe = local_db.clone();
@@ -447,9 +439,7 @@ mod tests {
             "the log's metadata crossed with it",
         );
 
-        src_db
-            .push_msg(Timestamp(101), MIRROR_LOG, b"live")
-            .unwrap();
+        src_db.push_msg(Timestamp(101), MIRROR_LOG, b"live").unwrap();
         let probe = local_db.clone();
         wait_for(
             move || log_records(&probe, MIRROR_LOG).len() == 2,
