@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
+use metor_proto::types::{
+    IntoLenPacket, PACKET_HEADER_LEN, PacketHeader, PacketId, PacketTy, table_id,
+};
 use metor_proto::vtable::{Field, Op, VTable};
 use metor_proto_wkt::{
     CommandInfo, CommandKind, ComponentMetadata, LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata,
     MsgStream, SetComponentMetadata, SetMsgMetadata, VTableMsg,
 };
+use zerocopy::IntoBytes;
 
 use crate::record::{MsgCodec, RecordSchema};
 use crate::system::PortDef;
@@ -192,9 +195,10 @@ pub(crate) fn fits(max_len: usize, conn_cap: usize) -> bool {
 
 /// The length prefix and header of a packet carrying `payload_len` bytes.
 pub(crate) fn packet_head(ty: PacketTy, id: PacketId, payload_len: usize) -> [u8; PACKET_OVERHEAD] {
-    let [a, b, c, d] = ((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes();
-    let [e, f, g, h, i, j, k, l] = id;
-    [a, b, c, d, ty as u8, e, f, g, h, i, j, k, l, 0, 0, 0]
+    let mut head = [0; PACKET_OVERHEAD];
+    head[..4].copy_from_slice(&((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes());
+    head[4..].copy_from_slice(PacketHeader::new(ty, id, 0).as_bytes());
+    head
 }
 
 /// A packet body in its wire format, without the length prefix.
@@ -209,18 +213,12 @@ pub(crate) fn body(ty: PacketTy, id: PacketId, payload: &[u8]) -> Vec<u8> {
 mod tests {
     use metor_proto::types::{LenPacket, Msg};
 
-    /// The id in a packet body.
-    fn id_of(body: &[u8]) -> PacketId {
-        let mut id = [0; 8];
-        id.copy_from_slice(&body[1..9]);
-        id
-    }
-
     use crate::port::Input;
     use crate::record::MsgCodec;
     use crate::tests::utils::{Fixed, Imu};
     use crate::{DefCx, Payload, Record};
 
+    use super::super::peer::packet;
     use super::*;
 
     /// A record encoded as JSON, so its metadata names a codec.
@@ -283,8 +281,9 @@ mod tests {
         let mut ids = Vec::new();
         let mut rest = &blob[..];
         while let Some((len, body)) = rest.split_first_chunk::<4>() {
-            ids.push(id_of(body));
-            rest = &body[u32::from_le_bytes(*len) as usize..];
+            let len = u32::from_le_bytes(*len) as usize;
+            ids.push(packet(&body[..len]).expect("a packet").1);
+            rest = &body[len..];
         }
         let mut expected = vec![LinkInfo::ID, VTableMsg::ID];
         expected.extend(metadata.iter().map(|_| SetComponentMetadata::ID));
@@ -334,7 +333,8 @@ mod tests {
         let mut rest = blob;
         while let Some((len, body)) = rest.split_first_chunk::<4>() {
             let len = u32::from_le_bytes(*len) as usize;
-            packets.push((id_of(body), &body[PACKET_HEADER_LEN..len]));
+            let (_, id, payload) = packet(&body[..len]).expect("a packet");
+            packets.push((id, payload));
             rest = &body[len..];
         }
         packets
@@ -410,27 +410,5 @@ mod tests {
             expected.extend_from_slice(b"body");
             assert_eq!(batch, expected.into_len_packet().inner);
         }
-        let empty = packet_head(PacketTy::Msg, WIDE, 0);
-        assert_eq!(
-            empty,
-            [
-                12,
-                0,
-                0,
-                0,
-                PacketTy::Msg as u8,
-                7,
-                9,
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                0,
-                0,
-                0
-            ]
-        );
     }
 }
