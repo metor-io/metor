@@ -1184,10 +1184,7 @@ pub struct InstanceId(pub [u8; 16]);
 
 impl std::fmt::Display for InstanceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        write!(f, "{:032x}", u128::from_be_bytes(self.0))
     }
 }
 
@@ -1207,18 +1204,12 @@ impl std::str::FromStr for InstanceId {
     type Err = InvalidInstanceId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (pairs, []) = s.as_bytes().as_chunks::<2>() else {
-            return Err(InvalidInstanceId);
-        };
-        if pairs.len() != 16 {
+        if s.len() != 32 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
             return Err(InvalidInstanceId);
         }
-        let mut id = [0u8; 16];
-        let nibble = |c: u8| (c as char).to_digit(16).ok_or(InvalidInstanceId);
-        for (byte, [high, low]) in id.iter_mut().zip(pairs) {
-            *byte = (nibble(*high)? << 4 | nibble(*low)?) as u8;
-        }
-        Ok(InstanceId(id))
+        u128::from_str_radix(s, 16)
+            .map(|id| InstanceId(id.to_be_bytes()))
+            .map_err(|_| InvalidInstanceId)
     }
 }
 
