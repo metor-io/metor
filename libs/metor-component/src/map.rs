@@ -8,8 +8,6 @@
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 
-use metor_proto::com_de::{Componentize, Decomponentize};
-use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use metor_proto::vtable::builder::{FieldBuilder, map, raw_field};
 use metor_proto_wkt::ComponentMetadata;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -99,25 +97,6 @@ impl<K, V: AsVTable> AsVTable for FrameMap<K, V> {
 
     fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
         map_fields::<K, V>(&prefix)
-    }
-}
-
-impl<K, V> Componentize for FrameMap<K, V> {
-    fn sink_columns(&self, _output: &mut impl Decomponentize) {}
-
-    const MAX_SIZE: usize = 0;
-}
-
-impl<K, V> Decomponentize for FrameMap<K, V> {
-    type Error = core::convert::Infallible;
-
-    fn apply_value(
-        &mut self,
-        _component_id: ComponentId,
-        _view: ComponentView<'_>,
-        _timestamp: Option<Timestamp>,
-    ) -> Result<(), Self::Error> {
-        Ok(())
     }
 }
 

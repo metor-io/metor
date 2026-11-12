@@ -157,11 +157,26 @@ fn test_rejects_bad_signatures() {
         quote! { fn a(x: impl Param) {} },
         quote! { fn a((x, y): (A, B)) {} },
         quote! { fn a() -> u32 { 0 } },
+        quote! { fn a(x: (A, B)) {} },
+        quote! { fn a(x: &mut (Input<A>, Output<B>)) {} },
+        quote! { async fn a(x: (), stop: Stop) {} },
     ];
     for case in cases {
         let out = expand(case.clone(), &quote!(::fsw), Kind::System).to_string();
         assert!(out.contains("compile_error"), "{case} expanded to {out}");
     }
+}
+
+#[test]
+fn test_tuple_state_is_accepted() {
+    let f = expand_fn(
+        quote! { fn a(#[state] s: &mut (u32, u32), now: Timestamp) {} },
+        Kind::System,
+    );
+    assert_eq!(
+        impl_item(&f, "FnSignature", "State"),
+        quote!((u32, u32)).to_string()
+    );
 }
 
 #[test]

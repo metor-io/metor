@@ -1,6 +1,6 @@
 use darling::FromDeriveInput;
 use darling::ast;
-use metor_component_derive_impl::{EnumInput, Field, Input, StructInput};
+use metor_component_derive_impl::{EnumInput, Field, Input, Stamp, StructInput};
 use proc_macro::TokenStream;
 use syn::{Attribute, DeriveInput, Generics, Ident, Meta};
 
@@ -36,8 +36,8 @@ fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
     None
 }
 
-/// `#[derive(AsVTable)]`: the standalone form, always expanded with no frame
-/// id (see [`as_vtable_impl`](metor_component_derive_impl::as_vtable_impl)).
+/// `#[derive(AsVTable)]`: the standalone form, which attaches a marked
+/// `timestamp` field to every member.
 pub fn as_vtable(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
     let AsVTable {
@@ -65,6 +65,10 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
             group: None,
         }),
     };
-    metor_component_derive_impl::as_vtable_impl(&model, None, &crate::metor_component_crate_name())
-        .into()
+    metor_component_derive_impl::as_vtable_impl(
+        &model,
+        Stamp::Attach,
+        &crate::metor_component_crate_name(),
+    )
+    .into()
 }

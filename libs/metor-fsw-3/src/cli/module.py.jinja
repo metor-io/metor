@@ -5,9 +5,9 @@ from __future__ import annotations
 
 {% if dataclasses %}from dataclasses import dataclass, field
 {% endif %}from pathlib import Path
-from typing import Literal{% if takes_ports %}, Sequence{% endif %}
+from typing import {% if takes_groups %}TYPE_CHECKING, {% endif %}Literal{% if takes_sequences %}, Sequence{% endif %}
 
-from metor_config import Field, {% if takes_ports %}Item, {% endif %}OutPort, Pack, Record, {% if takes_caps %}ResourceHandle, {% endif %}Sources, System
+from metor_config import Field, {% if takes_ports %}Item, {% endif %}{% if takes_groups %}OutGroup, {% endif %}OutPort, Pack, {% if takes_groups %}PortGroup, {% endif %}Record, {% if takes_caps %}ResourceHandle, {% endif %}Sources, System
 from metor_config._fields import _given
 
 PACK = Pack(
@@ -39,14 +39,22 @@ class {{ system.name }}(System):
     _ty = {{ system.ty | python_string }}
 {% if system.takes_inputs %}    _takes_inputs = True
 {% endif %}{% if system.takes_outputs %}    _takes_outputs = True
+{% endif %}{% if system.input_ports %}    _input_ports = {{ '{' }}{% for port in system.input_ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
 {% endif %}    _ports = {{ '{' }}{% for port in system.ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
 {% if system.caps %}    _caps = ({% for cap in system.caps %}{{ cap | python_string }}{% if not loop.last %}, {% elif loop.length == 1 %},{% endif %}{% endfor %})
-{% endif %}
+{% endif %}{% for group in system.groups %}
+    class {{ group.name }}({{ group.base }}):
+{% if group.input_ports %}        _input_ports = {{ '{' }}{% for port in group.input_ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
+        if TYPE_CHECKING:
+
+            def __init__(self, *{% for port in group.keywords %}, {{ port.name }}: {{ port.annotation }}{{ port.default }}{% endfor %}) -> None: ...
+{% endif %}{% for attr in group.attrs %}        {{ attr.name }}: {{ attr.annotation }}
+{% endfor %}{% endfor %}
     def __init__(self
         {%- if system.inputs or system.params or system.caps or system.takes_inputs or system.takes_outputs %}, *{% endif %}
         {%- if system.takes_inputs %}, items: Sequence[Item] = (){% endif %}
         {%- if system.takes_outputs %}, records: Sequence[type[Record]] = (){% endif %}
-        {%- for port in system.inputs %}, {{ port.name }}: Sources[{{ port.record }}] = (){% endfor %}
+        {%- for port in system.inputs %}, {{ port.name }}: {{ port.annotation }}{{ port.default }}{% endfor %}
         {%- for cap in system.caps %}, {{ cap }}: ResourceHandle{% endfor %}
         {%- for field in system.params %}, {{ field.name }}: {{ field.annotation }}{{ field.default }}{% endfor %}) -> None:
 {% if system.args_doc %}        {{ system.args_doc | docstring(8) }}
@@ -59,5 +67,5 @@ class {{ system.name }}(System):
             {%- for cap in system.caps %}{{ cap | python_string }}: {{ cap }}{% if not loop.last %}, {% endif %}{% endfor -%}
         }{% endif %})
 
-{% for port in system.ports %}    {{ port.name }}: {{ port.annotation }}
+{% for port in system.attrs %}    {{ port.name }}: {{ port.annotation }}
 {% endfor %}{% endfor %}

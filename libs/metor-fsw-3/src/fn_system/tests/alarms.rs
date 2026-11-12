@@ -11,11 +11,10 @@ use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, InputConfig, RunState,
     SystemConfig, SystemTable,
 };
-use crate::def::DefError;
 use crate::port::{Output, Sample};
 use crate::tests::alarms::{Seen, Shared, feeder, occ, sink};
 use crate::tests::utils::Imu;
-use crate::{AlarmCell, AlarmSpec, Alarms, Severity, Stop};
+use crate::{AlarmCell, AlarmSpec, Alarms, Severity};
 
 use super::def_of;
 
@@ -86,11 +85,6 @@ fn fragile(#[state] s: &mut Power, batt: &Sample<Imu>, alarms: &mut Alarms) {
     let b = batt.get();
     alarms.check(&mut s.batt_warm, &BATT_WARM, b.map(|b| b.sample > 40.0));
     assert!(b.is_none_or(|b| b.sample <= 100.0), "overheated");
-}
-
-#[crate::system]
-async fn async_alarms(alarms: &mut Alarms, stop: Stop) {
-    let _ = (alarms, stop);
 }
 
 fn table(rig: &Rig) -> SystemTable {
@@ -241,21 +235,6 @@ fn cleared_alarm_is_not_cleared_again_on_drop() {
     assert_eq!(shared.take().len(), 2);
     reset(&shared, &mut c, 2);
     assert_eq!(shared.take(), []);
-}
-
-#[test]
-fn async_system_with_alarms_is_refused() {
-    let err = SystemTable::new()
-        .register_async("a", async_alarms(), || ())
-        .err();
-    let refused = matches!(
-        &err,
-        Some(BuildError::TypeDef {
-            source: DefError::AlarmsOnAsync { .. },
-            ..
-        })
-    );
-    assert!(refused, "{err:?}");
 }
 
 #[test]

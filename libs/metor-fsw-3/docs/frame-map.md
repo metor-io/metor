@@ -19,7 +19,7 @@ struct Nics {
     nics: FrameMap<String, NicStats>,
 }
 
-#[derive(AsVTable, Metadatatize, Componentize, Decomponentize)]
+#[derive(Fields)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct NicStats {

@@ -1,0 +1,5 @@
+error: two fields are named `x`
+ --> tests/ui/fields_duplicate_leaf.rs:9:5
+  |
+9 |     y: f64,
+  |     ^

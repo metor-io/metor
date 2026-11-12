@@ -151,15 +151,6 @@ pub enum DefError {
     #[error("slot: {message}")]
     Slot { message: String },
 
-    #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
-    SampleOnAsync { system: String },
-
-    #[error("async system `{system}` takes a `Cap`, which only a stepped system takes")]
-    IoOnAsync { system: String },
-
-    #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
-    RngOnAsync { system: String },
-
     #[error("the type sets an op budget but takes no `Cap`")]
     NoIo,
 
@@ -185,11 +176,21 @@ pub enum DefError {
         conn_cap: usize,
     },
 
-    #[error("async system `{system}` takes `Alarms`, which only a stepped system takes")]
-    AlarmsOnAsync { system: String },
-
     #[error("output `{port}` cannot carry its frame under its own path: {message}")]
     Reroot { port: String, message: String },
+
+    #[error(
+        "a port or parameter has an empty name; `flatten` belongs only on a field holding a `SystemParams` struct"
+    )]
+    EmptyName,
+
+    #[error(
+        "`Cap` parameter `{name}` sits under a field or an array; a `Cap` is a config keyword, so it must be a fn argument or a field of a struct passed as one"
+    )]
+    NestedCap { name: String },
+
+    #[error("two `{kind}` parameters are named `{name}`")]
+    DuplicateParam { kind: String, name: String },
 }
 
 /// The smallest whole-MiB `conn_cap` whose packets carry a `max_len`-byte

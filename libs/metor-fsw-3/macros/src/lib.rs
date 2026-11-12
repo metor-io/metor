@@ -6,22 +6,54 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
 
+mod fields;
 mod frame;
+mod key;
 mod record;
 mod system_attr;
+mod system_params;
 
 /// Derives `Frame` for a struct sent as its raw bytes.
 ///
-/// The derive also implements `Payload`, `Record`, and the four metor component
-/// traits.
-/// Mark one field `#[frame(timestamp)]`.
-/// `#[frame(name = "..")]` sets the record name, which defaults to the struct
-/// name in snake_case. `#[frame(depth = N)]` sets `Record::DEPTH`.
-/// `#[frame(max_len = N)]` bounds a frame holding a `FrameMap`; a fixed
+/// `Frame` is [`Fields`](macro@Fields) plus `Payload`, `Record`, a timestamp,
+/// and the frame-id tag. Mark one field `#[fsw(timestamp)]`.
+/// `#[fsw(name = "..")]` sets the record name, which defaults to the struct
+/// name in snake_case. `#[fsw(depth = N)]` sets `Record::DEPTH`.
+/// `#[fsw(max_len = N)]` bounds a frame holding a `FrameMap`; a fixed
 /// frame's length is its size, and the attribute fails its build.
-#[proc_macro_derive(Frame, attributes(frame))]
+/// `#[frame(..)]` is an alias of `#[fsw(..)]`.
+///
+/// A frame used as a field of another frame is a plain group: the outer
+/// frame's timestamp and frame id apply to its leaves. `Frame::STAMP` is the
+/// timestamp field's offset and size.
+#[proc_macro_derive(Frame, attributes(fsw, frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
+}
+
+/// Derives `AsVTable` and `Metadatatize` for a group of components nested in
+/// a frame.
+///
+/// The group has no name, id, or timestamp; the frame that holds it stamps
+/// its leaves. Each field adds a path segment named after it, and an array
+/// adds `0` … `N-1`. A field marked `timestamp` is a compile error. Field
+/// attributes: `#[fsw(flatten)]` on a field holding another `Fields` struct
+/// adds no segment, `#[fsw(rename = "y")]` names the
+/// segment `y`, `#[fsw(skip)]` leaves the field out, and `#[fsw(unit = "..")]`
+/// and `#[fsw(metadata(..))]` label its components. A field named `_x` is
+/// skipped unless marked `#[fsw(skip = false)]`. `#[fsw(group)]` on the
+/// struct emits a metadata entry for the group itself. Two leaves at one path
+/// fail the derive where it sees them, and otherwise the build
+/// (`BuildError::DuplicateLeaf`).
+///
+/// ```ignore
+/// #[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
+/// #[repr(C)]
+/// pub struct Inner { pub x: f64, pub y: f64 }
+/// ```
+#[proc_macro_derive(Fields, attributes(fsw))]
+pub fn fields_derive(input: TokenStream) -> TokenStream {
+    fields::fields(input)
 }
 
 /// Derives `Payload` and `Record` for a type encoded with postcard.
@@ -35,10 +67,48 @@ pub fn record_derive(input: TokenStream) -> TokenStream {
     record::record(input)
 }
 
+/// Derives `Param` and `ArrayParam` for a struct of system params.
+///
+/// Each field is a param, as a `#[system]` fn argument would be, and names
+/// its ports under the field name; an array field names element `i` under
+/// `{field}.{i}`. `#[fsw(rename = "..")]` renames that segment,
+/// `#[fsw(flatten)]` on a field holding another struct adds no segment for
+/// it, and `#[fsw(skip)]` or a leading `_` leaves the field out, filled by
+/// `Default`. A struct passed as a fn argument adds no segment of its own.
+///
+/// The derive refuses `Seq`, `Timestamp`, `Abort`, and tuple fields, and
+/// `flatten` on a field whose type is a single param or an array. A
+/// flattened leaf it cannot see through fails the system's definition with
+/// `DefError::EmptyName`, as do two `Cap`s or `Rng`s of one name
+/// (`DefError::DuplicateParam`) and a `Cap` under a field or an array
+/// (`DefError::NestedCap`).
+///
+/// The struct takes at most one lifetime. It is a param of cyclic fns and
+/// sequences, or of async fns under `#[system_params(async)]`, whose inputs
+/// are `Input<T, Notifier>`.
+///
+/// ```ignore
+/// #[derive(SystemParams)]
+/// struct Sensors<'a> {
+///     fss: [&'a mut Input<Fss>; 8],
+///     gyro: &'a Sample<Gyro>,
+/// }
+///
+/// #[system]
+/// fn sun(sensors: Sensors<'_>, est: &mut Output<SunVec>) { .. }
+/// ```
+#[proc_macro_derive(SystemParams, attributes(fsw, system_params))]
+pub fn system_params_derive(input: TokenStream) -> TokenStream {
+    system_params::system_params(input)
+}
+
 /// Turns a free fn into a system.
 ///
 /// `#[system] fn nav(..)` becomes `fn nav() -> impl SystemFn`, which you
 /// register with a table. Each parameter is a port, named after the parameter.
+/// An array parameter `[P; N]` names element `i` `{name}.{i}`, and a
+/// [`SystemParams`](macro@SystemParams) struct names its fields' ports
+/// without the parameter's name. A tuple parameter is refused.
 /// Mark one `&mut S` parameter `#[state]` to give the system state. Without
 /// one, the state is `()`. The value `nav()` returns derefs to a fn pointer to
 /// the original body, so tests can call it directly. The fn's doc comment

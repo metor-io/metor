@@ -69,6 +69,19 @@ pub enum PackDevError {
     #[error("the module describes other systems than the library")]
     #[diagnostic(code(M0408))]
     DescriptorMismatch,
+    #[error(
+        "the ports of system `{system}` do not form lists and groups at `{port}`{}",
+        other.as_ref().map(|other| format!(", whose class `{other}` also names")).unwrap_or_default()
+    )]
+    #[diagnostic(
+        code(M0409),
+        help("rename the port or the fields that name the ports under it")
+    )]
+    PortShape {
+        system: String,
+        port: String,
+        other: Option<String>,
+    },
     #[error("the pack builds as wasm, and the wasm32 target is not installed")]
     #[diagnostic(code(M0413), help("rustup target add {}", crate::dl::WASM_TRIPLE))]
     NoWasmTarget,

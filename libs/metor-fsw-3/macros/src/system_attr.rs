@@ -19,9 +19,11 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
-    Attribute, Expr, ExprLit, FnArg, GenericArgument, Generics, Ident, Item, ItemFn, Lifetime, Lit,
-    Meta, Pat, PathArguments, ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
+    Attribute, Expr, ExprLit, FnArg, Generics, Ident, Item, ItemFn, Lifetime, Lit, Meta, Pat,
+    ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
 };
+
+use crate::key::{element_name, is_seq, key_type, set_seq_lifetime};
 
 /// Which attribute is expanding.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +94,16 @@ enum Shape {
     Sequence,
 }
 
+impl Shape {
+    /// The wake sink the fn's inputs use.
+    fn wake(&self, fsw: &TokenStream2) -> TokenStream2 {
+        match self {
+            Self::Async { .. } => quote!(#fsw::ring::Notifier),
+            Self::Cyclic | Self::Sequence => quote!(#fsw::ring::NoWake),
+        }
+    }
+}
+
 /// A checked `#[system]` or `#[sequence]` fn signature.
 struct Sig {
     shape: Shape,
@@ -121,7 +133,26 @@ impl Sig {
                 Shape::Sequence
             }
         };
-        Ok(Self { shape, args, state })
+        let sig = Self { shape, args, state };
+        sig.check_no_tuples(kind)?;
+        Ok(sig)
+    }
+
+    /// Rejects a tuple port; its elements would share one name.
+    fn check_no_tuples(&self, kind: Kind) -> syn::Result<()> {
+        match self
+            .ports()
+            .find(|arg| matches!(key_type(&arg.ty), Type::Tuple(_)))
+        {
+            Some(arg) => Err(syn::Error::new_spanned(
+                &arg.ty,
+                format!(
+                    "a `{}` parameter cannot be a tuple; group parameters in a `#[derive(SystemParams)]` struct",
+                    kind.attr()
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Returns the parameters that are ports, in order.
@@ -257,7 +288,7 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     for arg in args {
         if let Some((_, message)) = refused
             .iter()
-            .find(|(name, _)| is_type_named(&arg.ty, name))
+            .find(|(name, _)| element_name(&arg.ty).is_some_and(|n| n == name))
         {
             return Err(syn::Error::new_spanned(&arg.ty, *message));
         }
@@ -265,20 +296,12 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     Ok(())
 }
 
-/// Returns whether `ty` is a path ending in `name`, ignoring references.
-fn is_type_named(ty: &Type, name: &str) -> bool {
-    match ty {
-        Type::Reference(r) => is_type_named(&r.elem, name),
-        Type::Path(path) => path.path.segments.last().is_some_and(|s| s.ident == name),
-        _ => false,
-    }
-}
-
 fn ends_in_stop(args: &[Arg], state: Option<usize>) -> bool {
     let Some(last) = args.len().checked_sub(1) else {
         return false;
     };
-    let is_stop = matches!(&args[last].ty, Type::Path(_)) && is_type_named(&args[last].ty, "Stop");
+    let is_stop = matches!(&args[last].ty, Type::Path(_))
+        && element_name(&args[last].ty).is_some_and(|n| n == "Stop");
     is_stop && state != Some(last)
 }
 
@@ -303,7 +326,7 @@ fn check_output(output: &ReturnType) -> syn::Result<()> {
 /// The expected type is `Result<(), SeqError>`.
 fn check_sequence_output(sig: &Signature) -> syn::Result<()> {
     match &sig.output {
-        ReturnType::Type(_, ty) if is_type_named(ty, "Result") => Ok(()),
+        ReturnType::Type(_, ty) if element_name(ty).is_some_and(|n| n == "Result") => Ok(()),
         ReturnType::Type(_, ty) => Err(syn::Error::new_spanned(ty, SEQUENCE_OUTPUT)),
         ReturnType::Default => Err(syn::Error::new_spanned(&sig.ident, SEQUENCE_OUTPUT)),
     }
@@ -436,9 +459,11 @@ fn ports_impl(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let keys = sig.ports().map(|arg| key_type(&arg.ty));
     let names = sig.ports().map(|arg| arg.ident.to_string());
+    let wake = sig.shape.wake(fsw);
     quote! {
         impl #impl_generics #fsw::FnSignature for __MetorSystem #ty_generics #where_clause {
             type State = #state_ty;
+            type Wake = #wake;
             type Params = (#(#keys,)*);
             const NAME: &'static str = #name;
             const NAMES: &'static [&'static str] = &[#(#names),*];
@@ -462,11 +487,12 @@ fn call_parts(
         None => quote!(_),
     };
     let idents = sig.ports().map(|arg| &arg.ident);
-    let items = quote!((#(#idents,)*): <Self::Params as #fsw::Param>::Item);
+    let wake = sig.shape.wake(fsw);
+    let items = quote!((#(#idents,)*): <Self::Params as #fsw::Param<#wake>>::Item);
     // Spanned at each parameter type, so a type that is no `Param` errors there.
     let asserts = sig.ports().map(|arg| {
         let key = key_type(&arg.ty);
-        quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key>(); }
+        quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key, #wake>(); }
     });
     let args = sig.args.iter().map(|arg| &arg.ident);
     let turbofish = generics.split_for_impl().1.as_turbofish().to_token_stream();
@@ -500,7 +526,7 @@ fn sequence_call(
     let call = quote! {
         async fn call<#lifetime>(
             #state: &#lifetime mut #state_ty,
-            #items<#lifetime, #fsw::ring::NoWake>,
+            #items<#lifetime>,
         ) -> ::core::result::Result<(), #fsw::SeqError> {
             #body.await
         }
@@ -522,7 +548,7 @@ fn async_call(
     let call = quote! {
         async fn call(
             #state: &mut #state_ty,
-            #items<'_, #fsw::ring::Notifier>,
+            #items<'_>,
             #stop: #fsw::Stop,
         ) {
             #body.await
@@ -547,7 +573,7 @@ fn cyclic_call(
     let tys = sig.args.iter().map(|arg| &arg.ty);
     let fn_ptr = quote!(fn(#(#tys),*));
     let call = quote! {
-        fn call(#state: &mut #state_ty, #items<'_, #fsw::ring::NoWake>) {
+        fn call(#state: &mut #state_ty, #items<'_>) {
             #body
         }
     };
@@ -585,25 +611,6 @@ fn extract_doc(attrs: &[Attribute]) -> String {
         .map(|line| line.strip_prefix(' ').unwrap_or(&line).to_string())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Returns the type used to look up a parameter's `Param` impl.
-///
-/// One outer reference is stripped, so `&mut Input<T>` and `Input<T>` get the
-/// same key. `Seq` is keyed as `Seq<'static>`.
-fn key_type(ty: &Type) -> Type {
-    let key = match ty {
-        Type::Reference(r) => (*r.elem).clone(),
-        other => other.clone(),
-    };
-    match &key {
-        Type::Path(path) if is_seq(path) => {
-            let mut path = path.clone();
-            set_seq_lifetime(&mut path, &Lifetime::new("'static", Span::call_site()));
-            Type::Path(path)
-        }
-        _ => key,
-    }
 }
 
 /// Returns `'__seq`, the lifetime shared by a sequence's parameters.
@@ -651,32 +658,6 @@ impl VisitMut for ElidedLifetimes {
             set_seq_lifetime(path, &self.0);
         }
         visit_mut::visit_type_path_mut(self, path);
-    }
-}
-
-/// Returns whether `path` is `Seq` or `Seq<'_>`.
-///
-/// The macro fills in the lifetime of those two forms.
-fn is_seq(path: &TypePath) -> bool {
-    let Some(last) = path.path.segments.last() else {
-        return false;
-    };
-    if path.qself.is_some() || last.ident != "Seq" {
-        return false;
-    }
-    match &last.arguments {
-        PathArguments::None => true,
-        PathArguments::AngleBracketed(args) => {
-            args.args.len() == 1
-                && matches!(args.args.first(), Some(GenericArgument::Lifetime(lt)) if lt.ident == "_")
-        }
-        PathArguments::Parenthesized(_) => false,
-    }
-}
-
-fn set_seq_lifetime(path: &mut TypePath, lifetime: &Lifetime) {
-    if let Some(last) = path.path.segments.last_mut() {
-        last.arguments = PathArguments::AngleBracketed(syn::parse_quote!(<#lifetime>));
     }
 }
 

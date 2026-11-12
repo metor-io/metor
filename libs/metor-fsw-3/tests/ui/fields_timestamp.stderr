@@ -1,0 +1,5 @@
+error: #[fsw(timestamp)] is only for #[derive(Frame)]
+ --> tests/ui/fields_timestamp.rs:8:5
+  |
+8 |     timestamp: metor_fsw_3::Timestamp,
+  |     ^^^^^^^^^

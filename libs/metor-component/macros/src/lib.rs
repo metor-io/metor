@@ -23,8 +23,6 @@ use quote::quote;
 use syn::Ident;
 
 mod as_vtable;
-mod componentize;
-mod decomponentize;
 mod metadatatize;
 
 #[proc_macro_derive(Metadatatize, attributes(fsw, metor_fsw))]
@@ -35,16 +33,6 @@ pub fn metadatize(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(AsVTable, attributes(fsw, metor_fsw))]
 pub fn as_vtable(input: TokenStream) -> TokenStream {
     as_vtable::as_vtable(input)
-}
-
-#[proc_macro_derive(Componentize, attributes(fsw, metor_fsw))]
-pub fn componentize(input: TokenStream) -> TokenStream {
-    componentize::componentize(input)
-}
-
-#[proc_macro_derive(Decomponentize, attributes(fsw, metor_fsw))]
-pub fn decomponentize(input: TokenStream) -> TokenStream {
-    decomponentize::decomponentize(input)
 }
 
 /// The path generated code uses to reach the component crate: the name the
@@ -64,4 +52,3 @@ pub(crate) fn metor_component_crate_name() -> proc_macro2::TokenStream {
         Err(e) => panic!("the component derives require `metor-component` in [dependencies]: {e}"),
     }
 }
-

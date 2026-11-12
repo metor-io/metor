@@ -6,8 +6,8 @@ use crate::input::{EnumInput, Input, StructInput};
 
 /// Generates the `Metadatatize` impl.
 ///
-/// `crate_name` follows the same root-path contract as
-/// [`componentize_impl`](crate::componentize::componentize_impl).
+/// `crate_name` is the path prefix the generated code uses to reach the
+/// framework's re-exports.
 pub fn metadatatize_impl(input: &Input, crate_name: &TokenStream2) -> TokenStream2 {
     match input {
         Input::Enum(input) => enum_metadatatize_impl(input, crate_name),
@@ -49,33 +49,33 @@ pub fn struct_metadatatize_impl(input: &StructInput, crate_name: &TokenStream2) 
         ..
     } = input;
     let where_clause = &generics.where_clause;
-    let metadata_items = fields
-        .iter()
-        .filter(|f| !f.timestamp && !f.skipped())
-        .map(|field| {
-            let ty = &field.ty;
-            let name = field.qualified_component_name(parent.as_deref());
-            let entries: Vec<(&str, &str)> = field
-                .unit
-                .iter()
-                .map(|unit| ("unit", unit.as_str()))
-                .chain(field.metadata.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                .collect();
-            let set = (!entries.is_empty()).then(|| {
-                let keys = entries.iter().map(|(k, _)| k);
-                let values = entries.iter().map(|(_, v)| v);
-                quote! {
-                    .map(|mut m| {
-                        use #impeller_wkt::MetadataExt as _;
-                        #(m.set(#keys, #values);)*
-                        m
-                    })
-                }
-            });
+    let metadata_items = fields.iter().filter(|f| f.is_member()).map(|field| {
+        let ty = &field.ty;
+        let prefix = match field.segment(parent.as_deref()) {
+            Some(name) => quote! { prefix.clone().chain(#name) },
+            None => quote! { prefix.clone() },
+        };
+        let entries: Vec<(&str, &str)> = field
+            .unit
+            .iter()
+            .map(|unit| ("unit", unit.as_str()))
+            .chain(field.metadata.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .collect();
+        let set = (!entries.is_empty()).then(|| {
+            let keys = entries.iter().map(|(k, _)| k);
+            let values = entries.iter().map(|(_, v)| v);
             quote! {
-                .chain(<#ty>::metadata(prefix.clone().chain(#name)) #set)
+                .map(|mut m| {
+                    use #impeller_wkt::MetadataExt as _;
+                    #(m.set(#keys, #values);)*
+                    m
+                })
             }
         });
+        quote! {
+            .chain(<#ty>::metadata(#prefix) #set)
+        }
+    });
     // No group entry at an empty root prefix, since the empty name
     // would collide across roots.
     let group_emit = match group {

@@ -13,9 +13,9 @@ mod os;
 #[cfg(any(target_os = "linux", test))]
 pub mod smart;
 
-use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 use metor_fsw_3::{
-    Frame, FrameMap, FrameWriteError, JsonSchema, MapWriter, Output, Stop, Timestamp, system,
+    Fields, Frame, FrameMap, FrameWriteError, JsonSchema, MapWriter, Output, Stop, Timestamp,
+    system,
 };
 use serde::Deserialize;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -38,17 +38,7 @@ pub struct Counters {
 }
 
 /// One device's counters, byte rates (B/s), and SMART health.
-#[derive(
-    AsVTable,
-    Metadatatize,
-    Componentize,
-    Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Debug,
-)]
+#[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
 #[repr(C)]
 pub struct DiskStats {
     pub reads: u64,

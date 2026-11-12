@@ -10,8 +10,7 @@ mod os;
 #[cfg(any(target_os = "linux", test))]
 pub mod proc_stat;
 
-use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
-use metor_fsw_3::{Frame, FrameMap, JsonSchema, Output, Stop, Timestamp, system};
+use metor_fsw_3::{Fields, Frame, FrameMap, JsonSchema, Output, Stop, Timestamp, system};
 use serde::Deserialize;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -68,20 +67,7 @@ impl Ticks {
 const SHARES: usize = 5;
 
 /// One core's cumulative ticks and the percent of its time in each state.
-#[derive(
-    AsVTable,
-    Metadatatize,
-    Componentize,
-    Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-)]
+#[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct CoreStats {
     pub user: u64,
@@ -115,7 +101,6 @@ pub struct CoreStats {
 pub struct Cpu {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    #[frame(nest)]
     pub total: CoreStats,
     pub cores: FrameMap<u16, CoreStats>,
 }

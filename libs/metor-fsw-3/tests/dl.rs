@@ -164,7 +164,9 @@ fn test_pack_reports_system_metadata() {
             "count_by",
             "level",
             "hot",
-            "burn"
+            "burn",
+            "tag",
+            "gather"
         ]
     );
 

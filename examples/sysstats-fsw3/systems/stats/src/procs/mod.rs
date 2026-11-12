@@ -10,8 +10,7 @@ mod os;
 #[cfg(any(target_os = "linux", test))]
 pub mod proc_pid;
 
-use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
-use metor_fsw_3::{Frame, FrameMap, FrameStr, JsonSchema, Output, Stop, Timestamp, system};
+use metor_fsw_3::{Fields, Frame, FrameMap, FrameStr, JsonSchema, Output, Stop, Timestamp, system};
 use serde::Deserialize;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -19,19 +18,7 @@ use crate::sample::{Health, Interval, Pace};
 
 /// One process. IO counters read zero where the OS withholds them.
 #[derive(
-    AsVTable,
-    Metadatatize,
-    Componentize,
-    Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
+    Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, Default, PartialEq,
 )]
 #[repr(C)]
 pub struct ProcStats {

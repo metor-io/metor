@@ -8,11 +8,17 @@ use darling::FromField;
 pub struct Field {
     pub ident: Option<syn::Ident>,
     pub ty: syn::Type,
+    /// `#[fsw(rename = "y")]` names the field's segment `y`.
+    pub rename: Option<String>,
+    /// Alias of `rename`.
     pub component_id: Option<String>,
     #[darling(default)]
     pub timestamp: bool,
-    /// Descend into a sub-frame/struct through the component traits instead
-    /// of treating the field as a leaf scalar.
+    /// `#[fsw(flatten)]` adds no segment: the field's leaves sit at the
+    /// struct's own path.
+    #[darling(default)]
+    pub flatten: bool,
+    /// Read only to refuse it: a nested struct derives `Fields` instead.
     #[darling(default)]
     pub nest: bool,
     /// Max cardinality for a `FrameList`/`FrameMap` field. The const-generic
@@ -40,13 +46,28 @@ pub struct Field {
 impl Field {
     /// The field's component id, defaulting to the field name.
     pub fn component_name(&self) -> String {
-        match &self.component_id {
+        match self.rename.as_ref().or(self.component_id.as_ref()) {
             Some(c) => c.clone(),
             None => {
+                // PANIC Safety: the derives accept only named structs.
                 let ident = self.ident.as_ref().expect("field must have ident");
                 ident.to_string()
             }
         }
+    }
+
+    /// The path segment the field adds under an optional dotted prefix, or
+    /// `None` when it adds none.
+    pub fn segment(&self, parent: Option<&str>) -> Option<String> {
+        match self.flatten {
+            true => parent.map(str::to_string),
+            false => Some(self.qualified_component_name(parent)),
+        }
+    }
+
+    /// Whether the field becomes components: neither the timestamp nor skipped.
+    pub fn is_member(&self) -> bool {
+        !self.timestamp && !self.skipped()
     }
 
     /// The component id under an optional dotted prefix.
@@ -68,25 +89,5 @@ impl Field {
                 .as_ref()
                 .is_some_and(|i| i.to_string().starts_with('_'))
         })
-    }
-
-    /// Whether the field recurses through the component traits rather than
-    /// emitting a scalar leaf, either explicitly via `#[fsw(nest)]` or
-    /// implicitly because it is dynamic.
-    pub fn is_nested(&self) -> bool {
-        self.nest || self.is_dynamic()
-    }
-
-    /// Whether the field type's outermost path segment is `FrameList` or
-    /// `FrameMap`. Such fields carry no in-struct value, so the scalar
-    /// encode/decode paths skip them and `MAX_SIZE` sizes their trailer
-    /// instead.
-    pub fn is_dynamic(&self) -> bool {
-        if let syn::Type::Path(p) = &self.ty
-            && let Some(seg) = p.path.segments.last()
-        {
-            return seg.ident == "FrameList" || seg.ident == "FrameMap";
-        }
-        false
     }
 }

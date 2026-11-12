@@ -43,7 +43,7 @@ fn test_nested_paths() {
 }
 
 /// Leaves with no stamp; `derive(Frame)` requires one, so the def is built by hand.
-#[derive(metor_component::AsVTable, metor_component::Metadatatize)]
+#[derive(crate::Fields)]
 #[repr(C)]
 struct Unstamped {
     a: f64,

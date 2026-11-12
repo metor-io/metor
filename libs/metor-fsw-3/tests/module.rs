@@ -24,16 +24,7 @@ struct Sample {
     b: FrameArray<f64, 3>,
 }
 
-#[derive(
-    metor_component::AsVTable,
-    metor_component::Metadatatize,
-    metor_component::Componentize,
-    metor_component::Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-)]
+#[derive(metor_fsw_3::Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct Wheel {
     speed: f64,
@@ -46,7 +37,6 @@ struct Wheel {
 struct Wheels {
     #[frame(timestamp)]
     timestamp: Timestamp,
-    #[frame(nest)]
     wheel: Wheel,
 }
 
@@ -60,16 +50,7 @@ struct Procs {
 }
 
 /// A group whose leaves share names with a `Field`'s attributes.
-#[derive(
-    metor_component::AsVTable,
-    metor_component::Metadatatize,
-    metor_component::Componentize,
-    metor_component::Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-)]
+#[derive(metor_fsw_3::Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct Attrs {
     signature: f64,
@@ -82,7 +63,6 @@ struct Attrs {
 struct Signed {
     #[frame(timestamp)]
     timestamp: Timestamp,
-    #[frame(nest)]
     g: Attrs,
 }
 
@@ -377,7 +357,6 @@ struct Sensors {
     timestamp: Timestamp,
     gyro_b: FrameArray<f64, 3>,
     css: FrameArray<f64, 6>,
-    #[frame(nest)]
     wheel: Wheel,
 }
 
@@ -389,7 +368,6 @@ struct Body {
     timestamp: Timestamp,
     omega_b: FrameArray<f64, 3>,
     sun: FrameArray<f64, 6>,
-    #[frame(nest)]
     wheel: Wheel,
 }
 

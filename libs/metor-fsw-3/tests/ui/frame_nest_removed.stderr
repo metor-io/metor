@@ -1,0 +1,5 @@
+error: `nest` is not an attribute; derive `Fields` on the field's type instead
+  --> tests/ui/frame_nest_removed.rs:16:5
+   |
+16 |     inner: Inner,
+   |     ^^^^^

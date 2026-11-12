@@ -1,4 +1,4 @@
-error: #[derive(Frame)] requires a #[frame(timestamp)] field
+error: #[derive(Frame)] requires a #[fsw(timestamp)] field
  --> tests/ui/missing_timestamp.rs:7:8
   |
 7 | struct NoStamp {

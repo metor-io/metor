@@ -1,0 +1,91 @@
+error[E0277]: `metor_fsw_3::Input<Imu>` is not a parameter of a system whose inputs wake `Notifier`
+  --> tests/ui/async_nowake_input.rs:12:1
+   |
+12 | #[system]
+   | ^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+   |
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+help: the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+      but trait `Param<NoWake>` is implemented for it
+  --> src/fn_system/param.rs
+   |
+   | impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `NoWake`, found `Notifier`
+   = note: required for `(metor_fsw_3::Input<Imu>,)` to implement `Param<Notifier>`
+note: required by a bound in `metor_fsw_3::FnSignature::Params`
+  --> src/fn_system/mod.rs
+   |
+   |     type Params: Param<Self::Wake>;
+   |                  ^^^^^^^^^^^^^^^^^ required by this bound in `FnSignature::Params`
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `metor_fsw_3::Input<Imu>` is not a parameter of a system whose inputs wake `Notifier`
+  --> tests/ui/async_nowake_input.rs:12:10
+   |
+12 | #[system]
+   |          ^ the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+   |
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+help: the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+      but trait `Param<NoWake>` is implemented for it
+  --> src/fn_system/param.rs
+   |
+   | impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `NoWake`, found `Notifier`
+   = note: required for `(metor_fsw_3::Input<Imu>,)` to implement `Param<Notifier>`
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `metor_fsw_3::Input<Imu>` is not a parameter of a system whose inputs wake `Notifier`
+ --> src/fn_system/mod.rs
+  |
+  |         items: <Self::Params as Param<Notifier>>::Item<'_>,
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+  |
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+help: the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+      but trait `Param<NoWake>` is implemented for it
+ --> src/fn_system/param.rs
+  |
+  | impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `NoWake`, found `Notifier`
+  = note: required for `(metor_fsw_3::Input<Imu>,)` to implement `Param<Notifier>`
+
+error[E0277]: `metor_fsw_3::Input<Imu>` is not a parameter of a system whose inputs wake `Notifier`
+  --> tests/ui/async_nowake_input.rs:12:1
+   |
+12 | #[system]
+   | ^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+   |
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+help: the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+      but trait `Param<NoWake>` is implemented for it
+  --> src/fn_system/param.rs
+   |
+   | impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `NoWake`, found `Notifier`
+   = note: required for `(metor_fsw_3::Input<Imu>,)` to implement `Param<Notifier>`
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `metor_fsw_3::Input<Imu>` is not a parameter of a system whose inputs wake `Notifier`
+  --> tests/ui/async_nowake_input.rs:13:26
+   |
+13 | async fn relay(imu: &mut Input<Imu>, stop: Stop) {
+   |                          ^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+   |
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+help: the trait `Param<Notifier>` is not implemented for `metor_fsw_3::Input<Imu>`
+      but trait `Param<NoWake>` is implemented for it
+  --> src/fn_system/param.rs
+   |
+   | impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `NoWake`, found `Notifier`
+note: required by a bound in `metor_fsw_3::fn_system::assert_param`
+  --> src/fn_system/mod.rs
+   |
+   | pub fn assert_param<P: Param<W>, W: InputWake>() {}
+   |                        ^^^^^^^^ required by this bound in `assert_param`

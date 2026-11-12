@@ -14,6 +14,8 @@ use metor_proto_wkt::{LogEvent, SequenceCommand};
 
 use super::pack_dev::PackDevError;
 use super::port_class::Accessors;
+use super::port_stub::{Attr, GroupClass, Keyword, Leaf, Stubs};
+use super::port_tree::{ShapeError, port_tree};
 use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelMessage, ChannelStatus};
 use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
 use crate::def::DefCx;
@@ -82,6 +84,10 @@ struct Module {
     systems: Vec<Entry>,
     /// Whether any system takes a port list from its config.
     takes_ports: bool,
+    /// Whether the module names `Sequence`.
+    takes_sequences: bool,
+    /// Whether any system has a group of ports.
+    takes_groups: bool,
     /// Whether any system takes a `Cap`, so the module imports `ResourceHandle`.
     takes_caps: bool,
 }
@@ -199,13 +205,31 @@ struct Entry {
     takes_inputs: bool,
     /// Whether the type takes a `records` list.
     takes_outputs: bool,
-    inputs: Vec<Port>,
+    /// One keyword per input, list, or group of inputs.
+    inputs: Vec<Keyword>,
+    /// Every wired input with its record class, when any is in a list or
+    /// group.
+    input_ports: Vec<Leaf>,
     params: Vec<Field>,
     /// The name of each `Cap` parameter.
     caps: Vec<String>,
     /// Every output port with its record class. The framework's ports come
     /// last.
     ports: Vec<Port>,
+    /// One attribute per output, list, or group of outputs.
+    attrs: Vec<Attr>,
+    /// The classes of the system's groups of inputs and outputs.
+    groups: Vec<GroupClass>,
+}
+
+impl Entry {
+    /// Whether the system's stub names `Sequence`.
+    fn names_sequence(&self) -> bool {
+        let groups = self.groups.iter().flat_map(|group| &group.keywords);
+        let mut keywords = self.inputs.iter().chain(groups);
+        let lists = keywords.any(|k| k.annotation.starts_with("Sequence"));
+        lists || self.takes_inputs || self.takes_outputs
+    }
 }
 
 #[derive(Serialize)]
@@ -327,6 +351,8 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
             .iter()
             .any(|entry| entry.takes_inputs || entry.takes_outputs),
         takes_caps: systems.iter().any(|entry| !entry.caps.is_empty()),
+        takes_sequences: systems.iter().any(Entry::names_sequence),
+        takes_groups: systems.iter().any(|entry| !entry.groups.is_empty()),
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
@@ -418,7 +444,7 @@ fn type_name<T>() -> &'static str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
-fn pascal(name: &str) -> String {
+pub(super) fn pascal(name: &str) -> String {
     name.split('_')
         .flat_map(|part| {
             let mut chars = part.chars();
@@ -494,7 +520,13 @@ fn entry(
         .iter()
         .map(|g| g.param.to_string())
         .collect();
-    let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
+    let shape = |source: ShapeError| PackDevError::PortShape {
+        system: system.ty.to_string(),
+        port: source.port,
+        other: source.other,
+    };
+    let stubs = port_stubs(system).map_err(shape)?;
+    let input = |name: &str| stubs.inputs.iter().any(|keyword| keyword.name == name);
     let param = |name: &str| params.iter().any(|field| field.name == name);
     let clash = params.iter().map(|f| &f.name).find(|name| input(name));
     let taken = |name: &str| input(name) || param(name) || RESERVED_KEYWORDS.contains(&name);
@@ -512,10 +544,58 @@ fn entry(
         args_doc: args_doc(&params),
         takes_inputs: system.takes_inputs,
         takes_outputs: system.takes_outputs,
-        inputs: wired_inputs(system).map(Port::from_def).collect(),
+        input_ports: stubs.input_ports,
+        inputs: stubs.inputs,
         params,
         caps,
         ports: output_ports(system),
+        attrs: stubs.attrs,
+        groups: stubs.groups,
+    })
+}
+
+/// The keywords, attributes, and group classes of `system`'s ports.
+struct PortStubs {
+    inputs: Vec<Keyword>,
+    input_ports: Vec<Leaf>,
+    attrs: Vec<Attr>,
+    groups: Vec<GroupClass>,
+}
+
+fn port_stubs(system: &PackSystemDef) -> Result<PortStubs, ShapeError> {
+    let class = pascal(&system.ty);
+    let record = |name: &str| class_of(name);
+    let port = |def: &PortDef| Port::from_def(def).annotation;
+    let mut stubs = Stubs::new(&class, &record, &port);
+    let inputs = port_tree(wired_inputs(system))?;
+    let declared = exposed_outputs(system).filter(|p| !is_framework(&p.name));
+    let outputs = port_tree(declared)?;
+    let keywords = stubs.keywords(&inputs, "")?;
+    let framework = framework_ports().into_iter().map(|port| {
+        let port = Port::of(port);
+        Attr {
+            name: port.name,
+            annotation: port.annotation,
+        }
+    });
+    let attrs = stubs
+        .attrs(&outputs, "")?
+        .into_iter()
+        .chain(framework)
+        .collect();
+    let nested = wired_inputs(system).any(|port| port.name.contains('.'));
+    let input_ports = wired_inputs(system)
+        .filter(|_| nested)
+        .map(|port| Leaf {
+            name: port.name.to_string(),
+            record: class_of(&port.record),
+        })
+        .collect();
+    Ok(PortStubs {
+        inputs: keywords,
+        input_ports,
+        attrs,
+        groups: stubs.groups,
     })
 }
 
@@ -759,6 +839,165 @@ mod tests {
                 "_ports = {\"cmd\": MotorCmd, \"log\": LogEvent, \"status\": SystemStatus}"
             )
         );
+    }
+
+    #[test]
+    fn test_list_ports_render_as_sequences() {
+        let inputs = vec![
+            port("fss.0", "fss"),
+            port("fss.1", "fss"),
+            port("gain", "est"),
+        ];
+        let outputs = vec![
+            port("est.0", "est"),
+            port("est.1", "est"),
+            port("grid.0.0", "est"),
+            port("grid.0.1", "est"),
+            port("log", "log"),
+        ];
+        let text = rendered(vec![system("sun", inputs, outputs, None)]).expect("renders");
+        assert!(
+            text.contains("from typing import Literal, Sequence\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    _input_ports = {\"fss.0\": Fss, \"fss.1\": Fss, \"gain\": Est}\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "def __init__(self, *, fss: Sequence[Sources[Fss]] | None = None, gain: Sources[Est] = ()) -> None:"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("super().__init__({\"fss\": fss, \"gain\": gain}, {})"));
+        assert!(text.contains("_ports = {\"est.0\": Est, \"est.1\": Est, \"grid.0.0\": Est"));
+        assert!(
+            text.contains("    est: tuple[OutPort[Est], ...]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    grid: tuple[tuple[OutPort[Est], ...], ...]\n    log: OutPort[LogEvent]\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// The adcs system of the nesting design: a list of wheel groups.
+    fn adcs() -> PackSystemDef {
+        let inputs = vec![
+            port("wheels.0.speed", "wheel_speed"),
+            port("wheels.1.speed", "wheel_speed"),
+            port("mag", "mag"),
+        ];
+        let outputs = vec![
+            port("wheels.0.cmd", "wheel_cmd"),
+            port("wheels.1.cmd", "wheel_cmd"),
+            port("log", "log"),
+        ];
+        system("adcs", inputs, outputs, None)
+    }
+
+    #[test]
+    fn test_group_ports_render_classes() {
+        let text = rendered(vec![adcs()]).expect("renders");
+        assert!(
+            text.contains("from typing import TYPE_CHECKING, Literal, Sequence\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("OutGroup, OutPort, Pack, PortGroup, Record"),
+            "{text}"
+        );
+        let wheels = "    class Wheels(PortGroup):\n        _input_ports = {\"speed\": WheelSpeed}\n        if TYPE_CHECKING:\n\n            def __init__(self, *, speed: Sources[WheelSpeed] = ()) -> None: ...\n";
+        assert!(text.contains(wheels), "{text}");
+        assert!(
+            text.contains("    class WheelsOut(OutGroup):\n        cmd: OutPort[WheelCmd]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("def __init__(self, *, wheels: Sequence[Adcs.Wheels] | None = None, mag: Sources[Mag] = ()) -> None:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    wheels: tuple[Adcs.WheelsOut, ...]\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_reject_group_child_python_cannot_name() {
+        let inputs = vec![port("a.1", "imu"), port("a.2", "imu")];
+        let clash = rendered(vec![system("odd", inputs, vec![], None)]);
+        let Err(PackDevError::PortShape { port, .. }) = clash else {
+            panic!("the shape is reported")
+        };
+        assert_eq!(port, "a.1");
+    }
+
+    /// The paths a rendered `PortShape` error names.
+    fn shape_error(inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> (String, Option<String>) {
+        match rendered(vec![system("adcs", inputs, outputs, None)]) {
+            Err(PackDevError::PortShape { port, other, .. }) => (port, other),
+            other => panic!("the shape is reported: {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_groups_of_one_class_name_must_match() {
+        let same = vec![port("wheels.0.cmd.a", "imu"), port("wheels_cmd.a", "imu")];
+        let text = rendered(vec![system("adcs", same, vec![], None)]).expect("renders");
+        assert_eq!(
+            text.matches("class WheelsCmd(PortGroup)").count(),
+            1,
+            "{text}"
+        );
+        let apart = vec![port("wheels.0.cmd.a", "imu"), port("wheels_cmd.b", "imu")];
+        let (port, other) = shape_error(apart, vec![]);
+        assert_eq!(
+            (port.as_str(), other.as_deref()),
+            ("wheels_cmd", Some("wheels.0.cmd"))
+        );
+    }
+
+    #[test]
+    fn test_input_and_output_groups_of_one_class_name_clash() {
+        let inputs = vec![port("motor_out.a", "imu")];
+        let outputs = vec![port("motor.a", "imu")];
+        let (port, other) = shape_error(inputs, outputs);
+        assert_eq!(
+            (port.as_str(), other.as_deref()),
+            ("motor", Some("motor_out"))
+        );
+    }
+
+    #[test]
+    fn test_reject_python_keywords() {
+        assert_eq!(shape_error(vec![port("in", "imu")], vec![]).0, "in");
+        assert_eq!(
+            shape_error(vec![], vec![port("a.class", "imu")]).0,
+            "a.class"
+        );
+        assert_eq!(shape_error(vec![port("b.self", "imu")], vec![]).0, "b.self");
+    }
+
+    #[test]
+    fn test_flat_inputs_list_no_input_ports() {
+        let text =
+            rendered(vec![system("nav", vec![port("est", "est")], vec![], None)]).expect("renders");
+        assert!(!text.contains("_input_ports"), "{text}");
+        assert!(!text.contains("Sequence"), "{text}");
+    }
+
+    #[test]
+    fn test_reject_port_beside_its_children() {
+        let inputs = vec![port("fss", "fss"), port("fss.0", "fss")];
+        let clash = rendered(vec![system("sun", inputs, vec![], None)]);
+        let Err(PackDevError::PortShape { system, port, .. }) = clash else {
+            panic!("the clash is reported")
+        };
+        assert_eq!((system.as_str(), port.as_str()), ("sun", "fss"));
     }
 
     #[test]

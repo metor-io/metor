@@ -1,0 +1,11 @@
+error: `flatten` goes on a field holding a `Fields` struct
+ --> tests/ui/fields_flatten_leaf.rs:8:8
+  |
+8 |     x: f64,
+  |        ^^^
+
+error: `flatten` goes on a field holding a `Fields` struct
+  --> tests/ui/fields_flatten_leaf.rs:15:9
+   |
+15 |     xs: [f64; 3],
+   |         ^^^^^^^^

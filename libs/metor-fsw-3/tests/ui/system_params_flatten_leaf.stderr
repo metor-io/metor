@@ -1,0 +1,5 @@
+error: `flatten` goes on a field holding a `SystemParams` struct
+ --> tests/ui/system_params_flatten_leaf.rs:6:10
+  |
+6 |     log: &'a mut Log,
+  |          ^^^^^^^^^^^

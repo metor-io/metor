@@ -1,18 +1,17 @@
 use convert_case::{Case, Casing};
 use darling::FromDeriveInput;
 use darling::ast;
-use metor_component_derive_impl::{
-    Field, StructInput, componentize_impl, decomponentize_impl, struct_as_vtable_impl,
-    struct_metadatatize_impl,
-};
+use darling::util::Override;
+use metor_component_derive_impl::{Field, StructInput};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
-/// The struct being derived, with its fields, `#[frame(name = "..")]`,
-/// `#[frame(depth = N)]`, and `#[frame(max_len = N)]`.
+/// The struct being derived, with its fields, `#[fsw(name = "..")]`,
+/// `#[fsw(depth = N)]`, `#[fsw(max_len = N)]`, and `#[fsw(group)]`.
+/// `#[frame(..)]` is an alias of `#[fsw(..)]`.
 #[derive(FromDeriveInput)]
-#[darling(attributes(frame), supports(struct_named))]
+#[darling(attributes(fsw, frame), supports(struct_named))]
 struct FrameInput {
     ident: Ident,
     generics: Generics,
@@ -20,11 +19,13 @@ struct FrameInput {
     name: Option<String>,
     depth: Option<usize>,
     max_len: Option<syn::Expr>,
+    #[darling(default)]
+    group: Option<Override<String>>,
 }
 
 /// Expands `#[derive(Frame)]`.
 ///
-/// The output implements the four component traits, `Payload`, `Record`, and
+/// The output implements `AsVTable`, `Metadatatize`, `Payload`, `Record`, and
 /// `Frame`.
 pub fn frame(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as DeriveInput);
@@ -44,27 +45,33 @@ pub fn frame(input: TokenStream) -> TokenStream {
     let frame_name = raw
         .name
         .unwrap_or_else(|| raw.ident.to_string().to_case(Case::Snake));
-    let frame_id = quote! { #proto::types::ComponentId::new(#frame_name) };
     let depth = raw
         .depth
         .map(|depth| quote! { const DEPTH: usize = #depth; });
 
     let mut stamps = fields.iter().filter(|f| f.timestamp);
     let Some(stamp) = stamps.next() else {
-        let message = "#[derive(Frame)] requires a #[frame(timestamp)] field";
+        let message = "#[derive(Frame)] requires a #[fsw(timestamp)] field";
         return syn::Error::new_spanned(&raw.ident, message)
             .to_compile_error()
             .into();
     };
     if let Some(extra) = stamps.next() {
-        let message = "only one field can be marked #[frame(timestamp)]";
+        let message = "only one field can be marked #[fsw(timestamp)]";
         return syn::Error::new_spanned(&extra.ident, message)
             .to_compile_error()
             .into();
     }
+    let stamp_ty = &stamp.ty;
     // PANIC Safety: a named struct's fields all have idents.
     let stamp = stamp.ident.as_ref().expect("named field");
     let timestamp_body = quote! { self.#stamp };
+    let stamp_const = quote! {
+        const STAMP: (u32, u32) = (
+            ::core::mem::offset_of!(Self, #stamp) as u32,
+            ::core::mem::size_of::<#stamp_ty>() as u32,
+        );
+    };
 
     // A fixed frame encodes as its own bytes and needs no scratch; one with a
     // FrameMap is built into the port's scratch by `Output::write_with`.
@@ -111,19 +118,13 @@ pub fn frame(input: TokenStream) -> TokenStream {
         generics: raw.generics,
         fields,
         parent: None,
-        group: None,
+        group: raw.group,
     };
-    let componentize = componentize_impl(&struct_input, &fsw);
-    let decomponentize = decomponentize_impl(&struct_input, &fsw);
-    let as_vtable = struct_as_vtable_impl(&struct_input, Some(frame_id), &fsw);
-    let metadatatize = struct_metadatatize_impl(&struct_input, &fsw);
+    let fields = crate::fields::fields_impl(&struct_input, &fsw);
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     quote! {
-        #as_vtable
-        #metadatatize
-        #componentize
-        #decomponentize
+        #fields
 
         impl #impl_generics #fsw::Payload for #ident #ty_generics #where_clause {
             const ALIGN: usize = ::core::mem::align_of::<Self>();
@@ -149,7 +150,9 @@ pub fn frame(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {}
+        impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {
+            #stamp_const
+        }
 
         #guard
     }

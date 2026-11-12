@@ -405,24 +405,14 @@ impl<'a, K: MapKey, V: FromBytes + KnownLayout + Immutable + 'a> MapRef<'a, K, V
 
 #[cfg(test)]
 mod tests {
-    use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
+    use metor_component::AsVTable;
     use metor_proto::types::{ComponentId, Timestamp};
     use metor_proto::vtable::builder::vtable;
 
     use super::*;
-    use crate::{Frame, Payload, Record};
+    use crate::{Fields, Frame, Payload, Record};
 
-    #[derive(
-        AsVTable,
-        Metadatatize,
-        Componentize,
-        Decomponentize,
-        IntoBytes,
-        Immutable,
-        KnownLayout,
-        FromBytes,
-        Debug,
-    )]
+    #[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
     #[repr(C)]
     struct Nic {
         #[fsw(unit = "B", metadata(gradient = "auto", note = "x"))]
@@ -652,16 +642,7 @@ mod tests {
     #[repr(C)]
     struct Opaque([u8; 8]);
 
-    #[derive(
-        AsVTable,
-        Metadatatize,
-        Componentize,
-        Decomponentize,
-        IntoBytes,
-        Immutable,
-        KnownLayout,
-        FromBytes,
-    )]
+    #[derive(Fields, IntoBytes, Immutable, KnownLayout, FromBytes)]
     #[repr(C, align(16))]
     struct Wide {
         a: [u64; 3],

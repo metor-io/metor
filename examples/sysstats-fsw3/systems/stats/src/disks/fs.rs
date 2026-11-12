@@ -1,6 +1,6 @@
 //! Space used per mounted local filesystem.
 
-use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
+use metor_fsw_3::Fields;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::mem::pct;
@@ -18,19 +18,7 @@ pub struct Space {
 
 /// One filesystem's space, as `df` reports it.
 #[derive(
-    AsVTable,
-    Metadatatize,
-    Componentize,
-    Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
+    Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, Default, PartialEq,
 )]
 #[repr(C)]
 pub struct FsStats {

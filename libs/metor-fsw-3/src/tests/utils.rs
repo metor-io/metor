@@ -223,18 +223,7 @@ pub struct PairB {
 
 /// A struct nested in a frame.
 #[derive(
-    metor_component::AsVTable,
-    metor_component::Metadatatize,
-    metor_component::Componentize,
-    metor_component::Decomponentize,
-    IntoBytes,
-    Immutable,
-    KnownLayout,
-    FromBytes,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
+    crate::Fields, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq,
 )]
 #[repr(C)]
 pub struct Inner {
@@ -249,9 +238,20 @@ pub struct Inner {
 pub struct Nested {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    #[frame(nest)]
     pub inner: Inner,
     pub z: f64,
+}
+
+/// A frame whose flattened field puts `x` beside its own `x`.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[fsw(name = "collide")]
+#[repr(C)]
+pub struct Collide {
+    #[fsw(timestamp)]
+    pub timestamp: Timestamp,
+    pub x: f64,
+    #[fsw(flatten)]
+    pub inner: Inner,
 }
 
 /// Declares an output under the coordinator's reserved name.

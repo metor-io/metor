@@ -472,6 +472,79 @@ fn test_sample_held_across_cycles() {
     assert_eq!(imu_into(watcher()), [Some(1.0), Some(2.0), Some(3.0)]);
 }
 
+/// Keeps the samples it holds across each of three cycles; `imus.0` is
+/// never wired.
+#[crate::sequence]
+async fn pair_watcher(
+    #[state] seen: &mut Seen,
+    seq: &Seq,
+    imus: [&Sample<Imu>; 2],
+) -> Result<(), SeqError> {
+    for _ in 0..3 {
+        let [unwired, imu] = imus.map(|imu| imu.get().map(|imu| imu.sample));
+        seen.0.borrow_mut().push(unwired.or(imu.map(|v| -v)));
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
+/// Two samples, one never wired.
+#[derive(crate::SystemParams)]
+struct Imus<'a> {
+    unwired: &'a Sample<Imu>,
+    imu: &'a Sample<Imu>,
+}
+
+/// Keeps the sample its struct holds across each of three cycles.
+#[crate::sequence]
+async fn struct_watcher(
+    #[state] seen: &mut Seen,
+    seq: &Seq,
+    imus: Imus<'_>,
+) -> Result<(), SeqError> {
+    for _ in 0..3 {
+        assert!(imus.unwired.get().is_none());
+        seen.0
+            .borrow_mut()
+            .push(imus.imu.get().map(|imu| imu.sample));
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_struct_samples_held_across_cycles() {
+    assert_eq!(
+        imu_into(struct_watcher()),
+        [Some(1.0), Some(2.0), Some(3.0)]
+    );
+}
+
+#[test]
+fn test_sample_array_held_across_cycles() {
+    let seen = Seen::default();
+    let mut table = table(&Recorder::default());
+    let state = seen.clone();
+    table
+        .register_sequence("s", pair_watcher(), move || state.clone())
+        .expect("valid records");
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("imu", "imu"),
+            SystemConfig {
+                inputs: vec![InputConfig::new("imus.1", "imu", "imu")],
+                ..SystemConfig::new("s", "s")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    for at in 1..=3 {
+        coordinator.step(ms(at));
+    }
+    assert_eq!(seen.0.take(), [Some(-1.0), Some(-2.0), Some(-3.0)]);
+}
+
 #[test]
 fn test_sequence_registers_its_doc() {
     let table = table(&Recorder::default());

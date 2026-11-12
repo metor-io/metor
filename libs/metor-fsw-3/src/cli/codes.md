@@ -819,6 +819,17 @@ the system and the reason. Common ones:
 fsw.wasm(seqs, memory=16 << 20)
 ```
 
+## M0338
+
+**A frame names a leaf twice**
+
+A port's frame has two leaves at the same path. A `#[fsw(flatten)]`
+field puts its leaves at the struct's own path, so they can collide with a
+sibling field or with another flattened field.
+
+Rename one of the fields with `#[fsw(rename = "..")]`, or stop flattening
+it.
+
 ## M0401
 
 **A pack file could not be read**
@@ -913,6 +924,24 @@ module. The two describe different systems or ports.
 Code that is compiled only for one target, such as behind `#[cfg(target_arch
 = "wasm32")]`, is the usual cause. Make the pack's systems the same on both
 targets.
+
+## M0409
+
+**Ports do not form lists and groups**
+
+A pack module rebuilds lists and groups of ports from their dotted names, so
+`fss.0` is element 0 of the list `fss`, and `wheels.0.cmd` is the `cmd` port
+of a group. One of these holds:
+
+- the system has a port that other ports sit under, such as `a` beside
+  `a.b`;
+- a port segment is no Python name: `1` in a group whose children are not
+  `0` … `N-1`, a keyword such as `in` or `class`, or `self`;
+- two different groups share a class name, such as `wheels.0.cmd` and
+  `wheels_cmd` (both `WheelsCmd`), or the inputs `motor_out` and the outputs
+  `motor` (both `MotorOut`).
+
+Rename the port, or the field or array that names the ports under it.
 
 ## M0410
 

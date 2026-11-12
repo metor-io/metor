@@ -1,64 +1,55 @@
-error[E0277]: the trait bound `u32: Param` is not satisfied
+error[E0277]: `u32` is not a parameter of a system whose inputs wake `NoWake`
  --> tests/ui/system_bad_param.rs:5:1
   |
 5 | #[system]
-  | ^^^^^^^^^ the trait `Param` is not implemented for `u32`
+  | ^^^^^^^^^ the trait `Param<NoWake>` is not implemented for `u32`
   |
-  = help: the following other types implement trait `Param`:
-            ()
-            (A, B)
-            (A, B, C)
-            (A, B, C, D)
-            (A, B, C, D, E)
-            (A, B, C, D, E, F)
-            (A, B, C, D, E, F, G)
-            (A, B, C, D, E, F, G, H)
-          and $N others
-  = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `Param`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+  = help: the following other types implement trait `Param<W>`:
+            Alarms
+            Cap<K>
+            Sample<T>
+            metor_fsw_3::Rng
+            metor_fsw_3::Seq<'static>
+  = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `Param<NoWake>`
 note: required by a bound in `metor_fsw_3::FnSignature::Params`
  --> src/fn_system/mod.rs
   |
-  |     type Params: Param;
-  |                  ^^^^^ required by this bound in `FnSignature::Params`
+  |     type Params: Param<Self::Wake>;
+  |                  ^^^^^^^^^^^^^^^^^ required by this bound in `FnSignature::Params`
   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `u32: Param` is not satisfied
+error[E0277]: `u32` is not a parameter of a system whose inputs wake `NoWake`
  --> tests/ui/system_bad_param.rs:5:1
   |
 5 | #[system]
-  | ^^^^^^^^^ the trait `Param` is not implemented for `u32`
+  | ^^^^^^^^^ the trait `Param<NoWake>` is not implemented for `u32`
   |
-  = help: the following other types implement trait `Param`:
-            ()
-            (A, B)
-            (A, B, C)
-            (A, B, C, D)
-            (A, B, C, D, E)
-            (A, B, C, D, E, F)
-            (A, B, C, D, E, F, G)
-            (A, B, C, D, E, F, G, H)
-          and $N others
-  = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `Param`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+  = help: the following other types implement trait `Param<W>`:
+            Alarms
+            Cap<K>
+            Sample<T>
+            metor_fsw_3::Rng
+            metor_fsw_3::Seq<'static>
+  = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `Param<NoWake>`
   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `u32: Param` is not satisfied
+error[E0277]: `u32` is not a parameter of a system whose inputs wake `NoWake`
  --> tests/ui/system_bad_param.rs:6:60
   |
 6 | fn counter(#[state] s: &mut Counter, now: Timestamp, step: u32) {
-  |                                                            ^^^ the trait `Param` is not implemented for `u32`
+  |                                                            ^^^ the trait `Param<NoWake>` is not implemented for `u32`
   |
-  = help: the following other types implement trait `Param`:
-            ()
-            (A, B)
-            (A, B, C)
-            (A, B, C, D)
-            (A, B, C, D, E)
-            (A, B, C, D, E, F)
-            (A, B, C, D, E, F, G)
-            (A, B, C, D, E, F, G, H)
-          and $N others
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+  = help: the following other types implement trait `Param<W>`:
+            Alarms
+            Cap<K>
+            Sample<T>
+            metor_fsw_3::Rng
+            metor_fsw_3::Seq<'static>
 note: required by a bound in `metor_fsw_3::fn_system::assert_param`
  --> src/fn_system/mod.rs
   |
-  | pub fn assert_param<P: Param>() {}
-  |                        ^^^^^ required by this bound in `assert_param`
+  | pub fn assert_param<P: Param<W>, W: InputWake>() {}
+  |                        ^^^^^^^^ required by this bound in `assert_param`

@@ -1,0 +1,5 @@
+error: `Abort` is a fn argument, not a `SystemParams` field
+ --> tests/ui/system_params_abort_array.rs:5:13
+  |
+5 |     aborts: [&'a mut Abort; 2],
+  |             ^^^^^^^^^^^^^^^^^^

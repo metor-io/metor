@@ -50,6 +50,10 @@ struct Arm {
 }
 ```
 
+A struct reused inside frames derives `Fields`, a group of components with
+no name, id, or timestamp. [docs/nesting.md](docs/nesting.md) gives the path
+rules.
+
 Frames and messages share one delivery rule: every reader reads every
 record. `Output<T>` writes, `Input<T>` reads with `latest`, `drain`, or, on
 an async system, `next`. An input fed by several producers holds one view
@@ -92,6 +96,10 @@ Other parameters a system may take:
   and publishes `AlarmRaised` or `AlarmCleared` on an edge. Dropping `Alarms`,
   as a `Reset` or `Load` does, clears every alarm still active. A cyclic
   system takes at most one; an async system or a sequence takes none.
+
+Params nest: `[P; N]` takes an array of params, and a
+`#[derive(SystemParams)]` struct groups them, under the same path rules as
+frame fields ([docs/nesting.md](docs/nesting.md)).
 
 A failed write returns its error. It also counts toward one
 `publish_dropped` fault on the system's `log` that cycle, so a caller that
@@ -257,6 +265,10 @@ torque.connect(ctrl.torque_cmd)
 
 Add order is step order, so a system names only ports of systems already
 added, or a loop.
+
+Stubgen rebuilds lists and groups of ports from their dotted names, so
+`adcs.wheels[2].cmd` is the port `adcs.wheels.2.cmd`
+([docs/nesting.md](docs/nesting.md)).
 
 A file emits one envelope, config version 2: every target's packs and
 `CoordinatorConfig`, and a map of where each target runs. A file with one

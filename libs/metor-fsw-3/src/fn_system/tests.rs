@@ -21,6 +21,8 @@ use crate::tests::utils::{Control, Imu, Nav, NoParams, input, output, pair, ring
 use crate::{Frame, Payload, Record};
 
 mod alarms;
+mod arrays;
+mod system_params;
 
 /// Doubles the newest sample, stamping it with the cycle time.
 struct Doubler;
@@ -39,13 +41,14 @@ impl Doubler {
 
 impl FnSignature for Doubler {
     type State = Self;
+    type Wake = NoWake;
     type Params = (Input<Imu>, Output<Nav>, Timestamp);
     const NAME: &'static str = "doubler";
     const NAMES: &'static [&'static str] = &["imu", "nav", "now"];
 }
 
 impl SystemFn for Doubler {
-    fn call(state: &mut Self, (imu, nav, now): <Self::Params as Param>::Item<'_, NoWake>) {
+    fn call(state: &mut Self, (imu, nav, now): <Self::Params as Param<NoWake>>::Item<'_>) {
         state.execute(imu, nav, now);
     }
 }
@@ -66,13 +69,14 @@ impl Summer {
 
 impl FnSignature for Summer {
     type State = Self;
+    type Wake = NoWake;
     type Params = (Output<Control>, Input<Imu>, Input<Imu>);
     const NAME: &'static str = "summer";
     const NAMES: &'static [&'static str] = &["sum", "a", "b"];
 }
 
 impl SystemFn for Summer {
-    fn call(state: &mut Self, (sum, a, b): <Self::Params as Param>::Item<'_, NoWake>) {
+    fn call(state: &mut Self, (sum, a, b): <Self::Params as Param<NoWake>>::Item<'_>) {
         state.execute(sum, a, b);
     }
 }
@@ -144,6 +148,7 @@ impl Counter {
 
 impl FnSignature for Counter {
     type State = Self;
+    type Wake = NoWake;
     type Params = ();
     const NAME: &'static str = "counter";
     const NAMES: &'static [&'static str] = &[];
@@ -732,32 +737,6 @@ fn test_sample_sees_this_cycle() {
     );
 }
 
-/// Waits for `stop`, holding a sample no step would take.
-#[crate::system]
-async fn sampling_async(imu: &Sample<Imu>, stop: Stop) {
-    let _ = imu;
-    stop.wait().await;
-}
-
-#[test]
-fn test_async_sample_refused() {
-    let refused = DefError::SampleOnAsync {
-        system: "sampling_async".into(),
-    };
-    assert_eq!(
-        async_def_in(sampling_async(), &DefCx::empty()),
-        Err(refused)
-    );
-    let mut table = SystemTable::new();
-    assert!(matches!(
-        table.register_async("sampling_async", sampling_async(), Default::default),
-        Err(BuildError::TypeDef {
-            source: DefError::SampleOnAsync { .. },
-            ..
-        })
-    ));
-}
-
 /// Writes `a` samples on `a` and `b` on `b` each cycle.
 struct Flood {
     a: usize,
@@ -861,6 +840,7 @@ struct TwoOutputs;
 
 impl FnSignature for TwoOutputs {
     type State = ();
+    type Wake = NoWake;
     type Params = (Output<Imu>, Output<Imu>);
     const NAME: &'static str = "two_outputs";
     const NAMES: &'static [&'static str] = &["a", "b"];
@@ -900,11 +880,6 @@ struct Drawer {
 #[crate::system]
 fn drawer(#[state] s: &mut Drawer, rng: &mut crate::Rng) {
     s.seen.borrow_mut().push((s.tag.clone(), rng.next_u64()));
-}
-
-#[crate::system]
-async fn async_drawer(rng: &mut crate::Rng, stop: Stop) {
-    let _ = (rng.next_u64(), stop);
 }
 
 fn drawer_table(seen: &Draws) -> SystemTable {
@@ -998,22 +973,6 @@ fn test_rng_params_draw_their_own_streams() {
     assert_eq!(first(&draws, "left"), [left.next_u64(), left.next_u64()]);
     assert_eq!(first(&draws, "right"), [right.next_u64(), right.next_u64()]);
     assert_ne!(first(&draws, "left"), first(&draws, "right"));
-}
-
-#[test]
-fn test_rng_on_an_async_system_is_refused() {
-    let mut table = SystemTable::new();
-    let err = table.register_async("d", async_drawer(), || ()).err();
-    let refused = |e: &BuildError| {
-        matches!(
-            e,
-            BuildError::TypeDef {
-                source: DefError::RngOnAsync { .. },
-                ..
-            }
-        )
-    };
-    assert!(err.as_ref().is_some_and(refused), "{err:?}");
 }
 
 #[test]

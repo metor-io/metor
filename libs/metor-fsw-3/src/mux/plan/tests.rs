@@ -14,7 +14,6 @@ struct Swapped {
     #[frame(timestamp)]
     timestamp: Timestamp,
     z: f64,
-    #[frame(nest)]
     inner: Inner,
 }
 

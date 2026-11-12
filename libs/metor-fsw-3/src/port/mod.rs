@@ -8,6 +8,7 @@ use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::coordinator::MakeError;
@@ -182,16 +183,17 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
     /// Returns the definition of an output port called `name`.
     ///
     /// The record's schema is rooted at `cx.port_path(name)`.
-    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
+    pub fn def(cx: &DefCx<'_>, name: impl Into<Cow<'static, str>>) -> PortDef {
+        let name = name.into();
         PortDef {
-            name: name.into(),
+            schema: T::schema_with_root(&cx.port_path(&name)),
+            name,
             record: T::NAME.into(),
             id: T::ID,
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
             depth: T::DEPTH,
             layout: T::layout(),
-            schema: T::schema_with_root(&cx.port_path(name)),
         }
     }
 }
@@ -302,7 +304,7 @@ impl<T: Payload + ?Sized, W: InputWake> Input<T, W> {
 
 impl<T: Record + ?Sized, W: InputWake> Input<T, W> {
     /// Returns the definition of an input port called `name`.
-    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
+    pub fn def(cx: &DefCx<'_>, name: impl Into<Cow<'static, str>>) -> PortDef {
         Output::<T>::def(cx, name)
     }
 }
