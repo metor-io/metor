@@ -3,10 +3,9 @@ reusable piece."""
 
 from __future__ import annotations
 
-import inspect
-from functools import wraps
-from typing import TYPE_CHECKING, Callable, Concatenate, Generic, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Callable, Concatenate, ParamSpec, TypeVar
 
+from ._composite import Deferred, defer
 from ._config import ConfigError
 from ._model import Loop, Record
 from ._target import Target
@@ -19,30 +18,18 @@ R = TypeVar("R")
 T = TypeVar("T", bound=Record)
 
 
-class GroupBuild(Generic[R]):
-    """A group's function and arguments, waiting to be added.
-
-    `Deployment.add` and `Group.add` run the function and return its result.
-    """
-
-    def __init__(self, build: Callable[[Group], R]) -> None:
-        self._build = build
+class GroupBuild(Deferred["Group", R]):
+    """A group waiting to be added. `Deployment.add` and `Group.add` run it
+    and return its result."""
 
 
 def group(fn: Callable[Concatenate[Group, P], R]) -> Callable[P, GroupBuild[R]]:
     """Makes ``fn`` a group: calling it returns a `GroupBuild` to add.
 
     ``fn`` takes a `Group`, then its own arguments. Its body runs when the
-    group is added, and its result is what `add` returns. Arguments that do
-    not fit ``fn`` raise `TypeError` at the call.
+    group is added, and its result is what `add` returns.
     """
-
-    @wraps(fn)
-    def bind(*args: P.args, **kwargs: P.kwargs) -> GroupBuild[R]:
-        inspect.signature(fn).bind(None, *args, **kwargs)
-        return GroupBuild(lambda g: fn(g, *args, **kwargs))
-
-    return bind
+    return defer(GroupBuild[R], fn)
 
 
 class Group:
@@ -74,7 +61,14 @@ class Group:
         """Creates a target named ``{path}.{name}``, or ``{path}`` without
         ``name``. The rest are `Target`'s arguments."""
         namespace = self._path if name is None else child(self._path, name)
-        target = Target(cycle_rate, sim_dt, ring_depth, namespace, seed, epoch)
+        target = Target(
+            cycle_rate=cycle_rate,
+            sim_dt=sim_dt,
+            ring_depth=ring_depth,
+            namespace=namespace,
+            seed=seed,
+            epoch=epoch,
+        )
         self._deployment.targets.append(target)
         return target
 

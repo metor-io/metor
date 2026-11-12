@@ -19,14 +19,37 @@ S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
 
 
-class Composite(Generic[R]):
-    """A composite's function and arguments, waiting to be added.
+C = TypeVar("C")
+D = TypeVar("D")
 
-    `Target.add` and `Scope.add` run the function and return its result.
-    """
 
-    def __init__(self, build: Callable[[Scope], R]) -> None:
+class Deferred(Generic[C, R]):
+    """A function and its arguments, waiting to be added. The function takes
+    a ``C`` first: a `Scope` for a composite, a `Group` for a group."""
+
+    def __init__(self, build: Callable[[C], R]) -> None:
         self._build = build
+
+
+def defer(kind: Callable[[Callable[[C], R]], D], fn: Callable[Concatenate[C, P], R]) -> Callable[P, D]:
+    """Wraps ``fn`` so that a call checks its arguments against ``fn``,
+    raising `TypeError` if they do not fit, and returns a ``kind`` that runs
+    ``fn`` when added."""
+    signature = inspect.signature(fn)
+
+    @wraps(fn)
+    def bind(*args: P.args, **kwargs: P.kwargs) -> D:
+        signature.bind(None, *args, **kwargs)
+        return kind(lambda first: fn(first, *args, **kwargs))
+
+    params = list(signature.parameters.values())[1:]
+    bind.__signature__ = signature.replace(parameters=params)  # type: ignore[attr-defined]
+    return bind
+
+
+class Composite(Deferred["Scope", R]):
+    """A composite waiting to be added. `Target.add` and `Scope.add` run it
+    and return its result."""
 
 
 def composite(fn: Callable[Concatenate[Scope, P], R]) -> Callable[P, Composite[R]]:
@@ -34,20 +57,9 @@ def composite(fn: Callable[Concatenate[Scope, P], R]) -> Callable[P, Composite[R
 
     ``fn`` takes a `Scope`, then its own inputs and params. Its body runs when
     the composite is added, and its result is what `add` returns. A
-    ``NamedTuple`` of ports and handles can be passed as a port list. Arguments
-    that do not fit ``fn`` raise `TypeError` at the call.
+    ``NamedTuple`` of ports and handles can be passed as a port list.
     """
-
-    signature = inspect.signature(fn)
-
-    @wraps(fn)
-    def bind(*args: P.args, **kwargs: P.kwargs) -> Composite[R]:
-        signature.bind(None, *args, **kwargs)
-        return Composite(lambda scope: fn(scope, *args, **kwargs))
-
-    params = list(signature.parameters.values())[1:]
-    bind.__signature__ = signature.replace(parameters=params)  # type: ignore[attr-defined]
-    return bind
+    return defer(Composite[R], fn)
 
 
 class Scope:
