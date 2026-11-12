@@ -4,11 +4,11 @@
 //! struct with its lifetime set to `'static`, and builds the struct each
 //! cycle from its fields' items.
 
+use darling::FromField;
+use metor_component_derive_impl::Field;
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use darling::FromField;
-use metor_component_derive_impl::Field;
 use syn::{Data, DeriveInput, Fields, GenericParam, Ident, Lifetime, Type};
 
 use crate::key::{element, element_name, key_type};
@@ -221,7 +221,7 @@ fn fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
 fn field(field: &syn::Field) -> syn::Result<Field> {
     let parsed = Field::from_field(field)?;
     let component = parsed.unit.is_some() || !parsed.metadata.is_empty() || parsed.max.is_some();
-    if parsed.timestamp || component {
+    if parsed.timestamp || parsed.nest || component {
         let message = "a `SystemParams` field takes only `flatten`, `rename`, and `skip`";
         return Err(syn::Error::new_spanned(field, message));
     }

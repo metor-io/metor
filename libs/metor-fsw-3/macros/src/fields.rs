@@ -53,18 +53,60 @@ pub fn fields(input: TokenStream) -> TokenStream {
 
 /// The `AsVTable` and `Metadatatize` impls for a struct of components.
 ///
-/// A `timestamp` field is left out of both.
+/// A `timestamp` field is left out of both. A misused attribute adds a
+/// compile error beside the impls, so the error is the only one reported.
 pub(crate) fn fields_impl(input: &StructInput, fsw: &TokenStream2) -> TokenStream2 {
-    if let Some(field) = duplicate_segment(&input.fields) {
-        let message = format!("two fields are named `{}`", field.component_name());
-        return syn::Error::new_spanned(&field.ident, message).to_compile_error();
-    }
+    let error = check(&input.fields).err().map(|e| e.to_compile_error());
     let as_vtable = struct_as_vtable_impl(input, Stamp::Omit, fsw);
     let metadatatize = struct_metadatatize_impl(input, fsw);
     quote! {
+        #error
         #as_vtable
         #metadatatize
     }
+}
+
+/// Refuses `nest`, a flattened scalar or array, and two members of one name.
+fn check(fields: &[Field]) -> syn::Result<()> {
+    let error = |tokens: &dyn quote::ToTokens, message: String| {
+        Err(syn::Error::new_spanned(tokens, message))
+    };
+    if let Some(field) = fields.iter().find(|f| f.nest) {
+        let message = "`nest` is not an attribute; derive `Fields` on the field's type instead";
+        return error(&field.ident, message.into());
+    }
+    if let Some(field) = flattened_leaf(fields) {
+        let message = "`flatten` goes on a field holding a `Fields` struct";
+        return error(&field.ty, message.into());
+    }
+    match duplicate_segment(fields) {
+        Some(field) => error(
+            &field.ident,
+            format!("two fields are named `{}`", field.component_name()),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Scalar types, which hold one component and so cannot be flattened.
+const SCALARS: [&str; 14] = [
+    "bool", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "f32",
+    "f64",
+];
+
+/// The first flattened member whose type is a scalar or an array.
+fn flattened_leaf(fields: &[Field]) -> Option<&Field> {
+    fields
+        .iter()
+        .filter(|f| f.is_member() && f.flatten)
+        .find(|f| match &f.ty {
+            syn::Type::Array(_) => true,
+            syn::Type::Path(path) => path
+                .path
+                .get_ident()
+                .is_some_and(|i| SCALARS.iter().any(|s| i == s)),
+            _ => false,
+        })
 }
 
 /// The first member whose segment an earlier member already uses.

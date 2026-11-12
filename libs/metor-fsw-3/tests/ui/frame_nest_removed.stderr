@@ -1,5 +1,5 @@
-error: Unknown field: `nest`
-  --> tests/ui/frame_nest_removed.rs:15:13
+error: `nest` is not an attribute; derive `Fields` on the field's type instead
+  --> tests/ui/frame_nest_removed.rs:16:5
    |
-15 |     #[frame(nest)]
-   |             ^^^^
+16 |     inner: Inner,
+   |     ^^^^^

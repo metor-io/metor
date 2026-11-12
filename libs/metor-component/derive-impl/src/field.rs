@@ -18,6 +18,9 @@ pub struct Field {
     /// struct's own path.
     #[darling(default)]
     pub flatten: bool,
+    /// Read only to refuse it: a nested struct derives `Fields` instead.
+    #[darling(default)]
+    pub nest: bool,
     /// Max cardinality for a `FrameList`/`FrameMap` field. The const-generic
     /// on the type is the source of truth; this is accepted for
     /// forward-compat but unused by the derives.
