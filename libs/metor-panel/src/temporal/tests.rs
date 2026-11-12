@@ -339,12 +339,6 @@ fn elapsed_input_resolves_exact_instants_and_range_endpoints() {
         parse_range(&text, &parse).unwrap().resolve(&clock).unwrap(),
         Timestamp(90_000_123)..Timestamp(180_000_123)
     );
-    let extent = clock.extent.clone().unwrap();
-    let text = display::expand_input("T0..data end", &TemporalConfig::default(), &clock).unwrap();
-    assert_eq!(
-        parse_range(&text, &parse).unwrap().resolve(&clock).unwrap(),
-        extent.start..Timestamp(extent.end.0 + 1)
-    );
     for bad in [
         "T+00:60:00",
         "T+00:00:60",

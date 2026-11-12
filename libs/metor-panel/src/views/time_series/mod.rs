@@ -222,11 +222,11 @@ pub(crate) fn x_ticks(
     })
 }
 
-/// Anchor passed to [`x_ticks`]: the earliest sample for relative labels,
+/// Anchor passed to [`x_ticks`]: the time origin (T0) for relative labels,
 /// Unix epoch `0` for absolute ones (so ticks land on wall-clock boundaries).
-pub(crate) fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
+pub(crate) fn x_tick_anchor(fmt: TimeFormat, origin: f64) -> f64 {
     match fmt {
-        TimeFormat::Relative => data_start,
+        TimeFormat::Relative => origin,
         TimeFormat::Utc | TimeFormat::Local => 0.0,
     }
 }
@@ -591,7 +591,7 @@ fn alarm_limit_lines(lp: &LinePlot, cx: &gpui::App) -> Vec<(usize, f64, Hsla, Sh
 fn paint_underlay(
     outer_bounds: Bounds<Pixels>,
     view: &PlotView,
-    data_start: f64,
+    origin: f64,
     fmt: TimeFormat,
     tint: Option<Hsla>,
     window: &mut Window,
@@ -605,7 +605,7 @@ fn paint_underlay(
     if let Some(tint) = tint {
         window.paint_quad(gpui::fill(pb, tint));
     }
-    let anchor = x_tick_anchor(fmt, data_start);
+    let anchor = x_tick_anchor(fmt, origin);
     // Horizontal gridlines and the zero line track the primary axis only;
     // secondary axes would draw conflicting lines across the same plot.
     let primary = view.axis_bounds(0);
@@ -642,7 +642,7 @@ fn paint_overlay(
     axis_colors: &[Option<Hsla>],
     axis_markers: &[(usize, f64, Hsla)],
     limit_lines: &[(usize, f64, Hsla, SharedString)],
-    data_start: f64,
+    origin: f64,
     fmt: TimeFormat,
     window: &mut Window,
     cx: &mut gpui::App,
@@ -696,15 +696,14 @@ fn paint_overlay(
 
     // X tick labels track the primary axis's X range.
     let primary = view.axis_bounds(0);
-    let t_min_i = data_start as i64;
-    let anchor = x_tick_anchor(fmt, data_start);
+    let anchor = x_tick_anchor(fmt, origin);
     let span_us = primary.width();
     for tick in x_ticks(&primary, 5, anchor) {
         let x = primary.to_screen(pb, tick as f64, primary.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        let text = format_time_label(tick, t_min_i, fmt, span_us);
+        let text = format_time_label(tick, origin as i64, fmt, span_us);
         // Centered on the tick, but a label near an edge tick is pulled
         // inside the pane so it can't run over the tile border — the right
         // chrome is only PADDING wide, far narrower than a time label.

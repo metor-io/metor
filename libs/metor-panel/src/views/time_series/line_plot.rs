@@ -593,19 +593,14 @@ impl LinePlot {
             .collect()
     }
 
-    /// The instant relative x labels count from.
-    ///
-    /// The time controls' T0 (the chosen T0, else the global data start),
-    /// so `T0` typed into the range lands on the plot's `T+0` and the axis
-    /// reads the same offsets as the controls. Without a controller, the
-    /// earliest resident sample across traces stands in.
+    /// The instant relative x labels count from; see
+    /// [`crate::temporal::plot_origin`].
     pub fn time_origin(&self, cx: &gpui::App) -> Option<f64> {
-        if let Some(snapshot) = crate::temporal::snapshot(cx)
-            && let Some(origin) =
-                crate::temporal::display::origin(&crate::temporal::config(cx), &snapshot.context)
-        {
-            return Some(origin.0 as f64);
-        }
+        crate::temporal::plot_origin(cx, || self.data_start())
+    }
+
+    /// Earliest loaded sample across resolved traces.
+    fn data_start(&self) -> Option<f64> {
         let mut start = f64::INFINITY;
         let mut any = false;
         for trace in &self.traces {
