@@ -3,10 +3,9 @@ use syn::{Generics, Ident};
 
 use crate::Field;
 
-/// A named struct's fields, as consumed by every emitter: `AsVTable`,
-/// `Metadatatize`, `Componentize`, and `Decomponentize` all key off the same
-/// ident/generics/fields/parent-prefix quadruple, plus `group` for
-/// `metadatatize_impl`'s metadata-only parent entry.
+/// A named struct's fields, as consumed by the `AsVTable` and `Metadatatize`
+/// emitters, plus `group` for `metadatatize_impl`'s metadata-only parent
+/// entry.
 pub struct StructInput {
     pub ident: Ident,
     pub generics: Generics,
@@ -32,8 +31,8 @@ pub struct EnumInput {
 }
 
 /// Either shape a `#[derive(AsVTable)]`/`#[derive(Metadatatize)]` input can
-/// take. `Componentize`/`Decomponentize` and `#[derive(Frame)]` only ever
-/// produce [`StructInput`], so they skip this wrapper.
+/// take. `#[derive(Fields)]` and `#[derive(Frame)]` only ever produce
+/// [`StructInput`], so they skip this wrapper.
 pub enum Input {
     Struct(StructInput),
     Enum(EnumInput),

@@ -1,6 +1,5 @@
 //! The `quote!` bodies shared by `metor-component-macros` and
-//! `metor-fsw-3-macros`'s component derives (`AsVTable`, `Metadatatize`,
-//! `Componentize`, `Decomponentize`).
+//! `metor-fsw-3-macros`'s component derives (`AsVTable` and `Metadatatize`).
 //!
 //! This crate holds no proc-macro entry points — a proc-macro crate cannot
 //! export plain functions, so the two macro crates each keep their own
@@ -9,15 +8,11 @@
 //! [`proc_macro2::TokenStream`].
 
 mod as_vtable;
-mod componentize;
-mod decomponentize;
 mod field;
 mod input;
 mod metadatatize;
 
 pub use as_vtable::{Stamp, as_vtable_impl, enum_as_vtable_impl, struct_as_vtable_impl};
-pub use componentize::componentize_impl;
-pub use decomponentize::decomponentize_impl;
 pub use field::Field;
 pub use input::{EnumInput, Input, StructInput};
 pub use metadatatize::{enum_metadatatize_impl, metadatatize_impl, struct_metadatatize_impl};

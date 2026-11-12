@@ -87,17 +87,4 @@ impl Field {
                 .is_some_and(|i| i.to_string().starts_with('_'))
         })
     }
-
-    /// Whether the field type's outermost path segment is `FrameList` or
-    /// `FrameMap`. Such fields carry no in-struct value, so the scalar
-    /// encode/decode paths skip them and `MAX_SIZE` sizes their trailer
-    /// instead.
-    pub fn is_dynamic(&self) -> bool {
-        if let syn::Type::Path(p) = &self.ty
-            && let Some(seg) = p.path.segments.last()
-        {
-            return seg.ident == "FrameList" || seg.ident == "FrameMap";
-        }
-        false
-    }
 }

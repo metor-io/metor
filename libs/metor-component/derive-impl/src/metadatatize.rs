@@ -6,8 +6,8 @@ use crate::input::{EnumInput, Input, StructInput};
 
 /// Generates the `Metadatatize` impl.
 ///
-/// `crate_name` follows the same root-path contract as
-/// [`componentize_impl`](crate::componentize::componentize_impl).
+/// `crate_name` is the path prefix the generated code uses to reach the
+/// framework's re-exports.
 pub fn metadatatize_impl(input: &Input, crate_name: &TokenStream2) -> TokenStream2 {
     match input {
         Input::Enum(input) => enum_metadatatize_impl(input, crate_name),
