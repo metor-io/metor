@@ -91,15 +91,17 @@ pub(crate) struct SelectedReader {
     _point: gpui::Task<()>,
 }
 
-/// The last point read a reader asked for. One isn't asked again for the
-/// same instant until coverage moves, so a read that lands nothing (or
-/// fails) can't turn into a request loop.
+/// The last point read a reader asked for. A reader doesn't repeat a point
+/// read for the same instant until the component's manifest generation
+/// changes, so a read that lands nothing, or fails, can't loop.
 #[derive(Clone, Debug, PartialEq)]
 struct PointRead {
     id: ComponentId,
     at: Timestamp,
     /// The component's manifest generation when asked.
     generation: Option<u64>,
+    /// Whether the read has finished.
+    landed: bool,
     failed: Option<String>,
 }
 
@@ -114,6 +116,10 @@ impl Global for PointBatch {}
 fn send_points(cx: &mut App) {
     let reads = std::mem::take(&mut cx.default_global::<PointBatch>().0);
     let Some(hydrators) = crate::hydration::hydrator(cx) else {
+        // The last peer went meanwhile: nothing is in flight.
+        for (_, _, reader) in reads {
+            let _ = reader.update(cx, |reader, _| reader.point = None);
+        }
         return;
     };
     let asks: Vec<_> = reads.iter().map(|(id, at, _)| (*id, *at)).collect();
@@ -388,6 +394,7 @@ impl SelectedReader {
         // in the same batch.
         if hidden_predecessor(component, t, &self.tail)
             .is_some_and(|gap| gap.state == SpanState::RemoteOnly)
+            && crate::hydration::hydrator(cx).is_some()
         {
             self.request_point(self.id, t, cx);
         }
@@ -549,7 +556,9 @@ impl SelectedReader {
 
     /// Point-read `at` on `id` (this component, or an input a reconstruction
     /// reads): queued for the flush's batch unless this reader already
-    /// asked for that instant at the current coverage. Returns why that
+    /// asked for that instant at the current coverage, or, while playing,
+    /// still waits on an earlier read. Playback moves the instant every
+    /// frame, so without that it would ask once a frame. Returns why the
     /// earlier read failed, if it did.
     fn request_point(
         &mut self,
@@ -575,10 +584,16 @@ impl SelectedReader {
         {
             return point.failed.clone();
         }
+        if self.point.as_ref().is_some_and(|point| !point.landed)
+            && super::snapshot(cx).is_some_and(|s| s.playing)
+        {
+            return None;
+        }
         self.point = Some(PointRead {
             id,
             at,
             generation,
+            landed: false,
             failed: None,
         });
         let reader = cx.weak_entity();
@@ -607,6 +622,7 @@ impl SelectedReader {
         else {
             return;
         };
+        point.landed = true;
         match outcome {
             Ok(_) => {}
             // Pushed out of a full queue unserved: free to ask again.
@@ -793,15 +809,8 @@ fn latest_at_or_before(
     if newest_gap(&manifest, t).is_some_and(|gap| hides(&gap.range, Some(predecessor))) {
         return None;
     }
-    let next = manifest.spans.partition_point(|span| span.cover_start <= t);
-    for bound in manifest
-        .spans
-        .get(next)
-        .map(|span| span.cover_start)
-        .into_iter()
-        .chain(first_gap_after(&manifest, t))
-    {
-        result.next = Some(result.next.map_or(bound, |t| t.min(bound)));
+    if let Some(bound) = next_boundary(&manifest, t) {
+        result.next = Some(result.next.map_or(bound, |next| next.min(bound)));
     }
     (component.time_series.manifest().generation == manifest.generation).then_some(result)
 }
@@ -864,18 +873,19 @@ fn at_or_before(component: &Component, t: Timestamp, tail: &[SelectedSample]) ->
             remote: gap.state == SpanState::RemoteOnly,
             gap: gap.range,
         });
-    // Past the first stretch held neither as a node nor as a fragment, a
-    // newer predecessor may be hiding.
-    for bound in manifest
-        .spans
-        .iter()
-        .filter(|span| span.cover_start > t)
-        .map(|span| span.cover_start)
-        .chain(first_gap_after(&manifest, t))
-    {
+    if let Some(bound) = next_boundary(&manifest, t) {
         result.next = Some(result.next.map_or(bound, |next| next.min(bound)));
     }
     result
+}
+
+/// How far past `t` an answer from local samples holds: up to the next span,
+/// or the first stretch after `t` held neither as a node nor as a fragment,
+/// where a newer predecessor may be hiding.
+fn next_boundary(manifest: &ComponentManifest, t: Timestamp) -> Option<Timestamp> {
+    let next = manifest.spans.partition_point(|span| span.cover_start <= t);
+    let span = manifest.spans.get(next).map(|span| span.cover_start);
+    span.into_iter().chain(first_gap_after(manifest, t)).min()
 }
 
 /// Whether `gap` can hold a newer sample than `predecessor`, the newest
@@ -924,8 +934,9 @@ fn first_gap_after(manifest: &ComponentManifest, t: Timestamp) -> Option<Timesta
 }
 
 /// The stretch hiding `t`'s predecessor, when one does: [`at_or_before`]'s
-/// `missing`, decided without collecting the sample. Cheap enough for every
-/// refresh: the node walk only runs once a gap is found.
+/// `missing`, decided without collecting the sample. The node walk runs
+/// only when a gap is found, which is usual once eviction leaves older
+/// history remote; it then costs a binary search per resident node.
 fn hidden_predecessor(
     component: &Component,
     t: Timestamp,
@@ -1810,5 +1821,35 @@ mod tests {
         });
         assert_eq!(*remote.store.batches.lock().unwrap(), [READERS]);
         assert_eq!(remote.store.nodes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A scrub asks for every instant it lands on, but playback moves the
+    /// instant every frame, so a playing reader waits for its read to land
+    /// before asking again.
+    #[gpui::test]
+    fn a_playing_reader_keeps_one_point_read_in_flight(cx: &mut gpui::TestAppContext) {
+        let (_temp, db, c) = fixture();
+        let id = c.component_id;
+        let reader = cx.update(|cx| {
+            super::super::TemporalController::init(db.clone(), cx);
+            acquire(db.clone(), id, cx)
+        });
+        cx.run_until_parked();
+        let queued = |instants: [i64; 2], cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                reader.update(cx, |reader, cx| {
+                    reader.point = None;
+                    for t in instants {
+                        reader.request_point(id, Timestamp(t), cx);
+                    }
+                    cx.global::<PointBatch>().0.len()
+                })
+            })
+        };
+        assert_eq!(queued([50, 60], cx), 2);
+        cx.update(|cx| {
+            super::super::dispatch(super::super::TimeAction::Play { from_start: true }, cx).unwrap()
+        });
+        assert_eq!(queued([70, 80], cx), 1);
     }
 }
