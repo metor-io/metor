@@ -49,10 +49,9 @@ impl DbResolver {
 
     /// The id of a component this resolver resolved.
     ///
-    /// The id is carried, never re-derived. A component's id belongs to
-    /// whoever created it — a producer names its own channels — so hashing
-    /// a name a second time need not agree with the real id. That is a bug
-    /// that hides: it looks like the component has not published.
+    /// The id is carried, never re-derived: a producer picks its own ids, so
+    /// hashing the name again can give a different id, and the component then
+    /// looks as if it never published.
     pub fn id_of(&self, path: &str) -> Option<ComponentId> {
         self.components.get(path).map(|(id, _)| *id)
     }
