@@ -255,7 +255,7 @@ pub async fn db(
         stellarator::spawn(udp).drop_guard()
     });
     let serve_task = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
-    metor_db::lod::spawn(db.clone());
+    let lod = metor_db::lod::start(db.clone());
 
     let mut status = DbStatus::default();
     let mut reported = status;
@@ -280,6 +280,7 @@ pub async fn db(
     }
     drop(serve_task);
     drop(udp_task);
+    drop(lod);
     s.finish(log);
 }
 

@@ -19,7 +19,9 @@
 //! would disagree with the origin's.
 
 use std::{
+    cell::RefCell,
     collections::HashSet,
+    rc::{Rc, Weak},
     sync::{Arc, atomic},
     time::{Duration, Instant},
 };
@@ -102,14 +104,27 @@ pub fn lod_schema(source: &ComponentSchema) -> ComponentSchema {
     ComponentSchema::new(PrimType::F32, dim)
 }
 
-/// Spawn the engine: watches for new eligible components and runs one
-/// downsampling task per source. Call this only on the DB that ingests
-/// the raw data (the system of record), never on mirrors.
+/// Spawn the engine for the life of the process: it watches for new
+/// eligible components and runs one downsampling task per source. Call
+/// this only on the DB that ingests the raw data (the system of record),
+/// never on mirrors.
 pub fn spawn(db: Arc<DB>) {
-    stellarator::spawn(run(db));
+    std::mem::forget(start(db));
 }
 
-async fn run(db: Arc<DB>) {
+/// The engine's tasks: the watcher and every downsampling task it
+/// started. Dropping it stops them all, so nothing writes to the DB after.
+pub struct Lod(Rc<RefCell<Vec<stellarator::JoinHandleDropGuard<()>>>>);
+
+/// [`spawn`], running until the returned [`Lod`] is dropped.
+pub fn start(db: Arc<DB>) -> Lod {
+    let tasks = Rc::new(RefCell::new(Vec::new()));
+    let engine = stellarator::spawn(run(db, Rc::downgrade(&tasks)));
+    tasks.borrow_mut().push(engine.drop_guard());
+    Lod(tasks)
+}
+
+async fn run(db: Arc<DB>, tasks: Weak<RefCell<Vec<stellarator::JoinHandleDropGuard<()>>>>) {
     let mut tracked: HashSet<ComponentId> = HashSet::new();
     loop {
         let new: Vec<Component> = db.with_state(|state| {
@@ -119,10 +134,15 @@ async fn run(db: Arc<DB>) {
                 .filter_map(|(id, _)| state.get_component(*id).cloned())
                 .collect()
         });
+        let Some(tasks) = tasks.upgrade() else {
+            return;
+        };
         for src in new {
             tracked.insert(src.component_id);
-            stellarator::spawn(downsample_source(db.clone(), src));
+            let task = stellarator::spawn(downsample_source(db.clone(), src));
+            tasks.borrow_mut().push(task.drop_guard());
         }
+        drop(tasks);
         // Raced against a periodic recheck: a registration between the scan
         // above and the wait registering would otherwise be lost (wake_all
         // doesn't store wakeups), orphaning the component until some
@@ -825,6 +845,23 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Dropping the engine stops the watcher and the downsampling tasks it
+    /// started, after which none of them holds the DB.
+    #[stellarator::test]
+    async fn dropping_the_engine_stops_its_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
+        let id = ComponentId::new("a");
+        db.with_state_mut(|s| s.insert_component(id, f64_schema(&[]), &db.path))
+            .unwrap();
+        let lod = start(db.clone());
+        stellarator::sleep(Duration::from_millis(20)).await;
+        assert!(Arc::strong_count(&db) > 2, "the watcher and a source task run");
+        drop(lod);
+        stellarator::sleep(Duration::from_millis(20)).await;
+        assert_eq!(Arc::strong_count(&db), 1);
     }
 
     #[stellarator::test]
