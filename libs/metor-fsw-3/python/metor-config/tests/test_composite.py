@@ -6,7 +6,7 @@ import inspect
 import unittest
 from typing import NamedTuple
 
-from adcs_stub import Ctrl, Imu, Mode, MotorCmd, Nav, Plant
+from adcs_stub import Ctrl, Est, Imu, Mode, MotorCmd, Nav, Plant
 
 from metor_config import (
     ChannelRegistry,
