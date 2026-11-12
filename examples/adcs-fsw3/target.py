@@ -100,8 +100,8 @@ def gnc(s: Scope, *, sensors: SensorsPort, gps: GpsPort, wheels: WheelsPort) -> 
 
 @composite
 def monitor(s: Scope, *, sensors: SensorsPort, gps: GpsPort) -> None:
-    """Checks each sensor's health, on one frame per sensor, each emitted with
-    the sample it came from."""
+    """Splits the sensors into one frame per sensor, each emitted with its
+    sample, and checks each sensor's health."""
     split = s.add(
         "sensor_split",
         Mux(

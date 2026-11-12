@@ -45,15 +45,15 @@ input comes from an earlier system or a `Loop`.
 `add` returns whatever the function returns. Use a `NamedTuple` of handles and
 ports:
 
-- A handle exposes all of a system's ports. A port is an export with its own
-  name.
-- Every system has `status`, so the ports of several systems cannot merge into
-  one flat namespace.
+- Return a handle to expose all of a system's ports, or a single port under a
+  name of your choice. A composite cannot return one flat set of ports, since
+  every system has a `status` port and the names would clash.
 - A `NamedTuple` of handles and ports is a port list, so `Publish(g, ..)` reads
   each port it holds. A port listed twice is read once. A result holding other
   results is not a port list; pass `[*g.a, *g.b]`. A type checker does not catch
   this, and `Publish` raises `ConfigError`.
-- Annotate the return type. An inferred one is checked only by pyright.
+- Annotate the return type: mypy treats an unannotated function's result as
+  `Any`.
 
 ## Scope
 
@@ -78,11 +78,8 @@ calls them outside the composite.
   is an identifier. Add links at the top of the target and pass their ports in.
 - A composite's systems share one target.
 - One system's id cannot sit under another's: `a` and `a.b` cannot both be
-  systems, since their port names could match.
-- A peer's subscriber keeps one port per message record, so `log` from several
-  instances arrives on one port. See `Subscribe`.
-- `ChannelRegistry` writes at most 16 KiB, about 46 channels with ids like
-  `gnc.pod12.tick`. Past that it drops every write at runtime, and `metor check`
-  passes.
+  systems, since `a`'s port `b` and `a.b`'s ports would share component paths.
+  Nothing can be added under a composite's name once it has been added.
+- A channel name holds at most 48 bytes, prefix included.
 - An alarm id, `{ns}.{system}.{name}`, holds at most 96 bytes, so deep nesting
   can fail with `AlarmPrefixTooLong`.
