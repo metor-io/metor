@@ -16,7 +16,7 @@ use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
 use crate::inspector::rows::{
-    BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow, ScalarRow,
+    BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow, SliderRow,
 };
 use crate::theme::theme;
 use crate::views::Scrollbar;
@@ -565,7 +565,7 @@ pub fn dashboard_rows(
         SharedString::from(format!("{:.0}%", zoom * 100.0)),
         {
             let dashboard = dashboard.clone();
-            Box::new(move |cx| zoom_rows(dashboard.clone(), cx))
+            Box::new(move |_| zoom_rows(dashboard.clone()))
         },
     )));
 
@@ -596,7 +596,7 @@ pub fn dashboard_rows(
 
 /// Zoom commands for the dashboard's inspector page. Steps zoom around the
 /// viewport's centre; the wheel and pinch gestures anchor at the cursor.
-fn zoom_rows(dashboard: Entity<DashboardPanel>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+fn zoom_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
     let step = |label: &'static str, zoom: fn(f32) -> f32| {
         let dashboard = dashboard.clone();
         Box::new(CommandRow::new(
@@ -609,14 +609,18 @@ fn zoom_rows(dashboard: Entity<DashboardPanel>, cx: &App) -> Vec<Box<dyn Inspect
         )) as Box<dyn InspectorRow>
     };
     let percent = {
-        let dashboard = dashboard.clone();
-        ScalarRow::new(
-            "Zoom %".into(),
-            f64::from(dashboard.read(cx).viewport.zoom * 100.0).round(),
-            Arc::new(move |value, _window, cx| {
-                dashboard.update(cx, |this, cx| this.zoom_to(value as f32 / 100.0, None, cx));
+        let read = dashboard.clone();
+        let write = dashboard.clone();
+        SliderRow {
+            label: "Zoom %".into(),
+            read_value: Arc::new(move |cx| f64::from(read.read(cx).viewport.zoom * 100.0).round()),
+            min: f64::from(zoom::MIN_ZOOM * 100.0),
+            max: f64::from(zoom::MAX_ZOOM * 100.0),
+            integer: true,
+            on_change: Arc::new(move |value, _window, cx| {
+                write.update(cx, |this, cx| this.zoom_to(value as f32 / 100.0, None, cx));
             }),
-        )
+        }
     };
     let fit = {
         let dashboard = dashboard.clone();
@@ -1392,7 +1396,7 @@ mod tests {
         let dashboard = cx.update(|_, cx| cx.new(|cx| DashboardPanel::new(db.clone(), cx)));
         let run = |label: &str, cx: &mut gpui::VisualTestContext| {
             cx.update(|window, cx| {
-                let mut rows = zoom_rows(dashboard.clone(), cx);
+                let mut rows = zoom_rows(dashboard.clone());
                 let row = rows.iter_mut().find(|r| r.label() == label).unwrap();
                 row.activate(window, cx);
             });

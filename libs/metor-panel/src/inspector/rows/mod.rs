@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::theme::theme;
+use crate::views::value_box::ValueBox;
 
 pub mod bool;
 pub mod color;
@@ -82,6 +83,45 @@ pub trait InspectorRow: 'static {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement;
+
+    /// The box the row shows its value in, for a row drawn with
+    /// [`boxed_row`]. The edit field takes the value's place in it.
+    fn value_box(&self, _row_ix: usize, _cx: &App) -> Option<ValueBox> {
+        None
+    }
+
+    /// Paint the row while the inspector edits it as text, `field` being
+    /// the edit field: inside the row's value box, or beside the label for
+    /// a row without one.
+    fn render_editing(
+        &self,
+        row_ix: usize,
+        selected: bool,
+        field: AnyElement,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        if let Some(value_box) = self.value_box(row_ix, cx) {
+            return boxed_row(row_ix, selected, self.label(), value_box.editing(field), cx);
+        }
+        row_base(row_ix, selected, cx)
+            .child(
+                div()
+                    .text_size(LABEL_SIZE)
+                    .text_color(theme(cx).text_primary)
+                    .child(SharedString::from(self.label().to_owned())),
+            )
+            .child(div().flex_1().min_w_0().child(field))
+            .into_any_element()
+    }
+
+    /// Step the value on Left (negative `direction`) or Right while the row
+    /// is selected and the search is empty; `fine` (Shift) takes a smaller
+    /// step. Returns whether the row took the key; rows without a steppable
+    /// value leave the arrows to the search field.
+    fn nudge(&mut self, _direction: f64, _fine: bool, _window: &mut Window, _cx: &mut App) -> bool {
+        false
+    }
 
     /// Respond to Enter or a click. Returning a [`RowAction`] lets the row
     /// mutate its bound data directly while delegating navigation and
@@ -413,6 +453,35 @@ pub fn value_row(
         .gap(px(2.))
         .child(row_label(label, label_color))
         .child(row_value(value, value_color))
+}
+
+/// A value box with the row's id, showing `text`. A click on it edits the
+/// row, except while the inspector is passive.
+pub(crate) fn row_box(row_ix: usize, text: impl Into<SharedString>, cx: &App) -> ValueBox {
+    ValueBox::new(("value-box", row_ix), text, !passive(cx))
+}
+
+/// A label and a value box, the box against the row's right edge. A label
+/// too long for the room left ends in an ellipsis.
+pub(crate) fn boxed_row(
+    row_ix: usize,
+    selected: bool,
+    label: &str,
+    value_box: ValueBox,
+    cx: &App,
+) -> AnyElement {
+    let theme = theme(cx);
+    row_base(row_ix, selected, cx)
+        .gap(px(12.0))
+        .child(
+            row_label(SharedString::from(label.to_owned()), theme.text_primary)
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis(),
+        )
+        .child(value_box.render(&theme))
+        .into_any_element()
 }
 
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.

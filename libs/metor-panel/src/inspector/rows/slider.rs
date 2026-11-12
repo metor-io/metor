@@ -1,39 +1,44 @@
 use std::sync::Arc;
 
-use gpui::{
-    AnyElement, App, Bounds, Context, DragMoveEvent, Empty, Render, SharedString, Window, canvas,
-    div, fill, point, prelude::*, px, size,
-};
+use gpui::{AnyElement, App, SharedString, Window};
 
-use super::{InspectorRow, RowAction, row_base, row_label};
-use crate::theme::theme;
+use super::{InspectorRow, RowAction, boxed_row, passive, row_box};
+use crate::views::scrubber::Scrubber;
+use crate::views::value_box::ValueBox;
 
-const SLIDER_HEIGHT: f32 = 14.0;
-const SLIDER_TRACK_HEIGHT: f32 = 4.0;
-const SLIDER_HANDLE_SIZE: f32 = 10.0;
-
-struct SliderDrag {
-    min: f64,
-    max: f64,
-    on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
-}
-
-impl Render for SliderDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-        Empty
-    }
-}
-
-/// Inspector row for a bounded numeric field, rendered as a draggable slider.
+/// Inspector row for a bounded numeric field, drawn as a scrubber: drag the
+/// box to move the value, click it or press Enter to type one, and press
+/// Left or Right to step it.
 ///
-/// `on_change` runs on every drag tick, with the value rounded to two decimal
-/// places so the readout stays stable.
+/// `on_change` runs whenever a drag or a step changes the value, with the
+/// value snapped to the step (a tenth of it while Shift is held), and when
+/// a typed value is committed, kept within the range.
 pub struct SliderRow {
     pub label: SharedString,
     pub read_value: Arc<dyn Fn(&App) -> f64>,
     pub min: f64,
     pub max: f64,
+    /// Keep the value whole: the step is at least one, and Shift slows a
+    /// drag without making the step finer.
+    pub integer: bool,
     pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
+}
+
+impl SliderRow {
+    /// The row's scrubber; a drag changes the value only when `scrubs`.
+    fn scrubber(&self, scrubs: bool, cx: &App) -> Scrubber {
+        Scrubber::new(
+            (self.read_value)(cx),
+            (self.min, self.max),
+            self.integer,
+            scrubs.then(|| self.on_change.clone()),
+        )
+    }
+
+    fn boxed(&self, row_ix: usize, cx: &App) -> ValueBox {
+        let scrubber = self.scrubber(!passive(cx), cx);
+        row_box(row_ix, scrubber.text(), cx).scrubber(scrubber)
+    }
 }
 
 impl InspectorRow for SliderRow {
@@ -48,121 +53,38 @@ impl InspectorRow for SliderRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let theme = theme(cx);
-        let min = self.min;
-        let max = self.max;
-        let val = (self.read_value)(cx);
-        let fraction = if max > min {
-            ((val - min) / (max - min)).clamp(0.0, 1.0) as f32
-        } else {
-            0.0
-        };
-
-        let track_color = theme.border_primary;
-        let fill_color = theme.line_color;
-        let handle_color = theme.text_primary;
-
-        let on_change_drag = self.on_change.clone();
-        let owner = self.on_change.clone();
-
-        let slider = div()
-            .id(("slider", row_ix))
-            .w(px(100.0))
-            .h(px(SLIDER_HEIGHT))
-            .when(!super::passive(cx), |slider| {
-                slider
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_drag(
-                        SliderDrag {
-                            min,
-                            max,
-                            on_change: on_change_drag,
-                        },
-                        |drag, _, _, cx| {
-                            cx.new(|_| SliderDrag {
-                                min: drag.min,
-                                max: drag.max,
-                                on_change: drag.on_change.clone(),
-                            })
-                        },
-                    )
-                    .on_drag_move(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
-                        let drag = event.drag(cx);
-                        // Every visible slider hears every slider drag, and
-                        // each measures against its own track.
-                        if !Arc::ptr_eq(&drag.on_change, &owner) {
-                            return;
-                        }
-                        let bounds = event.bounds;
-                        let rel_x = f32::from(event.event.position.x - bounds.origin.x);
-                        let width = f32::from(bounds.size.width);
-                        let frac = (rel_x / width).clamp(0.0, 1.0) as f64;
-                        let new_val = drag.min + frac * (drag.max - drag.min);
-                        let rounded = (new_val * 100.0).round() / 100.0;
-                        let cb = drag.on_change.clone();
-                        cb(rounded, window, cx);
-                    })
-            })
-            .child(
-                canvas(
-                    move |bounds, _window, _cx| (bounds, fraction),
-                    move |_, (bounds, fraction), window, _cx| {
-                        let track_y =
-                            bounds.origin.y + px((SLIDER_HEIGHT - SLIDER_TRACK_HEIGHT) / 2.0);
-                        let track_bounds = Bounds::new(
-                            point(bounds.origin.x, track_y),
-                            size(bounds.size.width, px(SLIDER_TRACK_HEIGHT)),
-                        );
-                        window.paint_quad(fill(track_bounds, track_color));
-
-                        let fill_w = bounds.size.width * fraction;
-                        if fill_w > px(0.0) {
-                            let fill_bounds = Bounds::new(
-                                point(bounds.origin.x, track_y),
-                                size(fill_w, px(SLIDER_TRACK_HEIGHT)),
-                            );
-                            window.paint_quad(fill(fill_bounds, fill_color));
-                        }
-
-                        let handle_x = bounds.origin.x + fill_w - px(SLIDER_HANDLE_SIZE / 2.0);
-                        let handle_y =
-                            bounds.origin.y + px((SLIDER_HEIGHT - SLIDER_HANDLE_SIZE) / 2.0);
-                        let handle_bounds = Bounds::new(
-                            point(handle_x, handle_y),
-                            size(px(SLIDER_HANDLE_SIZE), px(SLIDER_HANDLE_SIZE)),
-                        );
-                        let mut handle_quad = fill(handle_bounds, handle_color);
-                        handle_quad.corner_radii = gpui::Corners::all(px(SLIDER_HANDLE_SIZE / 2.0));
-                        window.paint_quad(handle_quad);
-                    },
-                )
-                .w_full()
-                .h(px(SLIDER_HEIGHT)),
-            );
-
-        let value_text = SharedString::from(format!("{:.2}", val));
-
-        row_base(row_ix, selected, cx)
-            .child(row_label(self.label.clone(), theme.text_primary))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(slider)
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_secondary)
-                            .min_w(px(36.0))
-                            .child(value_text),
-                    ),
-            )
-            .into_any_element()
+        boxed_row(row_ix, selected, &self.label, self.boxed(row_ix, cx), cx)
     }
 
-    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
-        RowAction::Handled
+    fn value_box(&self, row_ix: usize, cx: &App) -> Option<ValueBox> {
+        Some(self.boxed(row_ix, cx))
+    }
+
+    fn nudge(&mut self, direction: f64, fine: bool, window: &mut Window, cx: &mut App) -> bool {
+        let value = (self.read_value)(cx);
+        let next = self.scrubber(false, cx).nudged(direction, fine);
+        if next != value {
+            (self.on_change)(next, window, cx);
+        }
+        true
+    }
+
+    fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
+        let (min, max, integer) = (self.min, self.max, self.integer);
+        let on_change = self.on_change.clone();
+        RowAction::StartEdit {
+            current_text: self.scrubber(false, cx).text(),
+            on_commit: Box::new(move |text, window, cx| {
+                let Ok(value) = text.trim().parse::<f64>() else {
+                    return;
+                };
+                if !value.is_finite() {
+                    return;
+                }
+                // Not `clamp`, which panics on an inverted or NaN range.
+                let value = value.max(min).min(max);
+                on_change(if integer { value.round() } else { value }, window, cx);
+            }),
+        }
     }
 }

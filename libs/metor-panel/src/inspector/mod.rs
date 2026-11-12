@@ -58,6 +58,13 @@ pub struct EditInspectorQuery {
     pub text: String,
 }
 
+/// Activate the selected row as Enter would. A row's value box stops the
+/// mouse-down that would activate the row, since the press may become a
+/// drag, and dispatches this instead when the press is released as a click.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct ActivateSelectedRow;
+
 /// Where the inspector draws itself relative to the window.
 #[derive(Clone, Copy)]
 pub enum InspectorMode {
@@ -803,6 +810,20 @@ impl Inspector {
                 cx.notify();
                 return;
             }
+            "left" | "right" if self.search.text.is_empty() => {
+                let direction = if key == "right" { 1.0 } else { -1.0 };
+                let fine = event.keystroke.modifiers.shift;
+                let indices = self.filtered_indices();
+                if let Some(&row_idx) = indices.get(self.selected_index)
+                    && let Some(row) = self
+                        .current_rows_mut()
+                        .and_then(|rows| rows.get_mut(row_idx))
+                    && row.nudge(direction, fine, window, cx)
+                {
+                    cx.notify();
+                    return;
+                }
+            }
             "enter" | "return" => {
                 self.confirm(window, cx);
                 cx.notify();
@@ -991,15 +1012,21 @@ impl Inspector {
             .flex_col()
             .when(self.persistent, |group| group.size_full())
             .when(!self.dismissed, |group| {
-                group.on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
-                    this.search.set_text(action.text.clone());
-                    this.search.cursor = this.search.text.len();
-                    this.search.mark = this.search.cursor;
-                    this.query_edited(cx);
-                    this.selected_index = this.first_selectable_index();
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
+                group
+                    .on_action(cx.listener(|this, _: &ActivateSelectedRow, window, cx| {
+                        this.confirm(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
+                        this.search.set_text(action.text.clone());
+                        this.search.cursor = this.search.text.len();
+                        this.search.mark = this.search.cursor;
+                        this.query_edited(cx);
+                        this.selected_index = this.first_selectable_index();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
             })
             .child(panel);
         if matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
@@ -1136,7 +1163,6 @@ impl Inspector {
                               range: Range<usize>,
                               window: &mut Window,
                               cx: &mut Context<Self>| {
-                            let theme = crate::theme::theme(cx);
                             let indices = this.filtered_indices();
                             let mut out = Vec::with_capacity(range.len());
                             for vis_ix in range {
@@ -1153,17 +1179,13 @@ impl Inspector {
 
                                 let element = if is_editing {
                                     let edit = this.editing.as_ref().unwrap();
-                                    let label =
-                                        SharedString::from(rows[row_idx].label().to_string());
-                                    crate::inspector::rows::row_base(vis_ix, selected, cx)
-                                        .child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .text_color(theme.text_primary)
-                                                .child(label),
-                                        )
-                                        .child(div().flex_1().min_w_0().child(edit.field.element()))
-                                        .into_any_element()
+                                    rows[row_idx].render_editing(
+                                        vis_ix,
+                                        selected,
+                                        edit.field.element().into_any_element(),
+                                        window,
+                                        cx,
+                                    )
                                 } else if rows[row_idx].is_header() {
                                     // Headers are inert: no click-to-select, no
                                     // selection highlight.
@@ -1172,11 +1194,23 @@ impl Inspector {
                                     let row_element =
                                         rows[row_idx].render_row(vis_ix, selected, window, cx);
                                     let row_idx_click = row_idx;
+                                    // Select the row and take focus in the
+                                    // capture phase, because a value box
+                                    // stops the mouse-down from bubbling up
+                                    // to the row.
+                                    let select = cx.listener(
+                                        move |this, e: &gpui::MouseDownEvent, window, cx| {
+                                            if e.button == gpui::MouseButton::Left {
+                                                this.selected_index = vis_ix;
+                                                this.focus_handle.focus(window, cx);
+                                            }
+                                        },
+                                    );
                                     div()
+                                        .capture_any_mouse_down(select)
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
                                             cx.listener(move |this, _, window, cx| {
-                                                this.selected_index = vis_ix;
                                                 this.activate_row(row_idx_click, window, cx);
                                             }),
                                         )
@@ -1609,5 +1643,180 @@ mod temporal_tests {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod scrubber_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+    use gpui::{Entity, Modifiers, MouseButton, Point, VisualTestContext};
+
+    use crate::inspector::rows::{InspectorRow, SliderRow, TextRow};
+
+    fn slider(
+        value: &Rc<Cell<f64>>,
+        (min, max): (f64, f64),
+        integer: bool,
+    ) -> Box<dyn InspectorRow> {
+        let (read, write) = (value.clone(), value.clone());
+        Box::new(SliderRow {
+            label: "Opacity".into(),
+            read_value: Arc::new(move |_| read.get()),
+            min,
+            max,
+            integer,
+            on_change: Arc::new(move |v, _, _| write.set(v)),
+        })
+    }
+
+    fn inspector(row: Box<dyn InspectorRow>, cx: &mut Context<Inspector>) -> Inspector {
+        Inspector::new(
+            vec![row],
+            InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
+            cx,
+        )
+    }
+
+    /// A window showing the inspector `build` makes, and its context.
+    fn open<V: Render>(
+        cx: &mut gpui::TestAppContext,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V + 'static,
+    ) -> (Entity<V>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
+        });
+        let (view, cx) = cx.add_window_view(build);
+        cx.refresh().unwrap();
+        (view, cx)
+    }
+
+    fn value_box(cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        cx.refresh().unwrap();
+        cx.debug_bounds("value-box")
+            .expect("the row draws a value box")
+    }
+
+    /// Press at `start`, move `dx` to the right in two steps, and release.
+    fn drag(cx: &mut VisualTestContext, start: Point<Pixels>, dx: f32, modifiers: Modifiers) {
+        cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+        for x in [4.0, dx] {
+            let at = start + gpui::point(px(x), px(0.0));
+            cx.simulate_mouse_move(at, MouseButton::Left, modifiers);
+        }
+        cx.simulate_mouse_up(
+            start + gpui::point(px(dx), px(0.0)),
+            MouseButton::Left,
+            modifiers,
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_a_slider_row_scrubs_without_opening_an_edit(cx: &mut gpui::TestAppContext) {
+        let value = Rc::new(Cell::new(0.5));
+        let row = slider(&value, (0.0, 1.0), false);
+        let (inspector, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let start = value_box(cx).origin + gpui::point(px(10.0), px(10.0));
+        drag(cx, start, 30.0, Modifiers::default());
+        assert!(
+            value.get() > 0.6,
+            "moved right from the middle: {}",
+            value.get()
+        );
+        assert!(cx.read(|cx| inspector.read(cx).editing.is_none()));
+    }
+
+    #[gpui::test]
+    fn shift_dragging_an_integer_slider_keeps_it_whole(cx: &mut gpui::TestAppContext) {
+        let value = Rc::new(Cell::new(100.0));
+        let row = slider(&value, (25.0, 200.0), true);
+        let (_, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let start = value_box(cx).origin + gpui::point(px(10.0), px(10.0));
+        drag(cx, start, 30.0, Modifiers::shift());
+        assert!(value.get() > 100.0, "moved: {}", value.get());
+        assert_eq!(value.get().fract(), 0.0, "whole: {}", value.get());
+    }
+
+    struct Pair(Entity<Inspector>, Entity<Inspector>);
+
+    impl Render for Pair {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let column = |inspector: &Entity<Inspector>| {
+                div().w(px(300.0)).h(px(100.0)).child(inspector.clone())
+            };
+            div().flex().child(column(&self.0)).child(column(&self.1))
+        }
+    }
+
+    #[gpui::test]
+    fn a_drag_moves_only_the_slider_it_began_in(cx: &mut gpui::TestAppContext) {
+        let (a, b) = (Rc::new(Cell::new(0.5)), Rc::new(Cell::new(0.5)));
+        let rows = (slider(&a, (0.0, 1.0), false), slider(&b, (0.0, 1.0), false));
+        let (_, cx) = open(cx, move |_, cx| {
+            let inline = |row, cx: &mut Context<Pair>| {
+                cx.new(|cx| Inspector::new(vec![row], InspectorMode::Inline, cx))
+            };
+            Pair(inline(rows.0, cx), inline(rows.1, cx))
+        });
+        let start = value_box(cx).origin + gpui::point(px(10.0), px(10.0));
+        drag(cx, start, 30.0, Modifiers::default());
+        let moved = [a.get(), b.get()].iter().filter(|&&v| v != 0.5).count();
+        assert_eq!(moved, 1, "a: {}, b: {}", a.get(), b.get());
+    }
+
+    #[gpui::test]
+    fn clicking_a_slider_row_types_into_its_box(cx: &mut gpui::TestAppContext) {
+        let value = Rc::new(Cell::new(0.5));
+        let row = slider(&value, (0.0, 1.0), false);
+        let (inspector, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let center = value_box(cx).center();
+        cx.simulate_click(center, Modifiers::default());
+        assert!(cx.read(|cx| inspector.read(cx).editing.is_some()));
+        value_box(cx);
+
+        cx.update(|_, cx| {
+            inspector.update(cx, |i, _| {
+                i.editing.as_mut().unwrap().field.set_text("0.25")
+            })
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(value.get(), 0.25);
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(value.get(), 0.26, "arrows step the selected slider");
+        cx.simulate_keystrokes("shift-left");
+        assert_eq!(value.get(), 0.259);
+    }
+
+    #[gpui::test]
+    fn clicking_a_text_row_types_into_its_box(cx: &mut gpui::TestAppContext) {
+        let text = Rc::new(std::cell::RefCell::new(String::from("hello")));
+        let row = {
+            let text = text.clone();
+            Box::new(TextRow::new(
+                "Title".into(),
+                "hello".into(),
+                Arc::new(move |value, _, _| *text.borrow_mut() = value),
+            ))
+        };
+        let (inspector, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let center = value_box(cx).center();
+        cx.simulate_click(center, Modifiers::default());
+        assert!(cx.read(|cx| inspector.read(cx).editing.is_some()));
+        value_box(cx);
+
+        cx.update(|_, cx| {
+            inspector.update(cx, |i, _| {
+                i.editing.as_mut().unwrap().field.set_text("world")
+            })
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(*text.borrow(), "world");
     }
 }

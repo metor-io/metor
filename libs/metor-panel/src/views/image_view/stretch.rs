@@ -13,8 +13,11 @@ use gpui::{
 use super::histogram::Histogram;
 use super::lut::Levels;
 use super::view::ImageView;
-use crate::inspector::rows::{AccessorySpec, CommandRow, InspectorRow, RowAction, value_row};
+use crate::inspector::rows::{
+    AccessorySpec, CommandRow, InspectorRow, RowAction, boxed_row, row_box,
+};
 use crate::theme::{Theme, theme};
+use crate::views::value_box::ValueBox;
 
 /// Stretch presets: a label and the levels it sets.
 const PRESETS: [(&str, Levels); 3] = [
@@ -69,6 +72,13 @@ struct LevelsRow {
     strip: RefCell<Option<Entity<HistogramStrip>>>,
 }
 
+impl LevelsRow {
+    fn boxed(&self, row_ix: usize, cx: &App) -> ValueBox {
+        let view = self.view.read(cx);
+        row_box(row_ix, summary(view.display.levels, view.levels()), cx)
+    }
+}
+
 impl InspectorRow for LevelsRow {
     fn label(&self) -> &str {
         "Levels"
@@ -95,9 +105,11 @@ impl InspectorRow for LevelsRow {
         _: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let view = self.view.read(cx);
-        let summary = summary(view.display.levels, view.levels());
-        value_row(row_ix, selected, "Levels".into(), summary, false, cx).into_any_element()
+        boxed_row(row_ix, selected, "Levels", self.boxed(row_ix, cx), cx)
+    }
+
+    fn value_box(&self, row_ix: usize, cx: &App) -> Option<ValueBox> {
+        Some(self.boxed(row_ix, cx))
     }
 
     fn activate(&mut self, _: &mut Window, cx: &mut App) -> RowAction {
