@@ -104,7 +104,7 @@ impl ScratchDir {
     pub fn remove(mut self) -> io::Result<()> {
         // The lock is held until the directory is gone, so no sweep races
         // this removal. Unix lets an open file's directory be removed.
-        let removed = remove_lock_last(&self.path);
+        let removed = remove_lock_last(&self.path, LOCK_FILE);
         self.lock = None;
         removed
     }
@@ -113,20 +113,20 @@ impl ScratchDir {
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         if self.lock.take().is_some() {
-            let _ = remove_lock_last(&self.path);
+            let _ = remove_lock_last(&self.path, LOCK_FILE);
         }
     }
 }
 
-/// Removes `path` with its lock file going last. A removal cut short, such
+/// Removes `path` with its lock file, named `lock_file`, going last. A removal cut short, such
 /// as a large database whose process exits mid-delete, then still leaves a
 /// lock file behind, so the next sweep finishes the job instead of
 /// mistaking the remnant for a lockless legacy directory and waiting out
 /// its age.
-fn remove_lock_last(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_lock_last(path: &Path, lock_file: &str) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        if entry.file_name() == LOCK_FILE {
+        if entry.file_name() == lock_file {
             continue;
         }
         if entry.file_type()?.is_dir() {
@@ -181,7 +181,7 @@ fn remove_if_stale(path: &Path) -> bool {
             }
             // Removed while holding the dead owner's lock, so a second
             // sweeper can't take it in between.
-            remove_lock_last(path)
+            remove_lock_last(path, LOCK_FILE)
         }
         Ok(_) => return false,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

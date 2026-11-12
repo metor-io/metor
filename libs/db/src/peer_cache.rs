@@ -363,21 +363,7 @@ fn try_lock(dir: &Path) -> Option<File> {
 /// [`PeerCache::open`] racing it either waits on the lock or sees the lock
 /// file gone and starts over.
 fn remove(dir: &Path, _lock: &File) -> bool {
-    let removed = (|| {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            if entry.file_name() == LOCK_FILE {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-            } else {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        fs::remove_dir_all(dir)
-    })();
-    match removed {
+    match crate::scratch::remove_lock_last(dir, LOCK_FILE) {
         Ok(()) => {
             info!(path = %dir.display(), "removed cached peer database");
             true
