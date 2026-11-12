@@ -746,7 +746,11 @@ fn a_fragment_on_a_nodes_edge_goes_with_the_node() {
         series.get(Timestamp(20)).unwrap().data(),
         2020u64.to_le_bytes()
     );
-    assert!(series.purge_span(Timestamp(10)).unwrap());
+    let manifest = series.manifest();
+    let held = manifest.span(Timestamp(10)).unwrap().bytes()
+        + manifest.fragments.iter().map(|f| f.bytes()).sum::<u64>();
+    // The purge reports the fragment's bytes along with the node's.
+    assert_eq!(series.purge_span_freed(Timestamp(10)).unwrap(), Some(held));
     assert!(series.manifest().fragments.is_empty());
     assert_eq!(gaps(&series, 0, 100).1, [(10, 21), (20, 31)]);
 }

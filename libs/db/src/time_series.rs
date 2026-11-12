@@ -928,6 +928,13 @@ impl TimeSeries {
     /// node's range go with it: one may claim the node's edge timestamps,
     /// which only the node held samples for.
     pub fn purge_span(&self, start_ts: Timestamp) -> Result<bool, Error> {
+        Ok(self.purge_span_freed(start_ts)?.is_some())
+    }
+
+    /// [`Self::purge_span`], returning the bytes it freed (the span's and
+    /// those of any fragments that went with it), or `None` if it purged
+    /// nothing.
+    pub(crate) fn purge_span_freed(&self, start_ts: Timestamp) -> Result<Option<u64>, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
         let Some(span) = manifest
@@ -939,8 +946,10 @@ impl TimeSeries {
                 f.start == start_ts || f.node.is_some_and(|seal| seal.start_ts == start_ts)
             });
             return match fragment {
-                Some(fragment) => self.purge_fragment_locked(&manifest, fragment.start),
-                None => Ok(false),
+                Some(fragment) => Ok(self
+                    .purge_fragment_locked(&manifest, fragment.start)?
+                    .then(|| fragment.bytes())),
+                None => Ok(None),
             };
         };
         let Some(node) = self
@@ -948,22 +957,29 @@ impl TimeSeries {
             .iter()
             .find(|n| !n.fragment && n.timestamps().first() == Some(&start_ts))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let mirrored = !span.acked && span.source == SpanSource::Mirrored;
         if !span.acked && !(mirrored && remote_holds(&manifest, node.timestamps(), false)) {
-            return Ok(false);
+            return Ok(None);
         }
         let node_is_head = self
             .list
             .head()
             .is_some_and(|head| Arc::ptr_eq(&head, &node));
         if node_is_head && self.has_writer.load(Ordering::Acquire) {
-            return Ok(false);
+            return Ok(None);
         }
         let (start, end) = (span.seal.start_ts.0, span.seal.end_ts.0);
         let mut gone = self.fragments_over(&manifest, &[(start, end)]);
         gone.nodes.push(node);
+        let freed = span.bytes()
+            + manifest
+                .fragments
+                .iter()
+                .filter(|f| gone.claims.contains(&f.start))
+                .map(|f| f.bytes())
+                .sum::<u64>();
 
         if mirrored {
             let resident = extents(self.list.iter(), gone.nodes.last());
@@ -986,7 +1002,7 @@ impl TimeSeries {
             })?;
             self.unlink_nodes(&gone, start_ts)?;
         }
-        Ok(true)
+        Ok(Some(freed))
     }
 
     /// Unlink the nodes in `gone` in one swap and delete their files: the

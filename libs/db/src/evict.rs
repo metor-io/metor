@@ -134,10 +134,12 @@ impl Victim {
         }
     }
 
-    fn purge(&self, series: &TimeSeries) -> Result<bool, Error> {
+    /// Purge the victim, returning the bytes freed, which for a span
+    /// include any fragments that went with it.
+    fn purge(&self, series: &TimeSeries) -> Result<Option<u64>, Error> {
         match self.fragment {
-            true => series.purge_fragment(self.start),
-            false => series.purge_span(self.start),
+            true => Ok(series.purge_fragment(self.start)?.then_some(self.bytes)),
+            false => series.purge_span_freed(self.start),
         }
     }
 }
@@ -218,13 +220,19 @@ pub fn evict(
     }
     let mut victims = Victims::new();
     idle_spans(series, now, grace, &mut evictable, &mut victims);
+    // One victim failing doesn't keep the rest; the first error is returned.
+    let mut failed = None;
     for victim in victims {
-        if victim.purge(series)? {
-            evicted.spans += 1;
-            evicted.bytes += victim.bytes;
+        match victim.purge(series) {
+            Ok(Some(bytes)) => {
+                evicted.spans += 1;
+                evicted.bytes += bytes;
+            }
+            Ok(None) => {}
+            Err(err) => failed = failed.or(Some(err)),
         }
     }
-    Ok(evicted)
+    failed.map_or(Ok(evicted), Err)
 }
 
 /// Whether any component of `db` has a span [`sweep`] would try to purge.
@@ -348,12 +356,12 @@ pub fn budget(
         }
         let component = &components[index];
         match victim.purge(&component.time_series) {
-            Ok(true) => {
-                total -= victim.bytes;
+            Ok(Some(bytes)) => {
+                total = total.saturating_sub(bytes);
                 evicted.spans += 1;
-                evicted.bytes += victim.bytes;
+                evicted.bytes += bytes;
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(err) => warn!(?err, id = ?component.component_id, "eviction failed"),
         }
     }
