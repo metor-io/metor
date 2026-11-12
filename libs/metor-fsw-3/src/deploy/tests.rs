@@ -11,10 +11,7 @@ use crate::tests::utils::{Emit, Recorder, Tap, emit, imu_source, table, tap};
 
 /// Resolves whatever `envelope` has pending, with no store.
 fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
-    match pending(envelope)? {
-        Some(pending) => pending.resolve(envelope, tables, std::path::Path::new("/no/store")),
-        None => Ok(()),
-    }
+    resolve_from(envelope, tables, FIRST_PORT)
 }
 
 /// Resolves `envelope`, giving dialed listeners on port 0 ports from `first`.
@@ -23,9 +20,12 @@ fn resolve_from(
     tables: &[SystemTable],
     first: u16,
 ) -> Result<(), DeployError> {
-    let pending = pending(envelope)?.expect("peers to resolve");
-    let store = std::path::Path::new("/no/store");
-    pending.first_port(first).resolve(envelope, tables, store)
+    match pending(envelope)? {
+        Some(pending) => {
+            pending.resolve(envelope, tables, std::path::Path::new("/no/store"), first)
+        }
+        None => Ok(()),
+    }
 }
 
 fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
@@ -385,7 +385,7 @@ fn test_peer_must_listen() {
     no_listener.targets[0]
         .coordinator
         .resources
-        .remove("pub_ep");
+        .shift_remove("pub_ep");
     no_listener.targets[0].coordinator.systems[2].grants.clear();
     assert_eq!(resolve(&mut no_listener, &tables(2)), Err(not_a_listener));
 }

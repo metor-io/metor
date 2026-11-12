@@ -53,11 +53,11 @@ pub struct Run {
     /// this directory or one above it.
     #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
-    /// Run the targets named NS or under it, as `flight` for
-    /// `flight.cpu1`. Repeatable. Without it, every target runs.
+    /// Run target NS, or every target in group NS (`flight` selects
+    /// `flight.cpu1`). Repeatable. Without it, every target runs.
     #[arg(long = "target", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
     pub targets: Vec<String>,
-    /// Leave out the targets named NS or under it. Repeatable.
+    /// Leave out target NS, or every target in group NS. Repeatable.
     #[arg(long = "except", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
     pub except: Vec<String>,
     /// Stop after this many cycles instead of on SIGINT.
@@ -247,7 +247,10 @@ fn run_member(
     let stats = tap.stats.clone();
     let (coordinator, systems) = load(&config.targets[member], args, Some(tap))?;
     let name = target_name(&config.targets[member]).to_string();
-    ui.emit(Event::SourceWidth(source_width(config)));
+    ui.emit(Event::SourceWidth(source_width(
+        config,
+        &namespaces[member..=member],
+    )));
     ui.emit(Event::Running(&[&name]));
     let origin = Origin {
         target,
@@ -318,14 +321,15 @@ fn lock(route: &Mutex<Route>) -> std::sync::MutexGuard<'_, Route> {
     route.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The widest `target.system` in `config`, or `system` in a deployment of
-/// one.
-fn source_width(config: &ResolvedDeployment) -> usize {
+/// The widest `target.system` among the targets `namespaces` of `config`,
+/// or `system` in a deployment of one.
+fn source_width(config: &ResolvedDeployment, namespaces: &[&str]) -> usize {
     let several = config.targets.len() > 1;
     config
         .targets
         .iter()
         .zip(config.namespaces())
+        .filter(|(_, namespace)| namespaces.contains(namespace))
         .flat_map(|(target, namespace)| {
             let prefix = if several { namespace.len() + 1 } else { 0 };
             target
@@ -354,7 +358,7 @@ fn run_children(
     watch_sigint();
     let started = Instant::now();
     let relay = Relay::new(ui.clone(), namespaces);
-    ui.emit(Event::SourceWidth(source_width(config)));
+    ui.emit(Event::SourceWidth(source_width(config, namespaces)));
     let waited = super::children::spawn_all(&path, namespaces, args, &relay)
         .map(super::children::wait_all)
         .map_err(RunError::Spawn);
@@ -497,8 +501,7 @@ fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeploy
             .collect::<Result<_, _>>()?;
         let dir = dir_of(target);
         let dir = std::path::absolute(dir).map_err(io(dir))?;
-        let pending = pending.first_port(first_port()?);
-        pending.resolve(&mut config, &tables, &store::dir(&dir))?;
+        pending.resolve(&mut config, &tables, &store::dir(&dir), first_port()?)?;
     }
     Ok(config.into_runtime()?)
 }

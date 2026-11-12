@@ -24,17 +24,14 @@ pub const SYSTEM: &str = "system";
 /// The cache of `config`'s names: its groups and targets, then every name
 /// `show` takes.
 pub fn cache(config: &ResolvedDeployment) -> String {
-    let targets = config
-        .groups()
+    let mut targets = config.groups();
+    targets.extend(config.namespaces());
+    targets.retain(|ns| !ns.is_empty());
+    let systems = show::names(config)
         .into_iter()
-        .chain(config.namespaces())
-        .filter(|ns| !ns.is_empty())
-        .map(|ns| format!("{TARGET} {ns}\n"));
-    let names = show::names(config).into_iter();
-    let systems = names
-        .filter(|name| !config.namespaces().contains(&name.as_str()))
-        .filter(|name| !config.groups().contains(&name.as_str()))
+        .filter(|name| !targets.contains(&name.as_str()))
         .map(|name| format!("{SYSTEM} {name}\n"));
+    let targets = targets.iter().map(|ns| format!("{TARGET} {ns}\n"));
     targets.chain(systems).collect()
 }
 

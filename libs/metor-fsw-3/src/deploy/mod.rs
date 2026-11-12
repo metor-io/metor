@@ -31,8 +31,7 @@ use slot::DeploySlot;
 /// The host a peer is dialed on when the deployment gives it no host.
 pub const LOOPBACK: &str = "127.0.0.1";
 
-/// The first port a dialed listener on port 0 is given, unless
-/// [`Pending::first_port`] sets another.
+/// The first port a dialed listener on port 0 is given by default.
 pub const FIRST_PORT: u16 = 2240;
 
 /// A resource: the index of its target, and its id.
@@ -43,7 +42,6 @@ type ResourceKey = (usize, String);
 pub struct Pending {
     listen: Listeners,
     slots: Vec<(SystemIndex, DeploySlot)>,
-    first_port: u16,
 }
 
 /// Decodes every slot's params in `envelope` once, and returns them if a
@@ -55,7 +53,6 @@ pub fn pending(envelope: &DeploymentConfig) -> Result<Option<Pending>, DeployErr
     let mut pending = Pending {
         listen: Listeners(HashMap::new()),
         slots: Vec::new(),
-        first_port: FIRST_PORT,
     };
     for (index, system) in SystemIndex::iter(envelope) {
         if let Some(addr) = listen_addr(envelope, index, system) {
@@ -107,26 +104,19 @@ impl Pending {
     /// every peer reference.
     ///
     /// `tables` holds one system table per target. Peer dials become
-    /// addresses, and peer outputs become port definitions.
+    /// addresses, and peer outputs become port definitions. A dialed
+    /// listener on port 0 gets a port counting up from `first_port`.
     pub fn resolve(
         self,
         envelope: &mut DeploymentConfig,
         tables: &[SystemTable],
         store: &Path,
+        first_port: u16,
     ) -> Result<(), DeployError> {
         slot::resolve_slots(envelope, tables, store, self.slots)?;
         let mut listen = self.listen;
-        assign_ports(envelope, &mut listen, self.first_port)?;
+        assign_ports(envelope, &mut listen, first_port)?;
         resolve_peers(envelope, tables, &listen)
-    }
-
-    /// Sets the first port a dialed listener on port 0 is given.
-    #[must_use]
-    pub fn first_port(self, port: u16) -> Self {
-        Self {
-            first_port: port,
-            ..self
-        }
     }
 }
 
@@ -171,15 +161,7 @@ fn dialed(envelope: &DeploymentConfig) -> BTreeSet<SystemIndex> {
             })
     });
     peers
-        .filter_map(|peer| {
-            let target = envelope
-                .targets
-                .iter()
-                .position(|t| t.namespace() == peer.target)?;
-            let systems = &envelope.targets[target].coordinator.systems;
-            let system = systems.iter().position(|s| s.id == peer.link)?;
-            Some(SystemIndex::new(target, system))
-        })
+        .filter_map(|peer| SystemIndex::find(envelope, &peer.target, &peer.link))
         .collect()
 }
 
