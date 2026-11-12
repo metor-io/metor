@@ -104,10 +104,10 @@ const INSTANCE_ID_FILE: &str = "instance_id";
 /// predates them (or whose file is unreadable).
 fn load_instance_id(dir: &Path) -> Result<InstanceId, Error> {
     let path = dir.join(INSTANCE_ID_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match text.trim().parse() {
-            Ok(id) => return Ok(id),
-            Err(_) => warn!(?path, "replacing an unreadable instance id"),
+    match std::fs::read(&path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes).map(|text| text.trim().parse()) {
+            Ok(Ok(id)) => return Ok(id),
+            _ => warn!(?path, "replacing an unreadable instance id"),
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
@@ -117,10 +117,7 @@ fn load_instance_id(dir: &Path) -> Result<InstanceId, Error> {
 
 fn save_new_instance_id(dir: &Path) -> Result<InstanceId, Error> {
     let id = InstanceId(fastrand::u128(..).to_le_bytes());
-    let path = dir.join(INSTANCE_ID_FILE);
-    let staged = dir.join(format!("{INSTANCE_ID_FILE}.tmp"));
-    std::fs::write(&staged, format!("{id}\n"))?;
-    std::fs::rename(&staged, &path)?;
+    seal::atomic_write(dir, INSTANCE_ID_FILE, format!("{id}\n").as_bytes())?;
     Ok(id)
 }
 
@@ -3334,7 +3331,11 @@ mod msg_sync_tests {
         std::fs::remove_file(path.join(INSTANCE_ID_FILE)).unwrap();
         let minted = DB::open(path.clone()).unwrap().instance_id();
         assert_ne!(minted, id);
-        assert_eq!(DB::open(path).unwrap().instance_id(), minted);
+        assert_eq!(DB::open(path.clone()).unwrap().instance_id(), minted);
+
+        // A torn file is replaced rather than failing the open.
+        std::fs::write(path.join(INSTANCE_ID_FILE), [0xff, 0xfe]).unwrap();
+        assert_ne!(DB::open(path).unwrap().instance_id(), minted);
     }
 
     fn msg_command(id: PacketId, name: &str) -> CommandInfo {
