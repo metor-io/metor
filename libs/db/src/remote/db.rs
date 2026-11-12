@@ -102,8 +102,10 @@ impl RemoteDb {
         self.store.clone()
     }
 
-    /// Spawn the supervisor: the reconnecting live mirror plus the
-    /// hydration worker. Tasks run until the runtime shuts down.
+    /// Spawn the supervisor: the reconnecting live mirror, plus the
+    /// hydration and manifest-seeding workers. They run until the runtime
+    /// shuts down, or until [`MirrorEvent::WrongPeer`] stops the mirror,
+    /// which stops the workers with it.
     pub fn spawn(self, db: Arc<DB>) {
         let Self {
             addr,
@@ -117,10 +119,12 @@ impl RemoteDb {
                 f(event);
             }
         };
-        stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
         let connected = Arc::new(WaitQueue::new());
-        stellarator::spawn(seed_loop(db.clone(), store.clone(), connected.clone()));
-        stellarator::spawn(async move {
+        let workers = futures_lite::future::zip(
+            hydrator.run(db.clone(), store.clone()),
+            seed_loop(db.clone(), store, connected.clone()),
+        );
+        let supervisor = async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
             const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
             let mut backoff = INITIAL_BACKOFF;
@@ -161,7 +165,10 @@ impl RemoteDb {
                 stellarator::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(10));
             }
-        });
+        };
+        stellarator::spawn(futures_lite::future::or(supervisor, async {
+            workers.await;
+        }));
     }
 }
 
@@ -306,6 +313,7 @@ async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>, connected: Arc<WaitQueue>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::testing::{serve, with_f64};
     use std::sync::Mutex as StdMutex;
 
     fn event_log() -> (
@@ -346,14 +354,9 @@ mod tests {
     async fn live_peer_emits_connected() {
         let (log, sink) = event_log();
         let dir = tempfile::tempdir().unwrap();
-        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
-        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = crate::Server {
-            listener,
-            db: server_db,
-        };
-        stellarator::struc_con::stellar(move || server.run());
+        let addr = serve(Arc::new(
+            crate::DB::create(dir.path().join("server")).unwrap(),
+        ));
         let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
         RemoteDb::new(addr).on_event(sink).spawn(mirror_db);
         wait_for(&log, MirrorEvent::Connected).await;
@@ -361,28 +364,23 @@ mod tests {
     }
 
     /// A mirror pinned to one database stops for good when another answers
-    /// at its address, and takes nothing in from it.
+    /// at its address, takes nothing in from it, and stops its workers.
     #[stellarator::test]
     async fn a_different_database_at_the_address_stops_the_mirror() {
         let dir = tempfile::tempdir().unwrap();
         let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
         let found = server_db.instance_id();
-        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = crate::Server {
-            listener,
-            db: server_db.clone(),
-        };
-        stellarator::struc_con::stellar(move || server.run());
+        let addr = serve(server_db);
 
         let expected = InstanceId([9; 16]);
         assert_ne!(found, expected);
         let (log, sink) = event_log();
         let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
-        RemoteDb::new(addr)
+        let remote = RemoteDb::new(addr)
             .expect_instance(Some(expected))
-            .on_event(sink)
-            .spawn(mirror_db);
+            .on_event(sink);
+        let store = remote.store();
+        remote.spawn(mirror_db);
         let wrong = MirrorEvent::WrongPeer {
             expected,
             found: Some(found),
@@ -391,6 +389,8 @@ mod tests {
         // Longer than the first reconnect backoff: no further attempt.
         stellarator::sleep(Duration::from_millis(600)).await;
         assert_eq!(*log.lock().unwrap(), [MirrorEvent::Connecting, wrong]);
+        // The workers dropped their handles on the store when they stopped.
+        assert_eq!(Arc::strong_count(&store), 1);
         assert!(matches!(
             PeerStore::new(addr)
                 .expect_instance(Some(expected))
@@ -413,31 +413,11 @@ mod tests {
     /// peer's own ingest of the same component stays local.
     #[stellarator::test]
     async fn mirrored_components_ingest_as_mirrored() {
-        use metor_proto::types::PrimType;
-        use metor_proto::vtable::builder::{
-            component, raw_field, raw_table, schema, timestamp, vtable,
-        };
-
         const ID: metor_proto::types::PacketId = [9, 2];
         let dir = tempfile::tempdir().unwrap();
         let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
-        server_db
-            .insert_vtable(metor_proto_wkt::VTableMsg {
-                id: ID,
-                vtable: vtable([raw_field(
-                    8,
-                    8,
-                    timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
-                )]),
-            })
-            .unwrap();
-        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = crate::Server {
-            listener,
-            db: server_db.clone(),
-        };
-        stellarator::struc_con::stellar(move || server.run());
+        with_f64(&server_db, ID, "a");
+        let addr = serve(server_db.clone());
         let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
         RemoteDb::new(addr).spawn(mirror_db.clone());
 
@@ -465,23 +445,11 @@ mod tests {
     #[stellarator::test]
     async fn a_peers_unsealed_history_is_fetchable_from_connect() {
         use crate::manifest::{SpanSource, SpanState};
-        use metor_proto::types::PrimType;
-        use metor_proto::vtable::builder::{
-            component, raw_field, raw_table, schema, timestamp, vtable,
-        };
 
         const ID: metor_proto::types::PacketId = [9, 5];
         let dir = tempfile::tempdir().unwrap();
         let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
-        peer.insert_vtable(metor_proto_wkt::VTableMsg {
-            id: ID,
-            vtable: vtable([raw_field(
-                8,
-                8,
-                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
-            )]),
-        })
-        .unwrap();
+        with_f64(&peer, ID, "a");
         let write = |peer: &DB, ts: i64| {
             let mut table = ts.to_le_bytes().to_vec();
             table.extend_from_slice(&(ts as f64).to_le_bytes());
@@ -494,13 +462,7 @@ mod tests {
         let series = |db: &DB| db.with_state(|s| s.get_component(a).map(|c| c.time_series.clone()));
         assert!(series(&peer).unwrap().manifest().spans.is_empty());
 
-        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = crate::Server {
-            listener,
-            db: peer.clone(),
-        };
-        stellarator::struc_con::stellar(move || server.run());
+        let addr = serve(peer.clone());
         let mirror = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
         let remote = RemoteDb::new(addr);
         let hydrator = remote.hydrator();
@@ -638,24 +600,12 @@ mod tests {
     #[stellarator::test]
     async fn a_reopened_peer_cache_resumes_and_fetches_the_gap() {
         use crate::manifest::SpanState;
-        use metor_proto::types::PrimType;
-        use metor_proto::vtable::builder::{
-            component, raw_field, raw_table, schema, timestamp, vtable,
-        };
         use stellarator::struc_con::Joinable as _;
 
         const ID: metor_proto::types::PacketId = [9, 3];
         let dir = tempfile::tempdir().unwrap();
         let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
-        peer.insert_vtable(metor_proto_wkt::VTableMsg {
-            id: ID,
-            vtable: vtable([raw_field(
-                8,
-                8,
-                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
-            )]),
-        })
-        .unwrap();
+        with_f64(&peer, ID, "a");
         let write = |ts: i64| {
             let mut table = ts.to_le_bytes().to_vec();
             table.extend_from_slice(&(ts as f64).to_le_bytes());
@@ -689,13 +639,7 @@ mod tests {
         };
         eventually("the peer sealing its history", || sealed(&peer) >= 2).await;
 
-        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = crate::Server {
-            listener,
-            db: peer.clone(),
-        };
-        let _server = stellarator::struc_con::stellar(move || server.run());
+        let addr = serve(peer.clone());
         let cache = crate::peer_cache::PeerCache::new(dir.path().join("peers"));
         let id = peer.instance_id();
 
