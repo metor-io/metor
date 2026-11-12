@@ -75,7 +75,8 @@ pub fn kind_key_to_string(key: EventKindKey) -> String {
     }
 }
 
-/// An id in hex: two bytes when its upper bytes are zero, otherwise all eight.
+/// An id in hex. A short id prints as two bytes joined by `separator`; a wide
+/// id prints as all eight, unseparated.
 fn id_hex(id: PacketId, separator: &str) -> String {
     match id {
         [a, b, 0, 0, 0, 0, 0, 0] => format!("{a:02x}{separator}{b:02x}"),

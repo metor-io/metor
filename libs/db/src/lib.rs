@@ -4197,7 +4197,7 @@ mod wide_id_tests {
 
     const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
 
-    /// Setting metadata is what first puts a log on disk.
+    /// Metadata for a test log. Setting it creates the log's directory.
     fn metadata() -> MsgMetadata {
         MsgMetadata {
             name: "log".into(),

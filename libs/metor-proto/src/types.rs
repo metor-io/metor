@@ -1227,7 +1227,7 @@ mod tests {
 
     const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
 
-    /// The frame's bytes after its length prefix, as a receiver sees them.
+    /// Parses `pkt` as a receiver does, with the length prefix still at the start of the buffer.
     #[cfg(feature = "alloc")]
     fn parse(pkt: LenPacket) -> Result<OwnedPacket<Vec<u8>>, Error> {
         OwnedPacket::parse_with_offset(pkt.inner, size_of::<u32>())
