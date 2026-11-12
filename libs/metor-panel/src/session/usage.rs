@@ -25,6 +25,29 @@ pub(super) struct Usage {
     /// Each cached peer and its size, largest first.
     peers: Vec<(InstanceId, u64)>,
     measuring: bool,
+    /// Bumped by each clear, so a measurement that started before it
+    /// doesn't bring back what it removed.
+    clears: u64,
+}
+
+impl Usage {
+    /// Take a measurement started at `clears`, unless a clear happened since.
+    /// Either way the measurement is over; returns whether it counted.
+    fn land(&mut self, clears: u64, session: u64, peers: Vec<(InstanceId, u64)>) -> bool {
+        self.measuring = false;
+        if clears != self.clears {
+            return false;
+        }
+        self.session = Some(session);
+        self.peers = peers;
+        true
+    }
+
+    fn clear(&mut self, removed: &[std::path::PathBuf]) {
+        self.clears += 1;
+        self.peers
+            .retain(|(id, _)| !removed.iter().any(|dir| dir_is(dir, *id)));
+    }
 }
 
 pub(super) type SharedUsage = Arc<Mutex<Usage>>;
@@ -95,10 +118,7 @@ pub(super) fn rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
                 let removed = task.await;
                 cx.update(|cx| {
                     if let Some(usage) = usage(cx) {
-                        let mut usage = usage.lock().unwrap();
-                        usage
-                            .peers
-                            .retain(|(id, _)| !removed.iter().any(|dir| dir_is(dir, *id)));
+                        usage.lock().unwrap().clear(&removed);
                     }
                     measure(cx);
                     cx.refresh_windows();
@@ -149,13 +169,14 @@ fn measure(cx: &App) {
         return;
     };
     let usage = state.usage.clone();
-    {
+    let clears = {
         let mut usage = usage.lock().unwrap();
         if usage.measuring {
             return;
         }
         usage.measuring = true;
-    }
+        usage.clears
+    };
     let session = state
         .storage
         .as_ref()
@@ -170,12 +191,16 @@ fn measure(cx: &App) {
         .spawn(async move { (disk_usage(&session), root.map(|root| peers(&root))) });
     cx.spawn(async move |cx| {
         let (session, peers) = task.await;
-        *usage.lock().unwrap() = Usage {
-            session: Some(session),
-            peers: peers.unwrap_or_default(),
-            measuring: false,
-        };
-        cx.update(|cx| cx.refresh_windows());
+        let counted = usage
+            .lock()
+            .unwrap()
+            .land(clears, session, peers.unwrap_or_default());
+        cx.update(|cx| {
+            if !counted {
+                measure(cx);
+            }
+            cx.refresh_windows();
+        });
     })
     .detach();
 }
@@ -232,6 +257,20 @@ mod tests {
         assert_eq!(bytes(512), "512 B");
         assert_eq!(bytes(1536), "1.5 KiB");
         assert_eq!(bytes(20 << 30), "20.0 GiB");
+    }
+
+    #[test]
+    fn a_measurement_from_before_a_clear_is_dropped() {
+        let (a, b) = (InstanceId([1; 16]), InstanceId([2; 16]));
+        let mut usage = Usage::default();
+        assert!(usage.land(0, 10, vec![(a, 5), (b, 3)]));
+        // A measurement starts, then the cache is cleared under it.
+        let started = usage.clears;
+        usage.clear(&[PathBuf::from(format!("/cache/{a}"))]);
+        assert_eq!(usage.peers, vec![(b, 3)]);
+        assert!(!usage.land(started, 10, vec![(a, 5), (b, 3)]));
+        assert_eq!(usage.peers, vec![(b, 3)], "the cleared peer stays gone");
+        assert!(usage.land(usage.clears, 10, vec![(b, 3)]));
     }
 
     #[test]
