@@ -1257,8 +1257,8 @@ fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::Te
     let db = Arc::new(db);
     let source = ComponentId::new("rpm");
     // History already on disk, as a target that ran before this session
-    // leaves it. (The test thread runs no persist task, so the WAL is not
-    // the way to put it there.)
+    // leaves it. (Installed directly, so it is history before the session
+    // starts rather than whenever the persist thread drains a WAL.)
     let input = db.with_state(|s| s.get_component(source).cloned()).unwrap();
     let recorded: Vec<(Timestamp, [u8; 8])> = (1..=50i64)
         .map(|ts| (Timestamp(ts), (ts as f64).to_le_bytes()))

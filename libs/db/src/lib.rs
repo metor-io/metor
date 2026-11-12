@@ -5,7 +5,7 @@ use metor_proto::types::{PacketHeader, PacketTy};
 use metor_proto::vtable::builder::{
     OpBuilder, component, raw_field, raw_table, schema, timestamp, vtable,
 };
-use metor_proto::vtable::{ElementKey, Field, Op, RealizedField, builder};
+use metor_proto::vtable::{ElementKey, Field, Op, RealizedField, RealizedOp, builder};
 use metor_proto::{
     registry,
     schema::Schema,
@@ -25,6 +25,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     net::{SocketAddr, ToSocketAddrs},
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, PoisonError, RwLock,
@@ -44,15 +45,18 @@ use stellarator::{
 use time_series::TimeSeries;
 use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
+pub use background::{Background, Gather, Workers};
 pub use error::Error;
 
+use crate::background::{Pending, Persister};
 use crate::disruptor::Disruptor;
 
 pub mod append_log;
 mod arc_ring;
 mod arrow;
+mod background;
 pub mod disruptor;
 mod error;
 pub mod evict;
@@ -78,6 +82,11 @@ pub struct DB {
     /// Invalidates cached display metadata independently of live sample arrival.
     pub metadata_gen: AtomicCell<u64>,
     state: RwLock<State>,
+    /// Serializes every change to `state`, taken before the state lock. A
+    /// change holds it across its file IO and takes the write lock only to
+    /// publish the result, so ingest never waits on the filesystem.
+    structural: std::sync::Mutex<()>,
+    workers: Workers,
     pub recording_cell: PlayingCell,
 
     // metadata
@@ -121,8 +130,9 @@ fn save_new_instance_id(dir: &Path) -> Result<InstanceId, Error> {
     Ok(id)
 }
 
-#[derive(Default)]
 pub struct State {
+    /// The db's threads, which persist and seal what `State` creates.
+    background: Background,
     components: HashMap<ComponentId, Component>,
     component_metadata: HashMap<ComponentId, ComponentMetadata>,
     metadata_generation: u64,
@@ -140,6 +150,8 @@ pub struct State {
     namespace: Option<String>,
 
     vtable_registry: registry::HashMapRegistry,
+    /// Plans for the registered static vtables that have one.
+    static_plans: HashMap<PacketId, StaticPlan>,
     streams: HashMap<StreamId, Arc<FixedRateStreamState>>,
 
     /// Raw bytes of the most recently ingested table for each dynamic vtable,
@@ -169,15 +181,18 @@ impl DB {
         std::fs::create_dir_all(&path)?;
         let instance_id = save_new_instance_id(&path)?;
         let default_stream_time_step = AtomicU64::new(time_step.as_nanos() as u64);
-        let state = State {
-            db_config: DbConfig {
+        let workers = Workers::new()?;
+        let state = State::new(
+            workers.background().clone(),
+            DbConfig {
                 default_stream_time_step: time_step,
                 ..Default::default()
             },
-            ..Default::default()
-        };
+        );
         let db = DB {
             state: RwLock::new(state),
+            structural: Default::default(),
+            workers,
             recording_cell: PlayingCell::new(true),
             path,
             vtable_gen: AtomicCell::new(0),
@@ -197,7 +212,23 @@ impl DB {
         f(&state)
     }
 
+    /// Runs `f` under the write lock. Any file IO `f` does stalls ingest, so
+    /// the db's own create paths stage their IO and [`publish`](Self::publish)
+    /// instead.
     pub fn with_state_mut<O, F: FnOnce(&mut State) -> O>(&self, f: F) -> O {
+        let structural = self.structural();
+        self.publish(&structural, f)
+    }
+
+    fn structural(&self) -> Structural<'_> {
+        self.structural
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies an in-memory change under the write lock. Holding `structural`
+    /// keeps what the caller read before its IO current until it publishes.
+    fn publish<O>(&self, _structural: &Structural<'_>, f: impl FnOnce(&mut State) -> O) -> O {
         let mut state = self.state.write().unwrap();
         let generation = state.metadata_generation;
         let result = f(&mut state);
@@ -205,6 +236,13 @@ impl DB {
             self.metadata_gen.store(state.metadata_generation);
         }
         result
+    }
+
+    /// Sets how the persist thread gathers pushes before draining them; see
+    /// [`Gather`]. A host that wants the lowest ingest latency and has a core
+    /// to spare spins; the default sleeps.
+    pub fn set_gather(&self, gather: Gather) {
+        self.workers.background().persister.set_gather(gather);
     }
 
     fn db_config(&self) -> DbConfig {
@@ -244,6 +282,7 @@ impl DB {
         let mut start_timestamp = i64::MAX;
 
         info!("Opening database: {}", path.display());
+        let workers = Workers::new()?;
         for elem in std::fs::read_dir(&path)? {
             let Ok(elem) = elem else { continue };
             let path = elem.path();
@@ -266,10 +305,16 @@ impl DB {
             trace!("Opening component file {}", path.display());
 
             // A LoD component's writer belongs to the engine; open it in
-            // drain mode so its `persist` never claims the writer that
+            // drain mode so persisting its WAL never claims the writer that
             // `setup_levels` re-takes after restart.
             let engine_owned = lod::is_lod_name(&metadata.name);
-            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?;
+            let component = Component::open(
+                &path,
+                component_id,
+                schema.clone(),
+                engine_owned,
+                workers.background(),
+            )?;
             if engine_owned {
                 component
                     .time_series
@@ -295,7 +340,7 @@ impl DB {
                     .and_then(|p| p.to_str())
                     .and_then(|p| p.parse().ok())
                     .ok_or(Error::InvalidMsgId)?;
-                let msg_log = MsgLog::open(path)?;
+                let msg_log = MsgLog::open(path, workers.background())?;
                 if let Some(first_timestamp) = msg_log.first_timestamp() {
                     start_timestamp = start_timestamp.min(first_timestamp.0);
                 }
@@ -311,11 +356,10 @@ impl DB {
         let db_state = DbConfig::read(path.join("db_state"))?;
         let instance_id = load_instance_id(&path)?;
         let state = State {
-            db_config: db_state.clone(),
             components,
             component_metadata,
             msg_logs,
-            ..Default::default()
+            ..State::new(workers.background().clone(), db_state.clone())
         };
         let earliest_timestamp = if start_timestamp == i64::MAX {
             Timestamp::now()
@@ -324,6 +368,8 @@ impl DB {
         };
         Ok(DB {
             state: RwLock::new(state),
+            structural: Default::default(),
+            workers,
             path,
             vtable_gen: AtomicCell::new(0),
             metadata_gen: AtomicCell::new(0),
@@ -362,59 +408,140 @@ impl DB {
     /// a registered id is refused, so one link's records can never be
     /// decoded through another's schema.
     pub fn insert_vtable(&self, vtable: VTableMsg) -> Result<(), Error> {
-        self.with_state_mut(|state| {
-            if let Some(registered) = state.vtable_registry.map.get(&vtable.id) {
-                return if postcard::to_allocvec(registered)?
-                    == postcard::to_allocvec(&vtable.vtable)?
-                {
-                    debug!(id = ?vtable.id, "vtable already registered");
-                    Ok(())
-                } else {
-                    Err(Error::VTableConflict(vtable.id))
-                };
+        let structural = self.structural();
+        if let Some(registered) =
+            self.with_state(|state| state.vtable_registry.map.get(&vtable.id).cloned())
+        {
+            return if postcard::to_allocvec(&registered)? == postcard::to_allocvec(&vtable.vtable)?
+            {
+                debug!(id = ?vtable.id, "vtable already registered");
+                Ok(())
+            } else {
+                Err(Error::VTableConflict(vtable.id))
+            };
+        }
+        info!(id = ?vtable.id, "inserting vtable");
+        // For static fields this registers the concrete component. For dynamic
+        // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
+        // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
+        // keyed/indexed components (`processes.0.pid`) are created lazily on first
+        // sample by [`DB::ingest_table`].
+        let mut staged = Staged::default();
+        let mut fields = 0;
+        for res in vtable.vtable.realize_fields(None) {
+            let RealizedField {
+                component_id,
+                shape,
+                ty,
+                dynamic,
+                ..
+            } = res?;
+            let component_schema = ComponentSchema::new(ty, shape);
+            self.stage_component(&structural, &mut staged, component_id, component_schema)?;
+            if dynamic {
+                // A member template never receives samples (the concrete keyed
+                // components do), so hide it from listings / live streams.
+                staged.templates.push(component_id);
+                let metadata = self
+                    .staged_metadata(&structural, &staged, component_id)
+                    .unwrap_or_else(|| default_metadata(component_id));
+                self.stage_metadata(&structural, &mut staged, metadata)?;
             }
-            info!(id = ?vtable.id, "inserting vtable");
-            // For static fields this registers the concrete component. For dynamic
-            // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
-            // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
-            // keyed/indexed components (`processes.0.pid`) are created lazily on first
-            // sample by [`DB::ingest_table`].
-            for res in vtable.vtable.realize_fields(None) {
-                let RealizedField {
-                    component_id,
-                    shape,
-                    ty,
-                    dynamic,
-                    ..
-                } = res?;
-                let component_schema = ComponentSchema::new(ty, shape);
-                state.insert_component(component_id, component_schema, &self.path)?;
-                if dynamic {
-                    // A member template never receives samples (the concrete keyed
-                    // components do), so hide it from listings / live streams.
-                    state.dynamic_templates.insert(component_id);
-                    let metadata = state
-                        .component_metadata
-                        .get(&component_id)
-                        .cloned()
-                        .unwrap_or_else(|| ComponentMetadata {
-                            component_id,
-                            name: component_id.to_string(),
-                            metadata: Default::default(),
-                        });
-                    state.set_component_metadata(metadata, &self.path)?;
-                }
-                self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
-            }
+            fields += 1;
+        }
+        self.publish(&structural, |state| {
+            staged.publish(state);
             if vtable.vtable.is_dynamic() {
                 state
                     .latest_dynamic_tables
                     .insert(vtable.id, Default::default());
             }
+            if let Some(plan) = StaticPlan::new(&vtable.vtable, &state.components) {
+                state.static_plans.insert(vtable.id, plan);
+            }
             state.vtable_registry.map.insert(vtable.id, vtable.vtable);
-            Ok::<_, Error>(())
-        })?;
+        });
+        self.vtable_gen.fetch_add(fields, atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Creates a component's files for [`publish`](Self::publish), with a
+    /// numeric name when it has no metadata yet. An existing component is
+    /// left be, unless its schema differs.
+    fn stage_component(
+        &self,
+        structural: &Structural<'_>,
+        staged: &mut Staged,
+        component_id: ComponentId,
+        schema: ComponentSchema,
+    ) -> Result<(), Error> {
+        let existing = staged
+            .components
+            .iter()
+            .find(|c| c.component_id == component_id)
+            .map(|c| c.schema.clone())
+            .or_else(|| {
+                self.with_state(|s| s.get_component(component_id).map(|c| c.schema.clone()))
+            });
+        if let Some(existing) = existing {
+            if existing != schema {
+                warn!(?existing, new_component.schema = ?schema, ?component_id, "schema mismatch");
+                return Err(Error::SchemaMismatch);
+            }
+            return Ok(());
+        }
+        info!(component.id = ?component_id.0, "inserting");
+        let component = Component::create(
+            &self.path,
+            component_id,
+            schema,
+            false,
+            self.workers.background(),
+        )?;
+        if self
+            .staged_metadata(structural, staged, component_id)
+            .is_none()
+        {
+            self.stage_metadata(structural, staged, default_metadata(component_id))?;
+        }
+        staged.components.push(component);
+        Ok(())
+    }
+
+    /// Writes a component's metadata file for [`publish`](Self::publish),
+    /// hidden if it names a dynamic template.
+    fn stage_metadata(
+        &self,
+        _structural: &Structural<'_>,
+        staged: &mut Staged,
+        metadata: ComponentMetadata,
+    ) -> Result<(), Error> {
+        let id = metadata.component_id;
+        let hidden = staged.templates.contains(&id)
+            || self.with_state(|s| s.dynamic_templates.contains(&id));
+        let metadata = match hidden {
+            true => metadata.with_hidden(),
+            false => metadata,
+        };
+        write_component_metadata(&metadata, &self.path)?;
+        staged.metadata.push(metadata);
+        Ok(())
+    }
+
+    /// A component's metadata as of `staged`'s publish.
+    fn staged_metadata(
+        &self,
+        _structural: &Structural<'_>,
+        staged: &Staged,
+        component_id: ComponentId,
+    ) -> Option<ComponentMetadata> {
+        staged
+            .metadata
+            .iter()
+            .rev()
+            .find(|m| m.component_id == component_id)
+            .cloned()
+            .or_else(|| self.with_state(|s| s.get_component_metadata(component_id).cloned()))
     }
 
     /// Sinks a table `buf` described by the registered vtable `id`, stamping a
@@ -448,6 +575,10 @@ impl DB {
             StaticIngest::Pushed(pushed) => pushed,
             StaticIngest::Dynamic => self.ingest_dynamic(id, buf, arrival)?,
         };
+        // One wake for the whole table, however many WALs it queued.
+        if pushed.wake {
+            self.workers.background().persister.wake();
+        }
         if pushed.new_series {
             self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
         }
@@ -466,6 +597,9 @@ impl DB {
         arrival: Arrival,
     ) -> Result<StaticIngest, Error> {
         self.with_state(|state| {
+            if let Some(plan) = state.static_plans.get(&id) {
+                return plan.push(buf, arrival).map(StaticIngest::Pushed);
+            }
             let vtable = state
                 .vtable_registry
                 .get(&id)
@@ -473,28 +607,82 @@ impl DB {
             if vtable.is_dynamic() {
                 return Ok(StaticIngest::Dynamic);
             }
-            let mut pushed = Pushed::default();
-            vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
-                let component = state
-                    .get_component(rf.component_id)
-                    .ok_or(Error::ComponentNotFound(rf.component_id))?;
-                pushed.merge(push_field(component, &rf, arrival)?);
-                Ok(())
-            })?;
-            Ok(StaticIngest::Pushed(pushed))
+            state
+                .push_fields(vtable, buf, arrival)
+                .map(StaticIngest::Pushed)
         })
     }
 
-    /// Sinks a dynamic table, taking the write lock only when a member is new.
+    /// Sinks a dynamic table, realizing its new members first.
     fn ingest_dynamic(&self, id: PacketId, buf: &[u8], arrival: Arrival) -> Result<Pushed, Error> {
         let pushed = match self.with_state(|state| state.push_known_fields(id, buf, arrival))? {
             Some(pushed) => pushed,
-            None => {
-                self.with_state_mut(|state| state.realize_and_push(id, buf, arrival, &self.path))?
-            }
+            None => self.realize_and_push(id, buf, arrival)?,
         };
         self.with_state(|state| state.cache_latest_table(id, buf));
         Ok(pushed)
+    }
+
+    /// Creates the members of a dynamic table that are new, each named on its
+    /// first sample, then pushes the table.
+    fn realize_and_push(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        arrival: Arrival,
+    ) -> Result<Pushed, Error> {
+        let structural = self.structural();
+        let vtable = self.with_state(|state| state.dynamic_vtable(id).cloned())?;
+        let mut staged = Staged::default();
+        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
+            self.stage_member(&structural, &mut staged, &rf)
+        })?;
+        self.publish(&structural, |state| staged.publish(state));
+        self.with_state(|state| state.push_fields(&vtable, buf, arrival))
+    }
+
+    /// Stages the component a dynamic table's field lands in, unless it
+    /// exists. A static field's component must already exist.
+    fn stage_member(
+        &self,
+        structural: &Structural<'_>,
+        staged: &mut Staged,
+        rf: &RealizedField,
+    ) -> Result<(), Error> {
+        let staged_component = staged
+            .components
+            .iter()
+            .any(|c| c.component_id == rf.component_id);
+        if staged_component
+            || self.with_state(|state| state.components.contains_key(&rf.component_id))
+        {
+            return Ok(());
+        }
+        if !rf.dynamic {
+            return Err(Error::ComponentNotFound(rf.component_id));
+        }
+        // Name the keyed member by its dotted path before `stage_component`
+        // falls back to the numeric id, so the panel shows
+        // `alarm_defs.limits.<key>`. A member that reappears already has real
+        // metadata, so leave it be.
+        if self
+            .staged_metadata(structural, staged, rf.component_id)
+            .is_none()
+            && let Some(name) = dynamic_member_name(rf)
+        {
+            let metadata = ComponentMetadata {
+                component_id: rf.component_id,
+                name,
+                metadata: self.with_state(|state| state.template_metadata(rf)),
+            };
+            self.stage_metadata(structural, staged, metadata)?;
+        }
+        self.stage_component(
+            structural,
+            staged,
+            rf.component_id,
+            ComponentSchema::new(rf.ty, rf.shape),
+        )
     }
 
     /// Builds one streamed `Table` packet for a dynamic vtable subscription from
@@ -512,6 +700,15 @@ impl DB {
             pkt.extend_from_slice(&cached);
             Some(pkt)
         })
+    }
+
+    /// Sets a component's display metadata and persists it.
+    pub fn set_component_metadata(&self, metadata: ComponentMetadata) -> Result<(), Error> {
+        let structural = self.structural();
+        let mut staged = Staged::default();
+        self.stage_metadata(&structural, &mut staged, metadata)?;
+        self.publish(&structural, |s| staged.publish(s));
+        Ok(())
     }
 
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
@@ -585,14 +782,24 @@ impl DB {
             }
         })?;
         if !exists {
-            self.with_state_mut(move |s| {
-                let msg_log = s.get_or_insert_msg_log(id, &self.path)?;
-                msg_log.push(timestamp, msg)?;
-                Ok::<_, Error>(())
-            })?;
+            self.get_or_insert_msg_log(id)?.push(timestamp, msg)?;
         }
         self.last_updated.update_max(timestamp);
         Ok(())
+    }
+
+    /// The log for `id`, created on first use.
+    pub fn get_or_insert_msg_log(&self, id: PacketId) -> Result<MsgLog, Error> {
+        if let Some(msg_log) = self.with_state(|s| s.msg_logs.get(&id).cloned()) {
+            return Ok(msg_log);
+        }
+        let structural = self.structural();
+        if let Some(msg_log) = self.with_state(|s| s.msg_logs.get(&id).cloned()) {
+            return Ok(msg_log);
+        }
+        let msg_log = MsgLog::create(msg_log_path(&self.path, id), self.workers.background())?;
+        self.publish(&structural, |s| s.insert_msg_log(id, msg_log.clone()));
+        Ok(msg_log)
     }
 
     pub fn get_or_insert_fixed_rate_state(
@@ -600,6 +807,7 @@ impl DB {
         stream_id: StreamId,
         behavior: FixedRateBehavior,
     ) -> Arc<FixedRateStreamState> {
+        let _structural = self.structural();
         let mut state = self.state.write().expect("poisoned lock");
         state
             .streams
@@ -653,7 +861,73 @@ fn push_element(name: &mut String, container: &str, key: ElementKey) {
     }
 }
 
+type Structural<'a> = std::sync::MutexGuard<'a, ()>;
+
+/// Changes whose files are written, published to [`State`] in one step so a
+/// reader never sees a component before its metadata.
+#[derive(Default)]
+struct Staged {
+    components: Vec<Component>,
+    metadata: Vec<ComponentMetadata>,
+    templates: Vec<ComponentId>,
+}
+
+impl Staged {
+    fn publish(self, state: &mut State) {
+        state.dynamic_templates.extend(self.templates);
+        for metadata in self.metadata {
+            state.cache_component_metadata(metadata);
+        }
+        for component in self.components {
+            state.components.insert(component.component_id, component);
+        }
+    }
+}
+
+/// The metadata of a component nothing has named yet.
+fn default_metadata(component_id: ComponentId) -> ComponentMetadata {
+    ComponentMetadata {
+        component_id,
+        name: component_id.to_string(),
+        metadata: Default::default(),
+    }
+}
+
+fn write_component_metadata(metadata: &ComponentMetadata, db_path: &Path) -> Result<(), Error> {
+    let component_metadata_path = db_path.join(metadata.component_id.to_string());
+    std::fs::create_dir_all(&component_metadata_path)?;
+    let component_metadata_path = component_metadata_path.join("metadata");
+    info!(component.name= ?metadata.name, component.id = ?metadata.component_id.0, "setting component metadata");
+    metadata.write(component_metadata_path)
+}
+
+fn msg_log_path(db_path: &Path, id: PacketId) -> PathBuf {
+    db_path
+        .join("msgs")
+        .join(u64::from_le_bytes(id).to_string())
+}
+
 impl State {
+    fn new(background: Background, db_config: DbConfig) -> Self {
+        State {
+            background,
+            components: Default::default(),
+            component_metadata: Default::default(),
+            metadata_generation: Default::default(),
+            msg_logs: Default::default(),
+            command_ids: Default::default(),
+            commands: Default::default(),
+            namespace: Default::default(),
+            vtable_registry: Default::default(),
+            static_plans: Default::default(),
+            streams: Default::default(),
+            latest_dynamic_tables: Default::default(),
+            dynamic_templates: Default::default(),
+            udp_vtable_streams: Default::default(),
+            db_config,
+        }
+    }
+
     pub fn insert_component(
         &mut self,
         component_id: ComponentId,
@@ -664,7 +938,7 @@ impl State {
     }
 
     /// Like [`Self::insert_component`], but for the LoD engine: the created
-    /// component's writer belongs to the engine, so its `persist` runs in
+    /// component's writer belongs to the engine, so its WAL persists in
     /// drain mode rather than racing to claim the writer.
     pub fn insert_engine_component(
         &mut self,
@@ -692,14 +966,15 @@ impl State {
             return Ok(());
         }
         info!(component.id = ?component_id.0, "inserting");
-        let component_metadata = ComponentMetadata {
+        let component = Component::create(
+            db_path,
             component_id,
-            name: component_id.to_string(),
-            metadata: Default::default(),
-        };
-        let component = Component::create(db_path, component_id, schema, engine_owned)?;
+            schema,
+            engine_owned,
+            &self.background,
+        )?;
         if !self.component_metadata.contains_key(&component_id) {
-            self.set_component_metadata(component_metadata, db_path)?;
+            self.set_component_metadata(default_metadata(component_id), db_path)?;
         }
         self.components.insert(component_id, component);
         Ok(())
@@ -707,43 +982,6 @@ impl State {
 
     pub fn get_component_metadata(&self, component_id: ComponentId) -> Option<&ComponentMetadata> {
         self.component_metadata.get(&component_id)
-    }
-
-    /// The component a dynamic table's field lands in, created and named on
-    /// its first sample. A static field's component must already exist.
-    fn realize_component(
-        &mut self,
-        rf: &RealizedField,
-        db_path: &Path,
-    ) -> Result<&Component, Error> {
-        if !self.components.contains_key(&rf.component_id) {
-            if !rf.dynamic {
-                return Err(Error::ComponentNotFound(rf.component_id));
-            }
-            // Name the keyed member by its dotted path before
-            // `insert_component` falls back to the numeric id, so the panel
-            // shows `alarm_defs.limits.<key>`. A member that reappears already
-            // has real metadata, so leave it be.
-            if !self.component_metadata.contains_key(&rf.component_id)
-                && let Some(name) = dynamic_member_name(rf)
-            {
-                self.set_component_metadata(
-                    ComponentMetadata {
-                        component_id: rf.component_id,
-                        name,
-                        metadata: self.template_metadata(rf),
-                    },
-                    db_path,
-                )?;
-            }
-            self.insert_component(
-                rf.component_id,
-                ComponentSchema::new(rf.ty, rf.shape),
-                db_path,
-            )?;
-        }
-        self.get_component(rf.component_id)
-            .ok_or(Error::ComponentNotFound(rf.component_id))
     }
 
     /// The metadata a keyed member inherits from its template, unhidden.
@@ -787,30 +1025,16 @@ impl State {
             Err(Error::ComponentNotFound(_)) => return Ok(None),
             known => known?,
         }
+        self.push_fields(vtable, buf, arrival).map(Some)
+    }
+
+    /// Pushes every field of a table whose components all exist.
+    fn push_fields(&self, vtable: &VTable, buf: &[u8], arrival: Arrival) -> Result<Pushed, Error> {
         let mut pushed = Pushed::default();
         vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
             let component = self
                 .get_component(rf.component_id)
                 .ok_or(Error::ComponentNotFound(rf.component_id))?;
-            pushed.merge(push_field(component, &rf, arrival)?);
-            Ok(())
-        })?;
-        Ok(Some(pushed))
-    }
-
-    /// Pushes a dynamic table, realizing each member on its first sample.
-    fn realize_and_push(
-        &mut self,
-        id: PacketId,
-        buf: &[u8],
-        arrival: Arrival,
-        db_path: &Path,
-    ) -> Result<Pushed, Error> {
-        // Cloned out so realizing a member can take `&mut self`.
-        let vtable = self.dynamic_vtable(id)?.clone();
-        let mut pushed = Pushed::default();
-        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
-            let component = self.realize_component(&rf, db_path)?;
             pushed.merge(push_field(component, &rf, arrival)?);
             Ok(())
         })?;
@@ -863,15 +1087,22 @@ impl State {
             true => metadata.with_hidden(),
             false => metadata,
         };
-        let component_metadata_path = db_path.join(metadata.component_id.to_string());
-        std::fs::create_dir_all(&component_metadata_path)?;
-        let component_metadata_path = component_metadata_path.join("metadata");
-        info!(component.name= ?metadata.name, component.id = ?metadata.component_id.0, "setting component metadata");
-        metadata.write(component_metadata_path)?;
+        write_component_metadata(&metadata, db_path)?;
+        self.cache_component_metadata(metadata);
+        Ok(())
+    }
+
+    fn cache_component_metadata(&mut self, metadata: ComponentMetadata) {
         self.component_metadata
             .insert(metadata.component_id, metadata);
         self.metadata_generation = self.metadata_generation.wrapping_add(1);
-        Ok(())
+    }
+
+    fn insert_msg_log(&mut self, id: PacketId, msg_log: MsgLog) {
+        self.msg_logs.insert(id, msg_log);
+        // A new log is a metadata change: it is how a `SyncMsgs`
+        // sweep learns there is another log to tail.
+        self.metadata_generation = self.metadata_generation.wrapping_add(1);
     }
 
     /// Every recorded message log's id with its announced metadata, for
@@ -888,11 +1119,7 @@ impl State {
         Ok(match self.msg_logs.entry(id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let msg_log = MsgLog::create(
-                    db_path
-                        .join("msgs")
-                        .join(u64::from_le_bytes(id).to_string()),
-                )?;
+                let msg_log = MsgLog::create(msg_log_path(db_path, id), &self.background)?;
                 // A new log is a metadata change: it is how a `SyncMsgs`
                 // sweep learns there is another log to tail.
                 self.metadata_generation = self.metadata_generation.wrapping_add(1);
@@ -1091,17 +1318,20 @@ enum StaticIngest {
     Dynamic,
 }
 
-/// The newest timestamp pushed, and whether a push began an empty series.
+/// The newest timestamp pushed, whether a push began an empty series, and
+/// whether the persist thread needs a wake for the pushes.
 #[derive(Default)]
 struct Pushed {
     max_ts: Option<Timestamp>,
     new_series: bool,
+    wake: bool,
 }
 
 impl Pushed {
     fn merge(&mut self, other: Pushed) {
         self.max_ts = self.max_ts.max(other.max_ts);
         self.new_series |= other.new_series;
+        self.wake |= other.wake;
     }
 }
 
@@ -1131,20 +1361,29 @@ fn push_field(
 ) -> Result<Pushed, Error> {
     // PANIC Safety: the callers walk a table, so every field realizes a view.
     let view = rf.view.as_ref().expect("table provided to for_each_field");
+    push_value(component, rf.timestamp, view.as_bytes(), arrival)
+}
+
+/// Pushes one value into `component` at `timestamp`, or stamped with its
+/// arrival when its vtable names no timestamp.
+fn push_value(
+    component: &Component,
+    timestamp: Option<Timestamp>,
+    value: &[u8],
+    arrival: Arrival,
+) -> Result<Pushed, Error> {
     if let Some(run) = arrival.mirror {
         component.time_series.enter_mirror_run(run);
     }
     let new_series = component.time_series.is_empty();
-    let ts = match rf.timestamp {
-        Some(ts) => {
-            component.push_buf(ts, view.as_bytes())?;
-            ts
-        }
-        None => component.push_buf_received(arrival.received, view.as_bytes()),
+    let (ts, wake) = match timestamp {
+        Some(ts) => (ts, component.push_unwoken(ts, value)?),
+        None => component.push_received_unwoken(arrival.received, value),
     };
     Ok(Pushed {
         max_ts: Some(ts),
         new_series,
+        wake,
     })
 }
 
@@ -1164,6 +1403,105 @@ fn wal_capacity(size: usize, entries: usize) -> usize {
     entry * (WAL_BUDGET / entry).max(WAL_MIN_ENTRIES).min(entries)
 }
 
+/// A static vtable resolved once at registration: each field's bytes, shape
+/// and timestamp, and the component it lands in. A table ingests through it
+/// without walking the vtable's ops or looking up each component, reading and
+/// checking the table just as the walk does.
+struct StaticPlan {
+    fields: Vec<PlannedField>,
+}
+
+struct PlannedField {
+    component: Component,
+    value: Range<usize>,
+    shape: Vec<usize>,
+    ty: PrimType,
+    timestamp: PlannedTimestamp,
+}
+
+/// Where a planned field's timestamp comes from.
+enum PlannedTimestamp {
+    /// The table's arrival, when the vtable names no timestamp.
+    Received,
+    Fixed(Timestamp),
+    /// These bytes of the table.
+    Table(Range<usize>),
+}
+
+impl StaticPlan {
+    /// Plans `vtable`, or `None` when it is dynamic or a field's ops are any
+    /// but a static chain, so the walk ingests it. A chain op that reads the
+    /// table fails to realize without one, so all a plan reads from a table
+    /// is each field's value and timestamp.
+    fn new(vtable: &VTable, components: &HashMap<ComponentId, Component>) -> Option<Self> {
+        if vtable.is_dynamic() {
+            return None;
+        }
+        let fields = vtable
+            .fields
+            .iter()
+            .map(|field| {
+                let mut op = vtable.realize(field.arg, None).ok()?;
+                let mut schema = None;
+                let mut timestamp = None;
+                let component_id = loop {
+                    op = match op {
+                        RealizedOp::Component(component) => break component.component_id,
+                        RealizedOp::Schema(s) => vtable.realize(schema.insert(s).arg, None).ok()?,
+                        // The walk reads and checks every timestamp in a chain,
+                        // though only the last stamps the field, so a chain of
+                        // several stays with the walk.
+                        RealizedOp::Timestamp(t) if timestamp.is_none() => {
+                            timestamp = Some(match (t.range, t.timestamp) {
+                                (Some(range), _) => PlannedTimestamp::Table(range),
+                                (None, Some(ts)) => PlannedTimestamp::Fixed(ts),
+                                (None, None) => PlannedTimestamp::Received,
+                            });
+                            vtable.realize(t.arg, None).ok()?
+                        }
+                        RealizedOp::Frame(frame) => vtable.realize(frame.arg, None).ok()?,
+                        RealizedOp::Ext(ext) => vtable.realize(ext.arg, None).ok()?,
+                        _ => return None,
+                    };
+                };
+                let schema = schema?;
+                let start = field.offset.to_index();
+                Some(PlannedField {
+                    component: components.get(&component_id)?.clone(),
+                    value: start..start + field.len as usize,
+                    shape: schema.dim.iter().map(|&dim| dim as usize).collect(),
+                    ty: schema.ty,
+                    timestamp: timestamp.unwrap_or(PlannedTimestamp::Received),
+                })
+            })
+            .collect::<Option<_>>()?;
+        Some(StaticPlan { fields })
+    }
+
+    fn push(&self, table: &[u8], arrival: Arrival) -> Result<Pushed, Error> {
+        use metor_proto::error::Error as ProtoError;
+        let mut pushed = Pushed::default();
+        for field in &self.fields {
+            let ts = match &field.timestamp {
+                PlannedTimestamp::Received => None,
+                PlannedTimestamp::Fixed(ts) => Some(*ts),
+                PlannedTimestamp::Table(range) => {
+                    let bytes = table
+                        .get(range.clone())
+                        .ok_or(ProtoError::BufferUnderflow)?;
+                    Some(Timestamp::read_from_bytes(bytes).map_err(ProtoError::from)?)
+                }
+            };
+            let value = table
+                .get(field.value.clone())
+                .ok_or(ProtoError::BufferUnderflow)?;
+            let view = ComponentView::try_from_bytes_shape(value, &field.shape, field.ty)?;
+            pushed.merge(push_value(&field.component, ts, view.as_bytes(), arrival)?);
+        }
+        Ok(pushed)
+    }
+}
+
 #[derive(Clone)]
 pub struct Component {
     pub component_id: ComponentId,
@@ -1174,6 +1512,9 @@ pub struct Component {
     persistence: Arc<std::sync::Mutex<Option<ComponentPersistence>>>,
     /// Samples dropped because the WAL was full, to rate-limit the warning.
     wal_dropped: Arc<AtomicU64>,
+    /// Whether the WAL is queued for the persist thread.
+    pub(crate) queued: Arc<AtomicBool>,
+    persister: Option<Persister>,
 }
 
 struct ComponentPersistence {
@@ -1202,17 +1543,20 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
             persistence: Default::default(),
             wal_dropped: Default::default(),
+            queued: Default::default(),
+            persister: None,
         }
     }
 
     /// `engine_owned` marks a component whose writer belongs to the LoD
-    /// engine (it emits buckets directly); its `persist` runs in drain mode
+    /// engine (it emits buckets directly); its WAL persists in drain mode
     /// so it never races [`lod`]'s `setup_levels` for the writer claim.
     pub fn create(
         db_path: &Path,
         component_id: ComponentId,
         schema: ComponentSchema,
         engine_owned: bool,
+        background: &Background,
     ) -> Result<Self, Error> {
         let component_path = db_path.join(component_id.to_string());
         std::fs::create_dir_all(&component_path)?;
@@ -1224,18 +1568,15 @@ impl Component {
         if let Some(age) = max_node_age_override() {
             time_series.set_max_node_age(age);
         }
-        let this = Component {
-            wal: Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
+        Ok(Self::with_background(
+            Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
             component_id,
             time_series,
             schema,
-            last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
-            persistence: Default::default(),
-            wal_dropped: Default::default(),
-        };
-        stellarator::spawn(this.clone().persist(engine_owned));
-        stellarator::spawn(this.time_series.clone().lifecycle());
-        Ok(this)
+            Timestamp(i64::MIN),
+            engine_owned,
+            background,
+        ))
     }
 
     pub fn open(
@@ -1243,6 +1584,7 @@ impl Component {
         component_id: ComponentId,
         schema: ComponentSchema,
         engine_owned: bool,
+        background: &Background,
     ) -> Result<Self, Error> {
         let time_series = TimeSeries::open(path)?;
         if let Some(age) = max_node_age_override() {
@@ -1253,40 +1595,46 @@ impl Component {
             .latest()
             .map(|t| t.timestamp())
             .unwrap_or(Timestamp(i64::MIN));
-        let this = Component {
-            wal: Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES)),
+        Ok(Self::with_background(
+            Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES)),
+            component_id,
+            time_series,
+            schema,
+            last_timestamp,
+            engine_owned,
+            background,
+        ))
+    }
+
+    /// A component persisted, and its rolled nodes sealed, by the db's
+    /// [`Background`] threads. Its WAL reader and writer stay with the
+    /// component, so [`DB::flush`] can drain it however those threads fare.
+    fn with_background(
+        wal: Disruptor,
+        component_id: ComponentId,
+        time_series: TimeSeries,
+        schema: ComponentSchema,
+        last_timestamp: Timestamp,
+        engine_owned: bool,
+        background: &Background,
+    ) -> Self {
+        let persistence = ComponentPersistence {
+            reader: wal.reader(),
+            writer: None,
+            engine_owned,
+        };
+        let lifecycle = time_series.clone();
+        background.sealer.spawn(move || lifecycle.lifecycle());
+        Component {
+            wal,
             component_id,
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
-            persistence: Default::default(),
+            persistence: Arc::new(std::sync::Mutex::new(Some(persistence))),
             wal_dropped: Default::default(),
-        };
-        stellarator::spawn(this.persist(engine_owned));
-        stellarator::spawn(this.time_series.clone().lifecycle());
-        Ok(this)
-    }
-
-    pub fn persist(&self, engine_owned: bool) -> impl Future<Output = ()> + 'static {
-        self.persistence
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| ComponentPersistence {
-                reader: self.wal.reader(),
-                writer: None,
-                engine_owned,
-            });
-        // This reader only wakes the task. The durable reader and writer stay
-        // with the component when its executor is stopped, for DB::flush.
-        let mut notify = self.wal.reader();
-        let component = self.clone();
-        async move {
-            loop {
-                if let Err(err) = component.flush_pending() {
-                    tracing::error!(?err, "failed to persist wal samples");
-                }
-                drop(notify.next().await);
-            }
+            queued: Default::default(),
+            persister: Some(background.persister.clone()),
         }
     }
 
@@ -1313,12 +1661,12 @@ impl Component {
             let writer = writer.as_mut().ok_or_else(|| {
                 Error::Io(std::io::Error::other("component writer owned elsewhere"))
             })?;
-            for msg in buf.chunks_exact(msg_size) {
-                let timestamp = Timestamp(i64::from_le_bytes(
-                    msg[..size_of::<Timestamp>()].try_into().unwrap(),
-                ));
-                writer.push_buf(timestamp, &msg[size_of::<Timestamp>()..])?;
-            }
+            writer.push_bufs(buf.chunks_exact(msg_size).map(|msg| {
+                let (timestamp, value) = msg.split_at(size_of::<Timestamp>());
+                // PANIC Safety: `split_at` leaves exactly a timestamp's bytes.
+                let timestamp = Timestamp(i64::from_le_bytes(timestamp.try_into().unwrap()));
+                (timestamp, value)
+            }))?;
         }
         Ok(())
     }
@@ -1342,11 +1690,22 @@ impl Component {
 
     /// Pushes a sample at `timestamp`, refusing one older than the series.
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
+        if self.push_unwoken(timestamp, value_buf)?
+            && let Some(persister) = &self.persister
+        {
+            persister.wake();
+        }
+        Ok(())
+    }
+
+    /// Pushes a sample and queues the WAL for persisting, but leaves the
+    /// persist thread to a [`Persister::wake`] once the caller's pushes are
+    /// done. Returns whether that wake is needed.
+    fn push_unwoken(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<bool, Error> {
         if timestamp < self.last_timestamp.latest() {
             return Err(Error::TimeTravel);
         }
-        self.write_wal(timestamp, value_buf, false);
-        Ok(())
+        Ok(self.write_wal(timestamp, value_buf, false).1)
     }
 
     /// Pushes a sample this db stamped with its own clock when the table
@@ -1358,19 +1717,35 @@ impl Component {
     /// as time travel, it lands at the latest timestamp: the db's arrival
     /// clock stays monotonic per component.
     pub fn push_buf_received(&self, received: Timestamp, value_buf: &[u8]) -> Timestamp {
+        let (timestamp, wake) = self.push_received_unwoken(received, value_buf);
+        if wake && let Some(persister) = &self.persister {
+            persister.wake();
+        }
+        timestamp
+    }
+
+    /// [`Self::push_buf_received`], leaving the persist thread's wake to the
+    /// caller as [`Self::push_unwoken`] does.
+    fn push_received_unwoken(&self, received: Timestamp, value_buf: &[u8]) -> (Timestamp, bool) {
         self.write_wal(received, value_buf, true)
     }
 
-    /// Writes one sample to the WAL at `timestamp`. With `restamp`, a
-    /// timestamp a concurrent writer has since passed is moved up to the
-    /// series' latest, settled under the grant's write lock where
-    /// `last_timestamp` is exact. Without it the sample keeps the timestamp
-    /// its sender gave it, and the WAL's drain refuses it if it is now out
-    /// of order.
-    fn write_wal(&self, timestamp: Timestamp, value_buf: &[u8], restamp: bool) -> Timestamp {
+    /// Writes one sample to the WAL at `timestamp` and queues the WAL for
+    /// persisting. With `restamp`, a timestamp a concurrent writer has since
+    /// passed is moved up to the series' latest, settled under the grant's
+    /// write lock where `last_timestamp` is exact. Without it the sample
+    /// keeps the timestamp its sender gave it, and the WAL's drain refuses
+    /// it if it is now out of order. Returns the timestamp written and
+    /// whether the persist thread needs a wake.
+    fn write_wal(
+        &self,
+        timestamp: Timestamp,
+        value_buf: &[u8],
+        restamp: bool,
+    ) -> (Timestamp, bool) {
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             self.warn_wal_drop(timestamp);
-            return timestamp;
+            return (timestamp, false);
         };
         let timestamp = match restamp {
             true => timestamp.max(self.last_timestamp.latest()),
@@ -1382,7 +1757,10 @@ impl Component {
         // stamp sees this one.
         self.last_timestamp.update_max(timestamp);
         drop(grant);
-        timestamp
+        let wake = self.persister.as_ref().is_some_and(|persister| {
+            persister.queue(&self.queued, || Pending::Component(self.clone()))
+        });
+        (timestamp, wake)
     }
 }
 
@@ -3032,6 +3410,22 @@ mod dynamic_ingest_tests {
         (db, id, v)
     }
 
+    /// Waits until each named component has persisted at least its count of
+    /// samples, off the db's persist thread, which a loaded machine can
+    /// hold up well past a fixed sleep.
+    async fn persisted(db: &DB, expected: &[(&str, usize)]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while expected
+            .iter()
+            .any(|(name, count)| sample_times(db, name).len() < *count)
+        {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            stellarator::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     fn sample_times(db: &DB, name: &str) -> Vec<i64> {
         let component = db
             .with_state(|s| s.get_component(ComponentId::new(name)).cloned())
@@ -3087,12 +3481,21 @@ mod dynamic_ingest_tests {
         let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
         let pushed = db
             .with_state(|s| s.push_known_fields(id, &t2, Arrival::local(Timestamp(0))))
-            .unwrap();
-        assert!(pushed.is_some());
+            .unwrap()
+            .expect("every member is known");
+        // The wake `ingest_table` would give: the WALs stay queued until it,
+        // so `t3`'s pushes find them queued and leave the wake to this one.
+        if pushed.wake {
+            db.with_state(|s| s.background.persister.wake());
+        }
         let t3 = map_table(3000, &[("htop", 5, 0.5), ("init", 6, 0.25)]);
         db.ingest_table(id, &t3).unwrap();
 
-        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        persisted(
+            &db,
+            &[("processes.htop.pid", 3), ("processes.init.cpu_usage", 3)],
+        )
+        .await;
         assert_eq!(sample_times(&db, "processes.htop.pid"), [1000, 2000, 3000]);
         assert_eq!(
             sample_times(&db, "processes.init.cpu_usage"),
@@ -3117,7 +3520,7 @@ mod dynamic_ingest_tests {
         db.ingest_table(id, &t2).unwrap();
         assert!(db.vtable_gen.latest() > gen_before);
 
-        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        persisted(&db, &[("processes.htop.pid", 2), ("processes.init.pid", 1)]).await;
         assert_eq!(sample_times(&db, "processes.htop.pid"), [1000, 2000]);
         assert_eq!(sample_times(&db, "processes.init.pid"), [2000]);
         let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
@@ -3133,7 +3536,7 @@ mod dynamic_ingest_tests {
         let t2 = map_table(2000, &[("init", 4, 0.25)]);
         db.ingest_table(id, &t2).unwrap();
 
-        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        persisted(&db, &[("processes.htop.pid", 1), ("processes.init.pid", 2)]).await;
         assert_eq!(sample_times(&db, "processes.htop.pid"), [1000]);
         assert_eq!(sample_times(&db, "processes.init.pid"), [1000, 2000]);
         assert_eq!(cached_table(&db, id), t2);
@@ -3702,6 +4105,111 @@ mod static_ingest_tests {
         let (_dir, db) = store();
         assert!(db.ingest_table(ID, &5i64.to_le_bytes()).is_err());
     }
+
+    #[stellarator::test]
+    async fn static_vtable_is_planned() {
+        let (_dir, db) = store();
+        assert!(db.with_state(|state| state.static_plans.contains_key(&ID)));
+    }
+
+    /// A planned table from a mirror marks its components mirrored, as the
+    /// walk does.
+    #[stellarator::test]
+    async fn planned_mirror_table_marks_its_components() {
+        let (_dir, db) = store();
+        db.ingest_table_from(
+            ID,
+            &sample(5, 1.5, 2.5),
+            Some(time_series::MirrorRun::next()),
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            let mirrored = db.with_state(|state| {
+                let component = state.get_component(ComponentId::new(name)).unwrap();
+                component.time_series.is_mirrored()
+            });
+            assert!(mirrored, "{name} is mirrored");
+        }
+    }
+
+    /// A plan ingests, and refuses, tables just as the walk does.
+    #[stellarator::test]
+    async fn plan_ingests_as_the_walk_does() {
+        let (_planned_dir, planned) = store();
+        let (_walked_dir, walked) = store();
+        walked.with_state_mut(|state| state.static_plans.clear());
+        let tables = [
+            sample(5, 1.5, 2.5),
+            // Short of `b`: `a` lands, then the table is refused.
+            sample(6, 1.0, 2.0)[..16].to_vec(),
+            sample(7, 3.0, 4.0),
+            // Earlier than `a`'s latest sample.
+            sample(6, 0.0, 0.0),
+            5i64.to_le_bytes().to_vec(),
+        ];
+        let mut refused = 0;
+        for table in &tables {
+            let planned = planned
+                .ingest_table(ID, table)
+                .map_err(|err| format!("{err:?}"));
+            let walked = walked
+                .ingest_table(ID, table)
+                .map_err(|err| format!("{err:?}"));
+            refused += planned.is_err() as usize;
+            assert_eq!(planned, walked);
+        }
+        assert_eq!(refused, 3);
+        for name in ["a", "b"] {
+            assert_eq!(latest(&planned, name), latest(&walked, name));
+        }
+    }
+
+    /// Spins until `name` has persisted its sample at `ts`.
+    fn wait_persisted(db: &DB, name: &str, ts: i64) {
+        let component = db
+            .with_state(|state| state.get_component(ComponentId::new(name)).cloned())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while component
+            .time_series
+            .latest()
+            .is_none_or(|latest| latest.timestamp().0 < ts)
+        {
+            assert!(Instant::now() < deadline, "{name} never persisted {ts}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A component's persistence outlives the connection thread that
+    /// announced it, so a producer that reconnects still lands its samples.
+    #[test]
+    fn persists_after_its_announcing_thread_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().to_path_buf()).unwrap());
+        let announcer = db.clone();
+        std::thread::spawn(move || {
+            stellarator::run(|| async move {
+                announcer
+                    .insert_vtable(VTableMsg {
+                        id: ID,
+                        vtable: two_fields(),
+                    })
+                    .unwrap();
+            })
+        })
+        .join()
+        .unwrap();
+        // Many WALs' worth, waited out in batches a WAL holds, so every
+        // sample lands only if the WALs keep draining.
+        for ts in 1..=4096 {
+            db.ingest_table(ID, &sample(ts, 1.5, 2.5)).unwrap();
+            if ts % 256 == 0 {
+                for name in ["a", "b"] {
+                    wait_persisted(&db, name, ts);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3792,7 +4300,14 @@ mod wal_tests {
     async fn large_component_persists_every_sample() {
         let dir = tempfile::tempdir().unwrap();
         let id = ComponentId::new("image");
-        let component = Component::create(dir.path(), id, image_schema(), false).unwrap();
+        let component = Component::create(
+            dir.path(),
+            id,
+            image_schema(),
+            false,
+            crate::background::test_background(),
+        )
+        .unwrap();
         assert!(component.wal.capacity() <= WAL_BUDGET);
         let mut buf = vec![0u8; IMAGE_SIZE];
         for ts in 0..100 {
