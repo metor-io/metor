@@ -9692,7 +9692,6 @@ dependencies = [
  "futures-lite",
  "metor-proto",
  "metor-proto-bbq",
- "metor-proto-stellar",
  "metor-proto-wkt",
  "miette 7.6.0",
  "postcard",
