@@ -76,7 +76,7 @@ async fn ingest(
     mut on_packet: impl FnMut(bool),
 ) -> Error {
     let mut conn = ConnState::downlink();
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0; 8], 1024 * 1024);
     loop {
         let pkt = match rx.next_grow(buf).await {
             Ok(pkt) => pkt,
@@ -102,15 +102,16 @@ async fn ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metor_proto::types::short_id;
     use metor_proto::types::{IntoLenPacket, OwnedPacket};
     use metor_proto_stellar::{Peer, identify};
     use metor_proto_wkt::{LINK_PROTOCOL_VERSION, LinkInfo};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    const CMD_A: PacketId = [0x51, 0];
-    const CMD_B: PacketId = [0x52, 0];
-    const DATA: PacketId = [0x33, 7];
+    const CMD_A: PacketId = short_id([0x51, 0]);
+    const CMD_B: PacketId = short_id([0x52, 0]);
+    const DATA: PacketId = short_id([0x33, 7]);
 
     /// Every command described as a message named for its id.
     fn described(command_ids: &[PacketId]) -> Vec<CommandInfo> {

@@ -1,6 +1,6 @@
 use super::*;
 use metor_proto::types::IntoLenPacket;
-use metor_proto::types::{Msg, PacketId};
+use metor_proto::types::{Msg, PacketId, short_id};
 use postcard::experimental::max_size::MaxSize;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -12,7 +12,7 @@ struct Foo {
 }
 
 impl Msg for Foo {
-    const ID: PacketId = [0x1, 0x2];
+    const ID: PacketId = short_id([0x1, 0x2]);
 }
 
 #[stellarator::test]
@@ -35,7 +35,62 @@ async fn test_packet_echo() {
     assert_eq!(foo, Foo { bar: 0xBB });
 }
 
-const DATA: PacketId = [0x33, 7];
+const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
+
+/// Serves `count` tables, each holding one `f64`, to the first connection.
+fn serve_tables(count: usize) -> SocketAddr {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let addr = listener.local_addr().unwrap();
+    stellarator::spawn(async move {
+        let sink = PacketSink::new(listener.accept().await.unwrap());
+        for _ in 0..count {
+            let mut table = LenPacket::table(WIDE, 8);
+            table.extend_from_slice(&2.5f64.to_le_bytes());
+            sink.send(table).await.0.unwrap();
+        }
+        std::future::pending::<()>().await;
+    });
+    addr
+}
+
+/// A table's fields are read through aligned views, so its body must land
+/// on an 8-byte boundary after the 16-byte prefix.
+fn assert_aligned_table(pkt: OwnedPacket<impl stellarator::buf::IoBuf>) {
+    let OwnedPacket::Table(table) = pkt else {
+        panic!("non table pkt");
+    };
+    assert_eq!(table.id, WIDE);
+    assert_eq!(table.buf.as_ptr() as usize % align_of::<f64>(), 0);
+    assert_eq!(table.buf[..], 2.5f64.to_le_bytes());
+}
+
+#[stellarator::test]
+async fn a_received_table_body_is_8_aligned() {
+    let addr = serve_tables(1);
+    let mut stream = PacketStream::new(TcpStream::connect(addr).await.unwrap());
+    assert_aligned_table(stream.next(vec![0; 128]).await.unwrap());
+}
+
+#[cfg(feature = "queue")]
+#[stellarator::test]
+async fn a_queued_table_body_is_8_aligned() {
+    use metor_proto_bbq::RxExt;
+
+    let addr = serve_tables(3);
+    let stream = PacketStream::new(TcpStream::connect(addr).await.unwrap());
+    let mut rx = crate::queue::spawn_recv(stream, 2 * 1024 * 1024);
+    let mut seen = 0;
+    while seen < 3 {
+        let Some(pkt) = rx.try_recv_pkt() else {
+            stellarator::sleep(std::time::Duration::from_millis(1)).await;
+            continue;
+        };
+        assert_aligned_table(pkt);
+        seen += 1;
+    }
+}
+
+const DATA: PacketId = short_id([0x33, 7]);
 
 fn identity(command_ids: Vec<PacketId>) -> Vec<u8> {
     (&LinkInfo {
@@ -70,8 +125,8 @@ fn fake_fsw(listener: TcpListener, command_ids: Vec<PacketId>) {
 
 #[stellarator::test]
 async fn identify_tells_an_fsw_link() {
-    const CMD_A: PacketId = [0x51, 0];
-    const CMD_B: PacketId = [0x52, 0];
+    const CMD_A: PacketId = short_id([0x51, 0]);
+    const CMD_B: PacketId = short_id([0x52, 0]);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

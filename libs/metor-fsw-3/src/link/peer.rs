@@ -110,16 +110,12 @@ pub(crate) fn packet(body: &[u8]) -> Option<(PacketTy, PacketId, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::wire::body;
+    use metor_proto::types::short_id;
 
-    const TABLE: PacketId = [1, 2];
-    const OTHER: PacketId = [3, 4];
+    const TABLE: PacketId = short_id([1, 2]);
+    const OTHER: PacketId = short_id([3, 4]);
     const TABLES: [PacketId; 2] = [TABLE, OTHER];
-
-    fn body(ty: PacketTy, id: PacketId, payload: &[u8]) -> Vec<u8> {
-        let mut body = vec![ty as u8, id[0], id[1], 0];
-        body.extend_from_slice(payload);
-        body
-    }
 
     fn msg(id: PacketId, payload: &[u8]) -> Vec<u8> {
         body(PacketTy::Msg, id, payload)
@@ -154,8 +150,8 @@ mod tests {
     #[test]
     fn test_route_returns_the_payload() {
         let mut state = ConnectionState::new(TABLES.len());
-        let (packet, missing) = route(&mut state, &msg([9, 9], b"one"));
-        assert_eq!(packet, Some(([9, 9], b"one".to_vec())));
+        let (packet, missing) = route(&mut state, &msg(short_id([9, 9]), b"one"));
+        assert_eq!(packet, Some((short_id([9, 9]), b"one".to_vec())));
         assert!(missing.is_empty());
         let mut missing = Vec::new();
         let table = body(PacketTy::Table, TABLE, &[7; 4]);
@@ -169,20 +165,25 @@ mod tests {
         state.reset(false);
         let mut stamped = 7i64.to_le_bytes().to_vec();
         stamped.extend_from_slice(b"late");
-        let stamped = body(PacketTy::MsgWithTimestamp, [9, 9], &stamped);
+        let stamped = body(PacketTy::MsgWithTimestamp, short_id([9, 9]), &stamped);
         let routed = state.route(&[], &stamped, |_| {});
-        assert_eq!(routed, Some((PacketTy::Msg, [9, 9], &b"late"[..])));
+        assert_eq!(
+            routed,
+            Some((PacketTy::Msg, short_id([9, 9]), &b"late"[..]))
+        );
     }
 
     #[test]
     fn test_missing_tables_are_reported_on_first_data() {
         let mut state = watched();
         assert_eq!(route(&mut state, &vtable(OTHER)), (None, Vec::new()));
-        let (packet, missing) = route(&mut state, &msg([9, 9], b"probe"));
+        let (packet, missing) = route(&mut state, &msg(short_id([9, 9]), b"probe"));
         assert!(packet.is_some());
         assert_eq!(missing, [TABLE]);
         assert!(
-            route(&mut state, &msg([9, 9], b"probe")).1.is_empty(),
+            route(&mut state, &msg(short_id([9, 9]), b"probe"))
+                .1
+                .is_empty(),
             "reported once"
         );
     }
@@ -201,11 +202,11 @@ mod tests {
         let mut state = watched();
         route(&mut state, &vtable(TABLE));
         route(&mut state, &vtable(OTHER));
-        route(&mut state, &msg([9, 9], b"probe"));
+        route(&mut state, &msg(short_id([9, 9]), b"probe"));
         state.reset(true);
         route(&mut state, &vtable(OTHER));
         assert_eq!(
-            route(&mut state, &msg([9, 9], b"probe")).1,
+            route(&mut state, &msg(short_id([9, 9]), b"probe")).1,
             [TABLE],
             "a peer rebuilt without the table faults again"
         );
@@ -215,7 +216,11 @@ mod tests {
     fn test_unwatched_connection_never_checks() {
         let mut state = watched();
         state.reset(false);
-        assert!(route(&mut state, &msg([9, 9], b"probe")).1.is_empty());
+        assert!(
+            route(&mut state, &msg(short_id([9, 9]), b"probe"))
+                .1
+                .is_empty()
+        );
     }
 
     #[test]
@@ -238,8 +243,8 @@ mod tests {
         for bad in [
             vec![PacketTy::Msg as u8, 1],
             vec![0xff, 1, 2, 0, 9],
-            body(PacketTy::MsgWithTimestamp, [9, 9], &[0; 3]),
-            body(PacketTy::TimeSeries, [9, 9], &[0; 8]),
+            body(PacketTy::MsgWithTimestamp, short_id([9, 9]), &[0; 3]),
+            body(PacketTy::TimeSeries, short_id([9, 9]), &[0; 8]),
         ] {
             assert_eq!(route(&mut state, &bad), (None, Vec::new()), "{bad:?}");
         }
@@ -253,22 +258,31 @@ mod tests {
         let tables = [TABLE, OTHER, TABLE];
         let mut missing = Vec::new();
         state.route(&tables, &vtable(OTHER), |id| missing.push(id));
-        state.route(&tables, &msg([9, 9], b"probe"), |id| missing.push(id));
+        state.route(&tables, &msg(short_id([9, 9]), b"probe"), |id| {
+            missing.push(id)
+        });
         assert_eq!(missing, [TABLE, TABLE], "one report per port");
     }
 
     #[test]
     fn test_announce_after_data_is_ignored() {
         let mut state = watched();
-        route(&mut state, &msg([9, 9], b"probe"));
+        route(&mut state, &msg(short_id([9, 9]), b"probe"));
         assert_eq!(route(&mut state, &vtable(TABLE)), (None, Vec::new()));
-        assert!(route(&mut state, &msg([9, 9], b"probe")).1.is_empty());
+        assert!(
+            route(&mut state, &msg(short_id([9, 9]), b"probe"))
+                .1
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_malformed_vtable_announces_nothing() {
         let mut state = watched();
         route(&mut state, &msg(VTableMsg::ID, &[0xff]));
-        assert_eq!(route(&mut state, &msg([9, 9], b"probe")).1, TABLES);
+        assert_eq!(
+            route(&mut state, &msg(short_id([9, 9]), b"probe")).1,
+            TABLES
+        );
     }
 }

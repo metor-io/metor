@@ -153,7 +153,7 @@ pub struct State {
     /// metadata a producer sets, and their keyed members inherit it.
     dynamic_templates: HashSet<ComponentId>,
 
-    udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
+    udp_vtable_streams: HashSet<(SocketAddr, PacketId)>,
 
     pub db_config: DbConfig,
 }
@@ -290,7 +290,7 @@ impl DB {
                 let Ok(elem) = elem else { continue };
 
                 let path = elem.path();
-                let msg_id: u16 = path
+                let msg_id: u64 = path
                     .file_name()
                     .and_then(|p| p.to_str())
                     .and_then(|p| p.parse().ok())
@@ -891,7 +891,7 @@ impl State {
                 let msg_log = MsgLog::create(
                     db_path
                         .join("msgs")
-                        .join(u16::from_le_bytes(id).to_string()),
+                        .join(u64::from_le_bytes(id).to_string()),
                 )?;
                 // A new log is a metadata change: it is how a `SyncMsgs`
                 // sweep learns there is another log to tail.
@@ -1510,7 +1510,7 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     // connection carries, up to `MAX_PACKET_LEN`, so each open connection
     // costs only what it uses.
     let mut buf = vec![0u8; CONN_BUF_LEN];
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], CONN_BUF_LEN);
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0; 8], CONN_BUF_LEN);
     let mut conn = ConnState::default();
     loop {
         let pkt = rx.next_grow_max(buf, MAX_PACKET_LEN).await?;
@@ -1562,12 +1562,7 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
     pub async fn send_msg<M: Msg>(&mut self, msg: &M) -> Result<(), Error> {
         let req_id = self.req_id;
         self.send_with_builder(|pkt| {
-            let header = PacketHeader {
-                packet_ty: metor_proto::types::PacketTy::Msg,
-                id: M::ID,
-                req_id,
-            };
-            pkt.as_mut_packet().header = header;
+            pkt.as_mut_packet().header = PacketHeader::new(PacketTy::Msg, M::ID, req_id);
             pkt.clear();
             postcard::serialize_with_flavor(&msg, pkt).map_err(Error::from)
         })
@@ -1669,12 +1664,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
 
             let req_id = tx.req_id;
             tx.send_with_builder(move |pkt| {
-                let header = PacketHeader {
-                    packet_ty: metor_proto::types::PacketTy::TimeSeries,
-                    id: req.id,
-                    req_id,
-                };
-                pkt.as_mut_packet().header = header;
+                pkt.as_mut_packet().header =
+                    PacketHeader::new(PacketTy::TimeSeries, req.id, req_id);
                 pkt.clear();
                 series::answer(pkt, &component.time_series, &req, component.schema.size())
             })
@@ -1688,12 +1679,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let GetComponentMetadata { component_id } = m.parse::<GetComponentMetadata>()?;
 
             tx.send_with_builder(|pkt| {
-                let header = PacketHeader {
-                    packet_ty: metor_proto::types::PacketTy::Msg,
-                    id: ComponentMetadata::ID,
-                    req_id: m.req_id,
-                };
-                pkt.as_mut_packet().header = header;
+                pkt.as_mut_packet().header =
+                    PacketHeader::new(PacketTy::Msg, ComponentMetadata::ID, m.req_id);
                 pkt.clear();
                 db.with_state(|state| {
                     let Some(metadata) = state.component_metadata.get(&component_id) else {
@@ -2592,7 +2579,7 @@ async fn handle_fixed_stream<A: AsyncWrite>(
 ) -> Result<(), Error> {
     let mut current_vtable_gen = db.vtable_gen.latest();
     let mut current_field_count: Option<usize> = None;
-    let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
+    let id: PacketId = state.stream_id.to_le_bytes();
     let mut table = LenPacket::table(id, 2048 - 16);
     let mut components = db.with_state(|state| state.fixed_rate_components());
     loop {
@@ -2758,7 +2745,7 @@ mod dynamic_ingest_tests {
     use super::*;
     use core::convert::Infallible;
     use metor_proto::com_de::Decomponentize;
-    use metor_proto::types::PACKET_HEADER_LEN;
+    use metor_proto::types::short_id;
     use metor_proto::vtable::builder::FieldBuilder;
     use metor_proto::vtable::builder::{
         list, map, path_component, raw_field, raw_table, schema, timestamp, vtable,
@@ -2829,7 +2816,7 @@ mod dynamic_ingest_tests {
         // Parse with offset so the table body keeps the same 8-byte alignment it
         // has on the wire (the 4-byte length prefix stays in the allocation, like
         // `LengthDelReader` leaves it), avoiding an `Alignment` error in `apply`.
-        let owned = Packet::parse_with_offset(pkt.inner, PACKET_HEADER_LEN).unwrap();
+        let owned = Packet::parse_with_offset(pkt.inner, size_of::<u32>()).unwrap();
         let Packet::Table(table) = owned else {
             panic!("expected a table packet");
         };
@@ -2846,7 +2833,7 @@ mod dynamic_ingest_tests {
     async fn dynamic_list_ingest_and_stream() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::create(dir.path().to_path_buf()).unwrap();
-        let id: PacketId = [7, 0];
+        let id: PacketId = short_id([7, 0]);
         let v = vtable([raw_field(
             8,
             8,
@@ -2954,7 +2941,7 @@ mod dynamic_ingest_tests {
     async fn dynamic_map_ingest_and_stream() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::create(dir.path().to_path_buf()).unwrap();
-        let id: PacketId = [9, 0];
+        let id: PacketId = short_id([9, 0]);
         let v = vtable([raw_field(
             8,
             8,
@@ -3037,7 +3024,7 @@ mod dynamic_ingest_tests {
 
     fn map_db(dir: &Path) -> (DB, PacketId, VTable) {
         let db = DB::create(dir.to_path_buf()).unwrap();
-        let id: PacketId = [9, 1];
+        let id: PacketId = short_id([9, 1]);
         let v = vtable([raw_field(
             8,
             8,
@@ -3171,7 +3158,7 @@ mod dynamic_ingest_tests {
     async fn scalar_map_member_named_by_key() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::create(dir.path().to_path_buf()).unwrap();
-        let id: PacketId = [11, 0];
+        let id: PacketId = short_id([11, 0]);
         let members = vec![raw_field(
             0,
             8,
@@ -3223,6 +3210,7 @@ mod dynamic_ingest_tests {
 #[cfg(test)]
 mod msg_sync_tests {
     use super::*;
+    use metor_proto::types::short_id;
     use metor_proto_stellar::Client;
     use std::sync::Mutex as StdMutex;
 
@@ -3233,9 +3221,9 @@ mod msg_sync_tests {
         i: u32,
     }
 
-    const CMD: PacketId = [0x51, 0];
-    const LOG_A: PacketId = [0x33, 7];
-    const LOG_B: PacketId = [0x34, 7];
+    const CMD: PacketId = short_id([0x51, 0]);
+    const LOG_A: PacketId = short_id([0x33, 7]);
+    const LOG_B: PacketId = short_id([0x34, 7]);
 
     type Seen = Arc<StdMutex<Vec<(PacketId, Option<Timestamp>, Vec<u8>)>>>;
 
@@ -3478,10 +3466,11 @@ mod msg_sync_tests {
 #[cfg(test)]
 mod vtable_id_tests {
     use super::*;
+    use metor_proto::types::short_id;
     use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
     use metor_proto_stellar::Client;
 
-    const ID: PacketId = [7, 3];
+    const ID: PacketId = short_id([7, 3]);
 
     fn announce(name: &str) -> VTable {
         vtable([raw_field(
@@ -3629,11 +3618,12 @@ mod vtable_id_tests {
 #[cfg(test)]
 mod static_ingest_tests {
     use super::*;
+    use metor_proto::types::short_id;
     use metor_proto::vtable::builder::{
         component, raw_field, raw_table, schema, timestamp, vtable,
     };
 
-    const ID: PacketId = [9, 1];
+    const ID: PacketId = short_id([9, 1]);
 
     /// Two `f64` fields sharing the table's leading timestamp.
     fn two_fields() -> VTable {
@@ -3702,7 +3692,7 @@ mod static_ingest_tests {
     #[stellarator::test]
     async fn unknown_table_is_refused() {
         let (_dir, db) = store();
-        let err = db.ingest_table([0, 0], &sample(1, 0.0, 0.0)).unwrap_err();
+        let err = db.ingest_table([0; 8], &sample(1, 0.0, 0.0)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -3828,10 +3818,11 @@ mod wal_tests {
 #[cfg(test)]
 mod series_tests {
     use super::*;
+    use metor_proto::types::short_id;
     use metor_proto_stellar::Client;
     use std::time::Duration;
 
-    const ID: PacketId = [9, 2];
+    const ID: PacketId = short_id([9, 2]);
     const IMAGE_SIZE: usize = 2 * 1024 * 1024;
     /// Image samples per page: what fits in `SERIES_BUDGET`.
     const PAGE: usize = 127;
@@ -4165,11 +4156,88 @@ mod series_tests {
         lens.dedup();
         assert_eq!(lens, [16, 8 + IMAGE_SIZE]);
     }
+
+    /// The first table's id on a fixed-rate stream named `stream_id`.
+    async fn fixed_table_id(addr: SocketAddr, stream_id: PacketId) -> PacketId {
+        let mut client = Client::connect(addr).await.unwrap();
+        let fixed = Stream {
+            behavior: StreamBehavior::FixedRate(FixedRateBehavior {
+                initial_timestamp: InitialTimestamp::Earliest,
+                timestep: 1,
+                frequency: 100,
+            }),
+            id: u64::from_le_bytes(stream_id),
+        };
+        client.send((&fixed).with_request_id(1)).await.0.unwrap();
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let pkt = client.rx.next_grow(buf).await.unwrap();
+            if let Packet::Table(table) = &pkt {
+                return table.id;
+            }
+            buf = pkt.into_buf().into_inner();
+        }
+    }
+
+    #[stellarator::test]
+    async fn fixed_rate_streams_sharing_low_bytes_keep_distinct_table_ids() {
+        let (_dir, db) = image_db();
+        ingest(&db, 2).await;
+        let addr = serve(db.clone());
+        for id in [[7, 0, 1, 0, 0, 0, 0, 0], [7, 0, 2, 0, 0, 0, 0, 0]] {
+            assert_eq!(fixed_table_id(addr, id).await, id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod wide_id_tests {
+    use super::*;
+    use metor_proto::types::short_id;
+
+    const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    /// Metadata for a test log. Setting it creates the log's directory.
+    fn metadata() -> MsgMetadata {
+        MsgMetadata {
+            name: "log".into(),
+            schema: postcard_schema::schema::owned::OwnedNamedType {
+                name: "Log".into(),
+                ty: postcard_schema::schema::owned::OwnedDataModelType::U8,
+            },
+            metadata: Default::default(),
+        }
+    }
+
+    #[stellarator::test]
+    async fn short_and_wide_logs_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = short_id([7, 1]);
+        let db = DB::create(dir.path().join("db")).unwrap();
+        db.with_state_mut(|s| {
+            for id in [short, WIDE] {
+                let log = s.get_or_insert_msg_log(id, &db.path).unwrap();
+                log.set_metadata(metadata()).unwrap();
+            }
+        });
+        assert!(
+            db.path.join("msgs").join("263").is_dir(),
+            "the old 16-bit name"
+        );
+        let path = db.path.clone();
+        drop(db);
+
+        let db = DB::open(path).unwrap();
+        let mut ids: Vec<_> = db.with_state(|s| s.msg_log_iter().map(|(id, _)| id).collect());
+        ids.sort();
+        assert_eq!(ids, [WIDE, short]);
+    }
 }
 
 #[cfg(test)]
 mod frame_command_tests {
     use super::*;
+    use metor_proto::types::short_id;
     use metor_proto::types::table_id;
     use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
     use metor_proto_stellar::Client;
@@ -4177,7 +4245,7 @@ mod frame_command_tests {
 
     type Seen = Arc<StdMutex<Vec<(PacketTy, PacketId, Vec<u8>)>>>;
 
-    const MSG: PacketId = [0x51, 0];
+    const MSG: PacketId = short_id([0x51, 0]);
 
     fn command() -> CommandInfo {
         let vtable = vtable([raw_field(

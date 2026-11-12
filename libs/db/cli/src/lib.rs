@@ -7,7 +7,9 @@ use arrow::{
 use metor_proto::{
     com_de::Decomponentize,
     schema::Schema,
-    types::{ComponentId, OwnedTimeSeries, PacketId, PrimType, Request, Timestamp, msg_id},
+    types::{
+        ComponentId, OwnedTimeSeries, PacketId, PrimType, Request, Timestamp, msg_id, short_id,
+    },
     vtable::{
         self, VTable,
         builder::{FieldBuilder, OpBuilder, schema},
@@ -115,7 +117,7 @@ impl Client {
     ) -> anyhow::Result<()> {
         let start = start.unwrap_or(i64::MIN);
         let stop = stop.unwrap_or(i64::MAX);
-        let id = fastrand::u16(..);
+        let id = fastrand::u64(..);
 
         let component_id: ComponentId = lua.from_value(component_id)?;
         self.require_range_fetch().await?;
@@ -219,7 +221,7 @@ impl Client {
             size as u32,
             schema(prim_type, &shape, component(component_id)),
         )]);
-        let id: [u8; 2] = fastrand::u16(..).to_le_bytes();
+        let id = fastrand::u64(..).to_le_bytes();
         let msg = VTableMsg { id, vtable };
         self.client.send(&msg).await.0?;
         let mut table = LenPacket::table(id, 8);
@@ -319,7 +321,7 @@ impl Client {
     }
 
     pub async fn vtable_stream(&mut self, vtable: VTable) -> anyhow::Result<()> {
-        let id = fastrand::u16(..).to_le_bytes();
+        let id = fastrand::u64(..).to_le_bytes();
         let vtable_msg = VTableMsg { vtable, id };
         self.client.send(&vtable_msg).await.0?;
         let stream = self.client.stream(&VTableStream { id }).await?;
@@ -500,13 +502,7 @@ impl UserData for Client {
                         .map_err(anyhow::Error::from)?;
                 } else if let Some(msg) = val {
                     let id = msg_or_id;
-                    let msg_id = if let Ok(id) = lua.from_value::<PacketId>(id.clone()) {
-                        id
-                    } else if let Ok(name) = lua.from_value::<String>(id) {
-                        msg_id(&name)
-                    } else {
-                        return Err(anyhow!("msg id must be a PacketId or String").into());
-                    };
+                    let msg_id = lua_msg_id(&lua, id)?;
                     let msg = lua.from_value(msg)?;
                     this.send_msg(msg_id, msg).await?;
                 } else {
@@ -562,13 +558,7 @@ impl UserData for Client {
         );
 
         methods.add_async_method_mut("stream_msgs", |lua, mut this, id: Value| async move {
-            let msg_id = if let Ok(id) = lua.from_value::<PacketId>(id.clone()) {
-                id
-            } else if let Ok(name) = lua.from_value::<String>(id) {
-                msg_id(&name)
-            } else {
-                return Err(anyhow!("msg id must be a PacketId or String").into());
-            };
+            let msg_id = lua_msg_id(&lua, id)?;
             this.stream_msgs(MsgStream { msg_id }).await?;
             Ok(())
         });
@@ -576,13 +566,7 @@ impl UserData for Client {
         methods.add_async_method_mut(
             "get_msgs",
             |lua, mut this, (id, start, stop): (Value, Option<i64>, Option<i64>)| async move {
-                let msg_id = if let Ok(id) = lua.from_value::<PacketId>(id.clone()) {
-                    id
-                } else if let Ok(name) = lua.from_value::<String>(id) {
-                    msg_id(&name)
-                } else {
-                    return Err(anyhow!("msg id must be a PacketId or String").into());
-                };
+                let msg_id = lua_msg_id(&lua, id)?;
                 this.get_msgs(msg_id, start, stop).await?;
                 Ok(())
             },
@@ -782,18 +766,18 @@ pub fn lua() -> anyhow::Result<Lua> {
     lua.globals().set(
         "vtable_msg",
         lua.create_function(
-            |lua, (id, fields): (u16, Vec<UserDataRef<LuaFieldBuilder>>)| {
+            |lua, (id, fields): (i64, Vec<UserDataRef<LuaFieldBuilder>>)| {
                 let fields = fields.into_iter().map(|field| field.0.clone());
                 let vtable = vtable::builder::vtable(fields);
-                let id = id.to_le_bytes();
+                let id = lua_int_id(id);
                 lua.create_ser_userdata(VTableMsg { id, vtable })
             },
         )?,
     )?;
     lua.globals().set(
         "udp_vtable_stream",
-        lua.create_function(|lua, (id, addr): (u16, String)| {
-            let id = id.to_le_bytes();
+        lua.create_function(|lua, (id, addr): (i64, String)| {
+            let id = lua_int_id(id);
             lua.create_ser_userdata(UdpVTableStream { id, addr })
         })?,
     )?;
@@ -1011,5 +995,62 @@ impl Decomponentize for DebugSink {
         let epoch = timestamp.map(hifitime::Epoch::from);
         println!("{component_id:?} @ {epoch:?} = {value:?}");
         Ok(())
+    }
+}
+
+/// An id from a Lua integer. Lua integers are `i64`, so ids at or past 2^63
+/// arrive negative and keep their bits.
+fn lua_int_id(id: i64) -> PacketId {
+    (id as u64).to_le_bytes()
+}
+
+/// A message id from Lua: a name, an integer, or a table of 2 or 8 bytes.
+fn lua_msg_id(lua: &Lua, id: Value) -> mlua::Result<PacketId> {
+    match &id {
+        Value::Integer(id) => return Ok(lua_int_id(*id)),
+        Value::String(name) => return Ok(msg_id(&name.to_str()?)),
+        _ => {}
+    }
+    if let Ok(short) = lua.from_value::<[u8; 2]>(id.clone()) {
+        return Ok(short_id(short));
+    }
+    lua.from_value::<PacketId>(id)
+        .map_err(|_| anyhow!("msg id must be a name, an integer, or 2 or 8 bytes").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(lua: &Lua, source: &str) -> mlua::Result<PacketId> {
+        lua_msg_id(lua, lua.load(source).eval()?)
+    }
+
+    #[test]
+    fn lua_ids_take_every_form() {
+        let lua = Lua::new();
+        assert_eq!(parse(&lua, "{0x51, 7}").unwrap(), short_id([0x51, 7]));
+        assert_eq!(
+            parse(&lua, "{1, 2, 3, 4, 5, 6, 7, 8}").unwrap(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(parse(&lua, "1").unwrap(), short_id([1, 0]));
+        assert_eq!(parse(&lua, "'imu'").unwrap(), msg_id("imu"));
+    }
+
+    #[test]
+    fn lua_integer_ids_keep_their_upper_bits() {
+        let lua = Lua::new();
+        let top = [0, 0, 0, 0, 0, 0, 0, 0x80];
+        assert_eq!(parse(&lua, "0x8000000000000000").unwrap(), top);
+        assert_eq!(lua_int_id(-1), [0xff; 8]);
+    }
+
+    #[test]
+    fn lua_ids_of_the_wrong_shape_are_refused() {
+        let lua = Lua::new();
+        assert!(parse(&lua, "{1, 2, 3}").is_err());
+        assert!(parse(&lua, "true").is_err());
+        assert!(parse(&lua, "{256, 0}").is_err());
     }
 }

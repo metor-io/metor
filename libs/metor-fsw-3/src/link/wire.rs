@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
+use metor_proto::types::{
+    IntoLenPacket, PACKET_HEADER_LEN, PacketHeader, PacketId, PacketTy, table_id,
+};
 use metor_proto::vtable::{Field, Op, VTable};
 use metor_proto_wkt::{
     CommandInfo, CommandKind, ComponentMetadata, LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata,
     MsgStream, SetComponentMetadata, SetMsgMetadata, VTableMsg,
 };
+use zerocopy::IntoBytes;
 
 use crate::record::{MsgCodec, RecordSchema};
 use crate::system::PortDef;
@@ -101,7 +104,7 @@ pub(crate) fn announce(
     link: &str,
 ) -> (Vec<u8>, Vec<PacketId>) {
     let mut blob = link_info(Vec::new(), namespace, link);
-    let mut ids = vec![[0; 2]; defs.len()];
+    let mut ids = vec![[0; 8]; defs.len()];
     for (index, def) in defs.iter().enumerate() {
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             continue;
@@ -192,8 +195,18 @@ pub(crate) fn fits(max_len: usize, conn_cap: usize) -> bool {
 
 /// The length prefix and header of a packet carrying `payload_len` bytes.
 pub(crate) fn packet_head(ty: PacketTy, id: PacketId, payload_len: usize) -> [u8; PACKET_OVERHEAD] {
-    let [a, b, c, d] = ((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes();
-    [a, b, c, d, ty as u8, id[0], id[1], 0]
+    let mut head = [0; PACKET_OVERHEAD];
+    head[..4].copy_from_slice(&((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes());
+    head[4..].copy_from_slice(PacketHeader::new(ty, id, 0).as_bytes());
+    head
+}
+
+/// A packet body in its wire format, without the length prefix.
+#[cfg(test)]
+pub(crate) fn body(ty: PacketTy, id: PacketId, payload: &[u8]) -> Vec<u8> {
+    let mut body = packet_head(ty, id, payload.len())[size_of::<u32>()..].to_vec();
+    body.extend_from_slice(payload);
+    body
 }
 
 #[cfg(test)]
@@ -205,6 +218,7 @@ mod tests {
     use crate::tests::utils::{Fixed, Imu};
     use crate::{DefCx, Payload, Record};
 
+    use super::super::peer::packet;
     use super::*;
 
     /// A record encoded as JSON, so its metadata names a codec.
@@ -267,8 +281,9 @@ mod tests {
         let mut ids = Vec::new();
         let mut rest = &blob[..];
         while let Some((len, body)) = rest.split_first_chunk::<4>() {
-            ids.push([body[1], body[2]]);
-            rest = &body[u32::from_le_bytes(*len) as usize..];
+            let len = u32::from_le_bytes(*len) as usize;
+            ids.push(packet(&body[..len]).expect("a packet").1);
+            rest = &body[len..];
         }
         let mut expected = vec![LinkInfo::ID, VTableMsg::ID];
         expected.extend(metadata.iter().map(|_| SetComponentMetadata::ID));
@@ -318,7 +333,8 @@ mod tests {
         let mut rest = blob;
         while let Some((len, body)) = rest.split_first_chunk::<4>() {
             let len = u32::from_le_bytes(*len) as usize;
-            packets.push(([body[1], body[2]], &body[PACKET_HEADER_LEN..len]));
+            let (_, id, payload) = packet(&body[..len]).expect("a packet");
+            packets.push((id, payload));
             rest = &body[len..];
         }
         packets
@@ -381,12 +397,18 @@ mod tests {
 
     #[test]
     fn test_packet_head_matches_len_packet() {
-        let mut batch = packet_head(PacketTy::Table, [7, 9], 4).to_vec();
-        batch.extend_from_slice(b"body");
-        let mut expected = LenPacket::table([7, 9], 4);
-        expected.extend_from_slice(b"body");
-        assert_eq!(batch, expected.into_len_packet().inner);
-        let empty = packet_head(PacketTy::Msg, [0, 1], 0);
-        assert_eq!(empty, [4, 0, 0, 0, PacketTy::Msg as u8, 0, 1, 0]);
+        const WIDE: PacketId = [7, 9, 1, 2, 3, 4, 5, 6];
+        for ty in [
+            PacketTy::Msg,
+            PacketTy::Table,
+            PacketTy::TimeSeries,
+            PacketTy::MsgWithTimestamp,
+        ] {
+            let mut batch = packet_head(ty, WIDE, 4).to_vec();
+            batch.extend_from_slice(b"body");
+            let mut expected = LenPacket::new(ty, WIDE, 4);
+            expected.extend_from_slice(b"body");
+            assert_eq!(batch, expected.into_len_packet().inner);
+        }
     }
 }

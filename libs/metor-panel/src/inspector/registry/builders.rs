@@ -373,7 +373,7 @@ pub(super) fn build_event_overlay_wizard(
                 }
                 let label = match meta {
                     Some(meta) if !meta.name.is_empty() => SharedString::from(meta.name.clone()),
-                    _ => SharedString::from(format!("msg {:02x}:{:02x}", id[0], id[1])),
+                    _ => SharedString::from(crate::plot_events::msg_label(id)),
                 };
                 Some((id, label))
             })

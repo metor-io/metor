@@ -162,9 +162,10 @@ mod tests {
         produce(&rings, 4.0);
         let batch = batcher.fill(&mut inputs).expect("two records");
         assert_eq!(batch.len(), IMU_LEN + FIXED_LEN);
-        assert_eq!(&batch[4..7], &[PacketTy::Table as u8, table[0], table[1]]);
-        let msg_head = &batch[IMU_LEN + 4..IMU_LEN + 7];
-        assert_eq!(msg_head, &[PacketTy::Msg as u8, msg[0], msg[1]]);
+        assert_eq!(batch[4], PacketTy::Table as u8);
+        assert_eq!(batch[5..13], table);
+        assert_eq!(batch[IMU_LEN + 4], PacketTy::Msg as u8);
+        assert_eq!(batch[IMU_LEN + 5..IMU_LEN + 13], msg);
         assert_eq!(
             &batch[..4],
             &((IMU_LEN - 4) as u32).to_le_bytes(),

@@ -44,10 +44,10 @@ inline uint16_t fnv1a_hash_16_xor(const std::string_view str)
     return upper ^ lower;
 }
 
-inline std::array<uint8_t, 2> msg_id(const std::string_view str)
+inline std::array<uint8_t, 8> msg_id(const std::string_view str)
 {
     auto hash = fnv1a_hash_16_xor(str);
-    return { static_cast<uint8_t>(hash & 0xff), static_cast<uint8_t>((hash >> 8) & 0xff) };
+    return { static_cast<uint8_t>(hash & 0xff), static_cast<uint8_t>((hash >> 8) & 0xff), 0, 0, 0, 0, 0, 0 };
 }
 
 inline uint64_t component_id(const std::string_view str)
@@ -65,9 +65,14 @@ enum class PacketType : uint8_t {
 struct PacketHeader {
     uint32_t len;
     PacketType ty;
-    std::array<uint8_t, 2> packet_id;
+    std::array<uint8_t, 8> packet_id;
     uint8_t request_id;
+    std::array<uint8_t, 2> pad;
 };
+static_assert(sizeof(PacketHeader) == 16);
+
+/// The bytes the length prefix counts ahead of a packet's body.
+inline constexpr uint32_t PACKET_HEADER_LEN = sizeof(PacketHeader) - sizeof(uint32_t);
 
 template <typename T>
 class Msg {
@@ -83,6 +88,7 @@ public:
             .ty = PacketType::MSG,
             .packet_id = packet_id,
             .request_id = 0,
+            .pad = {},
         };
         payload = p;
     }
@@ -90,7 +96,7 @@ public:
     std::vector<uint8_t> encode_vec()
     {
         auto t_size = payload.encoded_size();
-        header.len = t_size + 4;
+        header.len = t_size + PACKET_HEADER_LEN;
         auto header_len = sizeof(PacketHeader);
         auto buf = std::vector<uint8_t>(t_size + header_len);
         std::memcpy(buf.data(), &header, header_len);

@@ -10,8 +10,14 @@ use crate::tests::utils::pair;
 
 #[test]
 fn test_wkt_records_keep_panel_ids() {
-    assert_eq!(SequenceCommand::schema().packet_id(), [225, 247]);
-    assert_eq!(SequenceRegistry::schema().packet_id(), [78, 109]);
+    assert_eq!(
+        SequenceCommand::schema().packet_id(),
+        metor_proto::types::short_id([225, 247])
+    );
+    assert_eq!(
+        SequenceRegistry::schema().packet_id(),
+        metor_proto::types::short_id([78, 109])
+    );
 }
 
 #[test]
