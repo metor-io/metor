@@ -64,8 +64,7 @@ fn check_records(snapshot: &Snapshot) {
             {
                 let len = u32::from_le_bytes(descriptor[..4].try_into().unwrap()) as usize;
                 if len > 12 {
-                    let offset =
-                        u32::from_le_bytes(descriptor[12..16].try_into().unwrap()) as usize;
+                    let offset = u32::from_le_bytes(descriptor[12..16].try_into().unwrap()) as usize;
                     assert_eq!(&payload.parts()[1][offset..offset + 8], ts);
                     assert!(offset + len <= payload.parts()[1].len());
                 } else {

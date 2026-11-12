@@ -22,9 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::seal::{SEAL_FILE, SealRecord};
 
-use super::{
-    BoxFuture, CHUNK_BYTES, NodeFile, NodeKey, NodeStaging, NodeStore, SealedNode, StoreError,
-};
+use super::{BoxFuture, CHUNK_BYTES, NodeFile, NodeKey, NodeStaging, NodeStore, SealedNode, StoreError};
 
 /// A node's seal plus its two payloads, fetched whole.
 type FetchedNode = (SealRecord, Vec<u8>, Vec<u8>);
@@ -112,9 +110,7 @@ async fn run_job(store: &dyn object_store::ObjectStore, job: Job) {
         }
         Job::Get { node_path, reply } => {
             let result = async {
-                let seal = read_seal(store, &node_path)
-                    .await?
-                    .ok_or(StoreError::NotFound)?;
+                let seal = read_seal(store, &node_path).await?.ok_or(StoreError::NotFound)?;
                 let index = read_all(store, &node_path.child("index")).await?;
                 let data = read_all(store, &node_path.child("data")).await?;
                 Ok((seal, index, data))
@@ -203,8 +199,8 @@ impl NodeStore for ObjectStoreAdapter {
         node: SealedNode<'a>,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let seal =
-                postcard::to_allocvec(&node.seal).map_err(|e| StoreError::Other(e.to_string()))?;
+            let seal = postcard::to_allocvec(&node.seal)
+                .map_err(|e| StoreError::Other(e.to_string()))?;
             let (reply, rx) = oneshot();
             self.submit(Job::Put {
                 node_path: Self::node_path(&key),
