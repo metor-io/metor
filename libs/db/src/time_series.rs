@@ -312,12 +312,10 @@ fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> Compon
             flags.is_some_and(|s| s.acked),
         ));
     }
-    let resident = draft.spans.len();
+    let mut resident: Vec<i64> = draft.spans.iter().map(|s| s.cover_start.0).collect();
+    resident.sort_unstable();
     for span in &persisted.spans {
-        if draft.spans[..resident]
-            .iter()
-            .any(|s| s.cover_start == span.cover_start)
-        {
+        if resident.binary_search(&span.cover_start.0).is_ok() {
             continue;
         }
         if span.state == SpanState::Resident {
@@ -1752,13 +1750,14 @@ impl TimeSeries {
                     .take_while(|s| s.start_ts == seal.start_ts)
                     .any(|s| s == seal)
         };
-        let listed = |seal: &SealRecord| {
+        // Whether the listing holds the seal starting at `start` with
+        // `checksum`.
+        let listed_at = |start: Timestamp, checksum: u64| {
             seals
-                .binary_search_by_key(&(seal.start_ts.0, seal.checksum), |s| {
-                    (s.start_ts.0, s.checksum)
-                })
+                .binary_search_by_key(&(start.0, checksum), |s| (s.start_ts.0, s.checksum))
                 .is_ok()
         };
+        let listed = |seal: &SealRecord| listed_at(seal.start_ts, seal.checksum);
         let mut stale: Vec<SealRecord> = Vec::new();
         if complete {
             let fetching: Vec<&SealRecord> = manifest
@@ -1782,13 +1781,10 @@ impl TimeSeries {
             stale.dedup();
         }
         let stale_settled = complete
-            && manifest.settled.iter().any(|s| {
-                seals
-                    .binary_search_by_key(&(s.seal_start.0, s.checksum), |seal| {
-                        (seal.start_ts.0, seal.checksum)
-                    })
-                    .is_err()
-            });
+            && manifest
+                .settled
+                .iter()
+                .any(|s| !listed_at(s.seal_start, s.checksum));
         // A hydrated node's ack says the peer can give it back. A complete
         // listing without its seal withdraws that, and listing it again
         // restores it, so eviction never purges what only this side holds.
@@ -1836,13 +1832,7 @@ impl TimeSeries {
                 }
             }
             if complete {
-                draft.settled.retain(|s| {
-                    seals
-                        .binary_search_by_key(&(s.seal_start.0, s.checksum), |seal| {
-                            (seal.start_ts.0, seal.checksum)
-                        })
-                        .is_ok()
-                });
+                draft.settled.retain(|s| listed_at(s.seal_start, s.checksum));
             }
             draft.derive(
                 &resident,
