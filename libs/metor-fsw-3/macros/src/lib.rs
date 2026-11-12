@@ -36,8 +36,9 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
 ///
 /// The group has no name, id, or timestamp; the frame that holds it stamps
 /// its leaves. Each field adds a path segment named after it, and an array
-/// adds `0` … `N-1`. A field marked `timestamp` is a compile error. Field attributes:
-/// `#[fsw(flatten)]` adds no segment, `#[fsw(rename = "y")]` names the
+/// adds `0` … `N-1`. A field marked `timestamp` is a compile error. Field
+/// attributes: `#[fsw(flatten)]` on a field holding another `Fields` struct
+/// adds no segment, `#[fsw(rename = "y")]` names the
 /// segment `y`, `#[fsw(skip)]` leaves the field out, and `#[fsw(unit = "..")]`
 /// and `#[fsw(metadata(..))]` label its components. A field named `_x` is
 /// skipped unless marked `#[fsw(skip = false)]`. `#[fsw(group)]` on the
@@ -71,14 +72,16 @@ pub fn record_derive(input: TokenStream) -> TokenStream {
 /// Each field is a param, as a `#[system]` fn argument would be, and names
 /// its ports under the field name; an array field names element `i` under
 /// `{field}.{i}`. `#[fsw(rename = "..")]` renames that segment,
-/// `#[fsw(flatten)]` on a field holding another struct drops it, and
-/// `#[fsw(skip)]` or a leading `_` leaves the field out, filled by
+/// `#[fsw(flatten)]` on a field holding another struct adds no segment for
+/// it, and `#[fsw(skip)]` or a leading `_` leaves the field out, filled by
 /// `Default`. A struct passed as a fn argument adds no segment of its own.
 ///
-/// `Seq`, `Timestamp`, and `Abort` are fn arguments only, and a tuple is no
-/// field; the derive refuses them, and `flatten` on a field it can tell is a
-/// leaf. An empty name, or two `Cap`s or `Rng`s of one name, fail the
-/// system's definition.
+/// The derive refuses `Seq`, `Timestamp`, `Abort`, and tuple fields, and
+/// `flatten` on a field whose type is a single param or an array. A
+/// flattened leaf it cannot see through fails the system's definition with
+/// `DefError::EmptyName`, as do two `Cap`s or `Rng`s of one name
+/// (`DefError::DuplicateParam`) and a `Cap` under a field or an array
+/// (`DefError::NestedCap`).
 ///
 /// The struct takes at most one lifetime. It is a param of cyclic fns and
 /// sequences, or of async fns under `#[system_params(async)]`, whose inputs
