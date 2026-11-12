@@ -42,10 +42,8 @@ pub fn persist(db: &DB, name: String, input: Arc<Node>) -> Result<Arc<Node>, Bui
         name.hash(h);
     });
     // Name-derived, not node-id-derived, so the on-disk Component survives
-    // upstream edits. `ComponentId::new` is the one function that turns a
-    // name into an id anywhere in this workspace: it is const FNV-1a, so it
-    // is as durable as a hand-rolled one, and it masks the high bit so the
-    // value still fits an `i64`.
+    // upstream edits. `ComponentId::new` is const FNV-1a, so the id is
+    // stable across builds.
     let component_id = ComponentId::new(&name);
 
     // The existing on-disk schema (if any). Doubles as the "was this a new

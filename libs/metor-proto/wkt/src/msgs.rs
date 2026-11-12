@@ -304,45 +304,15 @@ pub struct SetDbConfig {
     pub metadata: HashMap<String, String>,
 }
 
-impl SetDbConfig {
-    pub fn schematic_content(kdl: String) -> Self {
-        SetDbConfig {
-            metadata: [("schematic.content".to_string(), kdl)]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        }
-    }
-}
-
 impl Msg for SetDbConfig {
     const ID: PacketId = short_id([224, 19]);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct DbConfig {
     pub recording: bool,
     pub default_stream_time_step: Duration,
     pub metadata: HashMap<String, String>,
-}
-
-impl DbConfig {
-    pub fn set_schematic_path(&mut self, path: String) {
-        self.metadata.insert("schematic.path".to_string(), path);
-    }
-
-    pub fn schematic_path(&self) -> Option<&str> {
-        self.metadata.get("schematic.path").map(String::as_str)
-    }
-
-    pub fn set_schematic_content(&mut self, path: String) {
-        self.metadata.insert("schematic.content".to_string(), path);
-    }
-
-    pub fn schematic_content(&self) -> Option<&str> {
-        self.metadata.get("schematic.content").map(String::as_str)
-    }
 }
 
 impl Default for DbConfig {
@@ -373,36 +343,6 @@ impl Msg for NewConnection {
     const ID: PacketId = short_id([225, 1]);
 }
 
-macro_rules! impl_user_data_msg {
-    ($t: ty) => {
-        #[cfg(feature = "mlua")]
-        impl mlua::UserData for $t {
-            fn add_methods<T: mlua::UserDataMethods<Self>>(methods: &mut T) {
-                methods.add_method("msg", |_, this, ()| {
-                    use metor_proto::types::IntoLenPacket;
-                    let msg = this.into_len_packet().inner;
-                    Ok(msg)
-                });
-            }
-        }
-        #[cfg(feature = "mlua")]
-        impl mlua::FromLua for $t {
-            fn from_lua(value: mlua::Value, lua: &mlua::Lua) -> mlua::Result<Self> {
-                mlua::LuaSerdeExt::from_value(lua, value)
-            }
-        }
-    };
-}
-
-impl_user_data_msg!(VTableStream);
-impl_user_data_msg!(VTableMsg);
-impl_user_data_msg!(Stream);
-impl_user_data_msg!(MsgStream);
-impl_user_data_msg!(SetStreamState);
-impl_user_data_msg!(SetComponentMetadata);
-impl_user_data_msg!(UdpUnicast);
-impl_user_data_msg!(UdpVTableStream);
-
 #[derive(Serialize, Deserialize)]
 pub struct GetEarliestTimestamp;
 
@@ -411,7 +351,6 @@ impl Msg for GetEarliestTimestamp {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct EarliestTimestamp(pub Timestamp);
 
 impl Msg for EarliestTimestamp {
@@ -419,7 +358,6 @@ impl Msg for EarliestTimestamp {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct DumpSchema;
 
 impl Msg for DumpSchema {
@@ -456,8 +394,6 @@ pub struct SQLQuery(pub String);
 impl Msg for SQLQuery {
     const ID: PacketId = short_id([224, 27]);
 }
-
-impl_user_data_msg!(SQLQuery);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[repr(transparent)]
@@ -899,19 +835,6 @@ impl SequenceAccepts {
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceRegistry {
     pub channels: Vec<SequenceChannelSpec>,
-}
-
-/// Run state of a channel's loaded sequence, as fsw-2 reports it. Kept only
-/// for fsw-2, and deleted with it; fsw-3 reports [`SequenceChannelState`].
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SequenceRunState {
-    Idle,
-    Running,
-    Stopped,
-    Aborted,
-    Completed,
-    Failed,
 }
 
 /// A single transition in a channel's lifecycle, as fsw-2 reports it. Events arrive in
@@ -1584,18 +1507,6 @@ impl Msg for LinkInfo {
 /// discovery on the local link. A ground tool browses this type to find
 /// every reachable fsw by name.
 pub const FSW_SERVICE_TYPE: &str = "_metor-fsw._tcp.local.";
-
-/// TXT-record key for the advertised [`LINK_PROTOCOL_VERSION`], so a
-/// browser can skip an incompatible link before it dials.
-pub const TXT_PROTOCOL_VERSION: &str = "pv";
-
-/// TXT-record key for the fsw's telemetry namespace, when it has one — the
-/// same bare dotted prefix its components carry.
-pub const TXT_NAMESPACE: &str = "ns";
-
-/// TXT-record key for the serving link's declaration name, the second half
-/// of the machine identity a subscriber matches on (`ns` is the first).
-pub const TXT_LINK: &str = "link";
 
 /// TXT-record key naming the advertised role, always `"fsw"` for a link
 /// server; reserved so one service type can grow sibling roles later.

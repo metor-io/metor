@@ -38,7 +38,7 @@ pub struct ComponentId(pub u64);
 
 impl ComponentId {
     pub const fn new(str: &str) -> Self {
-        ComponentId(const_fnv1a_hash::fnv1a_hash_str_64(str) & !(1u64 << 63)) // NOTE: we mask the last bit so the number can fit in an i64, and thus be lua compatible
+        ComponentId(const_fnv1a_hash::fnv1a_hash_str_64(str))
     }
 }
 
@@ -99,11 +99,6 @@ impl TryFrom<&[u8]> for EntityId {
         Ok(EntityId(u64::from_le_bytes(bytes)))
     }
 }
-
-#[cfg(feature = "mlua")]
-impl mlua::UserData for EntityId {}
-#[cfg(feature = "mlua")]
-impl mlua::UserData for ComponentId {}
 
 #[derive(
     Serialize,

@@ -7,15 +7,10 @@ description = "GStreamer plugin that streams Annex B NAL units to metor-db"
 [dependencies]
 gstreamer = { version = "0.23", features = ["v1_18"] }
 gstreamer-base = { version = "0.23", features = ["v1_18"] }
-gstreamer-video = { version = "0.23", features = ["v1_18"] }
 
 # impeller
 metor-proto.path = "../../libs/metor-proto"
 metor-proto.features = ["std"]
-metor-proto-wkt = { path = "../../libs/metor-proto/wkt" }
-
-# General utilities
-anyhow = "1.0"
 
 [lib]
 name = "gstmetor"
@@ -24,7 +19,6 @@ path = "src/lib.rs"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.8"
-pkg-config = "0.3"
 
 [features]
 capi = []

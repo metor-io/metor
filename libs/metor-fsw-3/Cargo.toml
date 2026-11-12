@@ -30,7 +30,6 @@ libc = { version = "0.2", optional = true }
 libloading = { version = "0.8", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
 miette = { version = "7", features = ["fancy"], optional = true }
-notify = { version = "8", optional = true }
 notify-debouncer-mini = { version = "0.6", optional = true }
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"], optional = true }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
@@ -80,7 +79,6 @@ host = [
     "dep:metor-proto-stellar",
     "dep:miette",
     "dep:minijinja",
-    "dep:notify",
     "dep:notify-debouncer-mini",
     "dep:polling",
     "dep:io-uring",

@@ -19,8 +19,6 @@ pub struct Cli {
 enum Commands {
     #[command(about = "Run the Metor database server")]
     Run(RunArgs),
-    #[command(about = "Run a Lua script or launch a REPL")]
-    Lua(metor_proto_cli::Args),
     #[command(about = "Generate C++ header files")]
     GenCpp,
 }
@@ -31,8 +29,6 @@ struct RunArgs {
     addr: SocketAddr,
     #[clap(help = "Path to the data directory")]
     path: Option<PathBuf>,
-    #[clap(long, help = "Path to the configuration file")]
-    pub config: Option<PathBuf>,
     #[clap(long, hide = true)]
     reset: bool,
 }
@@ -54,12 +50,7 @@ async fn main() -> miette::Result<()> {
         .try_init();
     let args = Cli::parse();
     match args.command {
-        Commands::Run(RunArgs {
-            addr,
-            path,
-            config,
-            reset,
-        }) => {
+        Commands::Run(RunArgs { addr, path, reset }) => {
             let path = path.unwrap_or_else(|| {
                 let dirs =
                     directories::ProjectDirs::from("systems", "metor", "db").expect("no dirs");
@@ -74,20 +65,8 @@ async fn main() -> miette::Result<()> {
             info!(?path, "starting db");
             let server = Server::new(path, addr).into_diagnostic()?;
             metor_db::lod::spawn(server.db.clone());
-            let db = stellarator::spawn(server.run());
-            if let Some(lua_config) = config {
-                let args = metor_proto_cli::Args {
-                    path: Some(lua_config),
-                };
-                metor_proto_cli::run(args)
-                    .await
-                    .map_err(|e| miette::miette!(e))?;
-            }
-            db.await.unwrap().into_diagnostic()
+            server.run().await.into_diagnostic()
         }
-        Commands::Lua(args) => metor_proto_cli::run(args)
-            .await
-            .map_err(|e| miette::miette!(e)),
         Commands::GenCpp => {
             let header = postcard_c_codegen::hpp_header(
                 "ELODIN_DB",

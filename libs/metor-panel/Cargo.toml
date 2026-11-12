@@ -15,7 +15,7 @@ nucleo-matcher = "0.3"
 regex = "1"
 metor-db.path = "../db"
 metor-proto.path = "../metor-proto"
-metor-proto.features = ["std", "facet"]
+metor-proto.features = ["std", "facet", "hifitime"]
 const-fnv1a-hash = "1.1.0"
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
@@ -104,9 +104,6 @@ bevy = { git = "https://github.com/bevyengine/bevy", rev = "5036d978a294a3fbb1c4
     # first unregistered component it encounters in a loaded scene.
     "reflect_auto_register",
 ] }
-
-[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
-rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"

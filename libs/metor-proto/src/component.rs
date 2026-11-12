@@ -1,7 +1,5 @@
 use crate::types::ComponentId;
 use crate::util::concat_str;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 #[cfg(feature = "alloc")]
 use crate::schema::Schema;
@@ -11,7 +9,6 @@ use alloc::vec::Vec;
 
 pub trait Component {
     const NAME: &'static str;
-    const ASSET: bool = false;
     const COMPONENT_ID: ComponentId = ComponentId::new(Self::NAME);
 
     #[cfg(feature = "alloc")]
@@ -42,10 +39,6 @@ impl_prim_type_element!(u16, U16);
 impl_prim_type_element!(u32, U32);
 impl_prim_type_element!(u64, U64);
 impl_prim_type_element!(bool, Bool);
-
-pub trait Asset: DeserializeOwned + Serialize {
-    const NAME: &'static str;
-}
 
 macro_rules! impl_prim_component {
     ($ty:ty) => {
