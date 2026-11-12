@@ -13,7 +13,6 @@ from typing import (
     Callable,
     ClassVar,
     Generic,
-    Iterable,
     Mapping,
     Sequence,
     TypeAlias,
@@ -21,9 +20,9 @@ from typing import (
     Union,
 )
 
-from ._cal import Calibrated
+from ._cal import Cal, Calibrated
 from ._config import ConfigError
-from ._fields import ArrayField, Field, index, indexable, signature
+from ._fields import ArrayField, Field, _children, _is_index_run, index, indexable, signature
 
 T = TypeVar("T", bound="Record")
 
@@ -112,6 +111,8 @@ def _check_calibrated(record: type[Record], path: str, value: Calibrated) -> Non
     source = value.source
     if not isinstance(source, Field):
         raise ConfigError(f"{where} calibrates a port field, got {source!r}")
+    if not isinstance(value.cal, Cal):
+        raise ConfigError(f"{where} takes a `Cal`, got {value.cal!r}")
     dst = _destination(record, path)
     if dst != "f64" or source.signature != "f64":
         raise ConfigError(
@@ -396,20 +397,6 @@ def _record_name(record: type[Record]) -> str:
     return record._name
 
 
-def _children(names: Iterable[str], path: str) -> list[str]:
-    """The distinct segments right under ``path`` in ``names``, in order."""
-    prefix = path + "."
-    found: dict[str, None] = {}
-    for name in names:
-        if name.startswith(prefix):
-            found.setdefault(name[len(prefix) :].split(".", 1)[0])
-    return list(found)
-
-
-def _is_index_run(children: list[str]) -> bool:
-    return children == [str(i) for i in range(len(children))]
-
-
 def _flatten_inputs(ports: dict[str, type[Record]], given: dict[str, Any]) -> dict[str, Any]:
     """Maps each keyword's value to the dotted inputs under it."""
     flat: dict[str, Any] = {}
@@ -520,8 +507,6 @@ class OutGroup:
 def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:
     if isinstance(sources, (OutPort, Loop)):
         return [sources]
-    if sources is None:
-        raise ConfigError(f"input `{port}` takes ports and loops, got None")
     listed = list(sources)
     for source in listed:
         if not isinstance(source, (OutPort, Loop)):

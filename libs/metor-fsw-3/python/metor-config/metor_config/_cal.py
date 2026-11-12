@@ -39,11 +39,11 @@ class Cal:
         return Cal.poly([offset, gain])
 
     @staticmethod
-    def two_point(*, volts: tuple[float, float], eng: tuple[float, float]) -> Cal:
-        """The line through ``(volts[0], eng[0])`` and ``(volts[1], eng[1])``."""
-        (v0, v1), (e0, e1) = _finite("two_point", volts, 2), _finite("two_point", eng, 2)
+    def two_point(*, raw: tuple[float, float], eng: tuple[float, float]) -> Cal:
+        """The line through ``(raw[0], eng[0])`` and ``(raw[1], eng[1])``."""
+        (v0, v1), (e0, e1) = _finite("two_point", raw, 2), _finite("two_point", eng, 2)
         if v0 == v1:
-            raise ConfigError(f"`Cal.two_point` takes two distinct volts, got {v0} twice")
+            raise ConfigError(f"`Cal.two_point` takes two distinct raw values, got {v0} twice")
         gain = (e1 - e0) / (v1 - v0)
         return Cal.linear(gain=gain, offset=e0 - gain * v0)
 

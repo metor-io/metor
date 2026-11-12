@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Iterable, TypeVar, cast
 
 from ._config import ConfigError
 
@@ -30,24 +30,41 @@ class Field(Generic[S]):
 
 
 class ArrayField(Field[S], Generic[S, E]):
-    """A shaped leaf, or a split array, whose elements are ``E``."""
+    """An array field whose elements are ``E``: a shaped leaf such as
+    ``f64[6]``, or a group whose children are named ``0..N``."""
 
     def __getitem__(self, i: int) -> E:
-        """Element ``i`` of a shaped leaf, or child ``i`` of a split array."""
+        """Element ``i`` of a shaped leaf, or child ``i`` of a group."""
         where = f"{self.port.name}.{self.path}"
         return cast(E, self.port.field(f"{self.path}.{index(i, where)}"))
 
     __iter__ = None
-    """Indexing does not make a field iterable."""
+    """Blocks Python's fallback iteration through ``__getitem__``; an
+    `ArrayField` is not a sequence."""
 
 
 def indexable(fields: dict[str, str], path: str, sig: str) -> bool:
-    """Whether ``path`` is shaped, or a group whose children are ``0..N``."""
+    """Whether ``path`` is shaped, or a group whose children are ``0..N`` in
+    order and share one signature."""
     if not sig.startswith("{"):
         return bool(parse(sig)[1])
-    prefix = f"{path}."
-    children = {leaf[len(prefix) :].split(".")[0] for leaf in fields if leaf.startswith(prefix)}
-    return children == {str(i) for i in range(len(children))}
+    children = _children(fields, path)
+    sigs = {signature(fields, f"{path}.{child}") for child in children}
+    return _is_index_run(children) and len(sigs) == 1
+
+
+def _children(names: Iterable[str], path: str) -> list[str]:
+    """The distinct segments right under ``path`` in ``names``, in order."""
+    prefix = path + "."
+    found: dict[str, None] = {}
+    for name in names:
+        if name.startswith(prefix):
+            found.setdefault(name[len(prefix) :].split(".", 1)[0])
+    return list(found)
+
+
+def _is_index_run(children: list[str]) -> bool:
+    return children == [str(i) for i in range(len(children))]
 
 
 def index(i: object, where: str) -> int:

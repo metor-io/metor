@@ -61,15 +61,15 @@ BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})  # dst paths open.0, open.1
 
 - Only an `ArrayField` indexes: `field[i]` returns
   `port.field("{path}.{i}")`, the element of a shaped leaf or child `i` of
-  a split array. A negative or non-`int` index, or an index past the end,
+  a group whose children are named `0..N`. A negative or non-`int` index, or an index past the end,
   raises `ConfigError`. A scalar or a group is a plain `Field`; indexing
   one is a `TypeError`, and pyright refuses it. Indexing does not make a
   field iterable.
 - A shaped leaf's property returns an `ArrayField[Literal[sig], E]`, whose
-  `[i]` is typed `E`. A split array whose children are exactly `0..N` with
-  one signature gets the same base class. Bounds are checked at runtime.
+  `[i]` is typed `E`. A group whose children are exactly `0..N`, in order,
+  with one signature gets the same base class. Bounds are checked at runtime.
 - `port.field(path)` returns an `ArrayField` for a shaped leaf or element,
-  or a group whose children are `0..N`, but is typed `Field[Any]`; narrow
+  or such a group, but is typed `Field[Any]`; narrow
   it with `isinstance`, or name the element as `field("x.1")`.
 - A record that maps a path and anything under it, such as a leaf and one
   of its elements, or one element twice, raises `ConfigError`.
@@ -82,7 +82,7 @@ through a calibration, to a scalar `f64` destination or an element of an
 from metor_config import Cal, Calibrated
 
 Mux(out=FeedPressures(
-    pt101=Calibrated(volts.v[5], Cal.two_point(volts=(0.5, 4.5), eng=(0, 1000))),
+    pt101=Calibrated(volts.v[5], Cal.two_point(raw=(0.5, 4.5), eng=(0, 1000))),
     tc=Calibrated(volts.v[7], Cal.thermocouple("K")),
     pt102=other.p,                                   # a plain copy
 ))
@@ -92,13 +92,13 @@ Mux(out=FeedPressures(
 |---|---|
 | `Cal.poly([c0, c1, ..])` | `{"poly": [..]}`, ascending |
 | `Cal.linear(gain=, offset=)` | `{"poly": [offset, gain]}` |
-| `Cal.two_point(volts=, eng=)` | the poly through both points |
+| `Cal.two_point(raw=, eng=)` | the poly through both points |
 | `Cal.table([(x, y), ..])` | `{"table": [[x, y], ..]}`, sorted by `x` |
 | `Cal.thermocouple("K")` | `{"thermocouple": {"kind": "k"}}`; K, J, T, or E |
-| `Cal.ratiometric(excitation=, span=, eng=)` | `{"ratiometric": ..}`, `excitation` a scalar `f64` field |
+| `Cal.ratiometric(excitation=, span=, eng=)` | `{"ratiometric": ..}`, `excitation` a scalar `f64` field of the source's port, written as its path |
 
 Constructors refuse NaN and inf, an empty poly or table, a repeated `x`,
-equal `two_point` volts, a zero-width span, and an unknown thermocouple.
+equal `two_point` raw values, a zero-width span, and an unknown thermocouple.
 `Record.__init__` refuses a `Calibrated` whose source or destination is not
 a scalar `f64`, and a ratiometric excitation on another port than the
 source. Stubgen types a scalar `f64` keyword, and an `f64` array's mapping
@@ -126,14 +126,13 @@ value, as `Field[Literal["f64"]] | Calibrated`.
   | `thermocouple` | the NIST ITS-90 inverse for type K, J, T, or E: cold-junction-compensated volts to °C; NaN outside the NIST ranges |
   | `ratiometric` | `x / excitation` mapped from `span` to `eng` |
 
-  A ratiometric `excitation` is a scalar `f64` of the mapping's own input,
-  since `take` applies one record at a time; another input fails make with
-  `CalInput`. An empty poly, an empty or unsorted table, or a zero-width
+  A ratiometric `excitation` is the path of a scalar `f64` in the mapping's
+  own input, since `take` applies one record at a time. An empty poly, an empty or unsorted table, or a zero-width
   span fails make with `CalTable`.
 - A NaN source gives a NaN destination in every kind. Nothing panics: a zero
   excitation gives a non-finite value.
-- Drivers emit volts, and volts stay in telemetry. A calibration writes the
-  engineering value to the mux's output alongside them.
+- A calibrated mapping leaves its source field as it is; the engineering
+  value appears only in the mux output.
 - Inputs that are not the trigger are latest-only: each record overwrites
   its fields in the output's staging.
 - An output never emits before every input it maps has delivered once.
@@ -186,9 +185,8 @@ a leaf and one of its elements, or one path twice. Adjacent elements are
 disjoint.
 
 A calibrated mapping lowers to one 8-byte copy with `cal: Some(i)`, an index
-into the plan's `cals`, which are built at make: a poly's coefficients past
-two spill to the heap, a table is a boxed slice, and an excitation is its
-byte offset in the source record. `apply` reads the `f64` at `src`,
+into the plan's `cals`, which are built at make: a poly or table is a boxed
+slice, and an excitation is its byte offset in the source record. `apply` reads the `f64` at `src`,
 evaluates, and writes the `f64` at `dst`. A mux holds at most 65 536
 calibrations (`TooManyCals`).
 

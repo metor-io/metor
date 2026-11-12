@@ -31,9 +31,9 @@ class CalTest(unittest.TestCase):
                 self.assertIsNone(cal.excitation)
 
     def test_two_point_is_a_line(self) -> None:
-        cal = Cal.two_point(volts=(0.5, 4.5), eng=(0, 1000))
+        cal = Cal.two_point(raw=(0.5, 4.5), eng=(0, 1000))
         self.assertEqual(cal, Cal.poly([-125, 250]))
-        falling = Cal.two_point(volts=(0, 1), eng=(10, 0))
+        falling = Cal.two_point(raw=(0, 1), eng=(10, 0))
         self.assertEqual(falling.to_json(), {"poly": [10.0, -10.0]})
 
     def test_table_sorts(self) -> None:
@@ -73,8 +73,8 @@ class CalTest(unittest.TestCase):
             ("finite", lambda: Cal.poly([True])),
             ("list", lambda: Cal.poly(1.0)),
             ("finite", lambda: Cal.linear(gain=math.nan, offset=0)),
-            ("distinct", lambda: Cal.two_point(volts=(1, 1), eng=(0, 1))),
-            ("takes 2 numbers", lambda: Cal.two_point(volts=(0, 1, 2), eng=(0, 1))),
+            ("distinct", lambda: Cal.two_point(raw=(1, 1), eng=(0, 1))),
+            ("takes 2 numbers", lambda: Cal.two_point(raw=(0, 1, 2), eng=(0, 1))),
             (
                 "takes 2 numbers",
                 lambda: Cal.ratiometric(excitation=excitation, span=(0,), eng=(0, 1)),

@@ -157,6 +157,7 @@ class MuxTest(unittest.TestCase):
             ("f64 to f64", lambda: MotorCmd(trim=Calibrated(est.field("bias.a"), linear))),
             ("not on `nav.est`", lambda: MotorCmd(**{"trim.a": Calibrated(est.field("bias.a"), other)})),
             ("calibrates a port field", lambda: MotorCmd(**{"trim.a": Calibrated(1.0, linear)})),  # pyright: ignore[reportArgumentType]
+            ("takes a `Cal`", lambda: MotorCmd(**{"trim.a": Calibrated(est.field("bias.a"), "k")})),  # pyright: ignore[reportArgumentType]
             ("has no field", lambda: MotorCmd(trim_x=Calibrated(est.field("bias.a"), linear))),
             ("maps", lambda: MotorCmd(torque={0: Calibrated(gyro[0], linear), 1: gyro[1]}, **{"torque.0": gyro[2]})),
         ]

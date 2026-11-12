@@ -8,6 +8,7 @@ from typing import Any
 from adcs_stub import Est, ModeCmd, MotorCmd, Nav, Plant
 
 from metor_config import ArrayField, ConfigError, Field, Target
+from metor_config._fields import indexable
 
 
 def array(field: Field[Any]) -> ArrayField[Any, Any]:
@@ -125,6 +126,10 @@ class ElementsTest(unittest.TestCase):
         for path in ("p", "p.1", "gains"):
             self.assertIsInstance(self.nav.est.field(path), ArrayField)
         self.assertNotIsInstance(self.nav.est.field("p.1.2"), ArrayField)
+
+    def test_group_of_mixed_signatures_is_not_indexable(self) -> None:
+        self.assertFalse(indexable({"h.0": "f64", "h.1": "u8"}, "h", "{0:f64,1:u8}"))
+        self.assertTrue(indexable({"h.0": "f64", "h.1": "f64"}, "h", "{0:f64,1:f64}"))
 
     def test_indexing_a_scalar_or_a_group(self) -> None:
         for field in (self.nav.est.field("bias.a"), self.nav.est.field("bias"), self.gyro[0]):
