@@ -1562,13 +1562,7 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
     pub async fn send_msg<M: Msg>(&mut self, msg: &M) -> Result<(), Error> {
         let req_id = self.req_id;
         self.send_with_builder(|pkt| {
-            let header = PacketHeader {
-                packet_ty: metor_proto::types::PacketTy::Msg,
-                id: M::ID,
-                req_id,
-                _pad: [0; 2],
-            };
-            pkt.as_mut_packet().header = header;
+            pkt.as_mut_packet().header = PacketHeader::new(PacketTy::Msg, M::ID, req_id);
             pkt.clear();
             postcard::serialize_with_flavor(&msg, pkt).map_err(Error::from)
         })
@@ -1670,13 +1664,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
 
             let req_id = tx.req_id;
             tx.send_with_builder(move |pkt| {
-                let header = PacketHeader {
-                    packet_ty: metor_proto::types::PacketTy::TimeSeries,
-                    id: req.id,
-                    req_id,
-                    _pad: [0; 2],
-                };
-                pkt.as_mut_packet().header = header;
+                pkt.as_mut_packet().header =
+                    PacketHeader::new(PacketTy::TimeSeries, req.id, req_id);
                 pkt.clear();
                 series::answer(pkt, &component.time_series, &req, component.schema.size())
             })
@@ -1690,13 +1679,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let GetComponentMetadata { component_id } = m.parse::<GetComponentMetadata>()?;
 
             tx.send_with_builder(|pkt| {
-                let header = PacketHeader {
-                    packet_ty: metor_proto::types::PacketTy::Msg,
-                    id: ComponentMetadata::ID,
-                    req_id: m.req_id,
-                    _pad: [0; 2],
-                };
-                pkt.as_mut_packet().header = header;
+                pkt.as_mut_packet().header =
+                    PacketHeader::new(PacketTy::Msg, ComponentMetadata::ID, m.req_id);
                 pkt.clear();
                 db.with_state(|state| {
                     let Some(metadata) = state.component_metadata.get(&component_id) else {

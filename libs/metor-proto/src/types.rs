@@ -572,6 +572,17 @@ pub struct PacketHeader {
     pub _pad: [u8; 2],
 }
 
+impl PacketHeader {
+    pub const fn new(packet_ty: PacketTy, id: PacketId, req_id: RequestId) -> Self {
+        Self {
+            packet_ty,
+            id,
+            req_id,
+            _pad: [0; 2],
+        }
+    }
+}
+
 #[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug, IntoBytes)]
 #[repr(C)]
 pub struct Packet {
@@ -682,9 +693,7 @@ impl LenPacket {
     pub fn new(ty: PacketTy, id: PacketId, cap: usize) -> Self {
         let mut inner = Vec::with_capacity(cap + size_of::<u32>() + PACKET_HEADER_LEN);
         inner.extend_from_slice(&(PACKET_HEADER_LEN as u32).to_le_bytes());
-        inner.push(ty as u8);
-        inner.extend_from_slice(&id);
-        inner.extend_from_slice(&[0; 3]);
+        inner.extend_from_slice(PacketHeader::new(ty, id, 0).as_bytes());
         Self { inner }
     }
 
