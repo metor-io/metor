@@ -107,70 +107,36 @@ impl Flat {
         self.partition_point(|s| s.0 < t.0)..self.partition_point(|s| s.0 <= t.0)
     }
 
-    /// Copy the samples `picks` selects into `stamps` and `data`, which are
+    /// Copy the samples `run` selects into `stamps` and `data`, which are
     /// sized for them.
     fn copy(
         &self,
-        picks: &Picks,
+        run: &Range<usize>,
         size: usize,
         stamps: &mut [u8],
         data: &mut [u8],
     ) -> Result<(), Error> {
         const STAMP: usize = size_of::<Timestamp>();
-        match picks {
-            Picks::Run(run) => {
-                let mut out = 0;
-                for (s, slice) in self.slices.iter().enumerate() {
-                    let start = s.checked_sub(1).map_or(0, |prev| self.ends[prev]);
-                    let (lo, hi) = (run.start.max(start), run.end.min(self.ends[s]));
-                    if lo >= hi {
-                        continue;
-                    }
-                    let (lo, hi, n) = (lo - start, hi - start, hi - lo);
-                    stamps[out * STAMP..(out + n) * STAMP]
-                        .copy_from_slice(slice.timestamps()[lo..hi].as_bytes());
-                    let src = slice
-                        .data()
-                        .get(lo * size..hi * size)
-                        .ok_or(Error::SeriesTruncated)?;
-                    data[out * size..(out + n) * size].copy_from_slice(src);
-                    out += n;
-                }
-                match out == run.len() {
-                    true => Ok(()),
-                    false => Err(Error::SeriesTruncated),
-                }
+        let mut out = 0;
+        for (s, slice) in self.slices.iter().enumerate() {
+            let start = s.checked_sub(1).map_or(0, |prev| self.ends[prev]);
+            let (lo, hi) = (run.start.max(start), run.end.min(self.ends[s]));
+            if lo >= hi {
+                continue;
             }
-            Picks::Cells(cells) => {
-                for (out, i) in cells.iter().enumerate() {
-                    let (slice, at) = self.locate(*i);
-                    stamps[out * STAMP..(out + 1) * STAMP]
-                        .copy_from_slice(slice.timestamps()[at].as_bytes());
-                    let src = slice
-                        .data()
-                        .get(at * size..(at + 1) * size)
-                        .ok_or(Error::SeriesTruncated)?;
-                    data[out * size..(out + 1) * size].copy_from_slice(src);
-                }
-                Ok(())
-            }
+            let (lo, hi, n) = (lo - start, hi - start, hi - lo);
+            stamps[out * STAMP..(out + n) * STAMP]
+                .copy_from_slice(slice.timestamps()[lo..hi].as_bytes());
+            let src = slice
+                .data()
+                .get(lo * size..hi * size)
+                .ok_or(Error::SeriesTruncated)?;
+            data[out * size..(out + n) * size].copy_from_slice(src);
+            out += n;
         }
-    }
-}
-
-/// Which samples of a [`Flat`] a reply carries, oldest first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Picks {
-    Run(Range<usize>),
-    /// One sample per stride cell.
-    Cells(Vec<usize>),
-}
-
-impl Picks {
-    fn len(&self) -> usize {
-        match self {
-            Picks::Run(run) => run.len(),
-            Picks::Cells(cells) => cells.len(),
+        match out == run.len() {
+            true => Ok(()),
+            false => Err(Error::SeriesTruncated),
         }
     }
 }
@@ -178,7 +144,8 @@ impl Picks {
 /// A planned reply: the samples to send and what they vouch for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reply {
-    pub picks: Picks,
+    /// The indices into the [`Flat`] of the samples it carries.
+    pub picks: Range<usize>,
     pub covered: Range<Timestamp>,
 }
 
@@ -223,17 +190,7 @@ pub(crate) fn plan(
 ) -> Result<Reply, Error> {
     let fit = fit(size)?;
     let limit = req.limit.unwrap_or(usize::MAX);
-    match req.stride {
-        Some(stride) => Ok(cells(
-            flat,
-            held,
-            &req.range,
-            req.from,
-            limit.min(fit),
-            stride,
-        )),
-        None => run(flat, held, req.from, limit.min(fit), fit, size),
-    }
+    run(flat, held, req.from, limit.min(fit), fit, size)
 }
 
 /// The `len` samples at `from`'s end of `flat`, moved so no timestamp is
@@ -259,13 +216,13 @@ fn run(
         SeriesEnd::Oldest => {
             if len == n {
                 return Ok(Reply {
-                    picks: Picks::Run(0..n),
+                    picks: 0..n,
                     covered: held,
                 });
             }
             if len == 0 {
                 return Ok(Reply {
-                    picks: Picks::Run(0..0),
+                    picks: 0..0,
                     covered: held.start..held.start,
                 });
             }
@@ -283,20 +240,20 @@ fn run(
                 false => held.start..flat.stamp(end),
             };
             Ok(Reply {
-                picks: Picks::Run(0..end),
+                picks: 0..end,
                 covered,
             })
         }
         SeriesEnd::Newest => {
             if len == n {
                 return Ok(Reply {
-                    picks: Picks::Run(0..n),
+                    picks: 0..n,
                     covered: held,
                 });
             }
             if len == 0 {
                 return Ok(Reply {
-                    picks: Picks::Run(n..n),
+                    picks: n..n,
                     covered: held.end..held.end,
                 });
             }
@@ -314,80 +271,10 @@ fn run(
                 start => Timestamp(flat.stamp(start - 1).0 + 1)..held.end,
             };
             Ok(Reply {
-                picks: Picks::Run(start..n),
+                picks: start..n,
                 covered,
             })
         }
-    }
-}
-
-/// The last sample of each stride cell, at most `limit` cells counted from
-/// `from`'s end. Each cell costs one binary search; empty cells cost none.
-///
-/// `covered` ends on cell boundaries wherever this server chose the edge:
-/// at a limit, and where `held` stops short of the requested `range` at a
-/// stretch it only knows remotely, since a cell cut there might hold a
-/// later sample than the one it would report. A cell cut by that is left
-/// out, pick and all. An edge the request itself set is kept as asked, so
-/// a cell it cuts reports its last sample within `range`; requests whose
-/// replies are merged align their ranges to the stride.
-fn cells(
-    flat: &Flat,
-    held: Range<Timestamp>,
-    range: &Range<Timestamp>,
-    from: SeriesEnd,
-    limit: usize,
-    stride: std::time::Duration,
-) -> Reply {
-    let width = i64::try_from(stride.as_micros()).unwrap_or(i64::MAX).max(1);
-    let cell = |t: Timestamp| t.0.div_euclid(width);
-    let cell_start = |c: i64| Timestamp(c.saturating_mul(width));
-    let n = flat.len();
-    let mut picks = Vec::new();
-    let mut covered = match from {
-        SeriesEnd::Oldest => {
-            let mut i = 0;
-            while i < n && picks.len() < limit {
-                let next = cell_start(cell(flat.stamp(i)).saturating_add(1));
-                // The next cell's start saturates at the end of time; always
-                // step past the cell, so a sample there (unreachable today,
-                // ranges being end-exclusive) could never stall the walk.
-                let end = flat.partition_point(|t| t.0 < next.0).max(i + 1);
-                picks.push(end - 1);
-                i = end;
-            }
-            match i < n {
-                true => held.start..cell_start(cell(flat.stamp(i))).max(held.start),
-                false => held,
-            }
-        }
-        SeriesEnd::Newest => {
-            let mut end = n;
-            while end > 0 && picks.len() < limit {
-                let start = cell_start(cell(flat.stamp(end - 1)));
-                picks.push(end - 1);
-                end = flat.partition_point(|t| t.0 < start.0);
-            }
-            picks.reverse();
-            match end > 0 {
-                true => {
-                    cell_start(cell(flat.stamp(end - 1)).saturating_add(1)).min(held.end)..held.end
-                }
-                false => held,
-            }
-        }
-    };
-    let aligned = |t: Timestamp| cell_start(cell(t)) == t;
-    if covered.end != range.end && !aligned(covered.end) {
-        covered.end = cell_start(cell(covered.end)).max(covered.start);
-    }
-    if covered.start != range.start && !aligned(covered.start) {
-        covered.start = cell_start(cell(covered.start).saturating_add(1)).min(covered.end);
-    }
-    picks.retain(|i| covered.contains(&flat.stamp(*i)));
-    Reply {
-        picks: Picks::Cells(picks),
-        covered,
     }
 }
 
@@ -429,8 +316,6 @@ pub(crate) fn answer(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use metor_proto::types::ComponentId;
 
     use super::*;
@@ -451,12 +336,8 @@ mod tests {
         let held = held(series, &req.range, req.from);
         let flat = Flat::new(series, &held);
         let reply = plan(&flat, held, req, 8).unwrap();
-        let picks: Vec<usize> = match &reply.picks {
-            Picks::Run(run) => run.clone().collect(),
-            Picks::Cells(cells) => cells.clone(),
-        };
         (
-            picks.iter().map(|i| flat.stamp(*i).0).collect(),
+            reply.picks.clone().map(|i| flat.stamp(i).0).collect(),
             reply.covered.start.0..reply.covered.end.0,
         )
     }
@@ -506,27 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn strides_keep_the_last_sample_per_cell() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = series(dir.path(), &[1, 4, 9, 10, 11, 25, 29, 41]);
-        let ten = Duration::from_micros(10);
-        assert_eq!(
-            ask(&s, &req(0, 50).stride(ten)),
-            (vec![9, 11, 29, 41], 0..50)
-        );
-        assert_eq!(
-            ask(&s, &req(0, 50).stride(ten).limit(2)),
-            (vec![9, 11], 0..20)
-        );
-        assert_eq!(
-            ask(&s, &req(0, 50).stride(ten).newest().limit(2)),
-            (vec![29, 41], 20..50)
-        );
-        // Cells are epoch-aligned, not aligned to the range.
-        assert_eq!(ask(&s, &req(5, 26).stride(ten)), (vec![9, 11, 25], 5..26));
-    }
-
-    #[test]
     fn an_empty_series_vouches_for_the_whole_range() {
         let dir = tempfile::tempdir().unwrap();
         let s = TimeSeries::create(dir.path()).unwrap();
@@ -556,38 +416,6 @@ mod tests {
         assert_eq!(ask(&s, &at(50)), (vec![30], 21..51));
     }
 
-    /// Where the server stops at a stretch it only knows remotely, the cell
-    /// that cuts is left out: its last sample may lie beyond.
-    #[test]
-    fn strided_coverage_stops_on_a_cell_boundary_at_a_remote_stretch() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = series(dir.path(), &[1, 4, 9, 11, 14]);
-        let remote = SealRecord {
-            start_ts: Timestamp(15),
-            end_ts: Timestamp(40),
-            count: 3,
-            index_len: 24,
-            data_len: 24,
-            checksum: 7,
-            element_size: 8,
-        };
-        s.merge_remote_spans([remote]).unwrap();
-        let ten = Duration::from_micros(10);
-        assert_eq!(ask(&s, &req(0, 30).stride(ten)), (vec![9], 0..10));
-        assert_eq!(
-            ask(&s, &req(41, 100).stride(ten).newest()),
-            (vec![], 41..100)
-        );
-    }
-
-    #[test]
-    fn strides_reach_the_end_of_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = series(dir.path(), &[5, i64::MAX - 1]);
-        let req = req(0, i64::MAX).stride(Duration::from_micros(u64::MAX));
-        assert_eq!(ask(&s, &req), (vec![i64::MAX - 1], 0..i64::MAX));
-    }
-
     #[test]
     fn a_tie_past_the_cap_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -601,7 +429,7 @@ mod tests {
         ));
         assert_eq!(
             run(&flat, held, SeriesEnd::Oldest, 4, 2, 8).unwrap().picks,
-            Picks::Run(0..4)
+            0..4
         );
     }
 }

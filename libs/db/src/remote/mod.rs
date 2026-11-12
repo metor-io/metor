@@ -21,7 +21,7 @@ pub use hydrate::hydrate_span;
 pub use hydrate::{HydratePriority, Hydrator, REQUEST_TTL};
 pub use metor_proto_stellar::{Peer, identify};
 pub use offload::offload_span;
-pub use range::{FetchError, PAGE_BYTES, RangeQuery, Strided, answered_here};
+pub use range::{FetchError, PAGE_BYTES};
 
 use std::sync::Arc;
 
@@ -174,6 +174,45 @@ async fn wait_any<'a>(logs: impl Iterator<Item = &'a MsgLog>) {
         Poll::Pending
     })
     .await
+}
+
+/// Fixtures shared by this module's tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::{net::SocketAddr, sync::Arc};
+
+    use metor_proto::types::{PacketId, PrimType};
+    use metor_proto::vtable::builder::{
+        component, raw_field, raw_table, schema, timestamp, vtable,
+    };
+
+    use crate::DB;
+
+    /// Registers component `name` as one `f64` per row of table `id`, the
+    /// row's first eight bytes its timestamp.
+    pub(crate) fn with_f64(db: &DB, id: PacketId, name: &str) {
+        db.insert_vtable(metor_proto_wkt::VTableMsg {
+            id,
+            vtable: vtable([raw_field(
+                8,
+                8,
+                timestamp(
+                    raw_table(0, 8),
+                    schema(PrimType::F64, &[1], component(name)),
+                ),
+            )]),
+        })
+        .unwrap();
+    }
+
+    /// Serves `db` on a local port, returning its address.
+    pub(crate) fn serve(db: Arc<DB>) -> SocketAddr {
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+        addr
+    }
 }
 
 #[cfg(test)]

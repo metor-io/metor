@@ -910,11 +910,11 @@ pub struct OwnedTimeSeries<B: IoBuf> {
     pub id: PacketId,
     pub req_id: RequestId,
     pub len: usize,
-    /// The stretch of time the sender vouches for: it holds no samples
-    /// there but these. Narrower than what was asked when a limit or the
-    /// size budget cut the reply short, or the sender doesn't hold part of
-    /// it locally; empty when it could answer nothing. Strided replies
-    /// vouch per cell: every cell in it is represented by its last sample.
+    /// The stretch of time the sender vouches for: it has no samples in
+    /// this range other than the ones in this reply. Narrower than what was
+    /// asked when a limit or the size budget cut the reply short, or when
+    /// the sender doesn't hold part of the range itself; empty when it
+    /// could answer nothing.
     pub covered: core::ops::Range<Timestamp>,
     pub buf: Slice<B>,
 }

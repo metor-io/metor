@@ -9,7 +9,9 @@ use metor_proto::types::{ComponentId, Timestamp};
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 
-use super::range::{Completion, FetchError, Outcome, RangeKey, RangeQuery};
+use metor_proto_wkt::GetTimeSeries;
+
+use super::range::{Completion, FetchError, component_name};
 use crate::{
     AtomicTimestampExt, ComponentSchema, DB, Error,
     manifest::{GapVec, SpanSource, SpanState},
@@ -124,7 +126,13 @@ impl<K> Request<K> {
         self.done.as_ref().is_some_and(|d| Arc::strong_count(d) > 1)
     }
 
-    pub(super) fn finish(&self, outcome: Result<Outcome, FetchError>) {
+    /// Whether the request is still wanted: asked within [`REQUEST_TTL`],
+    /// or awaited.
+    pub(super) fn live(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.asked) < REQUEST_TTL || self.awaited()
+    }
+
+    pub(super) fn finish(&self, outcome: Result<Range<Timestamp>, FetchError>) {
         if let Some(done) = &self.done {
             done.finish(outcome);
         }
@@ -215,7 +223,7 @@ impl<K: PartialEq> Queue<K> {
     /// awaited.
     fn expire(&mut self, now: Instant) {
         self.waiting.retain(|r| {
-            let alive = now.saturating_duration_since(r.asked) < REQUEST_TTL || r.awaited();
+            let alive = r.live(now);
             if !alive {
                 r.finish(Err(FetchError::Expired));
             }
@@ -292,7 +300,7 @@ pub(super) struct HydratorInner {
     waker: WaitQueue,
     /// Range fetches and point reads, served apart from whole nodes so
     /// neither waits on the other (see [`super::range`]).
-    pub(super) ranges: std::sync::Mutex<Queue<RangeKey>>,
+    pub(super) ranges: std::sync::Mutex<Queue<GetTimeSeries>>,
     pub(super) range_waker: WaitQueue,
     /// When each component's manifest was last re-listed for a range read
     /// whose answer no span covered (see [`super::range`]).
@@ -402,7 +410,7 @@ impl Hydrator {
                 }
             }
         };
-        futures_lite::future::zip(nodes, self.serve_ranges(&db, store.as_ref())).await;
+        futures_lite::future::zip(nodes, self.serve_ranges(&db, &store)).await;
     }
 
     pub(super) async fn serve(
@@ -413,16 +421,11 @@ impl Hydrator {
         range: Range<Timestamp>,
         priority: HydratePriority,
     ) -> Result<(), Error> {
-        let Some((component, name)) = db.with_state(|state| {
-            let component = state.components.get(&component_id)?.clone();
-            let name = state
-                .get_component_metadata(component_id)
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| component_id.to_string());
-            Some((component, name))
-        }) else {
+        let Some(component) = db.with_state(|state| state.components.get(&component_id).cloned())
+        else {
             return Ok(());
         };
+        let name = component_name(db, component_id);
         let mut gaps = GapVec::new();
         component.time_series.coverage(range, &mut gaps);
         let manifest = component.time_series.manifest();
@@ -435,7 +438,7 @@ impl Hydrator {
                 .span(gap.start_ts)
                 .is_some_and(|span| span.source == SpanSource::PeerHead)
             {
-                self.request_range(component_id, RangeQuery::range(gap.range), priority);
+                self.request_range(component_id, gap.range, priority);
                 continue;
             }
             // Keyed by seal: a seal's pieces, and so their keys, move as

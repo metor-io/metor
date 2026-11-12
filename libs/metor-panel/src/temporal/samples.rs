@@ -3,7 +3,7 @@ use gpui::{App, AppContext, Context, Entity, Global, Subscription, WeakEntity};
 use metor_db::{
     Component, DB,
     manifest::{ComponentManifest, Gap, GapVec, SpanState},
-    remote::{FetchError, HydratePriority, RangeQuery},
+    remote::{FetchError, HydratePriority},
 };
 use metor_proto::types::{ComponentId, Timestamp};
 use std::{
@@ -354,7 +354,7 @@ impl SelectedReader {
             && let Some(hydrator) = crate::hydration::hydrator(cx)
             && let Some(range) = prefetch(&component.time_series.manifest(), t, read_ahead(t, cx))
         {
-            hydrator.request_range(self.id, RangeQuery::range(range), HydratePriority::Prefetch);
+            hydrator.request_range(self.id, range, HydratePriority::Prefetch);
         }
         if plan_current
             && let Some(cache) = &self.cache

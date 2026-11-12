@@ -31,9 +31,7 @@ use std::task::Poll;
 
 use gpui::Global;
 use metor_db::manifest::{ComponentManifest, Gap, SpanSource};
-use metor_db::remote::{
-    FetchError, HydratePriority, Hydrator, PAGE_BYTES, REQUEST_TTL, RangeQuery,
-};
+use metor_db::remote::{FetchError, HydratePriority, Hydrator, PAGE_BYTES, REQUEST_TTL};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::connections::TargetId;
@@ -65,16 +63,16 @@ impl Hydrators {
         self.renew_later(cx);
     }
 
-    /// Ask every connected peer for `query` as a range fetch: the samples,
+    /// Ask every connected peer for `range` as a range fetch: the samples,
     /// landing as fragments, instead of the nodes holding them.
     pub fn request_range(
         &self,
         component_id: ComponentId,
-        query: RangeQuery,
+        range: Range<Timestamp>,
         priority: HydratePriority,
     ) {
         for (_, hydrator) in self.0.hydrators.lock().unwrap().iter() {
-            hydrator.request_range(component_id, query.clone(), priority);
+            hydrator.request_range(component_id, range.clone(), priority);
         }
     }
 
@@ -82,10 +80,7 @@ impl Hydrators {
     /// instant, queued at once so each peer serves them in one batch.
     pub fn request_points(&self, reads: &[(ComponentId, Timestamp)], priority: HydratePriority) {
         for (_, hydrator) in self.0.hydrators.lock().unwrap().iter() {
-            hydrator.request_ranges(
-                reads.iter().map(|(id, t)| (*id, RangeQuery::instant(*t))),
-                priority,
-            );
+            hydrator.request_points(reads.iter().copied(), priority);
         }
     }
 
@@ -176,7 +171,7 @@ impl Hydrators {
         cx: &gpui::App,
     ) {
         match range_fetch(manifest, gap) {
-            Some(range) => self.request_range(component_id, RangeQuery::range(range), priority),
+            Some(range) => self.request_range(component_id, range, priority),
             None => self.request(component_id, gap.range.clone(), priority, cx),
         }
     }

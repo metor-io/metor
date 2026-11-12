@@ -130,13 +130,13 @@ impl Msg for SetStreamState {
 }
 
 /// Asks a db for one component's samples within `range` (end exclusive),
-/// in a [`TimeSeriesReply`]. Gated on [`FEATURE_RANGE_FETCH`]: older servers
-/// read only the leading fields and reply in a layout without `covered`.
+/// answered with an [`OwnedTimeSeries`]. Gated on [`FEATURE_RANGE_FETCH`]:
+/// older servers read only the leading fields and reply in a layout without
+/// `covered`.
 ///
-/// Every way a client reads history it doesn't hold goes through this one
-/// request: pages of a range (`from: Oldest`, paging on `covered.end`), the
-/// sample shown at an instant (`range: ..t + 1, from: Newest, limit: 1`),
-/// and a decimated pick for fast playback (`stride`).
+/// A client reads history it doesn't hold with this one request: pages of
+/// a range (`from: Oldest`, paging on `covered.end`), or the sample shown
+/// at an instant (`range: ..t + 1, from: Newest, limit: 1`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GetTimeSeries {
     pub id: PacketId,
@@ -149,11 +149,6 @@ pub struct GetTimeSeries {
     /// Which end of `range` the reply starts from, and so which end its
     /// `covered` range keeps when the limit or size budget cuts it short.
     pub from: SeriesEnd,
-    /// At most one sample per epoch-aligned cell of this width (cell `k`
-    /// is `[k * stride, (k + 1) * stride)` in microseconds): the last real
-    /// sample in the cell, unchanged. Aligned like the LoD buckets, so
-    /// replies to different requests merge. `limit` then counts cells.
-    pub stride: Option<Duration>,
 }
 
 impl GetTimeSeries {
@@ -165,7 +160,6 @@ impl GetTimeSeries {
             component_id,
             limit: None,
             from: SeriesEnd::Oldest,
-            stride: None,
         }
     }
 
@@ -194,13 +188,6 @@ impl GetTimeSeries {
             ..self
         }
     }
-
-    pub fn stride(self, stride: Duration) -> Self {
-        Self {
-            stride: Some(stride),
-            ..self
-        }
-    }
 }
 
 /// The end of a range a [`GetTimeSeries`] counts its limit from.
@@ -220,10 +207,6 @@ impl Msg for GetTimeSeries {
 impl Request for GetTimeSeries {
     type Reply<B: IoBuf + Clone> = OwnedTimeSeries<B>;
 }
-
-/// What a [`GetTimeSeries`] gets back: an [`OwnedTimeSeries`], whose
-/// `covered` range is the stretch the server vouches for.
-pub type TimeSeriesReply<B> = OwnedTimeSeries<B>;
 
 #[derive(Serialize, Deserialize)]
 pub struct SchemaMsg(pub Schema<Vec<u64>>);
@@ -1097,12 +1080,13 @@ pub struct LogEvent {
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
 ///
-/// Version 7 extended [`GetTimeSeries`] with `from` and `stride`, made its
-/// range end exclusive, and added `covered` to the reply
-/// ([`FEATURE_RANGE_FETCH`]). That is a hard wire break with no fallback:
-/// a version-6 server answers a `GetTimeSeries` in the old layout, which a
-/// version-7 client misreads (its `covered` is the first 16 bytes of
-/// timestamps), so every client checks the feature bit before asking.
+/// Version 7 extended [`GetTimeSeries`] with `from`, made its range end
+/// exclusive, and added `covered` to the reply ([`FEATURE_RANGE_FETCH`]).
+/// That breaks the wire format in both directions: an older server answers
+/// in the old layout, which a newer client would misread (its `covered`
+/// would be the first 16 bytes of timestamps), so clients check the feature
+/// bit before asking; and a newer server can't decode an older client's
+/// shorter request, so that client gets an error reply.
 ///
 /// Version 8 appended `head` to [`NodeManifestResp`]
 /// ([`FEATURE_UNSEALED_HEAD`]). Older clients never read it; a version-8

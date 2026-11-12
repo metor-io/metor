@@ -805,13 +805,7 @@ async fn seed_manifests(
     let mut components = 0usize;
     let mut spans = 0usize;
     for (component_id, schema) in schemas {
-        let name = db
-            .with_state(|state| {
-                state
-                    .get_component_metadata(component_id)
-                    .map(|m| m.name.clone())
-            })
-            .unwrap_or_default();
+        let name = super::range::component_name(db, component_id);
         let Listing { nodes, head } = match store.listing(component_id, &name).await {
             Ok(listing) => listing,
             Err(err) => {
