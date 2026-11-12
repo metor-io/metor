@@ -138,7 +138,7 @@ cargo test -p metor-expr --locked
 cargo check --workspace --all-targets --locked
 ```
 
-The workspace check covers the additional consumers found by metadata: `metor-component`, `metor-db`, `metor-proto-cli`, `metor-db-tests`, `metor-panel`, `adcs-contracts`, and `adcs-systems`. Report unrelated workspace/platform failures separately rather than treating them as evidence that the Nox changes passed. Consult the existing `metor-expr` build setup for WASM prerequisites; its prelude is a separate workspace, so the root workspace check alone does not validate that guest artifact.
+The workspace check covers the additional consumers found by metadata: `metor-component`, `metor-db`, `metor-panel`, `adcs-contracts`, and `adcs-systems`. Report unrelated workspace/platform failures separately rather than treating them as evidence that the Nox changes passed. Consult the existing `metor-expr` build setup for WASM prerequisites; its prelude is a separate workspace, so the root workspace check alone does not validate that guest artifact.
 
 Use the existing tests to verify broadcasting and concatenation shapes, row mapping, LU/Cholesky, quaternion/spatial operations, and the expression compiler's differential results. Because the plan trims dimension macros, ensure coverage includes scalar/vector and matrix concatenation. Add a focused case only if existing tests do not exercise a retained implementation affected by the edit. Preserve serde/zerocopy derives and confirm protocol conversion code compiles.
 
