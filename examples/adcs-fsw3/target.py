@@ -1,27 +1,35 @@
 """Runs the plant, the flight software, and a gateway as three targets.
 
-`plant` simulates the spacecraft, `fsw` runs nav, ctrl, sensor health, and
-the `commission` sequence on its measurements, and the gateway's db records
-both. `commission` runs as a wasm module and takes its commands through the
-gateway.
+`plant` simulates the spacecraft. `fsw` runs its measurements through three
+composites: `gnc`, which holds nav, ctrl, and the `commission` sequence;
+`monitor`, which checks sensor health; and `downlink`, which sends the beacon.
+The gateway's db records both targets. `commission` runs as a wasm module and
+takes its commands through the gateway.
 `METOR_DEPLOY_PORTS` sets the three listen ports so tests can pick free ones.
 """
 import math
 import os
+from typing import NamedTuple
 
 import adcs_seqs
 from adcs_pack import (
+    AttitudeEstimatePort,
     Beacon,
     Body,
     Ctrl,
+    GpsPort,
     Health,
     Housekeeping,
     Magnetometer,
     MtqCmd,
+    MtqCmdPort,
     Nav,
     Plant,
+    SensorsPort,
     SunSensors,
     TorqueCmd,
+    TorqueCmdPort,
+    WheelsPort,
 )
 from adcs_seqs import Commission
 from metor_config import (
@@ -31,11 +39,98 @@ from metor_config import (
     Mux,
     Peer,
     Publish,
+    Scope,
     SequenceCommand,
     Subscribe,
     Target,
+    composite,
     gateway,
 )
+
+
+class Gnc(NamedTuple):
+    nav: Nav
+    commission: Commission
+    ctrl: Ctrl
+
+
+@composite
+def gnc(s: Scope, *, sensors: SensorsPort, gps: GpsPort, wheels: WheelsPort) -> Gnc:
+    """Estimates the attitude, sequences the modes, and commands the actuators."""
+    nav = s.add("nav", Nav(sensors=sensors, gps=gps, meas_sigma=0.02))
+    # Detumbles, then points at nadir and watches the wheels hold the rate.
+    commission = s.add(
+        "commission",
+        Commission(
+            estimate=nav.attitude_estimate, rate=0.02, detumble_timeout_s=1800.0, handover_s=600.0
+        ),
+        channel="commission",
+    )
+    ctrl = s.add(
+        "ctrl",
+        Ctrl(
+            estimate=nav.attitude_estimate,
+            gps=gps,
+            mode=commission.mode_cmd,
+            sensors=sensors,
+            wheels=wheels,
+            q_weight=5.0,
+            r_weight=8.0,
+            k_desat=0.0005,
+            k_detumble=0.00005,
+        ),
+    )
+    # The body state as the flight software knows it: nav's attitude and the GPS
+    # fix, emitted with each estimate while the fix is under half a second old.
+    s.add(
+        "est_body",
+        Mux(
+            body=Body(
+                q_b_eci=nav.attitude_estimate.q_hat_b_eci,
+                omega_b=nav.attitude_estimate.omega_b,
+                pos_eci=gps.pos_eci,
+                vel_eci=gps.vel_eci,
+            ),
+            on=nav.attitude_estimate,
+            max_age=0.5,
+        ),
+    )
+    return Gnc(nav, commission, ctrl)
+
+
+@composite
+def monitor(s: Scope, *, sensors: SensorsPort, gps: GpsPort) -> None:
+    """Splits the sensors into one frame per sensor, each emitted with its
+    sample, and checks each sensor's health."""
+    split = s.add(
+        "sensor_split",
+        Mux(
+            css=SunSensors(css=sensors.css),
+            mag=Magnetometer(mag_b=sensors.mag_b),
+        ),
+    )
+    s.add("health", Health(css=split.css, mag=split.mag, gps=gps))
+
+
+@composite
+def downlink(
+    s: Scope, *, estimate: AttitudeEstimatePort, torque: TorqueCmdPort, mtq: MtqCmdPort
+) -> None:
+    """Beacons housekeeping, built every cycle from each source's newest value."""
+    hk = s.add(
+        "hk",
+        Mux(
+            hk=Housekeeping(
+                omega_b=estimate.omega_b,
+                b_hat_b=estimate.b_hat_b,
+                torque_b=torque.torque_b,
+                dipole_b=mtq.dipole_b,
+            ),
+            on="cycle",
+        ),
+    )
+    s.add("beacon", Beacon(hk=hk.hk, period_s=10.0))
+
 
 p_plant, p_fsw, p_db = os.environ.get("METOR_DEPLOY_PORTS", "2240,2241,2250").split(",")
 
@@ -78,88 +173,30 @@ fsw = Target(cycle_rate=120.0, namespace="fsw")
 # Naming the mirror `plant` gives its components the same paths they have on
 # the plant target.
 mirror = fsw.add("plant", Subscribe(transport=Peer(plant_pub), items=[sim]))
-nav = fsw.add(
-    "nav",
-    Nav(sensors=mirror.port(sim.sensors), gps=mirror.port(sim.gps), meas_sigma=0.02),
-)
+sensors = mirror.port(sim.sensors)
+gps = mirror.port(sim.gps)
 
 fsw.wasm(adcs_seqs.PACK)
-# Detumbles, then points at nadir and watches the wheels hold the rate.
-commission = fsw.add(
-    "commission",
-    Commission(
-        estimate=nav.attitude_estimate, rate=0.02, detumble_timeout_s=1800.0, handover_s=600.0
-    ),
-    channel="commission",
+g = fsw.add("gnc", gnc(sensors=sensors, gps=gps, wheels=mirror.port(sim.wheels)))
+fsw.add("monitor", monitor(sensors=sensors, gps=gps))
+fsw.add(
+    "downlink",
+    downlink(estimate=g.nav.attitude_estimate, torque=g.ctrl.torque_cmd, mtq=g.ctrl.mtq_cmd),
 )
-ctrl = fsw.add(
-    "ctrl",
-    Ctrl(
-        estimate=nav.attitude_estimate,
-        gps=mirror.port(sim.gps),
-        mode=commission.mode_cmd,
-        sensors=mirror.port(sim.sensors),
-        wheels=mirror.port(sim.wheels),
-        q_weight=5.0,
-        r_weight=8.0,
-        k_desat=0.0005,
-        k_detumble=0.00005,
-    ),
-)
-# The body state as the flight software knows it: nav's attitude and the GPS
-# fix, emitted with each estimate while the fix is under half a second old.
-gps = mirror.port(sim.gps)
-est_body = fsw.add(
-    "est_body",
-    Mux(
-        body=Body(
-            q_b_eci=nav.attitude_estimate.q_hat_b_eci,
-            omega_b=nav.attitude_estimate.omega_b,
-            pos_eci=gps.pos_eci,
-            vel_eci=gps.vel_eci,
-        ),
-        on=nav.attitude_estimate,
-        max_age=0.5,
-    ),
-)
-# One frame per sensor, each emitted with the sample it came from.
-sensors = mirror.port(sim.sensors)
-split = fsw.add(
-    "sensor_split",
-    Mux(
-        css=SunSensors(css=sensors.css),
-        mag=Magnetometer(mag_b=sensors.mag_b),
-    ),
-)
-fsw.add("health", Health(css=split.css, mag=split.mag, gps=gps))
-# Housekeeping every cycle, holding each source's newest value.
-hk = fsw.add(
-    "hk",
-    Mux(
-        hk=Housekeeping(
-            omega_b=nav.attitude_estimate.omega_b,
-            b_hat_b=nav.attitude_estimate.b_hat_b,
-            torque_b=ctrl.torque_cmd.torque_b,
-            dipole_b=ctrl.mtq_cmd.dipole_b,
-        ),
-        on="cycle",
-    ),
-)
-fsw.add("beacon", Beacon(hk=hk.hk, period_s=10.0))
 # Tells the panel which channels the target has.
 fsw.add("channels", ChannelRegistry())
 fsw_pub = fsw.add("pub", Publish(transport=Listen(f"[::]:{p_fsw}"), all=True))
 
 # The plant applies the controller's commands one cycle late.
 ctrl_cmds = plant.add(
-    "ctrl", Subscribe(transport=Peer(fsw_pub), items=[ctrl.torque_cmd, ctrl.mtq_cmd])
+    "ctrl", Subscribe(transport=Peer(fsw_pub), items=[g.ctrl.torque_cmd, g.ctrl.mtq_cmd])
 )
-torque.connect(ctrl_cmds.port(ctrl.torque_cmd))
-mtq.connect(ctrl_cmds.port(ctrl.mtq_cmd))
+torque.connect(ctrl_cmds.port(g.ctrl.torque_cmd))
+mtq.connect(ctrl_cmds.port(g.ctrl.mtq_cmd))
 
 gw, db = gateway("gw", peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}", cycle_rate=120.0)
 
-# The ground commands `commission` through the gateway's db.
+# The ground commands `gnc.commission` through the gateway's db.
 ground_cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Peer(db)))
 fsw.commands(ground_cmds.sequence_command)
 

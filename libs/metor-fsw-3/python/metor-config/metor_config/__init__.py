@@ -1,6 +1,7 @@
 """Describe metor-fsw-3 targets in Python.
 
 A target file creates a `Target` and adds systems to it from pack modules.
+A `composite` function adds several systems as one reusable piece.
 For several targets that talk to each other, it creates one `Target` for
 each and groups them in a `Deployment`. When the file finishes, the config
 is written to `$METOR_CONFIG_OUT`, or to stdout, for `metor run` to read.
@@ -18,6 +19,7 @@ from ._builtins import (
     Subscribe,
     Transport,
 )
+from ._composite import Composite, Scope, composite
 from ._config import ConfigError
 from ._deployment import Deployment, emit, gateway
 from ._fields import Field
@@ -63,6 +65,9 @@ from ._target import SystemHandle, Target
 
 __all__ = [
     "Can",
+    "Composite",
+    "Scope",
+    "composite",
     "Dir",
     "File",
     "GpioLine",

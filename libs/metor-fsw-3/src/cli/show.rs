@@ -93,16 +93,24 @@ pub fn select(config: &ResolvedDeployment, name: Option<&str>) -> Result<Selecti
     if let Some(target) = namespaces.iter().position(|ns| *ns == name) {
         return Ok(Selection::Target(target));
     }
-    let (target, system) = match name.split_once('.') {
-        Some((ns, system)) => (namespaces.iter().position(|n| *n == ns), system),
+    let qualified = name.split_once('.').and_then(|(ns, system)| {
+        let target = namespaces.iter().position(|n| *n == ns)?;
+        Some((target, system))
+    });
+    let (target, system) = match qualified {
+        Some((target, system)) => (Some(target), system),
         None if config.targets.len() == 1 => (Some(0), name),
         None => (None, name),
     };
-    let found = target.and_then(|target| {
+    let find = |target: usize, system: &str| {
         let systems = &config.targets[target].coordinator.systems;
         let index = systems.iter().position(|s| s.id == system)?;
         Some(Selection::System(target, index))
-    });
+    };
+    // On one target, a bare id may start with the target's namespace.
+    let found = target
+        .and_then(|target| find(target, system))
+        .or_else(|| (config.targets.len() == 1).then(|| find(0, name)).flatten());
     found.ok_or_else(|| RunError::NoSuchName {
         name: name.to_string(),
         known: names(config),
@@ -430,6 +438,28 @@ mod tests {
         assert_eq!(kind(&at_path), "fsw.db");
         assert_eq!(kind(&kept), "fsw.db");
         assert_eq!(kind(&SystemConfig::new("nav", "adcs.Nav")), "adcs.Nav");
+    }
+
+    #[test]
+    fn test_select_dotted_id() {
+        let json = serde_json::json!({
+            "config_version": 2,
+            "targets": [{"packs": [], "coordinator": {
+                "clock": {"Wall": {"rate": 120.0}}, "ring_depth": 4, "namespace": "fsw",
+                "systems": [{"id": "gnc.nav", "ty": "adcs.Nav"}]}}]
+        });
+        let one: ResolvedDeployment = serde_json::from_value(json).expect("a deployment");
+        let nav = Some(Selection::System(0, 0));
+        assert_eq!(select(&one, Some("fsw.gnc.nav")).ok(), nav);
+        assert_eq!(select(&one, Some("gnc.nav")).ok(), nav);
+        assert!(select(&one, Some("gnc.navv")).is_err());
+        let mut own = one.clone();
+        own.targets[0].coordinator.systems[0].id = "fsw.nav".into();
+        assert_eq!(select(&own, Some("fsw.nav")).ok(), nav, "an id under the namespace");
+        assert!(
+            select(&deployment(), Some("gnc.nav")).is_err(),
+            "bare ids need one target"
+        );
     }
 
     #[test]

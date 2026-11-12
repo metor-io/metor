@@ -349,7 +349,7 @@ class LinkTest(ConfigTest):
 
     def test_link_name_is_an_identifier(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        with self.assertRaisesRegex(ConfigError, "a link's name is an identifier"):
+        with self.assertRaisesRegex(ConfigError, "identifiers joined by `.`, got 'gw-link'"):
             fsw.add("gw-link", Publish([], transport=Listen("0.0.0.0:2240")))
 
     def test_link_name_takes_its_endpoint_name(self) -> None:
