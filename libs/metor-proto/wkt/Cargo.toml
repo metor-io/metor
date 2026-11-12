@@ -16,11 +16,6 @@ nox.optional = true
 zerocopy.version = "0.8.2"
 zerocopy.features = ["derive"]
 
-
-# data-structs
-smallvec.version = "1.11.2"
-compact_str = "0.9"
-
 # serde
 serde.version = "1.0"
 serde.features = ["derive"]
