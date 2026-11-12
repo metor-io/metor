@@ -296,12 +296,12 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     Ok(())
 }
 
-
 fn ends_in_stop(args: &[Arg], state: Option<usize>) -> bool {
     let Some(last) = args.len().checked_sub(1) else {
         return false;
     };
-    let is_stop = matches!(&args[last].ty, Type::Path(_)) && element_name(&args[last].ty).is_some_and(|n| n == "Stop");
+    let is_stop = matches!(&args[last].ty, Type::Path(_))
+        && element_name(&args[last].ty).is_some_and(|n| n == "Stop");
     is_stop && state != Some(last)
 }
 
