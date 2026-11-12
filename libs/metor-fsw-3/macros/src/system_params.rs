@@ -7,7 +7,9 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, GenericParam, Ident, Lifetime, LitBool, LitStr, Type};
+use darling::FromField;
+use metor_component_derive_impl::Field;
+use syn::{Data, DeriveInput, Fields, GenericParam, Ident, Lifetime, Type};
 
 use crate::key::{element, element_name, key_type};
 
@@ -23,16 +25,6 @@ pub fn system_params(input: TokenStream) -> TokenStream {
     }
 }
 
-/// One field of the struct.
-struct Field {
-    ident: Ident,
-    ty: Type,
-    /// The segment the field adds to its ports' paths, or `None` when
-    /// flattened.
-    segment: Option<String>,
-    skip: bool,
-}
-
 /// What the generated impl is built from.
 struct Parts<'a> {
     name: &'a Ident,
@@ -45,7 +37,7 @@ struct Parts<'a> {
 
 impl Parts<'_> {
     fn params(&self) -> impl Iterator<Item = &Field> {
-        self.fields.iter().filter(|field| !field.skip)
+        self.fields.iter().filter(|field| !field.skipped())
     }
 
     /// The struct literal, with param field `i` set to `value(key, i)` and
@@ -54,7 +46,7 @@ impl Parts<'_> {
         let mut params = self.keys.iter().enumerate();
         let inits = self.fields.iter().map(|field| {
             let ident = &field.ident;
-            match (!field.skip).then(|| params.next()).flatten() {
+            match (!field.skipped()).then(|| params.next()).flatten() {
                 Some((i, key)) => {
                     let value = value(key, syn::Index::from(i));
                     quote!(#ident: #value)
@@ -74,7 +66,7 @@ fn expand(input: &DeriveInput, fsw: &TokenStream2) -> syn::Result<TokenStream2> 
     let fields = fields(input)?;
     let keys = fields
         .iter()
-        .filter(|f| !f.skip)
+        .filter(|f| !f.skipped())
         .map(|f| key_type(&f.ty))
         .collect();
     let parts = Parts {
@@ -104,7 +96,7 @@ fn impl_body(
     let Parts { keys, param, .. } = parts;
     let at: Vec<_> = parts
         .params()
-        .map(|f| match &f.segment {
+        .map(|f| match f.segment(None) {
             Some(segment) => quote!(&at.child(#segment)),
             None => quote!(at),
         })
@@ -224,34 +216,17 @@ fn fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
     named.named.iter().map(field).collect()
 }
 
+/// Reads one field's `#[fsw(..)]` attributes, which share the parser of
+/// `#[derive(Fields)]` but take only `flatten`, `rename`, and `skip`.
 fn field(field: &syn::Field) -> syn::Result<Field> {
-    let Some(ident) = field.ident.clone() else {
-        return Err(syn::Error::new_spanned(field, "a field needs a name"));
-    };
-    let name = ident.to_string();
-    let mut parsed = Field {
-        skip: name.starts_with('_'),
-        segment: Some(name),
-        ident,
-        ty: field.ty.clone(),
-    };
-    for attr in field.attrs.iter().filter(|a| a.path().is_ident("fsw")) {
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("flatten") {
-                parsed.segment = None;
-            } else if meta.path.is_ident("rename") {
-                parsed.segment = Some(meta.value()?.parse::<LitStr>()?.value());
-            } else if meta.path.is_ident("skip") {
-                parsed.skip =
-                    !meta.input.peek(syn::Token![=]) || meta.value()?.parse::<LitBool>()?.value;
-            } else {
-                return Err(meta.error("expected `flatten`, `rename`, or `skip`"));
-            }
-            Ok(())
-        })?;
+    let parsed = Field::from_field(field)?;
+    let component = parsed.unit.is_some() || !parsed.metadata.is_empty() || parsed.max.is_some();
+    if parsed.timestamp || component {
+        let message = "a `SystemParams` field takes only `flatten`, `rename`, and `skip`";
+        return Err(syn::Error::new_spanned(field, message));
     }
-    if !parsed.skip {
-        check_field(field, parsed.segment.is_none())?;
+    if !parsed.skipped() {
+        check_field(field, parsed.flatten)?;
     }
     Ok(parsed)
 }
@@ -287,7 +262,7 @@ fn check_field(field: &syn::Field, flatten: bool) -> syn::Result<()> {
         ));
     }
     if matches!(element(ty), Type::Tuple(_)) {
-        return error("a `SystemParams` field is no tuple; use a nested struct".into());
+        return error("a `SystemParams` field cannot be a tuple; use a nested struct".into());
     }
     let leaf = name.is_some_and(|name| LEAVES.iter().any(|n| *name == n));
     if flatten && (leaf || matches!(key_type(ty), Type::Array(_))) {
