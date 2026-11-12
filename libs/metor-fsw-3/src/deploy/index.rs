@@ -40,6 +40,17 @@ impl SystemIndex {
             })
     }
 
+    /// The system `link` on the target named `target`, if there is one.
+    pub(crate) fn find(envelope: &DeploymentConfig, target: &str, link: &str) -> Option<Self> {
+        let index = envelope
+            .targets
+            .iter()
+            .position(|m| m.namespace() == target)?;
+        let systems = &envelope.targets[index].coordinator.systems;
+        let system = systems.iter().position(|system| system.id == link)?;
+        Some(Self::new(index, system))
+    }
+
     pub(crate) fn get(self, envelope: &DeploymentConfig) -> &DeploySystem {
         &envelope.targets[self.target].coordinator.systems[self.system]
     }
@@ -83,26 +94,22 @@ impl<'a> DefIndex<'a> {
         target: &str,
         link: &str,
     ) -> Result<SystemIndex, DeployError> {
-        let target_index = self
-            .envelope
-            .targets
-            .iter()
-            .position(|member| member.namespace() == target)
-            .ok_or_else(|| DeployError::NoSuchTarget {
-                from: from.to_string(),
-                target: target.to_string(),
-            })?;
-        let system_index = self.envelope.targets[target_index]
-            .coordinator
-            .systems
-            .iter()
-            .position(|system| system.id == link)
-            .ok_or_else(|| DeployError::NoSuchLink {
-                from: from.to_string(),
-                target: target.to_string(),
-                link: link.to_string(),
-            })?;
-        Ok(SystemIndex::new(target_index, system_index))
+        SystemIndex::find(self.envelope, target, link).ok_or_else(|| {
+            let (from, target) = (from.to_string(), target.to_string());
+            match self
+                .envelope
+                .targets
+                .iter()
+                .any(|m| m.namespace() == target)
+            {
+                true => DeployError::NoSuchLink {
+                    from,
+                    target,
+                    link: link.to_string(),
+                },
+                false => DeployError::NoSuchTarget { from, target },
+            }
+        })
     }
 
     /// Returns the name used for a system in errors: `{namespace}.{id}`.

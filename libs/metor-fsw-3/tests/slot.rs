@@ -533,7 +533,12 @@ fn resolve_with(
     store: &Path,
 ) -> Result<(), DeployError> {
     match deploy::pending(envelope)? {
-        Some(pending) => pending.resolve(envelope, std::slice::from_ref(table), store),
+        Some(pending) => pending.resolve(
+            envelope,
+            std::slice::from_ref(table),
+            store,
+            metor_fsw_3::deploy::FIRST_PORT,
+        ),
         None => Ok(()),
     }
 }

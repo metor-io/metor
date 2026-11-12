@@ -27,10 +27,12 @@ pub struct Show {
 }
 
 /// What `show` prints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
     All,
     Target(usize),
+    /// The targets under a group, in file order.
+    Targets(Vec<usize>),
     System(usize, usize),
 }
 
@@ -93,10 +95,15 @@ pub fn select(config: &ResolvedDeployment, name: Option<&str>) -> Result<Selecti
     if let Some(target) = namespaces.iter().position(|ns| *ns == name) {
         return Ok(Selection::Target(target));
     }
-    let qualified = name.split_once('.').and_then(|(ns, system)| {
-        let target = namespaces.iter().position(|n| *n == ns)?;
-        Some((target, system))
-    });
+    if config.groups().contains(&name) {
+        let targets = config.select(&[name.to_string()], &[])?;
+        return Ok(Selection::Targets(targets));
+    }
+    let qualified = namespaces
+        .iter()
+        .enumerate()
+        .filter_map(|(target, ns)| Some((target, name.strip_prefix(ns)?.strip_prefix('.')?)))
+        .max_by_key(|&(target, _)| namespaces[target].len());
     let (target, system) = match qualified {
         Some((target, system)) => (Some(target), system),
         None if config.targets.len() == 1 => (Some(0), name),
@@ -120,7 +127,7 @@ pub fn select(config: &ResolvedDeployment, name: Option<&str>) -> Result<Selecti
 /// Every name `select` accepts.
 pub(crate) fn names(config: &ResolvedDeployment) -> Vec<String> {
     let several = config.targets.len() > 1;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<String> = config.groups().into_iter().map(String::from).collect();
     for (target, ns) in config.targets.iter().zip(config.namespaces()) {
         if several {
             names.push(ns.to_string());
@@ -143,6 +150,10 @@ fn selected_json(
     let value = match selection {
         Selection::All => serde_json::to_value(config),
         Selection::Target(target) => serde_json::to_value(&config.targets[target]),
+        Selection::Targets(targets) => {
+            let picked: Vec<_> = targets.iter().map(|&t| &config.targets[t]).collect();
+            serde_json::to_value(picked)
+        }
         Selection::System(target, system) => {
             serde_json::to_value(&config.targets[target].coordinator.systems[system])
         }
@@ -168,6 +179,15 @@ pub fn render(
             Ok(())
         }
         Selection::Target(index) => write_target(out, config, index, theme, width),
+        Selection::Targets(targets) => {
+            for (n, &index) in targets.iter().enumerate() {
+                if n > 0 {
+                    writeln!(out)?;
+                }
+                write_target(out, config, index, theme, width)?;
+            }
+            Ok(())
+        }
         Selection::System(target, system) => write_system(out, config, target, system, theme),
     }
 }
@@ -460,6 +480,87 @@ mod tests {
             select(&deployment(), Some("gnc.nav")).is_err(),
             "bare ids need one target"
         );
+    }
+
+    fn tree() -> ResolvedDeployment {
+        let target = |ns: &str, ids: &[&str]| {
+            let systems: Vec<_> = ids
+                .iter()
+                .map(|id| serde_json::json!({"id": id, "ty": "adcs.Nav"}))
+                .collect();
+            serde_json::json!({"packs": [], "coordinator": {
+                "clock": {"Wall": {"rate": 10.0}}, "ring_depth": 4, "namespace": ns, "systems": systems}})
+        };
+        let json = serde_json::json!({
+            "config_version": 2,
+            "targets": [
+                target("flight.s1.cpu", &["gnc.nav", "pub"]),
+                target("flight.s1.gw", &["pub"]),
+                target("gse", &["rec.db"]),
+            ]
+        });
+        serde_json::from_value(json).expect("a deployment")
+    }
+
+    #[test]
+    fn test_select_under_a_dotted_namespace() {
+        let config = tree();
+        assert_eq!(
+            select(&config, Some("flight.s1.cpu")).ok(),
+            Some(Selection::Target(0))
+        );
+        assert_eq!(
+            select(&config, Some("flight.s1.cpu.gnc.nav")).ok(),
+            Some(Selection::System(0, 0))
+        );
+        assert_eq!(
+            select(&config, Some("flight.s1.gw.pub")).ok(),
+            Some(Selection::System(1, 0))
+        );
+        assert_eq!(
+            select(&config, Some("gse.rec.db")).ok(),
+            Some(Selection::System(2, 0))
+        );
+    }
+
+    #[test]
+    fn test_select_a_group() {
+        let config = tree();
+        assert_eq!(
+            select(&config, Some("flight")).ok(),
+            Some(Selection::Targets(vec![0, 1]))
+        );
+        assert_eq!(
+            select(&config, Some("flight.s1")).ok(),
+            Some(Selection::Targets(vec![0, 1]))
+        );
+        let mut out = Vec::new();
+        let theme = Theme::new(&Caps::plain());
+        render(
+            &mut out,
+            &config,
+            Selection::Targets(vec![0, 1]),
+            &theme,
+            None,
+        )
+        .expect("writes");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.contains("flight.s1.cpu") && text.contains("flight.s1.gw"),
+            "{text}"
+        );
+        assert!(!text.contains("gse"), "{text}");
+    }
+
+    #[test]
+    fn test_select_refuses_partial_names() {
+        let config = tree();
+        let Err(RunError::NoSuchName { known, .. }) = select(&config, Some("flight.s")) else {
+            panic!("a partial group name is an error");
+        };
+        assert_eq!(&known[..2], ["flight", "flight.s1"]);
+        assert!(select(&config, Some("flight.s1.cpu.gnc")).is_err());
+        assert!(select(&config, Some("flight.s1.gw.gnc.nav")).is_err());
     }
 
     #[test]

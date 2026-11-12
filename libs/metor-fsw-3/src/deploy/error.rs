@@ -25,11 +25,8 @@ pub enum DeployError {
         link: String,
     },
 
-    #[error("`{from}` names link `{target}.{link}`, which does not listen on a fixed port")]
-    #[diagnostic(
-        code(M0212),
-        help("give the link a `Listen` transport with a fixed port")
-    )]
+    #[error("`{from}` names link `{target}.{link}`, which does not listen")]
+    #[diagnostic(code(M0212), help("give the link a `Listen` transport"))]
     NotAListener {
         from: String,
         target: String,
@@ -89,6 +86,13 @@ pub enum DeployError {
         name: String,
         cap: usize,
     },
+
+    #[error("no port is left on {host} for a listener on port 0")]
+    #[diagnostic(
+        code(M0221),
+        help("give some listeners on that host a fixed port, or a lower METOR_FIRST_PORT")
+    )]
+    NoFreePort { host: String },
 }
 
 impl DeployError {

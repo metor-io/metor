@@ -107,12 +107,15 @@ const EXAMPLES: &str = "Examples:
 const RUN_EXAMPLES: &str = "Examples:
   metor run                            the nearest target.py
   metor run --target fsw               one target of a deployment
+  metor run --target flight --except flight.cpu3
+                                       a group, less one of its targets
   metor run --sim-dt 10ms --for 30s    30 s of simulated time
   metor run --wall 50hz --cycles 500   pace at 50 Hz, stop after 500 cycles";
 
 const SHOW_EXAMPLES: &str = "Examples:
   metor show                   every target
   metor show fsw               one target
+  metor show flight            every target in a group
   metor show fsw.nav           one system, with its params and grants";
 
 #[derive(Subcommand)]

@@ -333,7 +333,9 @@ writes the records it is sent onto ports of its own. Each takes one
 Both are sequences that hold a `Cap<Endpoint>` named `ep`. `Target.add`
 makes the transport a resource named `{link}_ep` and grants it to `ep`:
 `Listen` a `tcp_listen`, `Connect` a `tcp_dial`, and `Peer` a dial that
-`metor build` points at the listener's `host:port`. A dial's host name
+`metor build` points at the listener's `host:port`. A dialed listener on
+port 0 is given the first port, from `METOR_FIRST_PORT` or 2240, that no
+other listener on its host uses. A dial's host name
 resolves on the target, when it builds. A listening link listens on its
 first cycle and accepts from then on; a taken address fails the listen,
 and the link listens again after a backoff. A listener's `allow` list of
@@ -351,10 +353,10 @@ nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 A subscriber faults each frame port whose table the publisher never
 announced, so a peer built against other definitions shows up on `log`.
 
-A gateway is a target whose `Db` embeds a metor-db. It subscribes to every
-peer and records what arrives. The ground reads one database, not each
-target's stream, and a slow reader never holds a target's rings.
-`gateway(..)` builds one.
+A gateway is a `Db` that embeds a metor-db, subscribes to every peer, and
+records what arrives. The ground reads one database, not each target's
+stream, and a slow reader never holds a target's rings. `gateway(..)` is a
+composite that adds the subscribers and the db to any target.
 
 The ground commands a target through a `Subscribe` whose records are
 commands. Each command is described by its id and either its message

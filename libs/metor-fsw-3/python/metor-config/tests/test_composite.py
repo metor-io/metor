@@ -6,13 +6,14 @@ import inspect
 import unittest
 from typing import NamedTuple
 
-from adcs_stub import Ctrl, Imu, Mode, MotorCmd, Nav, Plant
+from adcs_stub import Ctrl, Est, Imu, Mode, MotorCmd, Nav, Plant
 
 from metor_config import (
     ChannelRegistry,
     ConfigError,
     Listen,
     OutPort,
+    Peer,
     Publish,
     Scope,
     SequenceCommand,
@@ -128,6 +129,39 @@ class CompositeTest(unittest.TestCase):
         )
 
 
+class LinkTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.plant = Target(10.0, namespace="plant")
+        self.fsw = Target(10.0, namespace="sat")
+
+    def test_link_in_a_composite(self) -> None:
+        @composite
+        def comms(s: Scope, *, est: OutPort[Est]) -> Publish:
+            return s.add("pub", Publish([est], transport=Listen("127.0.0.1:2240")))
+
+        nav = self.fsw.add("nav", Nav(imu=self.fsw.add("plant", Plant()).imu))
+        self.fsw.add("comms", comms(est=nav.est))
+        step = steps(self.fsw)["comms.pub"]
+        self.assertEqual(step["grants"], {"ep": "comms_pub_ep"})
+        self.assertEqual(step["params"]["link"], "comms.pub")
+        self.assertIn("comms_pub_ep", self.fsw.to_config()["coordinator"]["resources"])
+
+    def test_peer_dials_a_dotted_link(self) -> None:
+        @composite
+        def comms(s: Scope) -> Publish:
+            imu = s.add("plant", Plant()).imu
+            return s.add("pub", Publish([imu], transport=Listen("127.0.0.1:2240")))
+
+        @composite
+        def rx(s: Scope, *, link: Publish) -> Subscribe:
+            return s.add("sub", Subscribe(transport=Peer(link)))
+
+        pub = self.plant.add("io", comms())
+        self.fsw.add("io", rx(link=pub))
+        resources = self.fsw.to_config()["coordinator"]["resources"]
+        self.assertEqual(resources["io_sub_ep"], {"peer": {"target": "plant", "link": "io.pub"}})
+
+
 class FailureTest(unittest.TestCase):
     def setUp(self) -> None:
         self.fsw = Target(10.0, namespace="sat")
@@ -167,13 +201,10 @@ class FailureTest(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "joined by `.`"):
                 self.fsw.add(name, gnc(imu=self.imu))
 
-    def test_link_is_refused(self) -> None:
-        @composite
-        def comms(s: Scope) -> None:
-            s.add("pub", Publish(transport=Listen("127.0.0.1:0"), all=True))
-
-        with self.assertRaisesRegex(ConfigError, "a link's name is an identifier"):
-            self.fsw.add("tx", comms())
+    def test_link_endpoints_collide(self) -> None:
+        self.fsw.add("a_b", Publish(transport=Listen("127.0.0.1:0"), all=True))
+        with self.assertRaisesRegex(ConfigError, "resource `a_b_ep` is already created"):
+            self.fsw.add("a.b", Publish(transport=Listen("127.0.0.1:0"), all=True))
 
     def test_overlapping_ids(self) -> None:
         self.fsw.add("mode", Mode())

@@ -22,7 +22,9 @@ from ._builtins import (
 from ._cal import Cal, Calibrated
 from ._composite import Composite, Scope, composite
 from ._config import ConfigError
-from ._deployment import Deployment, emit, gateway
+from ._deployment import Deployment, emit
+from ._group import Group, GroupBuild, group
+from ._gateway import Gateway, gateway
 from ._fields import ArrayField, Field
 from ._generated import (
     CONFIG_VERSION,
@@ -70,6 +72,9 @@ __all__ = [
     "Can",
     "Composite",
     "Scope",
+    "Group",
+    "GroupBuild",
+    "group",
     "composite",
     "Dir",
     "File",
@@ -90,7 +95,6 @@ __all__ = [
     "DlSlot",
     "SequenceCommand",
     "SequenceRegistry",
-    "gateway",
     "SystemStatus",
     "LogEvent",
     "LinkStatus",
@@ -116,6 +120,8 @@ __all__ = [
     "PortRef",
     "Publish",
     "Record",
+    "Gateway",
+    "gateway",
     "Source",
     "Sources",
     "Subscribe",

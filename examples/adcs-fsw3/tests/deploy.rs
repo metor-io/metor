@@ -74,15 +74,29 @@ fn free_ports() -> [u16; 3] {
     ports.try_into().expect("enough free test ports")
 }
 
-/// A `metor run` of the deployment, killed and reaped on drop.
+/// A `metor run` of the deployment, stopped and reaped on drop.
 struct Running(Child);
 
 impl Drop for Running {
+    /// Interrupts the process, which stops a deployment's children too, and
+    /// kills it if it has not exited after [`STOP_GRACE`].
     fn drop(&mut self) {
+        let pid = self.0.id().to_string();
+        let _ = Command::new("kill").args(["-INT", &pid]).status();
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
+
+/// How long a [`Running`] process has to stop after an interrupt.
+const STOP_GRACE: Duration = Duration::from_secs(10);
 
 fn run(ports: &[u16; 3]) -> Running {
     let child = metor()

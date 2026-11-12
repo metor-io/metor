@@ -347,10 +347,13 @@ class LinkTest(ConfigTest):
         dial = fsw.to_config()["coordinator"]["resources"]["v6_ep"]["real"]["tcp_dial"]
         self.assertEqual(dial["addr"], "[::1]:2240")
 
-    def test_link_name_is_an_identifier(self) -> None:
+    def test_link_id_is_dotted_identifiers(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        with self.assertRaisesRegex(ConfigError, "identifiers joined by `.`, got 'gw-link'"):
-            fsw.add("gw-link", Publish([], transport=Listen("0.0.0.0:2240")))
+        for name in ("gw-link", "a..b", "a.b-c", ".a"):
+            with self.assertRaisesRegex(ConfigError, "an id is identifiers joined by `.`"):
+                fsw.add(name, Publish([], transport=Listen("0.0.0.0:2240")))
+        fsw.add("gw.link", Publish([], transport=Listen("0.0.0.0:2240")))
+        self.assertIn("gw_link_ep", fsw.to_config()["coordinator"]["resources"])
 
     def test_link_name_takes_its_endpoint_name(self) -> None:
         fsw = Target(cycle_rate=100.0)

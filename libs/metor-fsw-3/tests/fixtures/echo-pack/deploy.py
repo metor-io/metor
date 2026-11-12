@@ -20,6 +20,7 @@ mirror = b.add("mirror", Subscribe(transport=Peer(a_pub), items=[sampler]))
 b.add("meter", Meter(sample=mirror.port(sampler.sample)))
 b_pub = b.add("pub", Publish(transport=Listen(f"127.0.0.1:{p_b}"), all=True))
 
-gw, gw_db = gateway("gw", peers=[a_pub, b_pub], listen=f"127.0.0.1:{p_db}", cycle_rate=1000.0)
+gw = Target(cycle_rate=1000.0, namespace="gw")
+gw.add("rec", gateway(peers=[a_pub, b_pub], listen=f"127.0.0.1:{p_db}"))
 
 Deployment(targets=[a, b, gw])

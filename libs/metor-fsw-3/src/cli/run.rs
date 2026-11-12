@@ -53,10 +53,13 @@ pub struct Run {
     /// this directory or one above it.
     #[arg(add = super::completions::files())]
     pub target: Option<PathBuf>,
-    /// The namespace of the target to run. Without it, a deployment with
-    /// several targets runs all of them.
+    /// Run target NS, or every target in group NS (`flight` selects
+    /// `flight.cpu1`). Repeatable. Without it, every target runs.
     #[arg(long = "target", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
-    pub member: Option<String>,
+    pub targets: Vec<String>,
+    /// Leave out target NS, or every target in group NS. Repeatable.
+    #[arg(long = "except", value_name = "NS", add = super::completions::names(&[super::completions::TARGET], false))]
+    pub except: Vec<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
     pub cycles: Option<u64>,
@@ -85,6 +88,9 @@ pub struct Run {
 /// An error running a target.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum RunError {
+    #[error("METOR_FIRST_PORT is `{0}`, not a port")]
+    #[diagnostic(code(M0110), help("set it to a number from 1 to 65535"))]
+    FirstPort(String),
     #[error("no target file at {}", .0.display())]
     #[diagnostic(
         code(M0206),
@@ -204,12 +210,13 @@ pub fn run(args: Run, ui: &Ui) -> Result<(), RunError> {
         route: route.clone(),
     });
     let config = prepare(args.target.as_deref(), ui)?;
-    let namespaces = config.namespaces();
-    if namespaces.len() > 1 && args.member.is_none() {
-        ui.emit(Event::Running(&namespaces));
-        return run_children(&config, &args, ui);
-    }
-    let member = config.target(args.member.as_deref())?;
+    let selected = config.select(&args.targets, &args.except)?;
+    let [member] = selected[..] else {
+        let namespaces = config.namespaces();
+        let names: Vec<&str> = selected.iter().map(|&i| namespaces[i]).collect();
+        ui.emit(Event::Running(&names));
+        return run_children(&config, &names, &args, ui);
+    };
     let latched = run_member(&config, member, &args, &route, ui)?;
     if !latched.is_empty() {
         return Err(RunError::Latched(latched.join(", ")));
@@ -240,7 +247,10 @@ fn run_member(
     let stats = tap.stats.clone();
     let (coordinator, systems) = load(&config.targets[member], args, Some(tap))?;
     let name = target_name(&config.targets[member]).to_string();
-    ui.emit(Event::SourceWidth(source_width(config)));
+    ui.emit(Event::SourceWidth(source_width(
+        config,
+        &namespaces[member..=member],
+    )));
     ui.emit(Event::Running(&[&name]));
     let origin = Origin {
         target,
@@ -311,14 +321,15 @@ fn lock(route: &Mutex<Route>) -> std::sync::MutexGuard<'_, Route> {
     route.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The widest `target.system` in `config`, or `system` in a deployment of
-/// one.
-fn source_width(config: &ResolvedDeployment) -> usize {
+/// The widest `target.system` among the targets `namespaces` of `config`,
+/// or `system` in a deployment of one.
+fn source_width(config: &ResolvedDeployment, namespaces: &[&str]) -> usize {
     let several = config.targets.len() > 1;
     config
         .targets
         .iter()
         .zip(config.namespaces())
+        .filter(|(_, namespace)| namespaces.contains(namespace))
         .flat_map(|(target, namespace)| {
             let prefix = if several { namespace.len() + 1 } else { 0 };
             target
@@ -331,20 +342,24 @@ fn source_width(config: &ResolvedDeployment) -> usize {
         .unwrap_or(0)
 }
 
-/// Runs every target in `config` as a child process.
+/// Runs the targets `namespaces` of `config`, each as a child process.
 ///
 /// The resolved config is written to a temp file for the children to read.
 /// Returns once every child has exited.
-fn run_children(config: &ResolvedDeployment, args: &Run, ui: &Ui) -> Result<(), RunError> {
+fn run_children(
+    config: &ResolvedDeployment,
+    namespaces: &[&str],
+    args: &Run,
+    ui: &Ui,
+) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
     let bytes = serde_json::to_vec(config).map_err(ConfigError::Decode)?;
     std::fs::write(&path, bytes).map_err(io(&path))?;
     watch_sigint();
     let started = Instant::now();
-    let namespaces = config.namespaces();
-    let relay = Relay::new(ui.clone(), &namespaces);
-    ui.emit(Event::SourceWidth(source_width(config)));
-    let waited = super::children::spawn_all(&path, &namespaces, args, &relay)
+    let relay = Relay::new(ui.clone(), namespaces);
+    ui.emit(Event::SourceWidth(source_width(config, namespaces)));
+    let waited = super::children::spawn_all(&path, namespaces, args, &relay)
         .map(super::children::wait_all)
         .map_err(RunError::Spawn);
     let _ = std::fs::remove_file(&path);
@@ -486,9 +501,19 @@ fn resolve(mut config: DeploymentConfig, target: &Path) -> Result<ResolvedDeploy
             .collect::<Result<_, _>>()?;
         let dir = dir_of(target);
         let dir = std::path::absolute(dir).map_err(io(dir))?;
-        pending.resolve(&mut config, &tables, &store::dir(&dir))?;
+        pending.resolve(&mut config, &tables, &store::dir(&dir), first_port()?)?;
     }
     Ok(config.into_runtime()?)
+}
+
+/// The first port a dialed listener on port 0 is given: `$METOR_FIRST_PORT`,
+/// or [`deploy::FIRST_PORT`].
+fn first_port() -> Result<u16, RunError> {
+    let Ok(value) = std::env::var("METOR_FIRST_PORT") else {
+        return Ok(deploy::FIRST_PORT);
+    };
+    let port = value.parse().ok().filter(|&port: &u16| port != 0);
+    port.ok_or(RunError::FirstPort(value))
 }
 
 /// Returns the dev packs a target depends on.

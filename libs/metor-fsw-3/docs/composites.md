@@ -69,6 +69,7 @@ ports:
 | `s.add(.., channel="seq")` | channel `gnc.seq` |
 | `s.add(.., thread="io")` | thread `io`, shared between instances |
 | `s.resource("uart", ..)` | resource `gnc_uart` |
+| `s.add("pub", Publish(..))` | link `gnc.pub`, resource `gnc_pub_ep` |
 | `s.loop(Record)` | unnamed |
 
 `Target.commands` and `Target.wasm` apply to a whole target, so a target file
@@ -78,8 +79,6 @@ calls them outside the composite.
 
 - `fsw.add("gnc", composite)` takes no `thread`, `channel`, or `start`. The
   body sets them on its systems.
-- A `Publish` or `Subscribe` cannot be inside a composite, since a link's name
-  is an identifier. Add links at the top of the target and pass their ports in.
 - A composite's systems share one target.
 - One system's id cannot sit under another's: `a` and `a.b` cannot both be
   systems, since `a`'s port `b` and `a.b`'s ports would share component paths.

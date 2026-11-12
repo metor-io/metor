@@ -4,7 +4,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{fixture_dir, fixture_wasm, metor, panicked};
+use common::{fixture_dir, fixture_wasm, free_ports, metor, panicked, ports_env};
 use metor_fsw_3::cli::run::{Run, load};
 use metor_fsw_3::coordinator::CoordinatorConfig;
 use metor_fsw_3::deploy::TargetConfig;
@@ -43,6 +43,75 @@ fn test_composites_run_and_show_by_dotted_id() {
         let stderr = String::from_utf8_lossy(&show.stderr);
         assert!(show.status.success(), "{name}: {stderr}");
     }
+}
+
+#[test]
+fn test_links_in_composites_connect() {
+    let target = fixture_dir().join("composite_links.py");
+    let ports: [u16; 1] = free_ports();
+    let run = metor()
+        .args(["run", &target.display().to_string(), "--cycles", "2000"])
+        .env("METOR_DEPLOY_PORTS", ports_env(&ports))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    let dialed = stderr
+        .lines()
+        .any(|line| line.contains("b.rx.sub") && line.contains("connected to"));
+    assert!(dialed, "{stderr}");
+}
+
+/// Runs the tree fixture with `args`, and returns its exit code and the
+/// targets its summary lists.
+fn run_tree(args: &[&str]) -> (Option<i32>, Vec<String>, String) {
+    let target = fixture_dir().join("tree.py");
+    let output = metor()
+        .args(["run", &target.display().to_string(), "--cycles", "3"])
+        .args(args)
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let ran = ["flight.s1.cpu", "flight.s1.gw", "ground"]
+        .into_iter()
+        .filter(|ns| {
+            stderr
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{ns} ")))
+        })
+        .map(String::from)
+        .collect();
+    (output.status.code(), ran, stderr)
+}
+
+#[test]
+fn test_target_selects_a_group() {
+    let (code, ran, stderr) = run_tree(&["--target", "flight.s1"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(ran, ["flight.s1.cpu", "flight.s1.gw"], "{stderr}");
+    let (code, ran, stderr) = run_tree(&["--target", "ground", "--target", "flight.s1.gw"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(ran, ["flight.s1.gw", "ground"], "{stderr}");
+}
+
+#[test]
+fn test_except_leaves_targets_out() {
+    let (code, ran, stderr) = run_tree(&["--except", "flight.s1.gw"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(ran, ["flight.s1.cpu", "ground"], "{stderr}");
+    let (code, ran, stderr) = run_tree(&["--target", "flight", "--except", "flight.s1.cpu"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(ran, ["flight.s1.gw"], "{stderr}");
+}
+
+#[test]
+fn test_selection_errors() {
+    let (code, _, stderr) = run_tree(&["--target", "fli"]);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("M0102"), "{stderr}");
+    let (code, _, stderr) = run_tree(&["--target", "flight", "--except", "flight"]);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("M0109"), "{stderr}");
 }
 
 #[test]
@@ -106,7 +175,7 @@ fn test_build_error_cites_the_target_file() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("`b.mirror` names link `a.out`, which does not listen on a fixed port")
+        stderr.contains("`b.mirror` names link `a.out`, which does not listen")
             && stderr.contains("[deploy.py:6:"),
         "{stderr}"
     );
