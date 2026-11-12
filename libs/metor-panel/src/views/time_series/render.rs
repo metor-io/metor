@@ -167,19 +167,19 @@ impl TimeSeriesPlot {
                     let lp = underlay_lp.read(cx);
                     let axis_count = lp.axes.len();
                     let view = lp.effective_view(cx);
-                    let data_start = lp.data_start().unwrap_or(0.0);
+                    let origin = lp.time_origin(cx).unwrap_or(0.0);
                     let fmt = lp.x_time_format;
                     let tint = alarm_plot_tint(lp, cx);
                     let _ = this.update(cx, |this, _| {
                         this.last_plot_area = Some(plot_area(bounds, axis_count, scale));
                         this.chrome_scale = scale;
                     });
-                    (bounds, view, data_start, fmt, tint)
+                    (bounds, view, origin, fmt, tint)
                 }
             },
-            move |_, (bounds, view, data_start, fmt, tint), window, cx| {
+            move |_, (bounds, view, origin, fmt, tint), window, cx| {
                 if let Some(view) = view {
-                    paint_underlay(bounds, &view, data_start, fmt, tint, window, cx);
+                    paint_underlay(bounds, &view, origin, fmt, tint, window, cx);
                 }
             },
         )
@@ -219,11 +219,11 @@ impl TimeSeriesPlot {
                     colors,
                     markers,
                     limit_lines,
-                    lp.data_start().unwrap_or(0.0),
+                    lp.time_origin(cx).unwrap_or(0.0),
                     lp.x_time_format,
                 )
             },
-            move |_, (bounds, view, colors, markers, limit_lines, data_start, fmt), window, cx| {
+            move |_, (bounds, view, colors, markers, limit_lines, origin, fmt), window, cx| {
                 if let Some(view) = view {
                     paint_overlay(
                         bounds,
@@ -231,7 +231,7 @@ impl TimeSeriesPlot {
                         &colors,
                         &markers,
                         &limit_lines,
-                        data_start,
+                        origin,
                         fmt,
                         window,
                         cx,

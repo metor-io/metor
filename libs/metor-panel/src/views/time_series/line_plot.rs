@@ -593,11 +593,14 @@ impl LinePlot {
             .collect()
     }
 
-    /// Earliest sample timestamp across resolved traces.
-    ///
-    /// Used by the x-axis tick generator to anchor labels against a
-    /// stable origin even as the plot scrolls.
-    pub fn data_start(&self) -> Option<f64> {
+    /// The instant relative x labels count from; see
+    /// [`crate::temporal::plot_origin`].
+    pub fn time_origin(&self, cx: &gpui::App) -> Option<f64> {
+        crate::temporal::plot_origin(cx, || self.data_start())
+    }
+
+    /// Earliest loaded sample across resolved traces.
+    fn data_start(&self) -> Option<f64> {
         let mut start = f64::INFINITY;
         let mut any = false;
         for trace in &self.traces {
@@ -1012,6 +1015,24 @@ mod rebind_tests {
     use super::*;
     use metor_db::ComponentSchema;
     use metor_proto::types::PrimType;
+
+    /// Relative axis labels count from the time controls' T0, not the
+    /// plot's own first sample, so `T0` in a range is the axis's `T+0`.
+    #[gpui::test]
+    fn relative_labels_count_from_global_t0(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        cx.update(|cx| {
+            let controller = crate::temporal::TemporalController::init(db.clone(), cx);
+            let plot = cx.new(|cx| LinePlot::new(db, cx));
+            controller.update(cx, |c, _| {
+                c.snapshot.context.extent = Some(Timestamp(10)..Timestamp(100));
+            });
+            assert_eq!(plot.read(cx).time_origin(cx), Some(10.0));
+            controller.update(cx, |c, _| c.config.t0 = Some(40));
+            assert_eq!(plot.read(cx).time_origin(cx), Some(40.0));
+        });
+    }
 
     #[gpui::test]
     fn temporal_zoom_is_local_until_explicit_sync(cx: &mut gpui::TestAppContext) {

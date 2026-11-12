@@ -540,6 +540,15 @@ pub fn view_time(cx: &App) -> Option<Timestamp> {
 pub fn is_live(cx: &App) -> bool {
     snapshot(cx).is_none_or(|s| s.live)
 }
+/// The instant a plot's relative time labels count from: the time controls'
+/// T0, or `fallback` (the plot's earliest loaded sample) when there is none.
+pub(crate) fn plot_origin(cx: &App, fallback: impl FnOnce() -> Option<f64>) -> Option<f64> {
+    let origin = controller(cx).and_then(|c| {
+        let c = c.read(cx);
+        display::origin(&c.config, &c.snapshot.context)
+    });
+    origin.map(|t| t.0 as f64).or_else(fallback)
+}
 pub fn config(cx: &App) -> TemporalConfig {
     controller(cx)
         .map(|c| c.read(cx).config.clone())
