@@ -1,5 +1,6 @@
 //! [`ParamPath`], the dotted name of a parameter inside a system fn.
 
+use core::fmt::Write as _;
 use std::borrow::Cow;
 
 /// Where a parameter sits among a system fn's parameters.
@@ -74,18 +75,11 @@ impl<'a> ParamPath<'a> {
         }
         match self {
             Self::Name(_, name) => out.push_str(name),
-            Self::Index(_, i) => push_index(out, *i),
+            // PANIC Safety: writing to a `String` cannot fail.
+            Self::Index(_, i) => write!(out, "{i}").expect("a String takes any write"),
             Self::Root | Self::Args(_) => {}
         }
     }
-}
-
-/// Appends `i` in decimal.
-fn push_index(out: &mut String, i: usize) {
-    if i >= 10 {
-        push_index(out, i / 10);
-    }
-    out.push(char::from_digit((i % 10) as u32, 10).unwrap_or('?'));
 }
 
 #[cfg(test)]
