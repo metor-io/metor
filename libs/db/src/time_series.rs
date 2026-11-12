@@ -1175,22 +1175,6 @@ impl TimeSeries {
         Ok(claimed)
     }
 
-    /// Re-derive the coverage of every idle remote seal meeting `range`
-    /// from what is resident now. Call after local data in `range` went
-    /// away by a path that does not re-derive itself (as
-    /// [`Self::purge_span`] does), so seals it shadowed become fetchable
-    /// again. Returns whether any seal was re-derived.
-    pub fn rederive_coverage(&self, range: RangeInclusive<Timestamp>) -> Result<bool, Error> {
-        let _guard = self.structural.lock().unwrap();
-        let resident = extents(self.list.iter(), None);
-        let mut derived = false;
-        self.publish_manifest(true, |draft| {
-            draft.unsettle(range.start().0, range.end().0);
-            derived = draft.derive(&resident, Some(range.start().0..=range.end().0), []);
-        })?;
-        Ok(derived)
-    }
-
     /// Publish a manifest snapshot derived from the current one by `f`,
     /// re-sorted so lookups can rely on key order. With `persist` the
     /// snapshot is durably on disk before it becomes visible, so a crash
@@ -1597,20 +1581,18 @@ impl TimeSeries {
         self.update_remote_spans(seals.into_iter().collect(), false, None)
     }
 
-    /// [`Self::merge_remote_spans`] for a peer's complete listing: seals
-    /// recorded from the peer earlier that it no longer lists (its own
-    /// tiering dropped them) are forgotten, so nothing counts on the peer
-    /// for data it can no longer serve. A node hydrated from a seal the
-    /// listing omits stays resident but loses its ack until the peer lists
-    /// it again, so it is not purged as though the peer could give it back.
-    /// Seals with a fetch in flight are left to that fetch. Returns the
-    /// number of seals recorded.
-    pub fn sync_remote_spans(&self, listing: Vec<SealRecord>) -> Result<usize, Error> {
-        self.update_remote_spans(listing, true, None)
-    }
-
-    /// [`Self::sync_remote_spans`] with the peer's unsealed head from the
-    /// same listing, recorded as [`SpanSource::PeerHead`] coverage in place
+    /// [`Self::merge_remote_spans`] for a peer's complete listing, with the
+    /// peer's unsealed head from the same listing.
+    ///
+    /// Seals recorded from the peer earlier that it no longer lists (its
+    /// own tiering dropped them) are forgotten, so nothing counts on the
+    /// peer for data it can no longer serve. A node hydrated from a seal
+    /// the listing omits stays resident but loses its ack until the peer
+    /// lists it again, so it is not purged as though the peer could give
+    /// it back. Seals with a fetch in flight are left to that fetch.
+    /// Returns the number of seals recorded.
+    ///
+    /// The head is recorded as [`SpanSource::PeerHead`] coverage in place
     /// of the head the last listing reported (`None` drops it).
     ///
     /// The head is cut off below an unsealed head of this side's own: a
@@ -1638,7 +1620,7 @@ impl TimeSeries {
     /// (see [`Self::sync_remote`]). The lifecycle task calls this when the
     /// writer starts a run, since the head listed on connect is usually
     /// cut before the stream's first sample arrives.
-    pub fn meet_mirror_run(&self) -> Result<(), Error> {
+    fn meet_mirror_run(&self) -> Result<(), Error> {
         self.update_remote_spans(Vec::new(), false, None)?;
         Ok(())
     }

@@ -349,15 +349,15 @@ fn a_full_listing_forgets_seals_the_peer_dropped() {
     let (series, src, peer) = split(dir.path());
     let other = peer_node(&dir.path().join("other"), &[300, 310]);
     let other = SealRecord::compute(&other).unwrap();
-    assert_eq!(series.sync_remote_spans(vec![peer, other]).unwrap(), 1);
-    assert_eq!(series.sync_remote_spans(vec![peer, other]).unwrap(), 0);
+    assert_eq!(series.sync_remote(vec![peer, other], None).unwrap(), 1);
+    assert_eq!(series.sync_remote(vec![peer, other], None).unwrap(), 0);
 
     // Settle the peer seal, then the peer drops it.
     series.begin_fetch(Timestamp(0)).unwrap();
     series
         .install_fetched(stage(&dir.path().join("c"), &src, &peer), &peer)
         .unwrap();
-    series.sync_remote_spans(vec![other]).unwrap();
+    series.sync_remote(vec![other], None).unwrap();
     let manifest = series.manifest();
     assert!(manifest.shadowed.is_empty());
     assert!(manifest.settled.is_empty());
@@ -590,7 +590,7 @@ fn a_fragment_of_a_seal_the_peer_dropped_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let (series, _, _) = remote(dir.path());
     fetch(&series, &every_10(140), 15..61);
-    series.sync_remote_spans(vec![]).unwrap();
+    series.sync_remote(vec![], None).unwrap();
     assert!(!series.purge_fragment(Timestamp(15)).unwrap());
     assert_eq!(stamps(&series, 0, 141), [20, 30, 40, 50, 60]);
 }

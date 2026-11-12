@@ -484,7 +484,7 @@ mod tests {
 
         // The peer's listing no longer has the hydrated node: this side's
         // copy is the only one left.
-        series.sync_remote_spans(vec![other]).unwrap();
+        series.sync_remote(vec![other], None).unwrap();
         let now = later(GRACE * 2);
         assert_eq!(evict(&series, now, GRACE, |_| true).unwrap().spans, 0);
         assert_eq!(state(&series, 0), Some(SpanState::Resident));
@@ -493,7 +493,7 @@ mod tests {
         assert!(!series.manifest().span(Timestamp(0)).unwrap().acked);
 
         // Listed again, the peer can give it back.
-        series.sync_remote_spans(vec![seal, other]).unwrap();
+        series.sync_remote(vec![seal, other], None).unwrap();
         assert!(series.manifest().span(Timestamp(0)).unwrap().acked);
         assert_eq!(evict(&series, now, GRACE, |_| true).unwrap().spans, 1);
         assert_eq!(state(&series, 0), Some(SpanState::RemoteOnly));
@@ -505,7 +505,7 @@ mod tests {
         {
             let series = TimeSeries::create(dir.path()).unwrap();
             hydrated(&series, dir.path(), 0..10);
-            series.sync_remote_spans(vec![]).unwrap();
+            series.sync_remote(vec![], None).unwrap();
         }
         let series = TimeSeries::open(dir.path()).unwrap();
         assert!(!series.manifest().span(Timestamp(0)).unwrap().acked);

@@ -141,7 +141,7 @@ pub struct ComponentManifest {
     /// Remote seals whose whole range local data already answers, sorted
     /// by start. They cover nothing, but are kept so that when the local
     /// data shadowing them is dropped, their range becomes fetchable
-    /// again (see `TimeSeries::rederive_coverage`).
+    /// again (see `TimeSeries::purge_span`).
     pub shadowed: Box<[SealRecord]>,
     /// Stretches of remote seals a fetch already reconciled, sorted by
     /// seal. Whatever a seal holds there is resident (or was nothing at
