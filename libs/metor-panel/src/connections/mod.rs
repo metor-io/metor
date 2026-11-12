@@ -105,7 +105,7 @@ impl ActiveConnection {
 
     /// Whether this connection can fetch history back on demand, which is
     /// what lets the panel evict its copy.
-    pub fn fetches_history(&self) -> bool {
+    pub(crate) fn fetches_history(&self) -> bool {
         self.hydrator.is_some()
     }
 }

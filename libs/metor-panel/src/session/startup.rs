@@ -24,7 +24,8 @@ pub(crate) struct SessionStartup {
 
 struct Probing {
     addr: std::net::SocketAddr,
-    /// Set by Escape: the probe's result, whenever it lands, is dropped.
+    /// Set by Escape: the probe's result, whenever it lands, is released
+    /// instead of started.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 

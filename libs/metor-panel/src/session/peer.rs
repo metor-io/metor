@@ -8,8 +8,8 @@
 //! exists, so the session probes the address first. Anything that can't
 //! name a cache — an fsw link, an ephemeral gateway, a peer that doesn't
 //! answer in time, a cache another panel holds, caching turned off — gets a
-//! temporary DB exactly as before; selection never fails a connect that a
-//! temporary DB would have served.
+//! temporary DB. Choosing storage never fails a connect that a temporary DB
+//! could serve.
 
 use std::future::Future;
 use std::net::SocketAddr;
