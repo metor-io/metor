@@ -2200,18 +2200,7 @@ impl TimerSeriesWriter {
 #[cfg(test)]
 mod tests {
 
-    /// The timestamps `get_range(start..end)` covers, oldest first.
-    fn range_stamps(series: &TimeSeries, start: i64, end: i64) -> Vec<i64> {
-        let Some(slice) = series.get_range(Timestamp(start)..Timestamp(end)) else {
-            return vec![];
-        };
-        let mut nodes: Vec<_> = slice.as_iter().collect();
-        nodes.reverse();
-        nodes
-            .iter()
-            .flat_map(|n| n.timestamps().iter().map(|t| t.0))
-            .collect()
-    }
+    use super::coverage_tests::{every_10, peer_node, stage, stamps};
 
     #[test]
     fn range_holds_whole_ties() {
@@ -2223,11 +2212,11 @@ mod tests {
                 .push_buf(Timestamp(*ts), &(i as u64).to_le_bytes())
                 .unwrap();
         }
-        assert_eq!(range_stamps(&series, 3, 3), [3, 3, 3]);
-        assert_eq!(range_stamps(&series, 0, 3), [1, 2, 3, 3, 3]);
-        assert_eq!(range_stamps(&series, 3, 9), [3, 3, 3, 4, 5]);
-        assert_eq!(range_stamps(&series, 6, 9), Vec::<i64>::new());
-        assert_eq!(range_stamps(&series, -5, 0), Vec::<i64>::new());
+        assert_eq!(stamps(&series, 3, 3), [3, 3, 3]);
+        assert_eq!(stamps(&series, 0, 3), [1, 2, 3, 3, 3]);
+        assert_eq!(stamps(&series, 3, 9), [3, 3, 3, 4, 5]);
+        assert_eq!(stamps(&series, 6, 9), Vec::<i64>::new());
+        assert_eq!(stamps(&series, -5, 0), Vec::<i64>::new());
     }
 
     #[test]
@@ -2238,10 +2227,10 @@ mod tests {
         for ts in [5i64, 10] {
             writer.push_buf(Timestamp(ts), &7u64.to_le_bytes()).unwrap();
         }
-        assert_eq!(range_stamps(&series, 0, 4), Vec::<i64>::new());
-        assert_eq!(range_stamps(&series, 6, 9), Vec::<i64>::new());
-        assert_eq!(range_stamps(&series, 5, 5), [5]);
-        assert_eq!(range_stamps(&series, 0, 99), [5, 10]);
+        assert_eq!(stamps(&series, 0, 4), Vec::<i64>::new());
+        assert_eq!(stamps(&series, 6, 9), Vec::<i64>::new());
+        assert_eq!(stamps(&series, 5, 5), [5]);
+        assert_eq!(stamps(&series, 0, 99), [5, 10]);
         let empty = series.get_range(Timestamp(0)..Timestamp(4)).unwrap();
         assert_eq!(empty.len(), 0);
         assert!(empty.as_iter().all(|n| n.data().is_empty()));
@@ -2259,10 +2248,10 @@ mod tests {
             writer.push_buf(Timestamp(ts), &buf).unwrap();
         }
         assert_eq!(series.iter_node_slices().count(), 2);
-        assert_eq!(range_stamps(&series, 63, 63), [63, 63, 63]);
-        assert_eq!(range_stamps(&series, 63, 100), [63, 63, 63]);
-        assert_eq!(range_stamps(&series, 60, 63), [60, 61, 62, 63, 63, 63]);
-        assert_eq!(range_stamps(&series, 0, 100).len(), 66);
+        assert_eq!(stamps(&series, 63, 63), [63, 63, 63]);
+        assert_eq!(stamps(&series, 63, 100), [63, 63, 63]);
+        assert_eq!(stamps(&series, 60, 63), [60, 61, 62, 63, 63, 63]);
+        assert_eq!(stamps(&series, 0, 100).len(), 66);
     }
     use super::*;
 
@@ -2352,38 +2341,11 @@ mod tests {
     /// The peer's node spans `[0, 140]` every 10; this side holds samples
     /// at 100 and 101, sealed. Returns the series and the peer's node.
     fn split_fixture(dir: &Path) -> (TimeSeries, TimeSeriesNode) {
-        for (start, stamps) in [(100i64, &[100i64, 101][..]), (500, &[500][..])] {
-            let node =
-                TimeSeriesNode::create(dir.join(start.to_string()), Timestamp(start), 8).unwrap();
-            for ts in stamps {
-                node.data.write(&ts.to_le_bytes()).unwrap();
-                node.index.write(&Timestamp(*ts).to_le_bytes()).unwrap();
-            }
-        }
+        peer_node(dir, &[100, 101]);
+        peer_node(dir, &[500]);
         let series = TimeSeries::open(dir).unwrap();
         series.seal_rolled_nodes().unwrap();
-
-        let src_dir = dir.join("peer");
-        let src = TimeSeriesNode::create(src_dir.join("0"), Timestamp(0), 8).unwrap();
-        for i in 0..15i64 {
-            let ts = i * 10;
-            src.data.write(&ts.to_le_bytes()).unwrap();
-            src.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
-        }
-        (series, src)
-    }
-
-    /// Stage `src` in full, as a fetch would.
-    fn stage(dir: &Path, src: &TimeSeriesNode, seal: &SealRecord) -> crate::store::NodeStaging {
-        use crate::store::{NodeFile, NodeStaging};
-        let staging = NodeStaging::create(dir, seal).unwrap();
-        staging
-            .append_file(NodeFile::Index, src.index.data())
-            .unwrap();
-        staging
-            .append_file(NodeFile::Data, src.data.data())
-            .unwrap();
-        staging
+        (series, peer_node(&dir.join("peer"), &every_10(140)))
     }
 
     #[test]
@@ -2430,7 +2392,7 @@ mod tests {
         assert_eq!(back.seal.end_ts, Timestamp(140));
         assert_eq!(back.seal.count, 4);
 
-        let stamps = range_stamps(&series, 0, 600);
+        let stamps = stamps(&series, 0, 600);
         let mut expected: Vec<i64> = (0..15).map(|i| i * 10).filter(|t| *t != 100).collect();
         expected.extend([100, 101, 500]);
         expected.sort_unstable();

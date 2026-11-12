@@ -13,7 +13,7 @@ use crate::{
     time_series::{MirrorRun, TimeSeries, TimeSeriesNode},
 };
 
-fn peer_node(dir: &Path, stamps: &[i64]) -> TimeSeriesNode {
+pub(super) fn peer_node(dir: &Path, stamps: &[i64]) -> TimeSeriesNode {
     let src =
         TimeSeriesNode::create(dir.join(stamps[0].to_string()), Timestamp(stamps[0]), 8).unwrap();
     for ts in stamps {
@@ -23,12 +23,12 @@ fn peer_node(dir: &Path, stamps: &[i64]) -> TimeSeriesNode {
     src
 }
 
-fn every_10(to: i64) -> Vec<i64> {
+pub(super) fn every_10(to: i64) -> Vec<i64> {
     (0..=to).step_by(10).collect()
 }
 
 /// Stage `src` in full, as a fetch would.
-fn stage(dir: &Path, src: &TimeSeriesNode, seal: &SealRecord) -> NodeStaging {
+pub(super) fn stage(dir: &Path, src: &TimeSeriesNode, seal: &SealRecord) -> NodeStaging {
     let staging = NodeStaging::create(dir, seal).unwrap();
     staging
         .append_file(NodeFile::Index, src.index.data())
@@ -39,7 +39,7 @@ fn stage(dir: &Path, src: &TimeSeriesNode, seal: &SealRecord) -> NodeStaging {
     staging
 }
 
-fn stamps(series: &TimeSeries, start: i64, end: i64) -> Vec<i64> {
+pub(super) fn stamps(series: &TimeSeries, start: i64, end: i64) -> Vec<i64> {
     let Some(slice) = series.get_range(Timestamp(start)..Timestamp(end)) else {
         return vec![];
     };
