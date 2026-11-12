@@ -1348,7 +1348,7 @@ impl Component {
         if timestamp < self.last_timestamp.latest() {
             return Err(Error::TimeTravel);
         }
-        self.write_wal(timestamp, value_buf);
+        self.write_wal(timestamp, value_buf, false);
         Ok(())
     }
 
@@ -1361,21 +1361,24 @@ impl Component {
     /// as time travel, it lands at the latest timestamp: the db's arrival
     /// clock stays monotonic per component.
     pub fn push_buf_received(&self, received: Timestamp, value_buf: &[u8]) -> Timestamp {
-        self.write_wal(received, value_buf)
+        self.write_wal(received, value_buf, true)
     }
 
-    /// Writes one sample to the WAL at `timestamp`, or at the series'
-    /// latest timestamp if a concurrent writer has since passed it.
-    ///
-    /// The stamp is settled under the grant's write lock, where
-    /// `last_timestamp` is exact, so the WAL never holds samples out of
-    /// order (its drain refuses those as time travel).
-    fn write_wal(&self, timestamp: Timestamp, value_buf: &[u8]) -> Timestamp {
+    /// Writes one sample to the WAL at `timestamp`. With `restamp`, a
+    /// timestamp a concurrent writer has since passed is moved up to the
+    /// series' latest, settled under the grant's write lock where
+    /// `last_timestamp` is exact. Without it the sample keeps the timestamp
+    /// its sender gave it, and the WAL's drain refuses it if it is now out
+    /// of order.
+    fn write_wal(&self, timestamp: Timestamp, value_buf: &[u8], restamp: bool) -> Timestamp {
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             self.warn_wal_drop(timestamp);
             return timestamp;
         };
-        let timestamp = timestamp.max(self.last_timestamp.latest());
+        let timestamp = match restamp {
+            true => timestamp.max(self.last_timestamp.latest()),
+            false => timestamp,
+        };
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
         // Before the grant releases the write lock, so the next writer's
