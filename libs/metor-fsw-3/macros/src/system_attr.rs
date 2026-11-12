@@ -23,7 +23,7 @@ use syn::{
     ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
 };
 
-use crate::key::{is_seq, key_type, set_seq_lifetime};
+use crate::key::{element_name, is_seq, key_type, set_seq_lifetime};
 
 /// Which attribute is expanding.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -147,7 +147,7 @@ impl Sig {
             Some(arg) => Err(syn::Error::new_spanned(
                 &arg.ty,
                 format!(
-                    "a `{}` parameter is no tuple; group parameters in a `#[derive(SystemParams)]` struct",
+                    "a `{}` parameter cannot be a tuple; group parameters in a `#[derive(SystemParams)]` struct",
                     kind.attr()
                 ),
             )),
@@ -288,7 +288,7 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     for arg in args {
         if let Some((_, message)) = refused
             .iter()
-            .find(|(name, _)| is_type_named(&arg.ty, name))
+            .find(|(name, _)| element_name(&arg.ty).is_some_and(|n| n == name))
         {
             return Err(syn::Error::new_spanned(&arg.ty, *message));
         }
@@ -296,20 +296,12 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     Ok(())
 }
 
-/// Returns whether `ty` is a path ending in `name`, ignoring references.
-fn is_type_named(ty: &Type, name: &str) -> bool {
-    match ty {
-        Type::Reference(r) => is_type_named(&r.elem, name),
-        Type::Path(path) => path.path.segments.last().is_some_and(|s| s.ident == name),
-        _ => false,
-    }
-}
 
 fn ends_in_stop(args: &[Arg], state: Option<usize>) -> bool {
     let Some(last) = args.len().checked_sub(1) else {
         return false;
     };
-    let is_stop = matches!(&args[last].ty, Type::Path(_)) && is_type_named(&args[last].ty, "Stop");
+    let is_stop = matches!(&args[last].ty, Type::Path(_)) && element_name(&args[last].ty).is_some_and(|n| n == "Stop");
     is_stop && state != Some(last)
 }
 
@@ -334,7 +326,7 @@ fn check_output(output: &ReturnType) -> syn::Result<()> {
 /// The expected type is `Result<(), SeqError>`.
 fn check_sequence_output(sig: &Signature) -> syn::Result<()> {
     match &sig.output {
-        ReturnType::Type(_, ty) if is_type_named(ty, "Result") => Ok(()),
+        ReturnType::Type(_, ty) if element_name(ty).is_some_and(|n| n == "Result") => Ok(()),
         ReturnType::Type(_, ty) => Err(syn::Error::new_spanned(ty, SEQUENCE_OUTPUT)),
         ReturnType::Default => Err(syn::Error::new_spanned(&sig.ident, SEQUENCE_OUTPUT)),
     }
