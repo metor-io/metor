@@ -1652,9 +1652,10 @@ impl PanelApp {
                     let selected = selected.await;
                     cx.update(|cx| match selected {
                         Ok((storage, db)) => self.start_session(storage, db, cx),
+                        // No session exists yet, so there is nothing to shut down.
                         Err(error) => {
-                            tracing::error!(%error, "could not create the session database");
-                            cx.quit();
+                            eprintln!("Could not create the session database: {error}");
+                            std::process::exit(1);
                         }
                     });
                 })
