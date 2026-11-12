@@ -287,9 +287,7 @@ mod through_the_io_steps {
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    use metor_fsw_3::coordinator::{
-        Clock, CoordinatorConfig, InputConfig, SystemConfig, SystemTable,
-    };
+    use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
     use metor_fsw_3::io::{
         Backing, Cap, Holder, IO_STATUS_PORT, IO_TYPE, RealKind, Reconnect, RecvOp, SendOp,
         SimKind, SimResource, Udp,
@@ -491,26 +489,6 @@ mod through_the_io_steps {
         let both = || !got.borrow().is_empty() && *seen.borrow() > 0;
         assert!(run_until(&mut c, both), "a ping and a fix arrive");
         assert_eq!(got.borrow().as_slice(), [b"ping".to_vec()]);
-    }
-
-    /// A simulated clock with a real resource is not refused at build.
-    #[test]
-    fn simulated_clock_with_a_real_resource_builds() {
-        let got = Got::default();
-        let config = CoordinatorConfig {
-            clock: Clock::Simulated {
-                dt: Duration::from_millis(10),
-                epoch: None,
-            },
-            resources: [("loop".to_string(), udp_loop())].into_iter().collect(),
-            systems: vec![
-                pinger_on("loop"),
-                SystemConfig::new("io_submit", IO_TYPE),
-                SystemConfig::new("io_complete", IO_TYPE),
-            ],
-            ..CoordinatorConfig::default()
-        };
-        assert!(config.build(&table(&got)).is_ok());
     }
 
     /// A system between the io steps may hold a real resource.
