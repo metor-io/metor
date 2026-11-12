@@ -7919,6 +7919,7 @@ dependencies = [
  "metor-star",
  "naga 30.0.1",
  "nalgebra",
+ "nox",
  "pollster 0.4.0",
  "rand 0.9.5",
  "rand_distr 0.5.1",
