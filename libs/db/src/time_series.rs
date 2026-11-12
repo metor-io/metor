@@ -1069,10 +1069,11 @@ impl TimeSeries {
     /// Every fragment lands in one swap of the node list and one publish.
     /// Returns the stretches claimed, oldest first.
     ///
-    /// Fragment nodes are staged and flushed under the structural lock,
-    /// which a reply of [`crate::remote::PAGE_BYTES`] holds for one 4 MB
-    /// write; staging first would mean re-deriving the stretches after
-    /// taking the lock, as the manifest can move in between.
+    /// Fragment nodes are staged under the structural lock, which a reply
+    /// of [`crate::remote::PAGE_BYTES`] holds for one 4 MB copy; staging
+    /// first would mean re-deriving the stretches after taking the lock, as
+    /// the manifest can move in between. Fragments last one run, so nothing
+    /// is synced to disk.
     pub fn install_fragment(
         &self,
         covered: Range<Timestamp>,
@@ -1152,7 +1153,6 @@ impl TimeSeries {
                     let tie_start = timestamps.partition_point(|t| t.0 < end).max(lo);
                     hi -= resident_at(end).min(hi.saturating_sub(tie_start));
                 }
-                let samples: Vec<usize> = (lo..hi).collect();
                 let mut fragment = Fragment {
                     start: Timestamp(start),
                     end: Timestamp(end),
@@ -1160,21 +1160,14 @@ impl TimeSeries {
                     dir: None,
                     access: Arc::new(LastAccess::now()),
                 };
-                if let Some(first) = samples.first() {
-                    let staging = crate::store::NodeStaging::with_capacity(
+                if lo < hi {
+                    let (staging, seal) = crate::store::NodeStaging::of_samples(
                         &self.path,
-                        timestamps[*first],
-                        element_size as u64,
-                        samples.len(),
+                        &timestamps[lo..hi],
+                        element_size,
+                        &data[lo * element_size..hi * element_size],
                     )?;
-                    for i in &samples {
-                        staging.push(
-                            timestamps[*i],
-                            &data[i * element_size..(i + 1) * element_size],
-                        )?;
-                    }
-                    let seal = staging.seal().expect("staged at least one sample");
-                    let (dir, node) = staging.commit_fragment(&seal)?;
+                    let (dir, node) = staging.commit_fragment()?;
                     fragment.node = Some(seal);
                     fragment.dir = Some(Arc::from(dir));
                     fragment.access = node.last_access.clone();

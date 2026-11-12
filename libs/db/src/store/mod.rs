@@ -25,6 +25,7 @@ use std::{future::Future, path::PathBuf, pin::Pin};
 
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto_wkt::GetTimeSeries;
+use zerocopy::IntoBytes;
 
 use crate::{
     Error,
@@ -261,13 +262,33 @@ impl NodeStaging {
             .dir
             .parent()
             .ok_or_else(|| StoreError::Other("staging has no component dir".to_string()))?;
-        let piece = Self::with_capacity(component_dir, timestamps[lo], size as u64, hi - lo)?;
-        let data = node.data.data();
-        for (i, ts) in timestamps.iter().enumerate().take(hi).skip(lo) {
-            piece.push(*ts, &data[i * size..(i + 1) * size])?;
-        }
-        let seal = piece.seal().expect("cut holds at least one sample");
-        Ok(Some((piece, seal)))
+        Self::of_samples(
+            component_dir,
+            &timestamps[lo..hi],
+            size,
+            &node.data.data()[lo * size..hi * size],
+        )
+        .map(Some)
+    }
+
+    /// Stage `timestamps`, in order and at least one, with their samples
+    /// `data` as one node, returning it with its seal.
+    pub(crate) fn of_samples(
+        component_dir: &std::path::Path,
+        timestamps: &[Timestamp],
+        element_size: usize,
+        data: &[u8],
+    ) -> Result<(NodeStaging, SealRecord), Error> {
+        let staging = Self::with_capacity(
+            component_dir,
+            timestamps[0],
+            element_size as u64,
+            timestamps.len(),
+        )?;
+        staging.index.write(timestamps.as_bytes())?;
+        staging.data.write(data)?;
+        let seal = staging.seal().expect("staged at least one sample");
+        Ok((staging, seal))
     }
 
     /// The staging directory, which [`Self::commit`] renames into place
@@ -283,38 +304,10 @@ impl NodeStaging {
     /// Verify the staged bytes against `seal` and promote the directory
     /// into place. Returns the final node directory and the (already
     /// mapped) node.
-    pub fn commit(self, seal: &SealRecord) -> Result<(PathBuf, TimeSeriesNode), Error> {
+    pub fn commit(mut self, seal: &SealRecord) -> Result<(PathBuf, TimeSeriesNode), Error> {
         let final_dir = self.dir.with_file_name(seal.start_ts.0.to_string());
-        self.commit_to(seal, final_dir)
-    }
-
-    /// [`Self::commit`] for a range-fetch fragment, into a directory named
-    /// apart from sealed nodes (`<start_ts>.<n>.fragment`): its first sample
-    /// may be where a whole node will later land, and opening the component
-    /// deletes it rather than loading it.
-    pub(crate) fn commit_fragment(
-        self,
-        seal: &SealRecord,
-    ) -> Result<(PathBuf, TimeSeriesNode), Error> {
-        let name = self
-            .dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_suffix(".fetching"))
-            .ok_or_else(|| StoreError::Other("staging dir has no name".to_string()))?
-            .to_string();
-        let final_dir = self.dir.with_file_name(format!("{name}.fragment"));
-        let (dir, mut node) = self.commit_to(seal, final_dir)?;
-        node.fragment = true;
-        Ok((dir, node))
-    }
-
-    fn commit_to(
-        mut self,
-        seal: &SealRecord,
-        final_dir: PathBuf,
-    ) -> Result<(PathBuf, TimeSeriesNode), Error> {
         let node = self.node();
+
         if !seal.verify(&node) {
             return Err(StoreError::ChecksumMismatch.into());
         }
@@ -333,6 +326,20 @@ impl NodeStaging {
             std::fs::File::open(parent)?.sync_all()?;
         }
         self.committed = true;
+        Ok((final_dir, node))
+    }
+
+    /// Move a range-fetch fragment into place, in a directory named apart
+    /// from sealed nodes (`<start_ts>.<n>.fragment`): its first sample may
+    /// be where a whole node will later land. Opening the component deletes
+    /// fragments rather than loading them, so unlike [`Self::commit`] this
+    /// neither verifies nor syncs anything.
+    pub(crate) fn commit_fragment(mut self) -> Result<(PathBuf, TimeSeriesNode), Error> {
+        let final_dir = self.dir.with_extension("fragment");
+        std::fs::rename(&self.dir, &final_dir)?;
+        self.committed = true;
+        let mut node = self.node();
+        node.fragment = true;
         Ok((final_dir, node))
     }
 }
