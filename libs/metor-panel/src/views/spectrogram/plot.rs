@@ -263,7 +263,7 @@ impl SpectrogramPlot {
             // lets a full-range view span the whole archive.
             let manifest = comp.time_series.manifest();
             if let Some(span) = manifest.spans.first() {
-                start = start.min(span.seal.start_ts.0 as f64);
+                start = start.min(span.cover_start.0 as f64);
                 any = true;
             }
             if let Some(span) = manifest.spans.last() {
@@ -388,6 +388,7 @@ impl SpectrogramPlot {
                 &self.db,
                 cfg.source.id(),
                 component,
+                tracking.plan.as_ref(),
                 range.clone(),
                 ELEMENT_SCAN_BUDGET,
                 cfg.len.max(1) as u64,

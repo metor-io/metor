@@ -93,7 +93,18 @@ impl<A: AsyncRead, L: Length> LengthDelReader<A, L> {
 
     pub async fn recv_growable<B: IoBufMut + GrowableBuf>(
         &mut self,
+        buf: B,
+    ) -> Result<Slice<B>, Error> {
+        self.recv_growable_max(buf, usize::MAX).await
+    }
+
+    /// [`Self::recv_growable`], refusing with [`Error::BufferOverflow`] a
+    /// frame longer than `max_len` before growing `buf` for it, so a small
+    /// buffer can serve a peer whose declared lengths aren't trusted.
+    pub async fn recv_growable_max<B: IoBufMut + GrowableBuf>(
+        &mut self,
         mut buf: B,
+        max_len: usize,
     ) -> Result<Slice<B>, Error> {
         let mut total_read = 0;
         while total_read < size_of::<L>() {
@@ -116,6 +127,9 @@ impl<A: AsyncRead, L: Length> LengthDelReader<A, L> {
         let len = L::from_le_bytes(len);
         let len = len.as_usize();
         let required_len = len.checked_add(L::SIZE).ok_or(Error::IntegerOverflow)?;
+        if len > max_len {
+            return Err(Error::BufferOverflow);
+        }
         buf.grow(required_len);
         if required_len > buf.total_len() {
             return Err(Error::BufferOverflow);
@@ -286,6 +300,25 @@ mod tests {
         let out = stream.recv(buf).await.unwrap();
         assert_eq!(&out[..], &[0xff]);
 
+        handle.await.unwrap();
+    }
+
+    /// A frame longer than the limit is refused before the buffer grows.
+    #[test]
+    async fn test_recv_growable_max_refuses_long_frames() {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = crate::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            stream.write(&[2, 0, 0, 0, 1, 2][..]).await.0.unwrap();
+            stream.write(&[0xff, 0xff, 0xff, 0xff][..]).await.0.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut stream = LengthDelReader::<_, u32>::new(stream);
+        let out = stream.recv_growable_max(vec![0u8; 4], 2).await.unwrap();
+        assert_eq!(&out[..], &[1, 2]);
+        let refused = stream.recv_growable_max(vec![0u8; 4], 2).await;
+        assert!(matches!(refused, Err(Error::BufferOverflow)));
         handle.await.unwrap();
     }
 

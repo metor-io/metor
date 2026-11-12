@@ -44,6 +44,7 @@ fn context() -> TimeContext {
         extent: Some(Timestamp(0)..Timestamp(120_000_000)),
         live: Some(Timestamp(600_000_000)),
         view: Some(Timestamp(60_000_000)),
+        ..TimeContext::default()
     }
 }
 
@@ -550,6 +551,7 @@ fn full_range_follows_samples_between_history_scans(cx: &mut gpui::TestAppContex
     cx.run_until_parked();
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
+            c.config.range = TimeRangeSpec::FULL;
             let scanned_at = Instant::now();
             c.last_bounds = scanned_at;
             let revision = cx.global::<TemporalRevision>().0;
@@ -571,6 +573,188 @@ fn full_range_follows_samples_between_history_scans(cx: &mut gpui::TestAppContex
 
             c.apply(TimeAction::WallClock, cx).unwrap();
             assert_eq!(c.snapshot.range, Some(Timestamp(100)..Timestamp(501)));
+        });
+    });
+}
+
+const HOUR: i64 = 3_600_000_000;
+const MINUTE: i64 = 60_000_000;
+
+fn session_context(extent: Range<i64>, session: Option<i64>) -> TimeContext {
+    TimeContext {
+        extent: Some(Timestamp(extent.start)..Timestamp(extent.end)),
+        live: Some(Timestamp(extent.end)),
+        view: Some(Timestamp(extent.end)),
+        session: session.map(Timestamp),
+        ..TimeContext::default()
+    }
+}
+
+#[test]
+fn session_range_shows_recent_data_then_the_whole_session() {
+    let range = |extent: Range<i64>, session| {
+        let end = extent.end;
+        let r = TimeRangeSpec::SESSION
+            .resolve(&session_context(extent, session))
+            .unwrap();
+        assert_eq!(r.end, Timestamp(end + 1), "the newest sample is shown");
+        r.start.0
+    };
+    let month = 30 * 24 * HOUR;
+    // Connecting to a month of history opens on its last hour...
+    assert_eq!(range(0..month, Some(month)), month - HOUR);
+    assert_eq!(
+        range(0..month + 20 * MINUTE, Some(month)),
+        month - 40 * MINUTE
+    );
+    // ...and grows to cover everything since connecting.
+    assert_eq!(range(0..month + 3 * HOUR, Some(month)), month);
+    // A recording shows its last hour, or all of it when shorter.
+    assert_eq!(range(0..3 * HOUR, Some(3 * HOUR)), 2 * HOUR);
+    assert_eq!(range(0..20 * MINUTE, Some(20 * MINUTE)), 0);
+    // Before the session is captured, the lookback alone decides.
+    assert_eq!(range(0..3 * HOUR, None), 2 * HOUR);
+    // A single instant still resolves.
+    assert_eq!(range(5..5, Some(5)), 5);
+
+    let mut short = session_context(0..3 * HOUR, Some(3 * HOUR));
+    short.lookback = 10 * MINUTE;
+    assert_eq!(
+        TimeRangeSpec::SESSION.resolve(&short).unwrap().start,
+        Timestamp(3 * HOUR - 10 * MINUTE)
+    );
+}
+
+#[test]
+fn data_end_windows_clamp_to_the_data_start() {
+    let parse = ParseContext::utc();
+    let recording = session_context(0..20 * MINUTE, None);
+    let of_data = parse_range("last 1h of data", &parse).unwrap();
+    assert_eq!(
+        of_data.resolve(&recording).unwrap(),
+        Timestamp(0)..Timestamp(20 * MINUTE + 1)
+    );
+    // A live window keeps its width: it scrolls rather than grows.
+    let live = parse_range("last 1h", &parse).unwrap();
+    assert_eq!(
+        live.resolve(&recording).unwrap().start,
+        Timestamp(20 * MINUTE - HOUR)
+    );
+}
+
+#[test]
+fn session_anchor_text_round_trips() {
+    let parse = ParseContext::utc();
+    for text in ["since session start", "session"] {
+        assert_eq!(parse_range(text, &parse).unwrap(), TimeRangeSpec::SESSION);
+    }
+    assert_eq!(TimeRangeSpec::SESSION.to_string(), "since session start");
+    let expr = parse_instant("session start - 5m", &parse, true).unwrap();
+    assert_eq!(expr, TimeExpr::new(Anchor::Session, -5 * MINUTE));
+    assert_eq!(
+        parse_instant(&expr.to_string(), &parse, true).unwrap(),
+        expr
+    );
+    let range = parse_range("session start .. data end", &parse).unwrap();
+    assert_eq!(parse_range(&range.to_string(), &parse).unwrap(), range);
+}
+
+#[gpui::test]
+fn version_one_layouts_move_full_range_to_the_session_default(cx: &mut gpui::TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(DB::create(tmp.path().join("db")).unwrap());
+    cx.update(|cx| {
+        TemporalController::init(db, cx);
+        assert_eq!(config(cx).range, TimeRangeSpec::SESSION);
+        let saved = save_layout(cx);
+        assert_eq!(saved.version, 2);
+        assert_eq!(saved.range_start, "session start");
+        restore_layout(&saved, cx);
+        assert_eq!(config(cx).range, TimeRangeSpec::SESSION);
+
+        let old = |range: TimeRangeSpec| metor_proto_wkt::TemporalLayout {
+            version: 1,
+            range_start: range.start.to_string(),
+            range_end: range.end.to_string(),
+            ..saved.clone()
+        };
+        restore_layout(&old(TimeRangeSpec::FULL), cx);
+        assert_eq!(config(cx).range, TimeRangeSpec::SESSION);
+        assert_eq!(config(cx).version, 2);
+        let chosen = TimeRangeSpec::fixed(Timestamp(100)..Timestamp(200));
+        restore_layout(&old(chosen), cx);
+        assert_eq!(config(cx).range, chosen, "a deliberate range survives");
+
+        let future = metor_proto_wkt::TemporalLayout {
+            version: 3,
+            ..saved.clone()
+        };
+        restore_layout(&future, cx);
+        assert_eq!(config(cx).range, chosen, "an unknown version is ignored");
+    });
+}
+
+#[gpui::test]
+fn session_start_is_latched_from_the_peer_head_not_its_last_seal(cx: &mut gpui::TestAppContext) {
+    use metor_db::{ComponentSchema, manifest::SpanSource};
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(DB::create(tmp.path().join("db")).unwrap());
+    let id = ComponentId::new("peer.value");
+    db.with_state_mut(|s| {
+        s.insert_component(
+            id,
+            ComponentSchema::new(metor_proto::types::PrimType::F64, &[][..]),
+            &db.path,
+        )
+    })
+    .unwrap();
+    db.with_state_mut(|s| {
+        s.set_component_metadata(
+            metor_proto_wkt::ComponentMetadata {
+                component_id: id,
+                name: "peer.value".into(),
+                metadata: Default::default(),
+            },
+            &db.path,
+        )
+    })
+    .unwrap();
+    let component = db.with_state(|s| s.get_component(id).cloned()).unwrap();
+    let bytes = 1f64.to_le_bytes();
+    let append = |t: i64| {
+        component
+            .time_series
+            .install_samples(
+                8,
+                [(Timestamp(t), bytes.as_slice())],
+                SpanSource::RemoteFetch,
+            )
+            .unwrap();
+    };
+    // The peer's history ends at a seal ten hours ago; its handshake said
+    // its head is at twenty.
+    append(0);
+    append(10 * HOUR);
+    metor_db::AtomicTimestampExt::update_max(&db.last_updated, Timestamp(20 * HOUR));
+    let c = cx.update(|cx| TemporalController::init(db.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        c.update(cx, |c, cx| {
+            assert_eq!(c.snapshot.context.session, Some(Timestamp(20 * HOUR)));
+            append(20 * HOUR + MINUTE);
+            c.tick(Instant::now(), cx);
+            assert_eq!(
+                c.snapshot.range.as_ref().unwrap().start,
+                Timestamp(19 * HOUR + MINUTE)
+            );
+            append(22 * HOUR);
+            c.tick(Instant::now(), cx);
+            assert_eq!(
+                c.snapshot.range.as_ref().unwrap().start,
+                Timestamp(20 * HOUR)
+            );
+            c.apply(TimeAction::Scope("other.".into()), cx).unwrap();
+            assert_eq!(c.snapshot.context.session, None);
         });
     });
 }

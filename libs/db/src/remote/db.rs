@@ -4,17 +4,17 @@ use metor_proto::schema::Schema;
 use metor_proto::types::{ComponentId, IntoLenPacket, LenPacket, PacketTy, Timestamp};
 use metor_proto_stellar::{Client, PacketSink, PacketStream};
 use metor_proto_wkt::{
-    DbInfoResp, DumpMetadata, DumpMetadataResp, FEATURE_MSG_SYNC, GetDbInfo, Stream,
+    DbInfoResp, DumpMetadata, DumpMetadataResp, FEATURE_MSG_SYNC, GetDbInfo, InstanceId, Stream,
     StreamBehavior, SyncMsgs,
 };
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
-use stellarator::sync::Mutex;
+use stellarator::sync::{Mutex, WaitQueue};
 use tracing::{info, warn};
 
 use crate::{
-    AtomicTimestampExt as _, ComponentSchema, ConnState, DB, Error, PacketTx, store::NodeStore,
-    store::PeerStore,
+    AtomicTimestampExt as _, ComponentSchema, ConnState, DB, Error, PacketTx,
+    store::{Listing, NodeStore, PeerStore},
 };
 
 use super::Hydrator;
@@ -32,6 +32,14 @@ pub enum MirrorEvent {
     Disconnected,
     /// The attempt failed with an error; the supervisor will retry.
     Failed,
+    /// A database other than the one [`RemoteDb::expect_instance`] named
+    /// answered (`found` is its id, `None` from a server that doesn't say).
+    /// Terminal: the supervisor stops, since writing that peer into the
+    /// expected one's mirror would mix two histories.
+    WrongPeer {
+        expected: InstanceId,
+        found: Option<InstanceId>,
+    },
 }
 
 type EventFn = Arc<dyn Fn(MirrorEvent) + Send + Sync>;
@@ -47,6 +55,7 @@ type EventFn = Arc<dyn Fn(MirrorEvent) + Send + Sync>;
 /// the same packets the local ingest path already understands.
 pub struct RemoteDb {
     addr: SocketAddr,
+    expected: Option<InstanceId>,
     store: Arc<PeerStore>,
     hydrator: Hydrator,
     on_event: Option<EventFn>,
@@ -56,10 +65,23 @@ impl RemoteDb {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
+            expected: None,
             store: Arc::new(PeerStore::new(addr)),
             hydrator: Hydrator::new(),
             on_event: None,
         }
+    }
+
+    /// Mirror only the database `id` (when `Some`), checked on every
+    /// connect: a mirror kept in that peer's cache must not take in
+    /// whatever answers at the address after the peer was wiped or
+    /// replaced. Another answer ends the mirror with
+    /// [`MirrorEvent::WrongPeer`], and the bulk store refuses it too. Call
+    /// before [`store`](Self::store), whose handle this replaces.
+    pub fn expect_instance(mut self, id: Option<InstanceId>) -> Self {
+        self.expected = id;
+        self.store = Arc::new(PeerStore::new(self.addr).expect_instance(id));
+        self
     }
 
     /// Observe supervisor lifecycle transitions. The callback fires from the
@@ -80,11 +102,14 @@ impl RemoteDb {
         self.store.clone()
     }
 
-    /// Spawn the supervisor: the reconnecting live mirror plus the
-    /// hydration worker. Tasks run until the runtime shuts down.
+    /// Spawn the supervisor: the reconnecting live mirror, plus the
+    /// hydration and manifest-seeding workers. They run until the runtime
+    /// shuts down, or until [`MirrorEvent::WrongPeer`] stops the mirror,
+    /// which stops the workers with it.
     pub fn spawn(self, db: Arc<DB>) {
         let Self {
             addr,
+            expected,
             store,
             hydrator,
             on_event,
@@ -94,17 +119,37 @@ impl RemoteDb {
                 f(event);
             }
         };
-        stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
-        stellarator::spawn(seed_loop(db.clone(), store.clone()));
-        stellarator::spawn(async move {
+        let connected = Arc::new(WaitQueue::new());
+        let workers = futures_lite::future::zip(
+            hydrator.run(db.clone(), store.clone()),
+            seed_loop(db.clone(), store, connected.clone()),
+        );
+        let supervisor = async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
             const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
             let mut backoff = INITIAL_BACKOFF;
             loop {
                 let connected_at = std::time::Instant::now();
                 emit(MirrorEvent::Connecting);
-                match mirror(&db, addr, &emit).await {
-                    Ok(()) => emit(MirrorEvent::Disconnected),
+                let emit = |event| {
+                    // The peer may have restarted, or run on while this side
+                    // was away: its head has moved, so list it again now
+                    // rather than at the next timed pass.
+                    if event == MirrorEvent::Connected {
+                        connected.wake();
+                    }
+                    emit(event)
+                };
+                match mirror(&db, addr, expected, &emit).await {
+                    Ok(event) => {
+                        warn!(
+                            ?addr,
+                            ?event,
+                            "a different database answered; mirror stopped"
+                        );
+                        emit(event);
+                        return;
+                    }
                     Err(err) if err.is_stream_closed() => {
                         info!(?addr, "remote db disconnected; reconnecting");
                         emit(MirrorEvent::Disconnected);
@@ -120,7 +165,10 @@ impl RemoteDb {
                 stellarator::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(10));
             }
-        });
+        };
+        stellarator::spawn(futures_lite::future::or(supervisor, async {
+            workers.await;
+        }));
     }
 }
 
@@ -142,10 +190,25 @@ pub(super) async fn handshake_request<T>(
 /// One connection lifetime: handshake, metadata sync, then the real-time
 /// stream — plus the message logs when the peer answers [`SyncMsgs`] —
 /// ingested until the connection drops, raced against the forwarder for
-/// the commands the peer advertised.
-async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> Result<(), Error> {
+/// the commands the peer advertised. Returns only with the error that
+/// ended it, or with the [`MirrorEvent::WrongPeer`] that ends mirroring
+/// before anything was ingested.
+async fn mirror(
+    db: &Arc<DB>,
+    addr: SocketAddr,
+    expected: Option<InstanceId>,
+    emit: &impl Fn(MirrorEvent),
+) -> Result<MirrorEvent, Error> {
     let mut client = Client::connect(addr).await?;
     let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
+    if let Some(expected) = expected
+        && info.instance_id != Some(expected)
+    {
+        return Ok(MirrorEvent::WrongPeer {
+            expected,
+            found: info.instance_id,
+        });
+    }
     info!(
         ?addr,
         peer_version = info.protocol_version,
@@ -155,6 +218,11 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> 
     // peer through the forwarder below.
     db.add_command_ids(&info.command_ids);
     db.add_commands(&info.commands);
+    // Before the first live sample, the peer's head is the only sign of
+    // where its data ends; seeded manifests stop at its last seal.
+    if let Some(head) = info.last_updated {
+        db.last_updated.update_max(head);
+    }
     emit(MirrorEvent::Connected);
 
     let metadata: DumpMetadataResp = handshake_request(client.request(&DumpMetadata)).await?;
@@ -195,7 +263,7 @@ async fn ingest(
     tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
     db: &Arc<DB>,
 ) -> Error {
-    let mut conn = ConnState::downlink();
+    let mut conn = ConnState::mirror();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
     loop {
@@ -216,14 +284,15 @@ async fn ingest(
     }
 }
 
-/// Periodically import the peer's sealed-node manifests, on the bulk
-/// store connection so a year of GetNodeManifest round trips never delays
-/// live ingest. The first pass per peer connect imports pre-connect
-/// history; later passes pick up spans the peer sealed since — hidden
-/// components (derived LoD series) especially, which never ride the live
-/// stream. The merge is idempotent, so re-seeding is cheap when nothing
-/// changed.
-async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>) {
+/// Periodically import the peer's sealed-node manifests and unsealed
+/// heads, on the bulk store connection so a year of GetNodeManifest round
+/// trips never delays live ingest. A pass runs at start and on every
+/// connect of the live mirror (`connected`), which imports pre-connect
+/// history, the peer's unsealed head included; timed passes pick up spans
+/// the peer sealed since, and where its head moved to — hidden components
+/// (derived LoD series) especially, which never ride the live stream. The
+/// merge is idempotent, so re-seeding is cheap when nothing changed.
+async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>, connected: Arc<WaitQueue>) {
     const RESEED_INTERVAL: Duration = Duration::from_secs(60);
     loop {
         match store.dump_schema().await {
@@ -232,13 +301,19 @@ async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>) {
                 warn!(?err, "failed to dump peer schemas for manifest seeding");
             }
         }
-        stellarator::sleep(RESEED_INTERVAL).await;
+        // A connect while that pass ran stored its wakeup, so it is
+        // answered at once.
+        futures_lite::future::or(stellarator::sleep(RESEED_INTERVAL), async {
+            let _ = connected.wait().await;
+        })
+        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::testing::{serve, with_f64};
     use std::sync::Mutex as StdMutex;
 
     fn event_log() -> (
@@ -279,28 +354,393 @@ mod tests {
     async fn live_peer_emits_connected() {
         let (log, sink) = event_log();
         let dir = tempfile::tempdir().unwrap();
-        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
-        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = crate::Server {
-            listener,
-            db: server_db,
-        };
-        stellarator::struc_con::stellar(move || server.run());
+        let addr = serve(Arc::new(
+            crate::DB::create(dir.path().join("server")).unwrap(),
+        ));
         let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
         RemoteDb::new(addr).on_event(sink).spawn(mirror_db);
         wait_for(&log, MirrorEvent::Connected).await;
         assert_eq!(log.lock().unwrap().first(), Some(&MirrorEvent::Connecting));
     }
+
+    /// A mirror pinned to one database stops for good when another answers
+    /// at its address, takes nothing in from it, and stops its workers.
+    #[stellarator::test]
+    async fn a_different_database_at_the_address_stops_the_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
+        let found = server_db.instance_id();
+        let addr = serve(server_db);
+
+        let expected = InstanceId([9; 16]);
+        assert_ne!(found, expected);
+        let (log, sink) = event_log();
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        let remote = RemoteDb::new(addr)
+            .expect_instance(Some(expected))
+            .on_event(sink);
+        let store = remote.store();
+        remote.spawn(mirror_db);
+        let wrong = MirrorEvent::WrongPeer {
+            expected,
+            found: Some(found),
+        };
+        wait_for(&log, wrong).await;
+        // Longer than the first reconnect backoff: no further attempt.
+        stellarator::sleep(Duration::from_millis(600)).await;
+        assert_eq!(*log.lock().unwrap(), [MirrorEvent::Connecting, wrong]);
+        // The workers dropped their handles on the store when they stopped.
+        assert_eq!(Arc::strong_count(&store), 1);
+        assert!(matches!(
+            PeerStore::new(addr)
+                .expect_instance(Some(expected))
+                .dump_schema()
+                .await,
+            Err(crate::store::StoreError::Unavailable(_))
+        ));
+
+        // The right id mirrors as before.
+        let (log, sink) = event_log();
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror2")).unwrap());
+        RemoteDb::new(addr)
+            .expect_instance(Some(found))
+            .on_event(sink)
+            .spawn(mirror_db);
+        wait_for(&log, MirrorEvent::Connected).await;
+    }
+
+    /// What the mirror's live ingest writes is mirrored data, while the
+    /// peer's own ingest of the same component stays local.
+    #[stellarator::test]
+    async fn mirrored_components_ingest_as_mirrored() {
+        const ID: metor_proto::types::PacketId = [9, 2];
+        let dir = tempfile::tempdir().unwrap();
+        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
+        with_f64(&server_db, ID, "a");
+        let addr = serve(server_db.clone());
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        RemoteDb::new(addr).spawn(mirror_db.clone());
+
+        let id = ComponentId::new("a");
+        let source = |db: &crate::DB| {
+            db.with_state(|s| s.get_component(id).map(|c| c.time_series.is_mirrored()))
+        };
+        for ts in 1i64.. {
+            let mut table = ts.to_le_bytes().to_vec();
+            table.extend_from_slice(&1.5f64.to_le_bytes());
+            server_db.ingest_table(ID, &table).unwrap();
+            if source(&mirror_db) == Some(true) {
+                break;
+            }
+            assert!(ts < 100, "mirror never ingested the live stream");
+            stellarator::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(source(&server_db), Some(false));
+    }
+
+    /// History a peer wrote before the mirror connected and has not sealed
+    /// is listed as the peer's head on connect, so it is range-fetchable
+    /// at once, while live data lands beside it; the mirror's earliest
+    /// timestamp reaches back to it.
+    #[stellarator::test]
+    async fn a_peers_unsealed_history_is_fetchable_from_connect() {
+        use crate::manifest::{SpanSource, SpanState};
+
+        const ID: metor_proto::types::PacketId = [9, 5];
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
+        with_f64(&peer, ID, "a");
+        let write = |peer: &DB, ts: i64| {
+            let mut table = ts.to_le_bytes().to_vec();
+            table.extend_from_slice(&(ts as f64).to_le_bytes());
+            peer.ingest_table(ID, &table).unwrap();
+        };
+        for ts in 1000..1500 {
+            write(&peer, ts);
+        }
+        let a = ComponentId::new("a");
+        let series = |db: &DB| db.with_state(|s| s.get_component(a).map(|c| c.time_series.clone()));
+        assert!(series(&peer).unwrap().manifest().spans.is_empty());
+
+        let addr = serve(peer.clone());
+        let mirror = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        let remote = RemoteDb::new(addr);
+        let hydrator = remote.hydrator();
+        remote.spawn(mirror.clone());
+
+        // The peer writes on while the mirror connects, so it holds more
+        // than it listed by the time the stream starts.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (peer, stop) = (peer.clone(), stop.clone());
+            move || {
+                let mut ts = 1500;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    write(&peer, ts);
+                    ts += 1;
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+        });
+        let head = |mirror: &DB| {
+            let manifest = series(mirror)?.manifest();
+            manifest
+                .spans
+                .iter()
+                .find(|s| s.source == SpanSource::PeerHead)
+                .copied()
+        };
+        eventually("the peer's head listed, with live data beside it", || {
+            let live = series(&mirror).and_then(|s| s.latest()).is_some();
+            live && head(&mirror).is_some_and(|span| span.cover_start == Timestamp(1000))
+        })
+        .await;
+        let span = head(&mirror).unwrap();
+        assert_eq!(span.state, SpanState::RemoteOnly);
+        // It ends right below the live data the mirror holds itself, though
+        // the peer wrote on between its listing and the stream's start.
+        let live_start = series(&mirror)
+            .unwrap()
+            .list
+            .iter()
+            .filter_map(|n| n.timestamps().first().copied())
+            .min()
+            .unwrap();
+        eventually("the head meets the live data", || {
+            head(&mirror).is_some_and(|span| span.cover_end.0 + 1 == live_start.0)
+        })
+        .await;
+        assert!(mirror.earliest_timestamp.latest() <= Timestamp(1000));
+
+        // What a plot asks for as nodes is read by range.
+        let read = |t: i64| {
+            let sample = series(&mirror)?.get(Timestamp(t))?;
+            Some(f64::from_le_bytes(sample.data().try_into().unwrap()))
+        };
+        eventually("the head read by range", || {
+            hydrator.request(
+                a,
+                Timestamp(1000)..live_start,
+                super::super::HydratePriority::Visible,
+            );
+            let last = live_start.0 - 1;
+            read(1000) == Some(1000.0) && read(last) == Some(last as f64)
+        })
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        let mut gaps = crate::manifest::GapVec::new();
+        series(&mirror)
+            .unwrap()
+            .coverage(Timestamp(1000)..live_start, &mut gaps);
+        assert!(gaps.is_empty(), "{gaps:?}");
+    }
+
+    /// Polls `check` every 20 ms until it holds, failing after ten seconds.
+    async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if check() {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("never saw {what}");
+    }
+
+    /// What a session opened: its db, whether the cache was fresh, and its
+    /// hydrator.
+    type Opened = (Arc<DB>, bool, Hydrator);
+
+    /// One mirror session into `id`'s peer cache, on a runtime of its own
+    /// so cancelling it ends the session: its tasks stop, and the cache's
+    /// lock is released.
+    fn cached_session(
+        cache: crate::peer_cache::PeerCache,
+        id: metor_proto_wkt::InstanceId,
+        addr: SocketAddr,
+        cancel: stellarator::util::CancelToken,
+    ) -> (
+        std::sync::mpsc::Receiver<Opened>,
+        stellarator::struc_con::Thread<Option<()>>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = stellarator::struc_con::ThreadBuilder::default()
+            .cancel_token(cancel)
+            .stellar(move || async move {
+                let mut cached = cache.open(id).unwrap().expect("cache is free");
+                let db = Arc::new(cached.open_db().unwrap());
+                let remote = RemoteDb::new(addr);
+                // Handed out before the mirror starts, so the caller sees
+                // the db as the session opened it.
+                tx.send((db.clone(), cached.fresh, remote.hydrator()))
+                    .unwrap();
+                remote.spawn(db);
+                let _held = cached;
+                std::future::pending::<()>().await
+            });
+        (rx, thread)
+    }
+
+    async fn recv<T>(rx: &std::sync::mpsc::Receiver<T>) -> T {
+        loop {
+            match rx.try_recv() {
+                Ok(value) => return value,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    stellarator::sleep(Duration::from_millis(10)).await
+                }
+                Err(err) => panic!("session thread ended: {err}"),
+            }
+        }
+    }
+
+    /// A mirror kept in the peer cache picks up where it left off: what the
+    /// first session held and the manifests it seeded are there the moment
+    /// the second opens, its live data lands in new nodes, and what the
+    /// peer wrote between the sessions hydrates from the peer.
+    #[stellarator::test]
+    async fn a_reopened_peer_cache_resumes_and_fetches_the_gap() {
+        use crate::manifest::SpanState;
+        use stellarator::struc_con::Joinable as _;
+
+        const ID: metor_proto::types::PacketId = [9, 3];
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(crate::DB::create(dir.path().join("peer")).unwrap());
+        with_f64(&peer, ID, "a");
+        let write = |ts: i64| {
+            let mut table = ts.to_le_bytes().to_vec();
+            table.extend_from_slice(&(ts as f64).to_le_bytes());
+            peer.ingest_table(ID, &table).unwrap();
+        };
+        let a = ComponentId::new("a");
+        let series = |db: &DB| db.with_state(|s| s.get_component(a).map(|c| c.time_series.clone()));
+        let latest =
+            |db: &DB| series(db).and_then(|ts| ts.latest().map(|sample| sample.timestamp().0));
+        // Small peer nodes, so history seals (and so can be seeded and
+        // fetched) a hundred samples at a time.
+        write(0);
+        series(&peer)
+            .unwrap()
+            .set_max_node_age(Duration::from_micros(100));
+        for ts in 1..250 {
+            write(ts);
+            if ts % 50 == 0 {
+                stellarator::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        // Sealed spans, not the peer's head, which the cache never keeps.
+        let sealed = |db: &DB| {
+            series(db).map_or(0, |ts| {
+                let manifest = ts.manifest();
+                let spans = manifest.spans.iter();
+                spans
+                    .filter(|s| s.source != crate::manifest::SpanSource::PeerHead)
+                    .count()
+            })
+        };
+        eventually("the peer sealing its history", || sealed(&peer) >= 2).await;
+
+        let addr = serve(peer.clone());
+        let cache = crate::peer_cache::PeerCache::new(dir.path().join("peers"));
+        let id = peer.instance_id();
+
+        // Session one: seed the peer's manifests and watch live data.
+        let cancel = stellarator::util::CancelToken::new();
+        let (rx, session) = cached_session(cache.clone(), id, addr, cancel.clone());
+        let (mirror, fresh, _) = recv(&rx).await;
+        assert!(fresh);
+        let mut ts = 250;
+        eventually("the mirror seeding manifests and ingesting live", || {
+            write(ts);
+            ts += 1;
+            latest(&mirror).is_some_and(|l| l >= 250) && sealed(&mirror) >= 2
+        })
+        .await;
+        let seeded = sealed(&mirror);
+        cancel.cancel();
+        let _ = session.join().await;
+        mirror.flush().unwrap();
+        let held = latest(&mirror).unwrap();
+        drop(mirror);
+
+        // Between sessions the peer keeps writing.
+        let gap_start = ts;
+        for t in gap_start..gap_start + 700 {
+            write(t);
+            if t % 50 == 0 {
+                stellarator::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let resume = gap_start + 700;
+        eventually("the peer sealing the gap", || {
+            series(&peer)
+                .unwrap()
+                .manifest()
+                .spans
+                .iter()
+                .any(|s| s.seal.start_ts.0 > gap_start + 100 && s.seal.end_ts.0 < resume - 100)
+        })
+        .await;
+        let gap = *series(&peer)
+            .unwrap()
+            .manifest()
+            .spans
+            .iter()
+            .find(|s| s.seal.start_ts.0 > gap_start + 100 && s.seal.end_ts.0 < resume - 100)
+            .unwrap();
+
+        // Session two: the same directory, with everything already there.
+        let cancel = stellarator::util::CancelToken::new();
+        let (rx, session) = cached_session(cache.clone(), id, addr, cancel.clone());
+        let (mirror, fresh, hydrator) = recv(&rx).await;
+        assert!(!fresh, "the cache is reopened");
+        assert_eq!(latest(&mirror), Some(held), "what session one held");
+        assert!(sealed(&mirror) >= seeded, "and the manifests it seeded");
+
+        let mut ts = resume;
+        eventually("live data in a new node", || {
+            write(ts);
+            ts += 1;
+            series(&mirror)
+                .and_then(|s| {
+                    s.list
+                        .iter()
+                        .next()
+                        .and_then(|n| n.timestamps().first().copied())
+                })
+                .is_some_and(|head| head.0 > held)
+        })
+        .await;
+
+        let gap_state = || {
+            series(&mirror).and_then(|s| s.manifest().span(gap.cover_start).map(|span| span.state))
+        };
+        eventually("the gap seeded as remote-only", || {
+            gap_state() == Some(SpanState::RemoteOnly)
+        })
+        .await;
+        let range = gap.seal.start_ts..Timestamp(gap.seal.end_ts.0 + 1);
+        eventually("the gap hydrating from the peer", || {
+            hydrator.request(a, range.clone(), super::super::HydratePriority::Visible);
+            series(&mirror).is_some_and(|s| {
+                s.manifest()
+                    .span(gap.cover_start)
+                    .is_some_and(|span| span.state == SpanState::Resident)
+            })
+        })
+        .await;
+        cancel.cancel();
+        let _ = session.join().await;
+    }
 }
 
 /// Import the peer's sealed-node manifest for every component it knows,
-/// so history that never rides the live stream shows up as fetchable
-/// remote-only coverage. Components are created on demand (a seeded
-/// component has no live writer, so the merge cannot conflict with
-/// ingest); ones with no sealed history are skipped rather than created
-/// empty. Per-component failures are logged and skipped — one bad
-/// component must not hide the rest of the archive.
+/// with its unsealed head, so history that never rides the live stream,
+/// and history from before the mirror connected that the peer has not
+/// sealed yet, shows up as fetchable remote-only coverage. Components are
+/// created on demand (a seeded component has no live writer, so the merge
+/// cannot conflict with ingest); ones with no history at all are skipped
+/// rather than created empty. Per-component failures are logged and
+/// skipped — one bad component must not hide the rest of the archive.
 async fn seed_manifests(
     db: &Arc<DB>,
     store: &Arc<PeerStore>,
@@ -309,21 +749,23 @@ async fn seed_manifests(
     let mut components = 0usize;
     let mut spans = 0usize;
     for (component_id, schema) in schemas {
-        let name = db
-            .with_state(|state| {
-                state
-                    .get_component_metadata(component_id)
-                    .map(|m| m.name.clone())
-            })
-            .unwrap_or_default();
-        let seals = match store.list(component_id, &name).await {
-            Ok(seals) => seals,
+        let name = super::range::component_name(db, component_id);
+        let Listing { nodes, head } = match store.listing(component_id, &name).await {
+            Ok(listing) => listing,
             Err(err) => {
                 warn!(?err, ?component_id, "failed to list remote sealed nodes");
                 continue;
             }
         };
-        if seals.is_empty() {
+        // An empty listing still matters to a component seeded before: the
+        // peer dropped every seal it had.
+        let existing = db.with_state(|state| state.components.get(&component_id).cloned());
+        if nodes.is_empty() && head.is_none() {
+            if let Some(component) = existing
+                && let Err(err) = component.time_series.sync_remote(nodes, None)
+            {
+                warn!(?err, ?component_id, "failed to sync remote spans");
+            }
             continue;
         }
         let inserted = db.with_state_mut(|state| {
@@ -337,21 +779,21 @@ async fn seed_manifests(
         else {
             continue;
         };
-        let bounds = seals
+        let bounds = nodes
             .iter()
-            .fold(None::<(i64, i64)>, |acc, seal| match acc {
-                Some((min, max)) => Some((min.min(seal.start_ts.0), max.max(seal.end_ts.0))),
-                None => Some((seal.start_ts.0, seal.end_ts.0)),
-            });
-        match component.time_series.merge_remote_spans(seals) {
-            Ok(0) => {}
+            .map(|seal| (seal.start_ts.0, seal.end_ts.0))
+            .chain(head.map(|head| (head.start_ts.0, head.end_ts.0)))
+            .reduce(|(min, max), (start, end)| (min.min(start), max.max(end)));
+        match component.time_series.sync_remote(nodes, head) {
             Ok(added) => {
                 if let Some((min, max)) = bounds {
                     db.earliest_timestamp.update_min(Timestamp(min));
                     db.last_updated.update_max(Timestamp(max));
                 }
-                components += 1;
-                spans += added;
+                if added > 0 {
+                    components += 1;
+                    spans += added;
+                }
             }
             Err(err) => {
                 warn!(?err, ?component_id, "failed to merge remote spans");

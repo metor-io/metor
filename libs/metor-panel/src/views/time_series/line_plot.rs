@@ -21,6 +21,7 @@ use super::bounds::PlotView;
 use super::gpu::{AxisSource, LineDraw, PlotRenderState};
 use super::override_field::Override;
 use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
+use crate::data_binding::RAW_SAMPLE_BUDGET;
 use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
 use crate::views::plot_common::{gpu_frame, link_traces, reconcile_trackers};
 use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
@@ -64,12 +65,6 @@ impl TraceTracking {
         }
     }
 }
-
-/// Per-trace sample budget for raw rendering: a quarter of the GPU value
-/// capacity, leaving room for several traces per plot. Windows estimated
-/// above it render from a min/max LoD component, whose buckets each render
-/// two points and so count double against the same budget.
-const RAW_SAMPLE_BUDGET: u64 = 1_000_000;
 
 /// Previous values of the reflected override knobs. Compared on each
 /// reconcile so an inspector edit can clear the interactive view override.
@@ -340,6 +335,7 @@ impl LinePlot {
                 &self.db,
                 cfg.source.id(),
                 component,
+                tracking.plan.as_ref(),
                 range.clone(),
                 RAW_SAMPLE_BUDGET,
                 1,
@@ -509,7 +505,7 @@ impl LinePlot {
                 // what lets a full-range view span the whole archive.
                 let manifest = comp.time_series.manifest();
                 if let Some(span) = manifest.spans.first() {
-                    start = start.min(span.seal.start_ts.0 as f64);
+                    start = start.min(span.cover_start.0 as f64);
                     any_time = true;
                 }
                 if let Some(span) = manifest.spans.last() {

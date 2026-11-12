@@ -144,7 +144,11 @@ mod tests {
         }
         assert!(seeded, "local db never seeded the remote manifest");
 
-        hydrator.request(component_id, Timestamp(1_000)..Timestamp(1_064));
+        hydrator.request(
+            component_id,
+            Timestamp(1_000)..Timestamp(1_064),
+            metor_db::remote::HydratePriority::Visible,
+        );
         let mut hydrated = false;
         for _ in 0..40 {
             sleep(Duration::from_millis(50)).await;
@@ -274,9 +278,9 @@ mod tests {
         // Buckets stop at the sealed frontier and stamp midpoints.
         assert!(latest.timestamp().0 < 1_064 + bucket_us);
 
-        // A mirror syncs the hidden metadata but must not materialize the
-        // LoD component from the live stream — its data arrives only via
-        // sealed-span seeding + hydration.
+        // A mirror syncs the hidden metadata, and may list the companion's
+        // unsealed head as remote-only history to fetch, but never takes its
+        // samples from the live stream, which carries no hidden components.
         let local_dir =
             std::env::temp_dir().join(format!("metor_db_lod_local_{}", fastrand::u64(..)));
         let local_db = Arc::new(DB::create(local_dir).unwrap());
@@ -296,7 +300,11 @@ mod tests {
         }
         assert!(metadata_synced, "mirror never synced lod metadata");
         assert!(
-            local_db.with_state(|state| state.get_component(lod_id).is_none()),
+            local_db.with_state(|state| {
+                state
+                    .get_component(lod_id)
+                    .is_none_or(|c| c.time_series.latest().is_none())
+            }),
             "lod component leaked onto the mirror through the live stream"
         );
         std::fs::remove_dir_all(&scratch).ok();
@@ -745,9 +753,8 @@ mod tests {
         // Query the time series data
         let query = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(10000),
-            component_id,
             limit: Some(256),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(10000))
         };
 
         let time_series = client.request(&query).await.unwrap();
@@ -1023,23 +1030,23 @@ mod tests {
 
         let query = GetTimeSeries {
             id: 1u16.to_le_bytes(),
-            range: Timestamp(0)..Timestamp(10000),
-            component_id,
             limit: None,
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(10000))
         };
 
-        let result = client.request(&query).await;
-
-        result.unwrap_err();
+        // A component with no samples answers with nothing, vouching for
+        // the whole range rather than failing.
+        let reply = client.request(&query).await.unwrap();
+        assert_eq!(reply.len, 0);
+        assert_eq!(reply.covered, Timestamp(0)..Timestamp(10000));
 
         // Now try with non-existent component
         let non_existent_component_id = ComponentId::new("non_existent_component");
 
         let query = GetTimeSeries {
             id: 1u16.to_le_bytes(),
-            range: Timestamp(0)..Timestamp(10000),
-            component_id: non_existent_component_id,
             limit: None,
+            ..GetTimeSeries::range(non_existent_component_id, Timestamp(0)..Timestamp(10000))
         };
 
         // Should return an error for non-existent component
@@ -1203,9 +1210,8 @@ mod tests {
         let mut verification_client = Client::connect(addr).await.unwrap();
         let query = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: Some(NUM_CLIENTS * WRITES_PER_CLIENT),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
 
         let time_series = verification_client.request(&query).await.unwrap();
@@ -1262,9 +1268,8 @@ mod tests {
 
             let query = GetTimeSeries {
                 id: vtable_id,
-                range: Timestamp(0)..Timestamp(i64::MAX),
-                component_id,
                 limit: Some(256),
+                ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
             };
             let time_series = client.request(&query).await.unwrap();
             let data_before = <[f64]>::ref_from_bytes(time_series.data().unwrap()).unwrap();
@@ -1294,9 +1299,8 @@ mod tests {
 
         let query = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: Some(256),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
         let new_time_series = new_client.request(&query).await.unwrap();
         let data_after = <[f64]>::ref_from_bytes(new_time_series.data().unwrap()).unwrap();
@@ -1354,9 +1358,8 @@ mod tests {
 
         let query_limited = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: Some(10),
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
 
         let time_series_limited = client.request(&query_limited).await.unwrap();
@@ -1364,9 +1367,8 @@ mod tests {
 
         let query_all = GetTimeSeries {
             id: vtable_id,
-            range: Timestamp(0)..Timestamp(i64::MAX),
-            component_id,
             limit: None,
+            ..GetTimeSeries::range(component_id, Timestamp(0)..Timestamp(i64::MAX))
         };
 
         let time_series_all = client.request(&query_all).await.unwrap();
@@ -1445,7 +1447,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        let sql = "SELECT * FROM `sensor_1_temp`, `sensor_2_temp` WHERE `sensor_1_temp`.`sensor_1_temp` > 22.0";
+        let sql = "SELECT * FROM `sensor1.temp`, `sensor2.temp` WHERE `sensor1.temp`.`sensor1.temp` > 22.0";
         let mut stream = client.stream(&SQLQuery(sql.to_string())).await.unwrap();
 
         let mut batches = vec![];
@@ -1461,7 +1463,7 @@ mod tests {
             }
         }
 
-        let sql_simple = "SELECT * FROM `sensor_1_temp` UNION ALL SELECT * FROM `sensor_2_temp`";
+        let sql_simple = "SELECT * FROM `sensor1.temp` UNION ALL SELECT * FROM `sensor2.temp`";
         let mut stream_simple = client
             .stream(&SQLQuery(sql_simple.to_string()))
             .await

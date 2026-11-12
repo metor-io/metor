@@ -87,11 +87,26 @@ pub struct ActiveConnection {
     resolved: Option<std::sync::mpsc::Receiver<target::Resolved>>,
     /// Poll-task bookkeeping: last status generation folded into the UI.
     last_generation: u64,
+    /// Listed only to say why it can't connect ([`cache_refusal`]); no
+    /// backend runs behind it.
+    refused: bool,
 }
 
 impl ActiveConnection {
     pub fn status(&self) -> ConnectionStatus {
         self.status.get()
+    }
+
+    /// Whether this row stands for a connection the session refused, so
+    /// nothing is fetched or awaited through it.
+    pub(crate) fn is_refused(&self) -> bool {
+        self.refused
+    }
+
+    /// Whether this connection can fetch history back on demand, which is
+    /// what lets the panel evict its copy.
+    pub(crate) fn fetches_history(&self) -> bool {
+        self.hydrator.is_some()
     }
 }
 
@@ -654,6 +669,10 @@ impl ConnectionsStore {
 
     /// Stand up `target`'s backend against the shared DB. A no-op when the
     /// target is already connected.
+    ///
+    /// A session whose DB is a peer's cache mirrors only that peer: any
+    /// other target is listed as failed, with no backend behind it, until
+    /// it is disconnected.
     pub fn connect(&mut self, target: ConnectionTarget, cx: &mut Context<Self>) {
         if self.is_connected(&target.id) {
             return;
@@ -663,11 +682,28 @@ impl ConnectionsStore {
         };
         let cancel = CancelToken::new();
         let status = StatusHandle::default();
+        let cached = crate::session::cached_peer(cx);
+        let others = self.active.iter().any(|c| !c.refused);
+        if let Some(reason) = cache_refusal(cached, &target, others) {
+            status.set(ConnectionStatus::Failed(reason));
+            self.active.push(ActiveConnection {
+                target,
+                cancel,
+                status,
+                hydrator: None,
+                resolved: None,
+                last_generation: 0,
+                refused: true,
+            });
+            cx.notify();
+            return;
+        }
         let connected = target.backend.connect(ConnectContext {
             db,
             cancel: cancel.clone(),
             status: status.clone(),
             options: self.state.options_for(&target),
+            expect_instance: cached.map(|peer| peer.id),
             tasks: self.tasks.clone(),
         });
         if let Some(hydrator) = &connected.hydrator {
@@ -691,6 +727,7 @@ impl ConnectionsStore {
             hydrator: connected.hydrator,
             resolved: connected.resolved,
             last_generation: 0,
+            refused: false,
         });
         cx.notify();
     }
@@ -725,6 +762,25 @@ impl ConnectionsStore {
         }
         cx.notify();
     }
+}
+
+/// Why a session caching `cached` won't connect `target`, with `others`
+/// saying whether another connection is already live. A peer cache holds
+/// one system's history; a second system, or something else answering in
+/// its place, would write into it.
+fn cache_refusal(
+    cached: Option<crate::session::CachedPeer>,
+    target: &ConnectionTarget,
+    others: bool,
+) -> Option<SharedString> {
+    let cached = cached?;
+    if target.peer == Some(cached.addr) && !others {
+        return None;
+    }
+    Some(SharedString::from(format!(
+        "This session caches {}; start a temporary session to mirror several systems",
+        cached.addr
+    )))
 }
 
 #[cfg(test)]

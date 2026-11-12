@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_lite::future;
+use metor_db::scratch::{self, ScratchDir};
 use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
@@ -34,12 +35,37 @@ pub struct DbParams {
     /// uses a fresh directory under the system temp dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// What happens to the database when the run stops. When unset, a
+    /// database without a `path` is deleted and one with a `path` is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_exit: Option<OnExit>,
     /// The target's telemetry namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// The commands that subscribers receive through this database.
     #[serde(default)]
     pub commands: Vec<DbCommand>,
+}
+
+impl DbParams {
+    /// What happens to the database when the run stops, with the default
+    /// resolved against `path`.
+    pub fn on_exit(&self) -> OnExit {
+        self.on_exit.unwrap_or(match self.path {
+            Some(_) => OnExit::Keep,
+            None => OnExit::Delete,
+        })
+    }
+}
+
+/// What a `Db` does with its database when the run stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExit {
+    /// The database directory is deleted.
+    Delete,
+    /// The database directory is left in place.
+    Keep,
 }
 
 /// A command a `Db` takes from its clients and serves to the subscribers
@@ -97,28 +123,39 @@ impl DbStatus {
     }
 }
 
+/// The temp-dir prefix of a `Db` without a `path`.
+const SCRATCH_PREFIX: &str = "metor-db-";
+
 /// A link that stores every record wired into it in an embedded metor-db.
 pub struct Db {
     listener: Option<TcpListener>,
     db: Arc<DB>,
     params: DbParams,
+    /// The temporary directory a deleted-on-exit database without a `path`
+    /// lives in, locked while the link runs.
+    scratch: Option<ScratchDir>,
 }
 
 impl Db {
     /// Binds the listener and opens the database, creating it if needed.
     ///
     /// Both happen here so that a taken address or an unwritable path fails
-    /// the build instead of the run.
+    /// the build instead of the run. Temporary databases that crashed runs
+    /// left behind are removed in the background.
     pub fn new(params: DbParams) -> Result<Self, MakeError> {
         let listener = TcpListener::bind(params.listen.as_str()).map_err(|e| MakeError::Bind {
             addr: params.listen.clone(),
             message: e.to_string(),
         })?;
-        let port = listener.local_addr().map_or(0, |addr| addr.port());
-        let path = params.path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("metor-db-{}-{port}", std::process::id()))
-        });
-        let store = if path.exists() {
+        std::thread::spawn(|| scratch::sweep(SCRATCH_PREFIX));
+        let (path, scratch) = match &params.path {
+            Some(path) => (path.clone(), None),
+            None => Self::scratch_dir(params.on_exit()).map_err(|error| MakeError::OpenDb {
+                path: std::env::temp_dir().display().to_string(),
+                message: error.to_string(),
+            })?,
+        };
+        let store = if params.path.is_some() && path.exists() {
             DB::open(path.clone())
         } else {
             DB::create(path.clone())
@@ -127,11 +164,46 @@ impl Db {
             path: path.display().to_string(),
             message: error.to_string(),
         })?;
+        // A scratch directory is new every run, so even one kept on exit
+        // is never served again under this id.
+        db.set_ephemeral(params.path.is_none() || params.on_exit() == OnExit::Delete);
         Ok(Self {
             listener: Some(listener),
             db: Arc::new(db),
             params,
+            scratch,
         })
+    }
+
+    /// Creates the temporary directory of a database without a `path`.
+    ///
+    /// It stays locked while the link runs, unless the database is kept.
+    fn scratch_dir(on_exit: OnExit) -> std::io::Result<(PathBuf, Option<ScratchDir>)> {
+        let dir = ScratchDir::create(SCRATCH_PREFIX)?;
+        Ok(match on_exit {
+            OnExit::Delete => (dir.path().to_owned(), Some(dir)),
+            OnExit::Keep => (dir.keep()?, None),
+        })
+    }
+
+    /// Deletes the database directory if the params ask for it.
+    ///
+    /// Called once the serve task and the writer have stopped. Clients and
+    /// background tasks may still map its files; unix keeps those mappings
+    /// valid after the directory is gone.
+    fn finish(&mut self, log: &mut Log) {
+        if self.params.on_exit() == OnExit::Keep {
+            return;
+        }
+        let path = self.db.path.clone();
+        let removed = match self.scratch.take() {
+            Some(dir) => dir.remove(),
+            None => std::fs::remove_dir_all(&path),
+        };
+        match removed {
+            Ok(()) => log.info(format!("deleted {}", path.display())),
+            Err(error) => log.fault("delete_db", format!("{}: {error}", path.display())),
+        }
     }
 }
 
@@ -158,7 +230,10 @@ pub async fn db(
         .collect();
     let commands = match commands {
         Ok(commands) => commands,
-        Err(error) => return log.fault("unknown_command", error.to_string()),
+        Err(error) => {
+            log.fault("unknown_command", error.to_string());
+            return s.finish(log);
+        }
     };
     // PANIC Safety: `new` always sets the listener, and a system runs once.
     let listener = s.listener.take().expect("one run per instance");
@@ -173,7 +248,7 @@ pub async fn db(
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
     }
-    let _udp = addr.map(|addr| {
+    let udp_task = addr.map(|addr| {
         let db = db.clone();
         let udp = async move {
             if let Err(error) = Server::handle_udp(addr, db).await {
@@ -182,8 +257,8 @@ pub async fn db(
         };
         stellarator::spawn(udp).drop_guard()
     });
-    let _serve = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
-    metor_db::lod::spawn(db.clone());
+    let serve_task = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
+    let lod = metor_db::lod::start(db.clone());
 
     let mut status = DbStatus::default();
     let mut reported = status;
@@ -197,7 +272,7 @@ pub async fn db(
             false
         };
         if !future::or(stopped, ready).await {
-            return;
+            break;
         }
         ingest(&db, inputs, &sinks, &mut status);
         status.timestamp = Timestamp::now();
@@ -206,6 +281,10 @@ pub async fn db(
             reported = status;
         }
     }
+    drop(serve_task);
+    drop(udp_task);
+    drop(lod);
+    s.finish(log);
 }
 
 /// Describes each resolved command for the database's clients.
@@ -562,6 +641,7 @@ mod tests {
         let params = DbParams {
             listen: "127.0.0.1:0".into(),
             path: Some(dir.path().join("store")),
+            on_exit: None,
             namespace: Some("gw".into()),
             commands: Vec::new(),
         };
@@ -569,11 +649,71 @@ mod tests {
         assert!(dir.path().join("store").is_dir());
     }
 
+    fn params(path: Option<PathBuf>, on_exit: Option<OnExit>) -> DbParams {
+        DbParams {
+            listen: "127.0.0.1:0".into(),
+            path,
+            on_exit,
+            namespace: None,
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_on_exit_defaults_to_delete_without_a_path() {
+        let path = Some(PathBuf::from("store"));
+        assert_eq!(params(None, None).on_exit(), OnExit::Delete);
+        assert_eq!(params(path.clone(), None).on_exit(), OnExit::Keep);
+        assert_eq!(params(None, Some(OnExit::Keep)).on_exit(), OnExit::Keep);
+        assert_eq!(params(path, Some(OnExit::Delete)).on_exit(), OnExit::Delete);
+        let parsed: DbParams = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "path": null,
+            "on_exit": "keep",
+        }))
+        .expect("valid params");
+        assert_eq!(parsed.on_exit, Some(OnExit::Keep));
+    }
+
+    #[test]
+    fn test_temporary_store_is_deleted_on_finish() {
+        let mut db = Db::new(params(None, None)).expect("a free port");
+        let path = db.db.path.clone();
+        assert!(path.starts_with(std::env::temp_dir()) && path.is_dir());
+        assert!(db.db.ephemeral(), "advertised as deleted on exit");
+        scratch::sweep(SCRATCH_PREFIX);
+        assert!(path.is_dir(), "a running db's dir survives a sweep");
+        db.finish(&mut Log);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_kept_stores_survive_finish() {
+        let mut temporary = Db::new(params(None, Some(OnExit::Keep))).expect("a free port");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut at_path =
+            Db::new(params(Some(dir.path().join("store")), None)).expect("a free port");
+        assert!(
+            temporary.db.ephemeral(),
+            "a kept scratch db is never served under its id again"
+        );
+        assert!(!at_path.db.ephemeral());
+        temporary.finish(&mut Log);
+        at_path.finish(&mut Log);
+        let kept = temporary.db.path.clone();
+        drop(temporary);
+        scratch::sweep(SCRATCH_PREFIX);
+        assert!(kept.join("db_state").exists());
+        assert!(at_path.db.path.join("db_state").exists());
+        std::fs::remove_dir_all(kept).expect("removes");
+    }
+
     #[test]
     fn test_reject_an_unassignable_address() {
         let params = DbParams {
             listen: "203.0.113.1:9".into(),
             path: None,
+            on_exit: None,
             namespace: None,
             commands: Vec::new(),
         };

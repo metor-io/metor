@@ -55,11 +55,15 @@ mod arc_ring;
 mod arrow;
 pub mod disruptor;
 mod error;
+pub mod evict;
 pub mod lod;
 pub mod manifest;
 pub mod msg_log;
+pub mod peer_cache;
 pub mod remote;
+pub mod scratch;
 pub mod seal;
+mod series;
 pub mod store;
 pub mod tiering;
 pub mod time_series;
@@ -67,6 +71,7 @@ pub mod time_series;
 mod vtable_stream;
 
 pub mod snapshot;
+pub mod storage;
 
 pub struct DB {
     pub vtable_gen: AtomicCell<u64>,
@@ -82,6 +87,38 @@ pub struct DB {
     /// Earliest timestamp known to this instance. Moves backwards when
     /// older history is hydrated from a store.
     pub earliest_timestamp: AtomicCell<Timestamp>,
+    /// This database's identity, advertised in [`DbInfoResp`].
+    instance_id: InstanceId,
+    /// Whether this database lasts only its owner's run; advertised in
+    /// [`DbInfoResp`] so mirrors don't cache it. See [`DB::set_ephemeral`].
+    ephemeral: AtomicBool,
+}
+
+/// The file in a database directory holding its [`InstanceId`] as hex. It
+/// sits beside `db_state` rather than in it because [`DbConfig`] is a wire
+/// type a client can overwrite with `SetDbConfig`, and identity isn't
+/// something a client gets to set.
+const INSTANCE_ID_FILE: &str = "instance_id";
+
+/// Read `dir`'s instance id, or make and save one for a database that
+/// predates them (or whose file is unreadable).
+fn load_instance_id(dir: &Path) -> Result<InstanceId, Error> {
+    let path = dir.join(INSTANCE_ID_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes).map(|text| text.trim().parse()) {
+            Ok(Ok(id)) => return Ok(id),
+            _ => warn!(?path, "replacing an unreadable instance id"),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    save_new_instance_id(dir)
+}
+
+fn save_new_instance_id(dir: &Path) -> Result<InstanceId, Error> {
+    let id = InstanceId(fastrand::u128(..).to_le_bytes());
+    seal::atomic_write(dir, INSTANCE_ID_FILE, format!("{id}\n").as_bytes())?;
+    Ok(id)
 }
 
 #[derive(Default)]
@@ -130,6 +167,7 @@ impl DB {
         info!(?path, "created db");
 
         std::fs::create_dir_all(&path)?;
+        let instance_id = save_new_instance_id(&path)?;
         let default_stream_time_step = AtomicU64::new(time_step.as_nanos() as u64);
         let state = State {
             db_config: DbConfig {
@@ -147,6 +185,8 @@ impl DB {
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: AtomicCell::new(Timestamp::now()),
+            instance_id,
+            ephemeral: AtomicBool::new(false),
         };
         db.save_db_state()?;
         Ok(db)
@@ -269,6 +309,7 @@ impl DB {
 
         info!(db.path = ?path, "opened db");
         let db_state = DbConfig::read(path.join("db_state"))?;
+        let instance_id = load_instance_id(&path)?;
         let state = State {
             db_config: db_state.clone(),
             components,
@@ -292,7 +333,28 @@ impl DB {
             ),
             last_updated: AtomicCell::new(Timestamp(last_updated)),
             earliest_timestamp: AtomicCell::new(earliest_timestamp),
+            instance_id,
+            ephemeral: AtomicBool::new(false),
         })
+    }
+
+    /// This database's identity: made by [`DB::create`], kept on disk, and
+    /// the same after every [`DB::open`].
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    /// Whether this database is advertised as lasting only its owner's run.
+    pub fn ephemeral(&self) -> bool {
+        self.ephemeral.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Declare that this database lasts only its owner's run: deleted when
+    /// it stops, or in a scratch directory no later run reopens. The DB
+    /// doesn't delete anything itself; this only tells clients, through
+    /// [`DbInfoResp::ephemeral`], not to treat it as a lasting peer.
+    pub fn set_ephemeral(&self, ephemeral: bool) {
+        self.ephemeral.store(ephemeral, atomic::Ordering::Relaxed);
     }
 
     /// Register an announced vtable under its id. A re-announce of the same
@@ -366,10 +428,25 @@ impl DB {
     /// A new component, or a first sample into an empty series, bumps
     /// `vtable_gen` so subscribers re-derive membership.
     pub fn ingest_table(&self, id: PacketId, buf: &[u8]) -> Result<(), Error> {
-        let received = Timestamp::now();
-        let pushed = match self.ingest_static(id, buf, received)? {
+        self.ingest_table_from(id, buf, None)
+    }
+
+    /// [`Self::ingest_table`] for a table a mirror receives during `mirror`,
+    /// which marks every component it writes as mirrored (see
+    /// [`time_series::MirrorRun`]).
+    pub fn ingest_table_from(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        mirror: Option<time_series::MirrorRun>,
+    ) -> Result<(), Error> {
+        let arrival = Arrival {
+            received: Timestamp::now(),
+            mirror,
+        };
+        let pushed = match self.ingest_static(id, buf, arrival)? {
             StaticIngest::Pushed(pushed) => pushed,
-            StaticIngest::Dynamic => self.ingest_dynamic(id, buf, received)?,
+            StaticIngest::Dynamic => self.ingest_dynamic(id, buf, arrival)?,
         };
         if pushed.new_series {
             self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
@@ -386,7 +463,7 @@ impl DB {
         &self,
         id: PacketId,
         buf: &[u8],
-        received: Timestamp,
+        arrival: Arrival,
     ) -> Result<StaticIngest, Error> {
         self.with_state(|state| {
             let vtable = state
@@ -401,7 +478,7 @@ impl DB {
                 let component = state
                     .get_component(rf.component_id)
                     .ok_or(Error::ComponentNotFound(rf.component_id))?;
-                pushed.merge(push_field(component, &rf, received)?);
+                pushed.merge(push_field(component, &rf, arrival)?);
                 Ok(())
             })?;
             Ok(StaticIngest::Pushed(pushed))
@@ -409,16 +486,11 @@ impl DB {
     }
 
     /// Sinks a dynamic table, taking the write lock only when a member is new.
-    fn ingest_dynamic(
-        &self,
-        id: PacketId,
-        buf: &[u8],
-        received: Timestamp,
-    ) -> Result<Pushed, Error> {
-        let pushed = match self.with_state(|state| state.push_known_fields(id, buf, received))? {
+    fn ingest_dynamic(&self, id: PacketId, buf: &[u8], arrival: Arrival) -> Result<Pushed, Error> {
+        let pushed = match self.with_state(|state| state.push_known_fields(id, buf, arrival))? {
             Some(pushed) => pushed,
             None => {
-                self.with_state_mut(|state| state.realize_and_push(id, buf, received, &self.path))?
+                self.with_state_mut(|state| state.realize_and_push(id, buf, arrival, &self.path))?
             }
         };
         self.with_state(|state| state.cache_latest_table(id, buf));
@@ -701,7 +773,7 @@ impl State {
         &self,
         id: PacketId,
         buf: &[u8],
-        received: Timestamp,
+        arrival: Arrival,
     ) -> Result<Option<Pushed>, Error> {
         let vtable = self.dynamic_vtable(id)?;
         let known = vtable.for_each_field::<Error>(Some(buf), &mut |rf| match self
@@ -720,7 +792,7 @@ impl State {
             let component = self
                 .get_component(rf.component_id)
                 .ok_or(Error::ComponentNotFound(rf.component_id))?;
-            pushed.merge(push_field(component, &rf, received)?);
+            pushed.merge(push_field(component, &rf, arrival)?);
             Ok(())
         })?;
         Ok(Some(pushed))
@@ -731,7 +803,7 @@ impl State {
         &mut self,
         id: PacketId,
         buf: &[u8],
-        received: Timestamp,
+        arrival: Arrival,
         db_path: &Path,
     ) -> Result<Pushed, Error> {
         // Cloned out so realizing a member can take `&mut self`.
@@ -739,7 +811,7 @@ impl State {
         let mut pushed = Pushed::default();
         vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
             let component = self.realize_component(&rf, db_path)?;
-            pushed.merge(push_field(component, &rf, received)?);
+            pushed.merge(push_field(component, &rf, arrival)?);
             Ok(())
         })?;
         Ok(pushed)
@@ -1033,18 +1105,43 @@ impl Pushed {
     }
 }
 
-/// Pushes one realized field into `component`, stamped `received` when its
-/// vtable names no timestamp.
+/// How a table reached this db: when, and whether through a mirror.
+#[derive(Clone, Copy)]
+struct Arrival {
+    received: Timestamp,
+    mirror: Option<time_series::MirrorRun>,
+}
+
+impl Arrival {
+    #[cfg(test)]
+    fn local(received: Timestamp) -> Self {
+        Self {
+            received,
+            mirror: None,
+        }
+    }
+}
+
+/// Pushes one realized field into `component`, stamped with its arrival
+/// when its vtable names no timestamp.
 fn push_field(
     component: &Component,
     rf: &RealizedField,
-    received: Timestamp,
+    arrival: Arrival,
 ) -> Result<Pushed, Error> {
     // PANIC Safety: the callers walk a table, so every field realizes a view.
     let view = rf.view.as_ref().expect("table provided to for_each_field");
-    let ts = rf.timestamp.unwrap_or(received);
+    if let Some(run) = arrival.mirror {
+        component.time_series.enter_mirror_run(run);
+    }
     let new_series = component.time_series.is_empty();
-    component.push_buf(ts, view.as_bytes())?;
+    let ts = match rf.timestamp {
+        Some(ts) => {
+            component.push_buf(ts, view.as_bytes())?;
+            ts
+        }
+        None => component.push_buf_received(arrival.received, view.as_bytes()),
+    };
     Ok(Pushed {
         max_ts: Some(ts),
         new_series,
@@ -1243,19 +1340,49 @@ impl Component {
         }
     }
 
+    /// Pushes a sample at `timestamp`, refusing one older than the series.
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
         if timestamp < self.last_timestamp.latest() {
             return Err(Error::TimeTravel);
         }
+        self.write_wal(timestamp, value_buf, false);
+        Ok(())
+    }
+
+    /// Pushes a sample this db stamped with its own clock when the table
+    /// arrived, returning the timestamp it was written at.
+    ///
+    /// Connections stamp their tables before they contend for the WAL, so
+    /// when two write one component at once the later stamp can land
+    /// first. Neither sample is stale, so rather than refuse the other one
+    /// as time travel, it lands at the latest timestamp: the db's arrival
+    /// clock stays monotonic per component.
+    pub fn push_buf_received(&self, received: Timestamp, value_buf: &[u8]) -> Timestamp {
+        self.write_wal(received, value_buf, true)
+    }
+
+    /// Writes one sample to the WAL at `timestamp`. With `restamp`, a
+    /// timestamp a concurrent writer has since passed is moved up to the
+    /// series' latest, settled under the grant's write lock where
+    /// `last_timestamp` is exact. Without it the sample keeps the timestamp
+    /// its sender gave it, and the WAL's drain refuses it if it is now out
+    /// of order.
+    fn write_wal(&self, timestamp: Timestamp, value_buf: &[u8], restamp: bool) -> Timestamp {
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             self.warn_wal_drop(timestamp);
-            return Ok(());
+            return timestamp;
+        };
+        let timestamp = match restamp {
+            true => timestamp.max(self.last_timestamp.latest()),
+            false => timestamp,
         };
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
-        drop(grant);
+        // Before the grant releases the write lock, so the next writer's
+        // stamp sees this one.
         self.last_timestamp.update_max(timestamp);
-        Ok(())
+        drop(grant);
+        timestamp
     }
 }
 
@@ -1337,6 +1464,9 @@ struct ConnState {
     /// command lands on sends the same table back down, and logging that
     /// echo as a command would forward it up again, round and round.
     downlink: bool,
+    /// Set on a db mirror's connection: the peer is the authority for
+    /// everything it streams, so the components it writes are mirrored.
+    mirror: Option<time_series::MirrorRun>,
 }
 
 impl ConnState {
@@ -1347,6 +1477,15 @@ impl ConnState {
             ..Self::default()
         }
     }
+
+    /// The state for a db mirror's connection, a downlink whose peer can
+    /// serve back everything it streams.
+    pub(crate) fn mirror() -> Self {
+        Self {
+            mirror: Some(time_series::MirrorRun::next()),
+            ..Self::downlink()
+        }
+    }
 }
 
 struct IncomingNode {
@@ -1355,16 +1494,26 @@ struct IncomingNode {
     staging: store::NodeStaging,
 }
 
+/// The largest packet a connection accepts.
+const MAX_PACKET_LEN: usize = 1024 * 1024 * 1024;
+
+/// What a connection's receive buffer and response packet start at. Large
+/// enough for any UDP datagram, since a datagram that doesn't fit is cut.
+const CONN_BUF_LEN: usize = 128 * 1024;
+
 async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     mut tx: Arc<Mutex<PacketSink<OwnedWriter<A>>>>,
     mut rx: PacketStream<OwnedReader<A>>,
     db: Arc<DB>,
 ) -> Result<(), Error> {
-    let mut buf = vec![0u8; 1024 * 1024 * 1024];
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024 * 1024);
+    // Both buffers start small and grow to the largest packet the
+    // connection carries, up to `MAX_PACKET_LEN`, so each open connection
+    // costs only what it uses.
+    let mut buf = vec![0u8; CONN_BUF_LEN];
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], CONN_BUF_LEN);
     let mut conn = ConnState::default();
     loop {
-        let pkt = rx.next(buf).await?;
+        let pkt = rx.next_grow_max(buf, MAX_PACKET_LEN).await?;
         let req_id = pkt.req_id();
         let mut pkt_tx = PacketTx {
             req_id,
@@ -1441,162 +1590,6 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
         self.pkt = Some(pkt);
         res.map_err(Error::from)
     }
-
-    pub async fn send_time_series(
-        &mut self,
-        id: PacketId,
-        timestamps: &[Timestamp],
-        data: &[u8],
-    ) -> Result<(), Error> {
-        let req_id = self.req_id;
-        self.send_with_builder(|pkt| {
-            let header = PacketHeader {
-                packet_ty: metor_proto::types::PacketTy::TimeSeries,
-                id,
-                req_id,
-            };
-            pkt.as_mut_packet().header = header;
-            pkt.clear();
-            pkt.extend_from_slice(&(timestamps.len() as u64).to_le_bytes());
-            pkt.extend_from_slice(timestamps.as_bytes());
-            pkt.extend_from_slice(data);
-            Ok(())
-        })
-        .await
-    }
-}
-
-/// Upper bound on a `GetTimeSeries` response, header included.
-const SERIES_BUDGET: usize = 256 * 1024 * 1024;
-/// A time series packet's bytes before its timestamps: header and count.
-const SERIES_HEAD: usize = size_of::<PacketHeader>() + size_of::<u64>();
-
-/// Samples a `GetTimeSeries` response carries: the oldest of `range_len`,
-/// at most `limit`, and no more than fit `SERIES_BUDGET`.
-fn series_len(range_len: usize, limit: usize, size: usize) -> Result<usize, Error> {
-    let entry = size.saturating_add(size_of::<Timestamp>());
-    match (SERIES_BUDGET - SERIES_HEAD) / entry {
-        0 => Err(Error::ComponentTooLarge(size)),
-        fit => Ok(range_len.min(limit).min(fit)),
-    }
-}
-
-/// Writes the oldest `len` samples of `range` into `pkt`, after skipping
-/// its newest `skip`. Slices arrive newest first, so each fills the
-/// destination from the back.
-fn write_series(
-    pkt: &mut LenPacket,
-    range: &time_series::TimeSeriesSlice,
-    mut skip: usize,
-    len: usize,
-    size: usize,
-) -> Result<(), Error> {
-    let stamps_len = len * size_of::<Timestamp>();
-    let body_len = stamps_len + len * size;
-    let pkt_len =
-        u32::try_from(SERIES_HEAD + body_len).map_err(|_| Error::ComponentTooLarge(size))?;
-    pkt.extend_from_slice((len as u64).as_bytes());
-    pkt.inner.resize(pkt.inner.len() + body_len, 0);
-    pkt.inner[..size_of::<u32>()].copy_from_slice(&pkt_len.to_le_bytes());
-    let body = &mut pkt.as_mut_packet().body[size_of::<u64>()..];
-    let (stamps, data) = body.split_at_mut(stamps_len);
-    let mut end = len;
-    for slice in range.as_iter() {
-        if end == 0 {
-            break;
-        }
-        let all = slice.timestamps();
-        let skipped = skip.min(all.len());
-        skip -= skipped;
-        let kept = (all.len() - skipped).min(end);
-        let from = all.len() - skipped - kept;
-        let start = end - kept;
-        let src = slice
-            .data()
-            .get(from * size..(from + kept) * size)
-            .ok_or(Error::SeriesTruncated)?;
-        stamps[start * size_of::<Timestamp>()..end * size_of::<Timestamp>()]
-            .copy_from_slice(all[from..from + kept].as_bytes());
-        data[start * size..end * size].copy_from_slice(src);
-        end = start;
-    }
-    match end {
-        0 => Ok(()),
-        _ => Err(Error::SeriesTruncated),
-    }
-}
-
-/// Moves a page's end of `len` (of `range_len`, oldest first) so that no
-/// timestamp is split across pages, since the next page starts after the
-/// last timestamp. The page shrinks back to the last timestamp change, or,
-/// if it is one tie, grows to hold the whole tie: up to `cap` samples, past
-/// any limit. `None` if that tie exceeds `cap`.
-fn whole_ties(
-    range: &time_series::TimeSeriesSlice,
-    range_len: usize,
-    len: usize,
-    cap: usize,
-) -> Option<usize> {
-    let skip = range_len - len;
-    if skip == 0 || len == 0 {
-        return Some(len);
-    }
-    // Newest first, `skip` excluded samples come before the `len` kept.
-    // Slices wholly excluded are passed by length; `newer` carries the
-    // newest-passed slice's first stamp and how many equal it, so a tie
-    // spanning slices is counted whole.
-    let mut position = 0;
-    let mut newer: Option<(Timestamp, usize)> = None;
-    let mut edge = None;
-    let (mut excluded_tie, mut kept_tie) = (0, 0);
-    for slice in range.as_iter() {
-        let stamps = slice.timestamps();
-        let n = stamps.len();
-        let newer_position = position;
-        position += n;
-        match edge {
-            None if position < skip => {
-                let Some(&first) = stamps.first() else {
-                    continue;
-                };
-                let lead = stamps.partition_point(|t| *t == first);
-                newer = match newer {
-                    Some((stamp, run)) if lead == n && stamp == first => Some((first, n + run)),
-                    _ => Some((first, lead)),
-                };
-            }
-            None => {
-                // The excluded edge, `skip - 1` positions from the newest.
-                let at = n - 1 - (skip - 1 - newer_position);
-                let stamp = stamps[at];
-                excluded_tie = stamps[at..].partition_point(|t| *t == stamp);
-                if let Some((first, run)) = newer
-                    && at + excluded_tie == n
-                    && first == stamp
-                {
-                    excluded_tie += run;
-                }
-                let older = stamps[..at].partition_point(|t| *t < stamp);
-                kept_tie = at - older;
-                edge = Some(stamp);
-                if older > 0 {
-                    break;
-                }
-            }
-            Some(stamp) => {
-                let older = stamps.partition_point(|t| *t < stamp);
-                kept_tie += n - older;
-                if older > 0 {
-                    break;
-                }
-            }
-        }
-    }
-    let kept_tie = kept_tie.min(len);
-    match kept_tie < len {
-        true => Some(len - kept_tie),
-        false => Some(len + excluded_tie).filter(|whole| *whole <= cap),
-    }
 }
 
 async fn handle_packet<A: AsyncWrite + 'static>(
@@ -1666,16 +1659,10 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&SchemaMsg(schema)).await?;
         }
         Packet::Msg(m) if m.id == GetTimeSeries::ID => {
-            let get_time_series = m.parse::<GetTimeSeries>()?;
-            let GetTimeSeries {
-                component_id,
-                range,
-                limit,
-                id,
-            } = get_time_series;
+            let req = m.parse::<GetTimeSeries>()?;
             let component = db.with_state(|state| {
-                let Some(component) = state.components.get(&component_id) else {
-                    return Err(Error::ComponentNotFound(component_id));
+                let Some(component) = state.components.get(&req.component_id) else {
+                    return Err(Error::ComponentNotFound(req.component_id));
                 };
                 Ok(component.clone())
             })?;
@@ -1684,26 +1671,12 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_with_builder(move |pkt| {
                 let header = PacketHeader {
                     packet_ty: metor_proto::types::PacketTy::TimeSeries,
-                    id,
+                    id: req.id,
                     req_id,
                 };
                 pkt.as_mut_packet().header = header;
                 pkt.clear();
-                let size = component.schema.size();
-                let range = component
-                    .time_series
-                    .get_range(range)
-                    .ok_or(Error::TimeRangeOutOfBounds)?;
-                let range_len = range.len();
-                let len = series_len(range_len, limit.unwrap_or(usize::MAX), size)?;
-                let len = whole_ties(
-                    &range,
-                    range_len,
-                    len,
-                    series_len(usize::MAX, usize::MAX, size)?,
-                )
-                .ok_or(Error::ComponentTooLarge(size))?;
-                write_series(pkt, &range, range_len - len, len, size)
+                series::answer(pkt, &component.time_series, &req, component.schema.size())
             })
             .await?;
         }
@@ -1814,7 +1787,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let command = !conn.downlink && db.with_state(|s| s.frame_command(table.id).is_some());
             match command {
                 true => db.push_msg(Timestamp::now(), table.id, buf)?,
-                false => db.ingest_table(table.id, buf)?,
+                false => db.ingest_table_from(table.id, buf, conn.mirror)?,
             }
         }
 
@@ -1992,10 +1965,13 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             });
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
-                features: FEATURE_MSG_SYNC,
+                features: FEATURE_MSG_SYNC | FEATURE_RANGE_FETCH | FEATURE_UNSEALED_HEAD,
                 command_ids,
                 namespace,
                 commands,
+                last_updated: Some(db.last_updated.latest()).filter(|t| t.0 != i64::MIN),
+                instance_id: Some(db.instance_id()),
+                ephemeral: db.ephemeral(),
             })
             .await?;
         }
@@ -2005,21 +1981,23 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             // syncing peer "never heard of it" and "no sealed nodes yet"
             // call for the same response.
             let component = db.with_state(|state| state.components.get(&component_id).cloned());
-            let nodes: Vec<SealRecord> = component
+            let (nodes, head) = component
                 .map(|component| {
-                    component
-                        .time_series
-                        .manifest()
+                    let series = &component.time_series;
+                    let manifest = series.manifest();
+                    let nodes: Vec<SealRecord> = manifest
                         .spans
                         .iter()
                         .filter(|s| s.state == manifest::SpanState::Resident)
                         .map(|s| s.seal)
-                        .collect()
+                        .collect();
+                    (nodes, series.unsealed_head(&manifest))
                 })
                 .unwrap_or_default();
             tx.send_msg(&NodeManifestResp {
                 component_id,
                 nodes,
+                head,
             })
             .await?;
         }
@@ -3127,7 +3105,7 @@ mod dynamic_ingest_tests {
             .unwrap();
         let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
         let pushed = db
-            .with_state(|s| s.push_known_fields(id, &t2, Timestamp(0)))
+            .with_state(|s| s.push_known_fields(id, &t2, Arrival::local(Timestamp(0))))
             .unwrap();
         assert!(pushed.is_some());
         let t3 = map_table(3000, &[("htop", 5, 0.5), ("init", 6, 0.25)]);
@@ -3151,7 +3129,7 @@ mod dynamic_ingest_tests {
 
         let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
         let pushed = db
-            .with_state(|s| s.push_known_fields(id, &t2, Timestamp(0)))
+            .with_state(|s| s.push_known_fields(id, &t2, Arrival::local(Timestamp(0))))
             .unwrap();
         assert!(pushed.is_none());
         let gen_before = db.vtable_gen.latest();
@@ -3317,6 +3295,8 @@ mod msg_sync_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
         db.set_identity(Some("sat".into()), vec![CMD]);
+        let db_id = db.instance_id();
+        let ephemeral = db.clone();
         let addr = serve(db);
         let mut client = Client::connect(addr).await.unwrap();
         let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
@@ -3325,6 +3305,36 @@ mod msg_sync_tests {
         assert_eq!(info.command_ids, vec![CMD]);
         assert_eq!(info.namespace.as_deref(), Some("sat"));
         assert!(info.commands.is_empty(), "nothing described the command");
+        assert_eq!(info.last_updated, None, "an empty db has no head");
+        assert_eq!(info.instance_id, Some(db_id));
+        assert!(!info.ephemeral);
+
+        ephemeral.set_ephemeral(true);
+        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
+        assert!(info.ephemeral);
+    }
+
+    /// The id survives a reopen, and a database that predates ids gets one
+    /// on open and keeps it from then on.
+    #[test]
+    fn instance_id_is_kept_across_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let created = DB::create(path.clone()).unwrap();
+        let id = created.instance_id();
+        let other = DB::create(dir.path().join("other")).unwrap();
+        assert_ne!(other.instance_id(), id);
+        drop(created);
+        assert_eq!(DB::open(path.clone()).unwrap().instance_id(), id);
+
+        std::fs::remove_file(path.join(INSTANCE_ID_FILE)).unwrap();
+        let minted = DB::open(path.clone()).unwrap().instance_id();
+        assert_ne!(minted, id);
+        assert_eq!(DB::open(path.clone()).unwrap().instance_id(), minted);
+
+        // A torn file is replaced rather than failing the open.
+        std::fs::write(path.join(INSTANCE_ID_FILE), [0xff, 0xfe]).unwrap();
+        assert_ne!(DB::open(path).unwrap().instance_id(), minted);
     }
 
     fn msg_command(id: PacketId, name: &str) -> CommandInfo {
@@ -3827,14 +3837,13 @@ mod series_tests {
     const PAGE: usize = 127;
 
     #[test]
-    fn series_len_clamps_to_the_budget() {
-        assert_eq!(series_len(300, usize::MAX, IMAGE_SIZE).unwrap(), PAGE);
-        assert_eq!(series_len(300, 10, IMAGE_SIZE).unwrap(), 10);
-        assert_eq!(series_len(1_000_000, usize::MAX, 8).unwrap(), 1_000_000);
-        let largest = SERIES_BUDGET - SERIES_HEAD - size_of::<Timestamp>();
-        assert_eq!(series_len(5, usize::MAX, largest).unwrap(), 1);
+    fn a_reply_fits_the_budget() {
+        assert_eq!(series::fit(IMAGE_SIZE).unwrap(), PAGE);
+        let head = size_of::<PacketHeader>() + metor_proto::types::TimeSeries::HEAD;
+        let largest = series::SERIES_BUDGET - head - size_of::<Timestamp>();
+        assert_eq!(series::fit(largest).unwrap(), 1);
         assert!(matches!(
-            series_len(1, usize::MAX, largest + 1),
+            series::fit(largest + 1),
             Err(Error::ComponentTooLarge(s)) if s == largest + 1
         ));
     }
@@ -3928,9 +3937,11 @@ mod series_tests {
     fn query(start: i64, limit: Option<usize>) -> GetTimeSeries {
         GetTimeSeries {
             id: ID,
-            range: Timestamp(start)..Timestamp(i64::MAX),
-            component_id: ComponentId::new("img"),
             limit,
+            ..GetTimeSeries::range(
+                ComponentId::new("img"),
+                Timestamp(start)..Timestamp(i64::MAX),
+            )
         }
     }
 
@@ -4051,22 +4062,6 @@ mod series_tests {
     }
 
     #[stellarator::test]
-    async fn a_tie_past_the_cap_is_refused() {
-        let (_dir, db) = image_db();
-        ingest_stamps(&db, &[1, 1, 1, 2]).await;
-        let range = db.with_state(|s| {
-            let f = s.get_component(ComponentId::new("f")).unwrap();
-            f.time_series
-                .get_range(Timestamp(0)..Timestamp(i64::MAX))
-                .unwrap()
-        });
-        assert_eq!(whole_ties(&range, 4, 1, 3), Some(3));
-        assert_eq!(whole_ties(&range, 4, 1, 2), None);
-        assert_eq!(whole_ties(&range, 4, 4, 2), Some(4));
-        assert_eq!(whole_ties(&range, 4, 0, 2), Some(0));
-    }
-
-    #[stellarator::test]
     async fn get_time_series_limits_and_single_samples() {
         let (_dir, db) = image_db();
         ingest(&db, 3).await;
@@ -4075,6 +4070,37 @@ mod series_tests {
         assert_eq!(page(&mut client, 2, Some(1)).await, [2]);
         assert_eq!(page(&mut client, 3, None).await, [3]);
         assert!(page(&mut client, 4, None).await.is_empty());
+    }
+
+    /// Replies vouch for what they checked: the whole range of an empty
+    /// component, the stretch an instant lookup walked back over, and the
+    /// edge a limit stopped at.
+    #[stellarator::test]
+    async fn replies_say_what_they_cover() {
+        let (_dir, db) = image_db();
+        let mut client = Client::connect(serve(db.clone())).await.unwrap();
+        let f = ComponentId::new("f");
+        let reply = client
+            .request(&GetTimeSeries::range(f, Timestamp(0)..Timestamp(100)))
+            .await
+            .unwrap();
+        assert_eq!(reply.len, 0);
+        assert_eq!(reply.covered, Timestamp(0)..Timestamp(100));
+
+        ingest(&db, 3).await;
+        let reply = client
+            .request(&GetTimeSeries::instant(f, Timestamp(10)))
+            .await
+            .unwrap();
+        assert_eq!(reply.timestamps().unwrap(), [Timestamp(3)]);
+        assert_eq!(reply.data().unwrap(), 3f64.to_le_bytes());
+        assert_eq!(reply.covered, Timestamp(3)..Timestamp(11));
+        let reply = client
+            .request(&GetTimeSeries::range(f, Timestamp(0)..Timestamp(100)).limit(2))
+            .await
+            .unwrap();
+        assert_eq!(reply.timestamps().unwrap(), [Timestamp(1), Timestamp(2)]);
+        assert_eq!(reply.covered, Timestamp(0)..Timestamp(3));
     }
 
     /// The first table packet of a stream on `client`, after its vtable.

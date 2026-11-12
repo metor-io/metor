@@ -18,6 +18,15 @@ pub(crate) struct SessionStartup {
     path: Option<PathBuf>,
     pub(crate) error: Option<SharedString>,
     opening: Option<Opening>,
+    /// The peer being asked who it is before its session DB is chosen.
+    probing: Option<Probing>,
+}
+
+struct Probing {
+    addr: std::net::SocketAddr,
+    /// Set by Escape: the probe's result, whenever it lands, is released
+    /// instead of started.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 type OpenResult = std::io::Result<(
@@ -78,6 +87,7 @@ pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
             path: None,
             error: None,
             opening: None,
+            probing: None,
         });
         let picker = cx.new(|cx| {
             crate::connections::ConnectionPicker::for_startup(store, startup.clone(), cx)
@@ -111,13 +121,51 @@ impl SessionStartup {
         if self.app.is_none() || self.busy() {
             return;
         }
-        let result = match self.path.clone() {
-            Some(path) => SessionStorage::record_to(path),
-            None => SessionStorage::create(),
+        let result = match (self.path.clone(), target.peer) {
+            (Some(path), _) => SessionStorage::record_to(path),
+            (None, Some(addr)) => {
+                // Which DB depends on who answers, so ask first, off the UI
+                // thread; the screen shows the wait as busy.
+                let config = self.app.as_ref().unwrap().storage_config().clone();
+                let cancel = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+                let selected = super::select_for_peer(addr, config, cancel.clone());
+                self.probing = Some(Probing {
+                    addr,
+                    cancel: cancel.clone(),
+                });
+                self.error = None;
+                cx.spawn_in(window, async move |this, cx| {
+                    let selected = selected.await;
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        discard(selected);
+                        return;
+                    }
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.probing = None;
+                        this.begin(selected, target, window, cx);
+                    });
+                })
+                .detach();
+                cx.notify();
+                return;
+            }
+            (None, None) => SessionStorage::create(),
         };
+        self.begin(result, target, window, cx);
+    }
+
+    /// Start the session on the storage `connect` chose, or show why there
+    /// is none.
+    fn begin(
+        &mut self,
+        result: super::peer::Selected,
+        target: crate::connections::ConnectionTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok((storage, db)) => {
-                if !storage.is_temporary() {
+                if storage.is_recording() {
                     let parent = storage
                         .directory
                         .path()
@@ -147,7 +195,7 @@ impl SessionStartup {
     }
 
     pub(crate) fn choose_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selecting || self.opening.is_some() {
+        if self.busy() {
             return;
         }
         self.selecting = true;
@@ -172,7 +220,7 @@ impl SessionStartup {
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.opening.is_some() || self.app.is_none() {
+        if self.busy() || self.app.is_none() {
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -233,7 +281,7 @@ impl SessionStartup {
     }
 
     pub(crate) fn record_to(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selecting || self.opening.is_some() || self.app.is_none() {
+        if self.busy() || self.app.is_none() {
             return;
         }
         self.selecting = true;
@@ -282,7 +330,7 @@ impl SessionStartup {
 
 impl SessionStartup {
     pub(crate) fn busy(&self) -> bool {
-        self.selecting || self.opening.is_some()
+        self.selecting || self.opening.is_some() || self.probing.is_some()
     }
 
     pub(crate) fn temporary(&mut self, cx: &mut Context<Self>) {
@@ -308,6 +356,8 @@ impl SessionStartup {
     pub(crate) fn summary(&self) -> Option<SharedString> {
         if self.opening.is_some() {
             Some("Opening recording… Press Escape to cancel.".into())
+        } else if let Some(probing) = &self.probing {
+            Some(format!("Connecting to {}… Press Escape to cancel.", probing.addr).into())
         } else if self.selecting {
             None
         } else {
@@ -317,12 +367,33 @@ impl SessionStartup {
         }
     }
 
-    pub(crate) fn cancel_open(&self) {
+    /// Escape while busy: stop opening a recording, or stop waiting for a
+    /// peer to answer and return to the idle screen.
+    pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(opening) = &self.opening {
             opening
                 .cancel
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(probing) = self.probing.take() {
+            probing
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+}
+
+/// Release storage chosen for a connect that was cancelled meanwhile: a
+/// temporary DB is deleted, a peer cache flushed and unlocked. Off the UI
+/// thread, since that can mean stopping a DB's executor.
+fn discard(selected: super::peer::Selected) {
+    if let Ok((storage, db)) = selected {
+        std::thread::spawn(move || {
+            if let Err(error) = storage.finish(&db, Ok(())) {
+                tracing::warn!(error = %error.error, "could not release a cancelled session's db");
+            }
+        });
     }
 }
 
@@ -339,6 +410,7 @@ mod tests {
             path: None,
             error: None,
             opening: None,
+            probing: None,
         });
         cx.update(|window, cx| picker.update(cx, |picker, cx| picker.record_to(window, cx)));
         assert!(cx.did_prompt_for_new_path());
@@ -372,6 +444,46 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
     }
     #[gpui::test]
+    fn escape_while_probing_a_peer_returns_to_idle(cx: &mut gpui::TestAppContext) {
+        // Accepts the connection and never answers, so the probe waits out
+        // its timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = crate::connections::ConnectionTarget::tcp("Silent", addr);
+        let visual = cx.add_empty_window();
+        let startup = visual.new(|_| SessionStartup {
+            app: Some(PanelApp::choose_session()),
+            selecting: false,
+            path: None,
+            error: None,
+            opening: None,
+            probing: None,
+        });
+        visual.update(|window, cx| {
+            startup.update(cx, |startup, cx| startup.connect(target, window, cx))
+        });
+        visual.update(|_, cx| {
+            let startup = startup.read(cx);
+            assert!(startup.busy());
+            assert!(startup.summary().unwrap().contains("Escape"));
+        });
+        visual.update(|_, cx| startup.update(cx, |startup, cx| startup.cancel(cx)));
+        visual.update(|_, cx| assert!(!startup.read(cx).busy()));
+
+        // The probe ends after cancelling; nothing starts from it.
+        std::thread::sleep(
+            super::super::peer::PROBE_TIMEOUT + std::time::Duration::from_millis(500),
+        );
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let startup = startup.read(cx);
+            assert!(startup.app.is_some() && !startup.busy());
+            assert!(startup.error.is_none());
+            assert!(crate::connections::try_global(cx).is_none());
+        });
+    }
+
+    #[gpui::test]
     fn choosing_storage_does_not_start_a_session_and_temporary_resets_it(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -384,6 +496,7 @@ mod tests {
             path: None,
             error: None,
             opening: None,
+            probing: None,
         });
         visual.update(|window, cx| startup.update(cx, |startup, cx| startup.record_to(window, cx)));
         visual.simulate_new_path_selection(|_| Some(path.clone()));
@@ -437,6 +550,7 @@ mod tests {
             path: Some(path.clone()),
             error: None,
             opening: None,
+            probing: None,
         });
         visual.update(|window, cx| {
             startup.update(cx, |startup, cx| startup.connect(target, window, cx))

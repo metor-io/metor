@@ -1,45 +1,78 @@
 //! Session ownership and shutdown. Saved snapshots are independent artifacts;
-//! only explicitly selected recording directories survive as live DB storage.
+//! only explicitly selected recording directories survive as live DB storage,
+//! plus the per-peer cache a single-peer mirror reopens next time.
 use gpui::App;
 use metor_db::DB;
+use metor_db::scratch::{self, ScratchDir};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
-use tempfile::TempDir;
 
 mod archive;
 mod commands;
+mod peer;
+mod usage;
+pub(crate) use peer::{CachedPeer, select_for_peer};
 pub(crate) mod startup;
 pub(crate) use commands::{
-    OpenHandler, OpenRecording, QuitPanel, SaveSnapshot, SaveSnapshotAs, finish_export, init,
-    open_recording, request_quit, rows, save, save_as, save_workspace, take,
+    OpenHandler, OpenRecording, QuitPanel, SaveSnapshot, SaveSnapshotAs, cached_peer,
+    finish_export, init, open_recording, request_quit, rows, save, save_as, save_workspace, take,
 };
 
 pub(crate) struct SessionStorage {
     // Field order ensures an abandoned import stops its executor before its
-    // temporary directory is removed, even if the panel was never run.
-    runtime: Option<ImportRuntime>,
+    // temporary directory is removed, even if the panel was never run, and
+    // a peer cache's executor stops before its lock is released.
+    runtime: Option<DbRuntime>,
     directory: StorageDirectory,
     source: Option<PathBuf>,
 }
+/// The temp-dir prefix of a session's own database.
+const SESSION_PREFIX: &str = "metor-panel-";
+/// The temp-dir prefix of an opened recording's working copy.
+const IMPORT_PREFIX: &str = "metor-open-";
+
+/// Removes the temporary session directories that crashed or killed panels
+/// left behind, on a background thread so startup doesn't wait for it.
+pub(crate) fn sweep_stale() {
+    std::thread::spawn(|| {
+        scratch::sweep(SESSION_PREFIX);
+        scratch::sweep(IMPORT_PREFIX);
+    });
+}
+
 enum StorageDirectory {
-    Temporary(TempDir),
-    Recording { path: PathBuf, _lock: File },
+    Temporary(ScratchDir),
+    Recording {
+        path: PathBuf,
+        _lock: File,
+    },
+    /// One peer's mirror, kept between sessions in the peer cache and
+    /// locked while this session runs. A cache, not a record: flushed and
+    /// kept on quit so the next session reopens it, never swept as stale,
+    /// evicted while running like a temporary session, and removed only by
+    /// the cache's own pruning once unused. Snapshots save from it like
+    /// from any session.
+    Cached(metor_db::peer_cache::CachedDb, CachedPeer),
 }
 impl StorageDirectory {
     fn path(&self) -> &Path {
         match self {
             Self::Temporary(d) => d.path(),
             Self::Recording { path, .. } => path,
+            Self::Cached(cached, _) => cached.path(),
         }
     }
 }
-struct ImportRuntime(crate::background_tasks::BackgroundTasks);
-impl Drop for ImportRuntime {
+/// The executor for the tasks [`DB::open`] spawns for an existing database
+/// (an imported recording's working copy, a reopened peer cache), which
+/// must outlive every reader of it.
+struct DbRuntime(crate::background_tasks::BackgroundTasks);
+impl Drop for DbRuntime {
     fn drop(&mut self) {
         if let Err(error) = self.0.shutdown() {
-            tracing::error!(%error, "import executor shutdown failed");
+            tracing::error!(%error, "session db executor shutdown failed");
         }
     }
 }
@@ -51,8 +84,11 @@ struct RecordingManifest {
 }
 impl SessionStorage {
     pub(crate) fn create() -> Result<(Self, Arc<DB>), metor_db::Error> {
-        let directory = tempfile::Builder::new().prefix("metor-panel-").tempdir()?;
+        let directory = ScratchDir::create(SESSION_PREFIX)?;
         let db = Arc::new(DB::create(directory.path().to_owned())?);
+        // Deleted on quit, so a mirror of it when it is served must not
+        // cache it or count on it for history.
+        db.set_ephemeral(true);
         Ok((
             Self {
                 directory: StorageDirectory::Temporary(directory),
@@ -113,18 +149,35 @@ impl SessionStorage {
         result
     }
 
-    fn is_temporary(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_temporary(&self) -> bool {
         matches!(self.directory, StorageDirectory::Temporary(_))
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        matches!(self.directory, StorageDirectory::Recording { .. })
+    }
+
+    /// Whether what the session holds may be dropped once a peer can give
+    /// it back: a temporary session or a peer cache, never a recording.
+    pub(crate) fn is_cache(&self) -> bool {
+        matches!(
+            self.directory,
+            StorageDirectory::Temporary(_) | StorageDirectory::Cached(..)
+        )
     }
 
     pub(crate) fn import(
         path: PathBuf,
         cancel: &AtomicBool,
     ) -> io::Result<(Self, Arc<DB>, archive::Imported)> {
-        let directory = tempfile::Builder::new().prefix("metor-open-").tempdir()?;
-        let imported = archive::import(&path, directory.path(), cancel)?;
-        let runtime = ImportRuntime(Default::default());
-        let db_path = directory.path().join("db");
+        let directory = ScratchDir::create(IMPORT_PREFIX)?;
+        // The import fills an empty directory; the scratch root holds its lock.
+        let bundle = directory.path().join("bundle");
+        fs::create_dir(&bundle)?;
+        let imported = archive::import(&path, &bundle, cancel)?;
+        let runtime = DbRuntime(Default::default());
+        let db_path = bundle.join("db");
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         runtime
             .0
@@ -169,13 +222,16 @@ impl SessionStorage {
         );
         match self.directory {
             StorageDirectory::Temporary(directory) => {
-                let path = directory.keep();
-                shutdown
-                    .and_then(|()| fs::remove_dir_all(&path))
-                    .map_err(|error| FinishError {
-                        recovery: path,
-                        error,
-                    })
+                let path = directory.path().to_owned();
+                let removed = match shutdown {
+                    Ok(()) => directory.remove(),
+                    // Kept for recovery: a sweep must not take it either.
+                    Err(error) => directory.keep().and(Err(error)),
+                };
+                removed.map_err(|error| FinishError {
+                    recovery: path,
+                    error,
+                })
             }
             StorageDirectory::Recording { path, _lock } => shutdown
                 .and_then(|()| {
@@ -184,6 +240,14 @@ impl SessionStorage {
                 })
                 .map_err(|error| FinishError {
                     recovery: path,
+                    error,
+                }),
+            // No fsync: a cache torn by a crash is replaced when it next
+            // fails to open, and its history fetched again.
+            StorageDirectory::Cached(cached, _) => shutdown
+                .and_then(|()| db.flush().map_err(io::Error::other))
+                .map_err(|error| FinishError {
+                    recovery: cached.path().to_owned(),
                     error,
                 }),
         }

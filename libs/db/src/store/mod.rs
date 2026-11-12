@@ -19,11 +19,13 @@ mod peer;
 pub use local_dir::LocalDirStore;
 #[cfg(feature = "store-object")]
 pub use object::ObjectStoreAdapter;
-pub use peer::PeerStore;
+pub use peer::{MAX_BATCH, PeerStore};
 
 use std::{future::Future, path::PathBuf, pin::Pin};
 
 use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto_wkt::GetTimeSeries;
+use zerocopy::IntoBytes;
 
 use crate::{
     Error,
@@ -238,40 +240,80 @@ impl NodeStaging {
         SealRecord::compute(&self.node())
     }
 
-    /// Discard staged samples newer than `cover_end` and return the seal
-    /// of what remains. This is how a coverage-trimmed span installs: the
-    /// fetch moves the peer's whole node, but only the prefix this side
-    /// is missing may land — the tail already exists as resident data.
-    /// Call after the full payload verified against the peer's seal, then
-    /// [`Self::commit`] with the returned seal.
-    pub fn trim_to(&self, cover_end: Timestamp) -> Result<SealRecord, Error> {
+    /// Copy the staged samples stamped within `cover` into a node of their
+    /// own, returning it with its seal, or `None` when none fall inside.
+    /// This is how a remote seal partly overlapped by local data installs:
+    /// the fetch moves the peer's whole node, but only the pieces this side
+    /// is missing may land. Call after the full payload verified against
+    /// the peer's seal, then [`Self::commit`] the piece with its seal.
+    pub fn cut(
+        &self,
+        cover: std::ops::RangeInclusive<Timestamp>,
+    ) -> Result<Option<(NodeStaging, SealRecord)>, Error> {
         let node = self.node();
-        let keep = node.timestamps().partition_point(|ts| ts.0 <= cover_end.0);
-        self.index.truncate((keep * size_of::<Timestamp>()) as u64);
-        self.data.truncate((keep * node.element_size()) as u64);
-        self.seal()
-            .ok_or_else(|| StoreError::Other("trim left an empty node".to_string()).into())
+        let timestamps = node.timestamps();
+        let lo = timestamps.partition_point(|ts| ts.0 < cover.start().0);
+        let hi = timestamps.partition_point(|ts| ts.0 <= cover.end().0);
+        if lo >= hi {
+            return Ok(None);
+        }
+        let size = node.element_size();
+        let component_dir = self
+            .dir
+            .parent()
+            .ok_or_else(|| StoreError::Other("staging has no component dir".to_string()))?;
+        Self::of_samples(
+            component_dir,
+            &timestamps[lo..hi],
+            size,
+            &node.data.data()[lo * size..hi * size],
+        )
+        .map(Some)
+    }
+
+    /// Stage `timestamps`, in order and at least one, with their samples
+    /// `data` as one node, returning it with its seal.
+    pub(crate) fn of_samples(
+        component_dir: &std::path::Path,
+        timestamps: &[Timestamp],
+        element_size: usize,
+        data: &[u8],
+    ) -> Result<(NodeStaging, SealRecord), Error> {
+        let staging = Self::with_capacity(
+            component_dir,
+            timestamps[0],
+            element_size as u64,
+            timestamps.len(),
+        )?;
+        staging.index.write(timestamps.as_bytes())?;
+        staging.data.write(data)?;
+        let seal = staging.seal().expect("staged at least one sample");
+        Ok((staging, seal))
+    }
+
+    /// The staging directory, which [`Self::commit`] renames into place
+    /// with everything in it.
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 
     fn node(&self) -> TimeSeriesNode {
-        TimeSeriesNode {
-            index: self.index.clone(),
-            data: self.data.clone(),
-        }
+        TimeSeriesNode::from_logs(self.index.clone(), self.data.clone())
     }
 
     /// Verify the staged bytes against `seal` and promote the directory
     /// into place. Returns the final node directory and the (already
     /// mapped) node.
     pub fn commit(mut self, seal: &SealRecord) -> Result<(PathBuf, TimeSeriesNode), Error> {
+        let final_dir = self.dir.with_file_name(seal.start_ts.0.to_string());
         let node = self.node();
+
         if !seal.verify(&node) {
             return Err(StoreError::ChecksumMismatch.into());
         }
         node.index.flush()?;
         node.data.flush()?;
         seal.write(&self.dir)?;
-        let final_dir = self.dir.with_file_name(seal.start_ts.0.to_string());
         if final_dir.exists() {
             return Err(StoreError::Other(format!(
                 "node {} was committed by a concurrent fetch",
@@ -284,6 +326,20 @@ impl NodeStaging {
             std::fs::File::open(parent)?.sync_all()?;
         }
         self.committed = true;
+        Ok((final_dir, node))
+    }
+
+    /// Move a range-fetch fragment into place, in a directory named apart
+    /// from sealed nodes (`<start_ts>.<n>.fragment`): its first sample may
+    /// be where a whole node will later land. Opening the component deletes
+    /// fragments rather than loading them, so unlike [`Self::commit`] this
+    /// neither verifies nor syncs anything.
+    pub(crate) fn commit_fragment(mut self) -> Result<(PathBuf, TimeSeriesNode), Error> {
+        let final_dir = self.dir.with_extension("fragment");
+        std::fs::rename(&self.dir, &final_dir)?;
+        self.committed = true;
+        let mut node = self.node();
+        node.fragment = true;
         Ok((final_dir, node))
     }
 }
@@ -333,5 +389,45 @@ pub trait NodeStore: Send + Sync + 'static {
         component_name: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>>;
 
+    /// [`Self::list`], plus the unsealed head a live database holds past
+    /// its sealed nodes, taken from the same snapshot. Stores of sealed
+    /// nodes have no head.
+    fn listing<'a>(
+        &'a self,
+        component_id: ComponentId,
+        component_name: &'a str,
+    ) -> BoxFuture<'a, Result<Listing, StoreError>> {
+        Box::pin(async move {
+            Ok(Listing {
+                nodes: self.list(component_id, component_name).await?,
+                head: None,
+            })
+        })
+    }
+
     fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Answer range fetches ([`GetTimeSeries`]) instead of whole nodes, one
+    /// reply (or error) per request, in order. Only a live database can:
+    /// the default, for stores of sealed nodes, is [`StoreError::Unsupported`],
+    /// as it is from a peer too old to say what a reply covers. Callers then
+    /// fall back to whole nodes.
+    fn time_series<'a>(
+        &'a self,
+        requests: &'a [GetTimeSeries],
+    ) -> BoxFuture<'a, Result<Vec<Result<SeriesReply, StoreError>>, StoreError>> {
+        let _ = requests;
+        Box::pin(async { Err(StoreError::Unsupported) })
+    }
 }
+
+/// Everything a store can give back for one component: its sealed nodes,
+/// sorted by start, and the unsealed head a live database holds past them.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    pub nodes: Vec<SealRecord>,
+    pub head: Option<metor_proto_wkt::UnsealedHead>,
+}
+
+/// One reply to a range fetch, owning its buffer.
+pub type SeriesReply = metor_proto::types::OwnedTimeSeries<stellarator::buf::Slice<Vec<u8>>>;

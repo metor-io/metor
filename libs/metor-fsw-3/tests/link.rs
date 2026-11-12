@@ -1213,6 +1213,59 @@ async fn test_db_advertises_command_record_ids() {
     assert_described(&info.command_ids, &info.commands);
 }
 
+/// A db deletes its directory when the run stops if `on_exit` says so, even
+/// with a client still connected, and keeps one at a `path` by default.
+#[stellarator::test]
+async fn test_db_deletes_its_dir_on_stop() {
+    let seen = Seen::default();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = |name: &str, addr: SocketAddr, on_exit: Option<&str>| SystemConfig {
+        params: json!({
+            "listen": addr.to_string(),
+            "path": dir.path().join(name),
+            "on_exit": on_exit,
+        }),
+        ..SystemConfig::new(name, "fsw.db")
+    };
+    let deleted_addr = pick_port("db-deleted");
+    let kept_addr = pick_port("db-kept");
+    let target = spawn(
+        vec![
+            db("deleted", deleted_addr, Some("delete")),
+            db("kept", kept_addr, None),
+        ],
+        &seen,
+        500.0,
+    );
+    dial_db(deleted_addr).await;
+    dial_db(kept_addr).await;
+    let _client = TcpStream::connect(deleted_addr).await.expect("connects");
+    assert!(dir.path().join("deleted/db_state").exists());
+    drop(target);
+    assert!(!dir.path().join("deleted").exists());
+    assert!(dir.path().join("kept/db_state").exists());
+}
+
+/// A db that faults before it serves still deletes its directory.
+#[stellarator::test]
+async fn test_db_deletes_its_dir_after_a_fault() {
+    let seen = Seen::default();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = SystemConfig {
+        params: json!({
+            "listen": pick_port("db-faulted").to_string(),
+            "path": dir.path().join("db"),
+            "on_exit": "delete",
+            "commands": ["no_such_record"],
+        }),
+        ..SystemConfig::new("db", "fsw.db")
+    };
+    let _target = spawn(vec![db], &seen, 500.0);
+    // Built (so created), then faulted on its first run, with the target up.
+    until_seen("the target ran", &seen, || seen.cycles() > 0).await;
+    until("the dir was deleted", || !dir.path().join("db").exists()).await;
+}
+
 /// Every advertised command is described as the message it is.
 fn assert_described(ids: &[metor_proto::types::PacketId], commands: &[CommandInfo]) {
     let described: Vec<_> = commands.iter().map(|command| command.id).collect();

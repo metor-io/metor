@@ -72,8 +72,10 @@ pub(super) fn database(path: &Path, cancel: &AtomicBool) -> io::Result<()> {
             .unwrap_or_default();
         for span in &manifest.spans {
             if span.seal.count == 0
-                || span.seal.start_ts.0 > span.cover_end.0
+                || span.seal.start_ts.0 > span.cover_start.0
+                || span.cover_start.0 > span.cover_end.0
                 || span.cover_end.0 > span.seal.end_ts.0
+                || (span.state == SpanState::Resident && !span.is_whole())
                 || span.seal.element_size != element_size
                 || span.seal.count.checked_mul(8) != Some(span.seal.index_len)
                 || span.seal.count.checked_mul(element_size) != Some(span.seal.data_len)

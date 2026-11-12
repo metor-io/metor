@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, DumpSchema, DumpSchemaResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo,
-    GetNodeManifest, NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, OfferNode,
-    OfferNodeResp, PushNodeDone,
+    DbInfoResp, DumpSchema, DumpSchemaResp, ErrorResponse, FEATURE_RANGE_FETCH,
+    FEATURE_UNSEALED_HEAD, FetchNode, FetchNodeDone, GetDbInfo, GetNodeManifest, GetTimeSeries,
+    InstanceId, NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, NodeManifestRespV7,
+    OfferNode, OfferNodeResp, PushNodeDone,
 };
 use stellarator::sync::{Mutex, MutexGuard};
 use tracing::warn;
@@ -13,8 +15,24 @@ use tracing::warn;
 use crate::seal::SealRecord;
 
 use super::{
-    BoxFuture, CHUNK_BYTES, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode, StoreError,
+    BoxFuture, CHUNK_BYTES, Listing, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode,
+    SeriesReply, StoreError,
 };
+
+/// Most range fetches one batch pipelines; also the request ids it uses.
+pub const MAX_BATCH: usize = 64;
+
+/// Longest a batch waits on the peer between sends or replies, so a wedged
+/// peer fails the batch and the next one redials instead of parking every
+/// waiting read. Reset per reply rather than spanning the batch: a batch of
+/// full pages on a slow link takes as long as its bytes take, and a bound
+/// on the whole would fail it every time, never converging.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a peer found unable to answer range fetches is believed: past
+/// this the range connection is redialed and the peer asked again, so one
+/// upgraded in place is noticed without restarting.
+const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// This store owns its connection outright, so bulk streams can use a
 /// fixed request id without colliding with anyone.
@@ -45,42 +63,143 @@ async fn bounded<T>(
 /// transport error.
 pub struct PeerStore {
     addr: SocketAddr,
+    /// The database this store must be talking to, when the caller knows
+    /// it (see [`crate::remote::RemoteDb::expect_instance`]); any other
+    /// answer at `addr` is refused rather than fetched from or listed.
+    expected: Option<InstanceId>,
     client: Mutex<Option<Client>>,
+    /// A second connection, for range fetches only. Bulk transfers hold
+    /// [`Self::client`] for a whole node, which can take seconds; a scrub's
+    /// point reads must not queue behind one. Requests on it are pipelined
+    /// in batches (see [`NodeStore::time_series`]).
+    ranges: Mutex<Option<RangeConn>>,
+    /// Whether the peer [`Self::client`] last dialed reports its unsealed
+    /// head in manifest replies. Only read under that connection's lock.
+    heads: AtomicBool,
+}
+
+/// The range-fetch connection, and whether the peer at its far end
+/// answers range fetches at all.
+struct RangeConn {
+    client: Client,
+    supported: bool,
+    probed: std::time::Instant,
 }
 
 impl PeerStore {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
+            expected: None,
             client: Mutex::new(None),
+            ranges: Mutex::new(None),
+            heads: AtomicBool::new(false),
         }
+    }
+
+    /// Refuse to talk to any database at `addr` but `id`.
+    pub fn expect_instance(mut self, id: Option<InstanceId>) -> Self {
+        self.expected = id;
+        self
     }
 
     async fn lock_connected(&self) -> Result<MutexGuard<'_, Option<Client>>, StoreError> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
-            // Bounded like `remote::db::handshake_request`: old-protocol
-            // peers record unknown requests as telemetry and never reply,
-            // which would otherwise park this future while it holds the
-            // client mutex — wedging every store consumer forever.
-            let mut client = bounded(HANDSHAKE_TIMEOUT, Client::connect(self.addr))
-                .await
-                .map_err(unavailable)?
-                .map_err(unavailable)?;
-            let info: DbInfoResp = bounded(HANDSHAKE_TIMEOUT, client.request(&GetDbInfo))
-                .await
-                .map_err(unavailable)?
-                .map_err(unavailable)?;
-            if info.protocol_version > NODE_PROTOCOL_VERSION {
-                warn!(
-                    peer = info.protocol_version,
-                    ours = NODE_PROTOCOL_VERSION,
-                    "peer speaks a newer node protocol"
-                );
-            }
+            let (client, info) = self.dial().await?;
+            let heads = info.protocol_version >= 8 && info.features & FEATURE_UNSEALED_HEAD != 0;
+            self.heads.store(heads, Ordering::Relaxed);
             *guard = Some(client);
         }
         Ok(guard)
+    }
+
+    /// Connect and handshake. Bounded like `remote::db::handshake_request`:
+    /// old-protocol peers record unknown requests as telemetry and never
+    /// reply, which would otherwise park this future while it holds a
+    /// connection mutex — wedging every store consumer forever.
+    async fn dial(&self) -> Result<(Client, DbInfoResp), StoreError> {
+        let mut client = bounded(HANDSHAKE_TIMEOUT, Client::connect(self.addr))
+            .await
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
+        let info: DbInfoResp = bounded(HANDSHAKE_TIMEOUT, client.request(&GetDbInfo))
+            .await
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
+        if let Some(expected) = self.expected
+            && info.instance_id != Some(expected)
+        {
+            return Err(StoreError::Unavailable(format!(
+                "{} is no longer database {expected}",
+                self.addr
+            )));
+        }
+        if info.protocol_version > NODE_PROTOCOL_VERSION {
+            warn!(
+                peer = info.protocol_version,
+                ours = NODE_PROTOCOL_VERSION,
+                "peer speaks a newer node protocol"
+            );
+        }
+        Ok((client, info))
+    }
+
+    /// Send `requests` down the range connection back to back, then read
+    /// their replies, matched by request id. One round trip for the batch,
+    /// however many it holds.
+    async fn pipeline(
+        client: &mut Client,
+        requests: &[GetTimeSeries],
+    ) -> Result<Vec<Result<SeriesReply, StoreError>>, StoreError> {
+        for (i, request) in requests.iter().enumerate() {
+            let id = (i + 1) as u8;
+            bounded(REPLY_TIMEOUT, client.send(request.with_request_id(id)))
+                .await
+                .map_err(unavailable)?
+                .0
+                .map_err(unavailable)?;
+        }
+        let mut replies: Vec<Option<Result<SeriesReply, StoreError>>> =
+            (0..requests.len()).map(|_| None).collect();
+        let mut pending = requests.len();
+        while pending > 0 {
+            // Each reply keeps its buffer, so none is reused; the length
+            // the peer declares is checked before the buffer grows to it.
+            let pkt = bounded(
+                REPLY_TIMEOUT,
+                client
+                    .rx
+                    .next_grow_max(vec![0u8; 1024], crate::series::SERIES_BUDGET),
+            )
+            .await
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
+            let Some(slot) = (pkt.req_id() as usize)
+                .checked_sub(1)
+                .and_then(|i| replies.get_mut(i))
+                .filter(|slot| slot.is_none())
+            else {
+                continue;
+            };
+            *slot = Some(match pkt {
+                OwnedPacket::TimeSeries(series) => Ok(series),
+                OwnedPacket::Msg(m) if m.id == ErrorResponse::ID => {
+                    match m.parse::<ErrorResponse>() {
+                        Ok(err) => Err(StoreError::Other(err.description)),
+                        Err(err) => Err(StoreError::Other(err.to_string())),
+                    }
+                }
+                _ => Err(StoreError::Other(
+                    "unexpected reply to a range fetch".into(),
+                )),
+            });
+            pending -= 1;
+        }
+        Ok(replies
+            .into_iter()
+            .map(|r| r.expect("every reply arrived"))
+            .collect())
     }
 }
 
@@ -114,6 +233,18 @@ impl PeerStore {
         match client.request(&DumpSchema).await {
             Ok(resp) => Ok(resp),
             Err(err) => Err(request_err(&mut guard, err)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PeerStore {
+    /// Make the range connection believe its peer can't answer range
+    /// fetches, as of `ago`.
+    pub(crate) async fn pretend_unsupported(&self, ago: std::time::Duration) {
+        if let Some(conn) = self.ranges.lock().await.as_mut() {
+            conn.supported = false;
+            conn.probed = std::time::Instant::now() - ago;
         }
     }
 }
@@ -238,14 +369,85 @@ impl NodeStore for PeerStore {
     fn list<'a>(
         &'a self,
         component_id: metor_proto::types::ComponentId,
-        _component_name: &'a str,
+        component_name: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>> {
+        Box::pin(async move { Ok(self.listing(component_id, component_name).await?.nodes) })
+    }
+
+    /// One `GetNodeManifest`, read in the layout the peer's version sends.
+    fn listing<'a>(
+        &'a self,
+        component_id: metor_proto::types::ComponentId,
+        _component_name: &'a str,
+    ) -> BoxFuture<'a, Result<Listing, StoreError>> {
         Box::pin(async move {
             let mut guard = self.lock_connected().await?;
             let client = guard.as_mut().expect("just connected");
-            match client.request(&GetNodeManifest { component_id }).await {
-                Ok(NodeManifestResp { nodes, .. }) => Ok(nodes),
-                Err(err) => Err(request_err(&mut guard, err)),
+            let request = GetNodeManifest { component_id };
+            let reply = match self.heads.load(Ordering::Relaxed) {
+                true => client
+                    .request(&request)
+                    .await
+                    .map(|r: NodeManifestResp| Listing {
+                        nodes: r.nodes,
+                        head: r.head,
+                    }),
+                // The request is the same; only the reply's layout differs.
+                false => match client.send((&request).with_request_id(1)).await.0 {
+                    Ok(()) => client.recv(1).await.map(|r: NodeManifestRespV7| Listing {
+                        nodes: r.nodes,
+                        head: None,
+                    }),
+                    Err(err) => Err(err.into()),
+                },
+            };
+            reply.map_err(|err| request_err(&mut guard, err))
+        })
+    }
+
+    /// Pipelined on the range connection, at most [`MAX_BATCH`] at a time:
+    /// the server answers a connection's requests in order and each reply
+    /// is small, so a batch costs one round trip. A transport error, or
+    /// [`REPLY_TIMEOUT`] without progress, fails the batch and drops the
+    /// connection. A peer that could not answer range fetches is asked
+    /// again after [`REPROBE_INTERVAL`].
+    fn time_series<'a>(
+        &'a self,
+        requests: &'a [GetTimeSeries],
+    ) -> BoxFuture<'a, Result<Vec<Result<SeriesReply, StoreError>>, StoreError>> {
+        Box::pin(async move {
+            if requests.len() > MAX_BATCH {
+                return Err(StoreError::Other(format!(
+                    "a batch holds at most {MAX_BATCH} range fetches"
+                )));
+            }
+            let mut guard = self.ranges.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|conn| !conn.supported && conn.probed.elapsed() >= REPROBE_INTERVAL)
+            {
+                *guard = None;
+            }
+            if guard.is_none() {
+                let (client, info) = self.dial().await?;
+                let supported =
+                    info.protocol_version >= 7 && info.features & FEATURE_RANGE_FETCH != 0;
+                *guard = Some(RangeConn {
+                    client,
+                    supported,
+                    probed: std::time::Instant::now(),
+                });
+            }
+            let conn = guard.as_mut().expect("just connected");
+            if !conn.supported {
+                return Err(StoreError::Unsupported);
+            }
+            match Self::pipeline(&mut conn.client, requests).await {
+                Ok(replies) => Ok(replies),
+                Err(err) => {
+                    *guard = None;
+                    Err(err)
+                }
             }
         })
     }

@@ -44,6 +44,17 @@ impl<R: AsyncRead> PacketStream<R> {
         let packet_buf = self.reader.recv_growable(buf).await?;
         OwnedPacket::parse(packet_buf).map_err(Error::from)
     }
+
+    /// [`Self::next_grow`], refusing a packet longer than `max_len` bytes
+    /// instead of growing `buf` to hold it.
+    pub async fn next_grow_max<B: IoBufMut + GrowableBuf>(
+        &mut self,
+        buf: B,
+        max_len: usize,
+    ) -> Result<OwnedPacket<Slice<B>>, Error> {
+        let packet_buf = self.reader.recv_growable_max(buf, max_len).await?;
+        OwnedPacket::parse(packet_buf).map_err(Error::from)
+    }
 }
 
 pub struct PacketSink<W: AsyncWrite> {

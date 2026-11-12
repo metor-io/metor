@@ -24,6 +24,7 @@ pub mod config;
 pub mod connections;
 pub mod data_binding;
 pub mod dynamic;
+pub mod eviction;
 pub mod gpu_context;
 pub mod hydration;
 pub mod icons;
@@ -51,6 +52,7 @@ pub use connections::{
     ConnectionOptions, ConnectionStatus, ConnectionTarget, OptionKind, OptionSpec, OptionValue,
     RegistryHandle, Resolved, TargetId,
 };
+pub use eviction::Eviction;
 pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 
 /// Streams the most recent value of a component from its WAL.

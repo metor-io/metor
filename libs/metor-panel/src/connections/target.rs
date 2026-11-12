@@ -95,6 +95,10 @@ pub struct ConnectContext {
     /// against its spec. A snapshot: changing one restarts the backend
     /// through here rather than mutating it in flight.
     pub options: ConnectionOptions,
+    /// The database a metor-db mirror must find at its address: the cached
+    /// peer, in a session whose DB is that peer's cache. Anything else
+    /// answering ends the mirror instead of mixing into the cache.
+    pub(crate) expect_instance: Option<metor_proto_wkt::InstanceId>,
     pub(crate) tasks: crate::background_tasks::BackgroundTasks,
 }
 
@@ -210,6 +214,10 @@ pub struct ConnectionTarget {
     /// [`with_address`](Self::with_address) for resolver-produced kinds;
     /// discovery-only targets leave it unset and don't persist.
     pub(crate) address: Option<SharedString>,
+    /// The metor-db a built-in kind may mirror, which a session that
+    /// connects only this target probes to pick its peer cache. `None` for
+    /// the fsw mode and custom backends, which never mirror a metor-db.
+    pub(crate) peer: Option<SocketAddr>,
     /// Knobs this target's backend reads at connect time. Empty for the
     /// built-in kinds and for anything a discoverer produces — those fall
     /// back to the panel-wide set installed on the store.
@@ -231,6 +239,7 @@ impl ConnectionTarget {
             detail: SharedString::from(addr.to_string()),
             backend: Arc::new(DiscoverBackend { addr }),
             address: Some(SharedString::from(addr.to_string())),
+            peer: Some(addr),
             options: OptionSpec::default(),
         }
     }
@@ -244,6 +253,7 @@ impl ConnectionTarget {
             detail: SharedString::from(format!("{addr} · metor-db")),
             backend: Arc::new(TcpBackend { addr }),
             address: Some(SharedString::from(format!("db://{addr}"))),
+            peer: Some(addr),
             options: OptionSpec::default(),
         }
     }
@@ -257,6 +267,7 @@ impl ConnectionTarget {
             detail: SharedString::from(format!("{addr} · fsw")),
             backend: Arc::new(FswBackend { addr }),
             address: Some(SharedString::from(format!("fsw://{addr}"))),
+            peer: None,
             options: OptionSpec::default(),
         }
     }
@@ -273,6 +284,7 @@ impl ConnectionTarget {
             detail: detail.into(),
             backend: Arc::new(backend),
             address: None,
+            peer: None,
             options: OptionSpec::default(),
         }
     }
@@ -317,6 +329,10 @@ fn mirror_status(status: StatusHandle) -> impl Fn(MirrorEvent) + Send + Sync + '
             MirrorEvent::Failed => {
                 ConnectionStatus::Failed(SharedString::new_static("connection failed"))
             }
+            MirrorEvent::WrongPeer { .. } => ConnectionStatus::Failed(SharedString::new_static(
+                "a different database answers at this address now (wiped or replaced); \
+                 start a new session to mirror it",
+            )),
         };
         status.set(status_for(event));
     }
@@ -328,7 +344,9 @@ struct TcpBackend {
 
 impl ConnectionBackend for TcpBackend {
     fn connect(&self, ctx: ConnectContext) -> Connected {
-        let remote = RemoteDb::new(self.addr).on_event(mirror_status(ctx.status.clone()));
+        let remote = RemoteDb::new(self.addr)
+            .expect_instance(ctx.expect_instance)
+            .on_event(mirror_status(ctx.status.clone()));
         let hydrator = remote.hydrator();
         let db = ctx.db.clone();
         ctx.spawn(move || async move {
@@ -420,6 +438,7 @@ impl ConnectionBackend for DiscoverBackend {
     fn connect(&self, ctx: ConnectContext) -> Connected {
         let (tx, rx) = std::sync::mpsc::channel();
         let (db, status, addr) = (ctx.db.clone(), ctx.status.clone(), self.addr);
+        let expected = ctx.expect_instance;
         ctx.spawn(move || async move {
             let mut backoff = LINK_BACKOFF_INITIAL;
             loop {
@@ -428,7 +447,9 @@ impl ConnectionBackend for DiscoverBackend {
                 // loop; clones keep the borrows straight.
                 match identify(addr).await {
                     Ok(Peer::Db(_)) => {
-                        let remote = RemoteDb::new(addr).on_event(mirror_status(status.clone()));
+                        let remote = RemoteDb::new(addr)
+                            .expect_instance(expected)
+                            .on_event(mirror_status(status.clone()));
                         let _ = tx.send(Resolved {
                             hydrator: Some(remote.hydrator()),
                             local_authority: false,

@@ -563,8 +563,11 @@ impl SamplesTable {
                 *start = Timestamp(from.0.saturating_sub(HISTORY_PAGE_US));
             }
             let range = *start..Timestamp(head.0.saturating_add(1));
+            // The table pages backwards, so `range` only grows a page at a
+            // time as the user scrolls; each page is computed whatever it
+            // costs rather than left blank.
             for history in &histories {
-                history.request(range.clone(), cx);
+                history.request(range.clone(), u64::MAX, cx);
             }
         }
         let state: Vec<_> = sources

@@ -1257,6 +1257,11 @@ pub struct PanelApp {
     themes: Vec<crate::theme::Theme>,
     default_theme: Option<SharedString>,
     splash_logo: Option<crate::connections::logo::SplashLogoBuilder>,
+    storage: metor_db::storage::StorageConfig,
+    /// A peer [`remote`](PanelApp::remote) named before any storage was
+    /// chosen: the session DB is picked by probing it when the app runs.
+    deferred_peer: Option<SocketAddr>,
+    session_lookback: std::time::Duration,
 }
 
 impl PanelApp {
@@ -1290,6 +1295,11 @@ impl PanelApp {
             themes: Vec::new(),
             default_theme: None,
             splash_logo: None,
+            storage: Default::default(),
+            deferred_peer: None,
+            session_lookback: std::time::Duration::from_micros(
+                crate::temporal::DEFAULT_SESSION_LOOKBACK as u64,
+            ),
         }
     }
 
@@ -1495,6 +1505,42 @@ impl PanelApp {
         self
     }
 
+    /// How much disk the session may use: what it evicts while running, and
+    /// where and how much the per-peer caches keep between sessions. A
+    /// session that mirrors exactly one long-running metor-db keeps its DB
+    /// in that peer's cache and reopens it next time (see
+    /// [`remote`](PanelApp::remote)); point `cache_dir` at nothing usable
+    /// and every session is temporary instead.
+    pub fn storage(mut self, storage: metor_db::storage::StorageConfig) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// What a temporary or cached session does with mirrored history nobody
+    /// is reading: by default, keep the working set and evict the rest a few
+    /// seconds after views stop reading it, since the peer can serve it
+    /// again (see [`crate::eviction`]). A recording, or a database passed
+    /// to [`new`](PanelApp::new), never evicts. Shorthand for the
+    /// `eviction` of [`storage`](PanelApp::storage).
+    pub fn eviction(mut self, eviction: crate::eviction::Eviction) -> Self {
+        self.storage.eviction = eviction;
+        self
+    }
+
+    pub(crate) fn storage_config(&self) -> &metor_db::storage::StorageConfig {
+        &self.storage
+    }
+
+    /// How much recent data the default time range shows at least. It
+    /// covers everything since the session started, reaching back at least
+    /// this far before the newest sample, so a session that just connected
+    /// (or a recording with no live data) opens on its latest stretch
+    /// rather than an empty range. One hour by default.
+    pub fn session_lookback(mut self, lookback: std::time::Duration) -> Self {
+        self.session_lookback = lookback;
+        self
+    }
+
     /// Show `logo` on the startup screen in place of the metor logo. It is
     /// built again every frame, like any element, and fills the top of the
     /// screen's sidebar.
@@ -1522,7 +1568,20 @@ impl PanelApp {
     ///
     /// Sugar over [`connection`](PanelApp::connection) +
     /// [`auto_connect`](PanelApp::auto_connect) with the built-in TCP target.
-    pub fn remote(self, addr: SocketAddr) -> Self {
+    ///
+    /// On an app that hasn't chosen its storage
+    /// ([`choose_session`](PanelApp::choose_session)), this also chooses it:
+    /// at startup the panel asks `addr` who it is and mirrors into that
+    /// peer's cache, reopening what earlier sessions held, or into a
+    /// temporary DB when the peer can't be cached (see
+    /// [`storage`](PanelApp::storage)). The startup screen is skipped. With
+    /// storage already chosen ([`temporary`](PanelApp::temporary),
+    /// [`record_to`](PanelApp::record_to), [`new`](PanelApp::new)) it mirrors
+    /// into that.
+    pub fn remote(mut self, addr: SocketAddr) -> Self {
+        if self.db.is_none() && self.startup_open.is_none() {
+            self.deferred_peer = Some(addr);
+        }
         let target = ConnectionTarget::tcp("Remote", addr);
         let id = target.id.0.clone();
         self.connection(target).auto_connect(id)
@@ -1570,6 +1629,7 @@ impl PanelApp {
     /// app outlives its last window: closing them all leaves the process in
     /// the dock, and a reopen (dock click) spawns a fresh window.
     pub fn run(mut self) {
+        crate::session::sweep_stale();
         let app = gpui_platform::application().with_assets(crate::icons::IconAssets);
         app.on_reopen(|cx| {
             if crate::workspace::panel_windows(cx).is_empty()
@@ -1585,6 +1645,21 @@ impl PanelApp {
             initialize_appearance(themes, self.default_theme.as_deref(), cx);
             if self.db.is_some() {
                 self.start(cx);
+            } else if let Some(addr) = self.deferred_peer.take() {
+                let selected =
+                    crate::session::select_for_peer(addr, self.storage.clone(), Default::default());
+                cx.spawn(async move |cx| {
+                    let selected = selected.await;
+                    cx.update(|cx| match selected {
+                        Ok((storage, db)) => self.start_session(storage, db, cx),
+                        // No session exists yet, so there is nothing to shut down.
+                        Err(error) => {
+                            eprintln!("Could not create the session database: {error}");
+                            std::process::exit(1);
+                        }
+                    });
+                })
+                .detach();
             } else {
                 // The startup screen is a window like any other, so overlays
                 // have to be installed before it opens: a consumer's overlay
@@ -1622,6 +1697,9 @@ impl PanelApp {
             themes: _,
             default_theme: _,
             splash_logo: _,
+            storage,
+            deferred_peer: _,
+            session_lookback,
         } = self;
 
         let db = db.expect("session selected before DB services start");
@@ -1647,9 +1725,11 @@ impl PanelApp {
             .leader
             .clone();
         edits::init(cx);
-        crate::temporal::TemporalController::init(db.clone(), cx);
+        crate::temporal::TemporalController::init(db.clone(), cx)
+            .update(cx, |c, cx| c.set_session_lookback(session_lookback, cx));
         ItemRegistry::init(cx);
-        crate::session::init(session, db.clone(), open_handler, cx);
+        let evicts = session.as_ref().is_some_and(|s| s.is_cache());
+        crate::session::init(session, db.clone(), open_handler, storage.peer_cache(), cx);
         crate::temporal::picker::register(cx);
         crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
         crate::views::dashboard::WidgetRegistry::init(cx);
@@ -1724,6 +1804,9 @@ impl PanelApp {
             }
             register_connection_commands(cx);
             register_inspector_command(cx);
+            if evicts {
+                crate::eviction::spawn(db.clone(), storage.eviction, cx);
+            }
         }
 
         // Inspector requests route to the window they were made in:

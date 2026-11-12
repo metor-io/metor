@@ -35,13 +35,12 @@ fn main() {
             .unwrap_or_else(|error| exit("Could not create temporary session", &error)),
         Startup::Connect(addr) => {
             let addr = startup_args::resolve(&addr).unwrap_or_else(|e| exit("Bad address", &e));
-            metor_panel::PanelApp::temporary()
-                .unwrap_or_else(|error| exit("Could not create temporary session", &error))
-                .remote(addr)
+            // Storage is chosen at run time, once the peer has said who it is.
+            metor_panel::PanelApp::choose_session().remote(addr)
         }
         Startup::Help => {
             println!(
-                "{USAGE}\n\nWithout a mode, choose a connection and optional recording location.\n--connect mirrors a running db in a temporary session; --preset loads a layout file."
+                "{USAGE}\n\nWithout a mode, choose a connection and optional recording location.\n--connect mirrors a running db into its cache (temporary when it can't be cached); --preset loads a layout file."
             );
             return;
         }

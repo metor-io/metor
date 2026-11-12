@@ -373,7 +373,7 @@ impl Render for XyLinePlot {
                         .into_iter()
                         .flatten()
                     {
-                        history.request(range.clone(), cx);
+                        history.request(range.clone(), crate::data_binding::RAW_SAMPLE_BUDGET, cx);
                     }
                 }
             }

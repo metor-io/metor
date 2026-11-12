@@ -53,6 +53,26 @@ impl ReplayPlan {
         schema_of(&self.field_ty(field))
     }
 
+    /// Roughly how many samples replaying `range` touches: every input
+    /// sample there, wherever it lives, plus a clocked system's ticks.
+    /// Counted from manifests rather than by reading, so a view can weigh it
+    /// every frame before deciding to pull the inputs at all.
+    pub fn estimate_samples(&self, range: Range<Timestamp>) -> u64 {
+        let reads: u64 = self
+            .ports
+            .iter()
+            .map(|port| port.time_series.estimate_samples(range.clone()))
+            .sum();
+        let ticks = match self.compiled.manifest.systems[self.system].rate {
+            Some(hz) => {
+                let seconds = range.end.0.saturating_sub(range.start.0).max(0) as f64 / 1e6;
+                (seconds * hz) as u64
+            }
+            None => 0,
+        };
+        reads.saturating_add(ticks)
+    }
+
     fn field_ty(&self, field: usize) -> Ty {
         self.compiled.manifest.systems[self.system].output.fields[field]
             .ty

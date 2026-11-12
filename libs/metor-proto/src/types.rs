@@ -578,18 +578,31 @@ pub struct Packet {
     pub body: [u8],
 }
 
+/// A time series packet's body: a sample count, the range the sender
+/// vouches for (see [`OwnedTimeSeries::covered`]), then the timestamps and
+/// the samples, oldest first.
 #[derive(TryFromBytes, Unaligned, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct TimeSeries {
     pub len: [u8; 8],
+    pub covered_start: [u8; 8],
+    pub covered_end: [u8; 8],
     pub body: [u8],
 }
 
 impl TimeSeries {
+    /// Bytes ahead of the timestamps.
+    pub const HEAD: usize = 3 * size_of::<u64>();
+
     fn len(&self) -> Result<usize, Error> {
         u64::from_le_bytes(self.len)
             .try_into()
             .map_err(|_| Error::OffsetOverflow)
+    }
+
+    fn covered(&self) -> core::ops::Range<Timestamp> {
+        Timestamp(i64::from_le_bytes(self.covered_start))
+            ..Timestamp(i64::from_le_bytes(self.covered_end))
     }
 }
 
@@ -828,11 +841,13 @@ impl<B: IoBuf> OwnedPacket<B> {
             PacketTy::TimeSeries => {
                 let time_series = TimeSeries::try_ref_from_bytes(&buf)?;
                 let len = time_series.len()?;
+                let covered = time_series.covered();
                 OwnedPacket::TimeSeries(OwnedTimeSeries {
                     id,
                     req_id,
                     buf,
                     len,
+                    covered,
                 })
             }
         })
@@ -895,22 +910,35 @@ pub struct OwnedTimeSeries<B: IoBuf> {
     pub id: PacketId,
     pub req_id: RequestId,
     pub len: usize,
+    /// The stretch of time the sender vouches for: it has no samples in
+    /// this range other than the ones in this reply. Narrower than what was
+    /// asked when a limit or the size budget cut the reply short, or when
+    /// the sender doesn't hold part of the range itself; empty when it
+    /// could answer nothing.
+    pub covered: core::ops::Range<Timestamp>,
     pub buf: Slice<B>,
 }
 
 impl<B: IoBuf> OwnedTimeSeries<B> {
+    /// Where the timestamps end and the samples begin. `len` comes off the
+    /// wire, so a malformed count is an error rather than an overflow.
+    fn stamps_end(&self) -> Result<usize, Error> {
+        self.len
+            .checked_mul(size_of::<i64>())
+            .and_then(|stamps| stamps.checked_add(TimeSeries::HEAD))
+            .ok_or(Error::OffsetOverflow)
+    }
+
     pub fn timestamps(&self) -> Result<&[Timestamp], Error> {
-        let start = size_of::<u64>();
-        let end = start + self.len * size_of::<i64>();
+        let end = self.stamps_end()?;
         let timestamps = stellarator_buf::deref(&self.buf)
-            .get(start..end)
+            .get(TimeSeries::HEAD..end)
             .ok_or(Error::BufferUnderflow)?;
         Ok(<[Timestamp]>::ref_from_bytes(timestamps)?)
     }
 
     pub fn data(&self) -> Result<&[u8], Error> {
-        let start = size_of::<u64>();
-        let end = start + self.len * size_of::<i64>();
+        let end = self.stamps_end()?;
         stellarator_buf::deref(&self.buf)
             .get(end..)
             .ok_or(Error::BufferUnderflow)
@@ -1108,6 +1136,25 @@ impl<R: Request> Request for &'_ R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A count off the wire too large for the buffer, or for `usize`
+    /// arithmetic, is an error, never a panic.
+    #[cfg(feature = "std")]
+    #[test]
+    fn malformed_time_series_counts_are_errors() {
+        use stellarator_buf::IoBuf;
+        for len in [usize::MAX, usize::MAX / 8, 4] {
+            let series = OwnedTimeSeries {
+                id: [0, 0],
+                req_id: 0,
+                len,
+                covered: Timestamp(0)..Timestamp(1),
+                buf: vec![0u8; TimeSeries::HEAD + 8].try_slice(..).unwrap(),
+            };
+            assert!(series.timestamps().is_err());
+            assert!(series.data().is_err());
+        }
+    }
 
     #[test]
     fn test_padding() {

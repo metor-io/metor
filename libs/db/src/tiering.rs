@@ -87,7 +87,8 @@ struct Victim {
     end_ts: Timestamp,
     bytes: u64,
     acked: bool,
-    /// Hydrated from a store — purging is free, no upload needed.
+    /// Hydrated from a store, or mirrored from a peer that is its
+    /// authority: usually purged without an upload (see [`evict`]).
     cache_copy: bool,
     /// Set once the age pass purges this span, so the budget pass skips it
     /// without a second survivor buffer.
@@ -222,7 +223,7 @@ fn collect_victims(
                 end_ts: span.seal.end_ts,
                 bytes: span.bytes(),
                 acked: span.acked,
-                cache_copy: span.source == SpanSource::RemoteFetch,
+                cache_copy: matches!(span.source, SpanSource::RemoteFetch | SpanSource::Mirrored),
                 evicted: false,
             });
         }
@@ -258,6 +259,13 @@ async fn evict(
     victim: &Victim,
     store: Option<&dyn NodeStore>,
 ) -> Result<bool, Error> {
+    let series = &victim.component.time_series;
+    // A cache copy needs no upload when something else can give it back,
+    // which only `purge_span` can tell: a hydrated span whose peer stopped
+    // listing it, or a mirrored one no peer seal covers, is the only copy.
+    if victim.cache_copy && !victim.acked && series.purge_span(victim.start_ts)? {
+        return Ok(true);
+    }
     if !victim.acked {
         let Some(store) = store else {
             warn!(
@@ -275,7 +283,7 @@ async fn evict(
             .unwrap_or_else(|| victim.component_id.to_string());
         let schema = victim.component.schema.to_schema();
         offload_span(
-            &victim.component.time_series,
+            series,
             store,
             victim.component_id,
             &name,
@@ -284,7 +292,7 @@ async fn evict(
         )
         .await?;
     }
-    victim.component.time_series.purge_span(victim.start_ts)
+    series.purge_span(victim.start_ts)
 }
 
 #[cfg(test)]
@@ -421,6 +429,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resident_starts(&db), vec![200]);
+    }
+
+    /// A hydrated span the peer stopped listing is the only copy left, so
+    /// it is offloaded like local data before it is purged.
+    #[stellarator::test]
+    async fn a_delisted_fetched_span_is_offloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_db(&dir.path().join("db"), &[300]);
+        let series = db
+            .with_state(|s| s.components.get(&COMPONENT).cloned())
+            .unwrap()
+            .time_series;
+        let samples: Vec<_> = (100..104i64)
+            .map(|t| (Timestamp(t), (t as u64).to_le_bytes()))
+            .collect();
+        series
+            .install_samples(
+                8,
+                samples.iter().map(|(t, b)| (*t, &b[..])),
+                SpanSource::RemoteFetch,
+            )
+            .unwrap();
+        series.sync_remote(vec![], None).unwrap();
+        assert!(!series.manifest().span(Timestamp(100)).unwrap().acked);
+        let store = LocalDirStore::new(dir.path().join("store"));
+        let config = TieringConfig {
+            max_age: Some(Duration::from_micros(750)),
+            min_resident: Duration::ZERO,
+            ..Default::default()
+        };
+        tier_once(
+            &db,
+            Some(&store),
+            &config,
+            Timestamp(1000),
+            &mut TieringScratch::default(),
+        )
+        .await
+        .unwrap();
+        let span = *series.manifest().span(Timestamp(100)).unwrap();
+        assert_eq!(span.state, SpanState::RemoteOnly);
+        assert!(span.acked, "offloaded to the store first");
     }
 
     #[stellarator::test]

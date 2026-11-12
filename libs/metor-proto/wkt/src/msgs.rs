@@ -129,12 +129,75 @@ impl Msg for SetStreamState {
     const ID: PacketId = [224, 2];
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Asks a db for one component's samples within `range` (end exclusive),
+/// answered with an [`OwnedTimeSeries`]. Gated on [`FEATURE_RANGE_FETCH`]:
+/// older servers read only the leading fields and reply in a layout without
+/// `covered`.
+///
+/// A client reads history it doesn't hold with this one request: pages of
+/// a range (`from: Oldest`, paging on `covered.end`), or the sample shown
+/// at an instant (`range: ..t + 1, from: Newest, limit: 1`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GetTimeSeries {
     pub id: PacketId,
     pub range: Range<Timestamp>,
     pub component_id: ComponentId,
+    /// At most this many samples, counted from `from`. A timestamp is never
+    /// split across replies, so a reply can hold more when the limit falls
+    /// inside a run of equal timestamps.
     pub limit: Option<usize>,
+    /// Which end of `range` the reply starts from, and so which end its
+    /// `covered` range keeps when the limit or size budget cuts it short.
+    pub from: SeriesEnd,
+}
+
+impl GetTimeSeries {
+    /// The oldest samples of `range`, as many as fit one reply.
+    pub fn range(component_id: ComponentId, range: Range<Timestamp>) -> Self {
+        Self {
+            id: [0, 0],
+            range,
+            component_id,
+            limit: None,
+            from: SeriesEnd::Oldest,
+        }
+    }
+
+    /// The sample a reader shows at `t`: the newest at or before it.
+    pub fn instant(component_id: ComponentId, t: Timestamp) -> Self {
+        Self {
+            from: SeriesEnd::Newest,
+            limit: Some(1),
+            ..Self::range(
+                component_id,
+                Timestamp(i64::MIN)..Timestamp(t.0.saturating_add(1)),
+            )
+        }
+    }
+
+    pub fn limit(self, limit: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            ..self
+        }
+    }
+
+    pub fn newest(self) -> Self {
+        Self {
+            from: SeriesEnd::Newest,
+            ..self
+        }
+    }
+}
+
+/// The end of a range a [`GetTimeSeries`] counts its limit from.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SeriesEnd {
+    /// From the start forward: pages of history, oldest first.
+    #[default]
+    Oldest,
+    /// From the end backward: the latest samples before a point.
+    Newest,
 }
 
 impl Msg for GetTimeSeries {
@@ -1016,10 +1079,32 @@ pub struct LogEvent {
 /// telemetry, so probing with anything else pollutes the remote DB.
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
-pub const NODE_PROTOCOL_VERSION: u32 = 4;
+///
+/// Version 7 extended [`GetTimeSeries`] with `from`, made its range end
+/// exclusive, and added `covered` to the reply ([`FEATURE_RANGE_FETCH`]).
+/// That breaks the wire format in both directions: an older server answers
+/// in the old layout, which a newer client would misread (its `covered`
+/// would be the first 16 bytes of timestamps), so clients check the feature
+/// bit before asking; and a newer server can't decode an older client's
+/// shorter request, so that client gets an error reply.
+///
+/// Version 8 appended `head` to [`NodeManifestResp`]
+/// ([`FEATURE_UNSEALED_HEAD`]). Older clients never read it; a version-8
+/// client reads a version-7 server's reply as [`NodeManifestRespV7`].
+pub const NODE_PROTOCOL_VERSION: u32 = 8;
 
 /// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
 pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
+
+/// [`DbInfoResp::features`] bit: the server answers the extended
+/// [`GetTimeSeries`] and says what each reply covers, so a mirror can fetch
+/// a range or an instant instead of a whole sealed node.
+pub const FEATURE_RANGE_FETCH: u64 = 1 << 2;
+
+/// [`DbInfoResp::features`] bit: [`NodeManifestResp`] says where the
+/// server's unsealed head lies, so a mirror can range-fetch history the
+/// server has not sealed into a node yet.
+pub const FEATURE_UNSEALED_HEAD: u64 = 1 << 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetDbInfo;
@@ -1039,7 +1124,8 @@ pub struct DbInfoResp {
     pub protocol_version: u32,
     /// Capability bits; clients gate post-version-1 requests on these.
     /// Bit 0 was the retired envelope protocol ([224,56]/[224,57]) and
-    /// must not be reused. Bit 1 is [`FEATURE_MSG_SYNC`].
+    /// must not be reused. Bit 1 is [`FEATURE_MSG_SYNC`], bit 2
+    /// [`FEATURE_RANGE_FETCH`], bit 3 [`FEATURE_UNSEALED_HEAD`].
     pub features: u64,
     /// The msg ids a client should forward up this connection: requests
     /// going to the server, never records coming back. Added in version 3.
@@ -1051,6 +1137,64 @@ pub struct DbInfoResp {
     /// command this server takes, messages and frames alike. Added in
     /// version 4.
     pub commands: Vec<CommandInfo>,
+    /// The newest sample time the server held when it answered, or `None`
+    /// for an empty db. A mirror learns from it where "now" is in the
+    /// peer's data before the first live sample arrives, which manifests
+    /// alone can't say: they end at the last seal, possibly long ago.
+    /// Added in version 5.
+    pub last_updated: Option<Timestamp>,
+    /// Which database answered, stable across the server's restarts. A
+    /// mirror keys its on-disk cache of this peer by it. `None` from a
+    /// server that predates it. Added in version 6.
+    pub instance_id: Option<InstanceId>,
+    /// The server's database lasts only this run: it is deleted when the
+    /// server stops, or lives in a scratch directory the next run won't
+    /// reuse, so its id is never seen again. A mirror shouldn't keep a
+    /// cache it will never reopen, and shouldn't evict history only the
+    /// peer could give back once the peer is gone. Added in version 6.
+    pub ephemeral: bool,
+}
+
+/// A database's identity: random, made when the database is created, and
+/// kept with it for its lifetime.
+///
+/// It says which cached copy of a peer to reopen, not that the copy is
+/// still right: a copied database directory keeps its id, so whoever reuses
+/// a cache still checks sealed spans against the peer's.
+#[derive(
+    Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+pub struct InstanceId(pub [u8; 16]);
+
+impl std::fmt::Display for InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}", u128::from_be_bytes(self.0))
+    }
+}
+
+/// Why a string isn't an [`InstanceId`]: anything but 32 hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidInstanceId;
+
+impl std::fmt::Display for InvalidInstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an instance id is 32 hex digits")
+    }
+}
+
+impl std::error::Error for InvalidInstanceId {}
+
+impl std::str::FromStr for InstanceId {
+    type Err = InvalidInstanceId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 32 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(InvalidInstanceId);
+        }
+        u128::from_str_radix(s, 16)
+            .map(|id| InstanceId(id.to_be_bytes()))
+            .map_err(|_| InvalidInstanceId)
+    }
 }
 
 impl<'de> Deserialize<'de> for DbInfoResp {
@@ -1074,6 +1218,9 @@ impl<'de> Deserialize<'de> for DbInfoResp {
                     command_ids: fields.since(3)?,
                     namespace: fields.since(3)?,
                     commands: fields.since(4)?,
+                    last_updated: fields.since(5)?,
+                    instance_id: fields.since(6)?,
+                    ephemeral: fields.since(6)?,
                 })
             }
         }
@@ -1083,6 +1230,9 @@ impl<'de> Deserialize<'de> for DbInfoResp {
             "command_ids",
             "namespace",
             "commands",
+            "last_updated",
+            "instance_id",
+            "ephemeral",
         ];
         deserializer.deserialize_struct("DbInfoResp", FIELDS, Visitor)
     }
@@ -1199,16 +1349,51 @@ impl Request for GetNodeManifest {
 }
 
 /// Every sealed node the server can currently serve for the component,
-/// sorted by start timestamp. The live (unsealed) head is never listed —
-/// its samples arrive via streaming instead.
+/// sorted by start timestamp, and where its unsealed head lies.
+///
+/// The head is not a node anyone can fetch: it is still being written, and
+/// it is only ever read with a range fetch ([`GetTimeSeries`]). `nodes` and
+/// `head` come from one snapshot, so together they cover everything the
+/// server holds: a node sealed after the snapshot is still part of `head`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NodeManifestResp {
     pub component_id: ComponentId,
     pub nodes: Vec<SealRecord>,
+    /// The samples past the sealed nodes, or `None` when there are none.
+    /// Added in version 8.
+    pub head: Option<UnsealedHead>,
 }
 
 impl Msg for NodeManifestResp {
     const ID: PacketId = [224, 48];
+}
+
+/// [`NodeManifestResp`] as a server before version 8 sends it: no head.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeManifestRespV7 {
+    pub component_id: ComponentId,
+    pub nodes: Vec<SealRecord>,
+}
+
+impl Msg for NodeManifestRespV7 {
+    const ID: PacketId = NodeManifestResp::ID;
+}
+
+/// The stretch of a component a server holds but has not sealed: its live
+/// head, and any node it rolled past but has not sealed yet.
+///
+/// A summary, not a seal: there is no checksum, since the bytes are still
+/// changing, and `end_ts` is only where the head ended when the server
+/// answered.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsealedHead {
+    /// The oldest unsealed sample.
+    pub start_ts: Timestamp,
+    /// The newest sample when the server answered.
+    pub end_ts: Timestamp,
+    /// Samples in `start_ts..=end_ts`, for cost estimates.
+    pub count: u64,
+    pub element_size: u64,
 }
 
 /// Ask the server to stream one sealed node's payloads as [`NodeChunk`]s
@@ -2017,6 +2202,50 @@ mod link_info_tests {
 mod db_info_tests {
     use super::*;
 
+    /// A version-7 client reads a version-8 manifest reply up to the head
+    /// it doesn't know, and a version-7 reply is read as
+    /// [`NodeManifestRespV7`], which a version-8 reply's prefix also is.
+    #[test]
+    fn node_manifest_head_is_a_trailing_field() {
+        let seal = SealRecord {
+            start_ts: Timestamp(1),
+            end_ts: Timestamp(9),
+            count: 3,
+            index_len: 24,
+            data_len: 24,
+            checksum: 5,
+            element_size: 8,
+        };
+        let v8 = NodeManifestResp {
+            component_id: ComponentId(4),
+            nodes: vec![seal],
+            head: Some(UnsealedHead {
+                start_ts: Timestamp(10),
+                end_ts: Timestamp(20),
+                count: 2,
+                element_size: 8,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&v8).expect("encode");
+        let v7: NodeManifestRespV7 = postcard::from_bytes(&bytes).expect("decode v8 as v7");
+        assert_eq!((v7.component_id, v7.nodes), (ComponentId(4), vec![seal]));
+        let back: NodeManifestResp = postcard::from_bytes(&bytes).expect("round trip");
+        assert_eq!(back.head, v8.head);
+
+        let old = postcard::to_allocvec(&NodeManifestRespV7 {
+            component_id: ComponentId(4),
+            nodes: vec![seal],
+        })
+        .expect("encode");
+        assert!(postcard::from_bytes::<NodeManifestResp>(&old).is_err());
+        assert_eq!(
+            postcard::from_bytes::<NodeManifestRespV7>(&old)
+                .expect("decode v7")
+                .nodes,
+            vec![seal]
+        );
+    }
+
     /// A v2 reader decodes a current reply: postcard stops at the fields it
     /// knows and ignores the trailing bytes.
     #[test]
@@ -2032,6 +2261,9 @@ mod db_info_tests {
             command_ids: vec![AlarmAck::ID],
             namespace: Some("sat".into()),
             commands: Vec::new(),
+            last_updated: Some(Timestamp(42)),
+            instance_id: Some(InstanceId([7; 16])),
+            ephemeral: true,
         };
         let bytes = postcard::to_allocvec(&v3).expect("encode");
         let v2: DbInfoRespV2 = postcard::from_bytes(&bytes).expect("decode v3 as v2");
@@ -2074,8 +2306,38 @@ mod db_info_tests {
                 command_ids: vec![AlarmAck::ID],
                 namespace: Some("sat".into()),
                 commands: Vec::new(),
+                last_updated: None,
+                instance_id: None,
+                ephemeral: false,
             }
         );
+    }
+
+    /// A version-5 server's reply ends at `last_updated`; the identity
+    /// fields came in version 6.
+    #[test]
+    fn db_info_v5_bytes_decode_as_current() {
+        #[derive(Serialize)]
+        struct DbInfoRespV5 {
+            protocol_version: u32,
+            features: u64,
+            command_ids: Vec<PacketId>,
+            namespace: Option<String>,
+            commands: Vec<CommandInfo>,
+            last_updated: Option<Timestamp>,
+        }
+        let bytes = postcard::to_allocvec(&DbInfoRespV5 {
+            protocol_version: 5,
+            features: FEATURE_MSG_SYNC,
+            command_ids: Vec::new(),
+            namespace: None,
+            commands: Vec::new(),
+            last_updated: Some(Timestamp(42)),
+        })
+        .expect("encode");
+        let info = postcard::from_bytes::<DbInfoResp>(&bytes).expect("decode v5");
+        assert_eq!(info.last_updated, Some(Timestamp(42)));
+        assert!(info.instance_id.is_none() && !info.ephemeral);
     }
 
     #[test]
@@ -2084,5 +2346,19 @@ mod db_info_tests {
         let info = postcard::from_bytes::<DbInfoResp>(&bytes).expect("decode v2");
         assert_eq!(info.features, FEATURE_MSG_SYNC);
         assert!(info.command_ids.is_empty() && info.namespace.is_none());
+        assert!(info.instance_id.is_none() && !info.ephemeral);
+    }
+
+    #[test]
+    fn instance_id_round_trips_through_hex() {
+        let id = InstanceId(std::array::from_fn(|i| (i * 17) as u8));
+        let text = id.to_string();
+        assert_eq!(text.len(), 32);
+        assert_eq!(text.parse::<InstanceId>(), Ok(id));
+        assert_eq!(text.to_uppercase().parse::<InstanceId>(), Ok(id));
+        assert!("abc".parse::<InstanceId>().is_err());
+        assert!("zz".repeat(16).parse::<InstanceId>().is_err());
+        assert!("+f".repeat(16).parse::<InstanceId>().is_err());
+        assert!("é".repeat(16).parse::<InstanceId>().is_err());
     }
 }
