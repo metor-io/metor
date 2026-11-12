@@ -1507,9 +1507,8 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     db: Arc<DB>,
 ) -> Result<(), Error> {
     // Both buffers start small and grow to the largest packet the
-    // connection carries. Every connection runs on its own thread, and
-    // reserving the 1 GiB ceiling up front for each one stalled new
-    // connections for most of a second once a few dozen were open.
+    // connection carries, up to `MAX_PACKET_LEN`, so each open connection
+    // costs only what it uses.
     let mut buf = vec![0u8; CONN_BUF_LEN];
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], CONN_BUF_LEN);
     let mut conn = ConnState::default();

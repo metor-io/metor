@@ -616,8 +616,8 @@ impl TimeSeries {
     }
 
     /// Append the stretches of `range` that no one has ever produced data
-    /// for, in time order. Never blocks and never allocates beyond `out`'s
-    /// spill; safe to call from a render loop.
+    /// for, in time order. Never blocks; it sorts every span and node, so
+    /// its cost grows with the component's history.
     ///
     /// The complement to [`Self::coverage`]: a gap there is history that
     /// exists but is not *here* (a remote-only span a fetch can hydrate),
@@ -1058,12 +1058,12 @@ impl TimeSeries {
     /// went, so the caller learns of it from an empty or short return and
     /// re-seeds the manifest instead.
     ///
-    /// A stretch is never claimed across a resident node. At a timestamp a
-    /// resident node starts or ends on (two peer nodes tying), the reply
-    /// lists the tie oldest node first, so the node's own samples there are
-    /// dropped from the reply's front when the node lies before the stretch
-    /// and from its back when it lies after, and the rest stay in the
-    /// fragment, which then shares the node's edge timestamp.
+    /// A stretch is never claimed across a resident node. Where a stretch
+    /// shares an edge timestamp with a resident node (two peer nodes with
+    /// samples at the same timestamp), as many of the reply's samples there
+    /// as the node holds are left out: from the front of the stretch if the
+    /// node comes before it, from the back if it comes after. The rest stay
+    /// in the fragment, so each sample is held once.
     /// Every fragment lands in one swap of the node list and one publish.
     /// Returns the stretches claimed, oldest first.
     ///
@@ -1640,8 +1640,8 @@ impl TimeSeries {
         Ok(())
     }
 
-    /// The seal a peer's `head` is recorded under, and a zero checksum,
-    /// which no node a peer serves carries in practice.
+    /// Build the seal that records a peer's unsealed `head` as remote
+    /// coverage. Its checksum is zero, which no node a peer serves has.
     ///
     /// It runs up to the current mirror run's first sample when that is
     /// past the listing's end, and stops below this side's

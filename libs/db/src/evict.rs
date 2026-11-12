@@ -15,7 +15,7 @@
 //!
 //! Locally produced spans ([`SpanSource::LocalIngest`]) are never evicted
 //! here, acked or not: they are the system of record, or panel-computed
-//! data whose recomputation nothing schedules yet.
+//! data that nothing would recompute.
 
 use std::{
     sync::{
