@@ -322,6 +322,58 @@ fn crash_mid_mirrored_purge_reopens_fetchable() {
     assert_eq!(gaps(&series, 0, 141).1, [(0, 141)]);
 }
 
+/// A crash after a purge persisted a hydrated span as remote-only, but
+/// before its node was deleted, reopens the node with its source and ack,
+/// so it is purged again.
+#[test]
+fn crash_mid_acked_purge_reopens_purgeable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let manifest = cdir.join(crate::manifest::MANIFEST_FILE);
+    let src = peer_node(&dir.path().join("peer"), &every_10(40));
+    let seal = SealRecord::compute(&src).unwrap();
+    let series = TimeSeries::create(&cdir).unwrap();
+    let install = || {
+        let staging = stage(&cdir, &src, &seal);
+        series
+            .install_node(staging, &seal, SpanSource::RemoteFetch)
+            .unwrap();
+    };
+    install();
+    assert!(series.purge_span(Timestamp(0)).unwrap());
+    let purged = std::fs::read(&manifest).unwrap();
+    install();
+    drop(series);
+    std::fs::write(&manifest, purged).unwrap();
+    // Only the manifest speaks for the node's source here.
+    std::fs::remove_file(cdir.join("0").join("fetched")).unwrap();
+    let series = TimeSeries::open(&cdir).unwrap();
+    let span = *series.manifest().span(Timestamp(0)).unwrap();
+    assert_eq!(span.state, SpanState::Resident);
+    assert_eq!(span.source, SpanSource::RemoteFetch);
+    assert!(span.acked);
+    assert!(series.purge_span(Timestamp(0)).unwrap());
+}
+
+/// An installed node whose manifest never reached disk reopens as fetched
+/// data, not local ingest.
+#[test]
+fn a_node_installed_before_a_crash_keeps_its_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdir = dir.path().join("c");
+    let src = peer_node(&dir.path().join("peer"), &every_10(40));
+    let seal = SealRecord::compute(&src).unwrap();
+    let series = TimeSeries::create(&cdir).unwrap();
+    series
+        .install_node(stage(&cdir, &src, &seal), &seal, SpanSource::RemoteFetch)
+        .unwrap();
+    drop(series);
+    std::fs::remove_file(cdir.join(crate::manifest::MANIFEST_FILE)).unwrap();
+    let series = TimeSeries::open(&cdir).unwrap();
+    let span = *series.manifest().span(Timestamp(0)).unwrap();
+    assert_eq!(span.source, SpanSource::RemoteFetch);
+}
+
 #[test]
 fn a_node_sealed_after_restart_keeps_its_mirrored_tag() {
     let dir = tempfile::tempdir().unwrap();

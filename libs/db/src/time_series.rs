@@ -230,19 +230,28 @@ fn is_sealed(manifest: &ComponentManifest, node: &TimeSeriesNode) -> bool {
         })
 }
 
-/// Marks a node directory as holding [`SpanSource::Mirrored`] data. Written
-/// when the node is created (by a mirror run's writer, or as a hydration
-/// piece), so the tag survives a crash or a restart that seals the node
-/// before the manifest ever records it.
-const MIRRORED_TAG: &str = "mirrored";
+/// Files that mark a node directory as holding data from somewhere other
+/// than local ingest. Written when the node is created (by a mirror run's
+/// writer, a hydration piece, or an installed node), so the source survives
+/// a crash or restart before the manifest records it.
+const SOURCE_TAGS: [(&str, SpanSource); 2] = [
+    ("mirrored", SpanSource::Mirrored),
+    ("fetched", SpanSource::RemoteFetch),
+];
 
-fn tag_mirrored(node_dir: &Path) -> Result<(), Error> {
-    std::fs::File::create(node_dir.join(MIRRORED_TAG))?.sync_all()?;
+fn tag_source(node_dir: &Path, source: SpanSource) -> Result<(), Error> {
+    if let Some((name, _)) = SOURCE_TAGS.iter().find(|(_, s)| *s == source) {
+        std::fs::File::create(node_dir.join(name))?.sync_all()?;
+    }
     Ok(())
 }
 
-fn is_tagged_mirrored(node_dir: &Path) -> bool {
-    node_dir.join(MIRRORED_TAG).exists()
+/// The source a node directory is tagged with, if any.
+fn tagged_source(node_dir: &Path) -> Option<SpanSource> {
+    SOURCE_TAGS
+        .iter()
+        .find(|(name, _)| node_dir.join(name).exists())
+        .map(|(_, source)| *source)
 }
 
 /// Rebuild the manifest on open: the directory scan (already loaded into
@@ -281,20 +290,21 @@ fn reconcile_manifest(path: &Path, list: &AtomicStack<TimeSeriesNode>) -> Compon
                 continue;
             }
         };
-        // Older writes could persist a stale remote entry under a resident
-        // node's key; flags only ever come from a resident entry.
+        // Flags come from an entry for this exact node, whatever its state:
+        // a crash partway through a purge leaves it persisted as
+        // remote-only, and it must keep its source and ack to be purged
+        // again. A remote entry for a different seal under the same key
+        // says nothing about this node.
         let lo = persisted
             .spans
             .partition_point(|s| s.cover_start.0 < start_ts.0);
         let flags = persisted.spans[lo..]
             .iter()
             .take_while(|s| s.cover_start == start_ts)
-            .find(|s| s.state == SpanState::Resident);
-        let source = if is_tagged_mirrored(&node_dir) {
-            SpanSource::Mirrored
-        } else {
-            flags.map(|s| s.source).unwrap_or(SpanSource::LocalIngest)
-        };
+            .find(|s| s.seal == seal);
+        let source = tagged_source(&node_dir)
+            .or(flags.map(|s| s.source))
+            .unwrap_or(SpanSource::LocalIngest);
         draft.spans.push(NodeSpan::whole(
             seal,
             SpanState::Resident,
@@ -738,10 +748,7 @@ impl TimeSeries {
                     None => continue,
                 },
             };
-            let source = match is_tagged_mirrored(&node_dir) {
-                true => SpanSource::Mirrored,
-                false => SpanSource::LocalIngest,
-            };
+            let source = tagged_source(&node_dir).unwrap_or(SpanSource::LocalIngest);
             sealed.push(NodeSpan::whole(seal, SpanState::Resident, source, false));
         }
         let Some(touched) = sealed
@@ -1232,6 +1239,7 @@ impl TimeSeries {
         }
         let superseded = self.fragments_over(&manifest, &[(seal.start_ts.0, seal.end_ts.0)]);
         self.check_splice(seal, tie, &superseded.nodes)?;
+        tag_source(staging.dir(), source)?;
         let (_node_dir, node) = staging.commit(seal)?;
         self.link(vec![node], &superseded.nodes)?;
         let resident = extents(self.list.iter(), None);
@@ -1457,7 +1465,7 @@ impl TimeSeries {
             let cut = staging.cut(piece.cover_start..=piece.cover_end);
             installed = cut.and_then(|cut| match cut {
                 Some((node, piece_seal)) => {
-                    tag_mirrored(node.dir())?;
+                    tag_source(node.dir(), SpanSource::Mirrored)?;
                     self.check_splice(&piece_seal, true, &replaced.nodes)?;
                     nodes.push(node.commit(&piece_seal)?.1);
                     landed.push((*piece, Some(piece_seal)));
@@ -2122,7 +2130,7 @@ impl TimerSeriesWriter {
             let node_dir = self.time_series.path.join(timestamp.0.to_string());
             let node = TimeSeriesNode::create(&node_dir, timestamp, buf.len() as u64)?;
             if self.time_series.mirror_run.load(Ordering::Acquire) != 0 {
-                tag_mirrored(&node_dir)?;
+                tag_source(&node_dir, SpanSource::Mirrored)?;
             }
             let _ = self.time_series.list.try_push(node);
             rolled = true;
