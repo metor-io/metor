@@ -230,7 +230,10 @@ pub async fn db(
         .collect();
     let commands = match commands {
         Ok(commands) => commands,
-        Err(error) => return log.fault("unknown_command", error.to_string()),
+        Err(error) => {
+            log.fault("unknown_command", error.to_string());
+            return s.finish(log);
+        }
     };
     // PANIC Safety: `new` always sets the listener, and a system runs once.
     let listener = s.listener.take().expect("one run per instance");

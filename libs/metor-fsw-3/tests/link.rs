@@ -1246,6 +1246,26 @@ async fn test_db_deletes_its_dir_on_stop() {
     assert!(dir.path().join("kept/db_state").exists());
 }
 
+/// A db that faults before it serves still deletes its directory.
+#[stellarator::test]
+async fn test_db_deletes_its_dir_after_a_fault() {
+    let seen = Seen::default();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = SystemConfig {
+        params: json!({
+            "listen": pick_port("db-faulted").to_string(),
+            "path": dir.path().join("db"),
+            "on_exit": "delete",
+            "commands": ["no_such_record"],
+        }),
+        ..SystemConfig::new("db", "fsw.db")
+    };
+    let _target = spawn(vec![db], &seen, 500.0);
+    // Built (so created), then faulted on its first run, with the target up.
+    until_seen("the target ran", &seen, || seen.cycles() > 0).await;
+    until("the dir was deleted", || !dir.path().join("db").exists()).await;
+}
+
 /// Every advertised command is described as the message it is.
 fn assert_described(ids: &[metor_proto::types::PacketId], commands: &[CommandInfo]) {
     let described: Vec<_> = commands.iter().map(|command| command.id).collect();
