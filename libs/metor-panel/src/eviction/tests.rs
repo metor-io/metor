@@ -6,6 +6,11 @@ use metor_proto::types::{PrimType, Timestamp};
 
 /// How long these tests wait for setup-time stamps to go idle.
 const GRACE: Duration = Duration::from_millis(50);
+const WORKING_SET: Eviction = Eviction::WorkingSet { grace: GRACE };
+
+fn budget(max_bytes: u64) -> Eviction {
+    Eviction::Budget { max_bytes }
+}
 
 fn component(db: &DB, name: &str, dim: &[usize], metadata: &[(&str, String)]) -> Component {
     let id = ComponentId::new(name);
@@ -136,7 +141,7 @@ fn a_plot_keeps_what_it_draws(cx: &mut gpui::TestAppContext) {
     assert!(lod.selected().is_none());
     std::thread::sleep(GRACE * 2);
     frame(&lod, cx);
-    let evicted = sweep(&db, Instant::now(), GRACE);
+    let evicted = purge(&db, WORKING_SET, Instant::now());
     assert_eq!(
         evicted.spans, 2,
         "the raw span off screen and the unread level"
@@ -155,11 +160,11 @@ fn a_plot_keeps_what_it_draws(cx: &mut gpui::TestAppContext) {
     );
     std::thread::sleep(GRACE * 2);
     frame(&lod, cx);
-    assert!(any_idle(&db, Instant::now(), GRACE));
-    assert_eq!(sweep(&db, Instant::now(), GRACE).spans, 1);
+    assert!(due(&db, WORKING_SET, Instant::now()));
+    assert_eq!(purge(&db, WORKING_SET, Instant::now()).spans, 1);
     assert!(!resident(&rpm, 1000));
     assert!(resident(&coarse, 0));
-    assert!(!any_idle(&db, Instant::now(), GRACE));
+    assert!(!due(&db, WORKING_SET, Instant::now()));
 }
 
 /// Over a budget the least recently read goes first, until the rest fits;
@@ -187,13 +192,13 @@ fn a_budget_keeps_the_most_recently_read() {
         later - evict::DEFAULT_GRACE * 2,
     );
 
-    assert!(!over_budget(&db, u64::MAX));
-    assert!(over_budget(&db, span));
-    let evicted = trim(&db, later, span);
+    assert!(!due(&db, budget(u64::MAX), Instant::now()));
+    assert!(due(&db, budget(span), Instant::now()));
+    let evicted = purge(&db, budget(span), later);
     assert_eq!(evicted.spans, 2, "the unread raw span and the fine level");
     assert!(!resident(&rpm, 0));
     assert!(!resident(&fine, 0));
     assert!(resident(&rpm, 1000), "the most recently read fits");
     assert!(resident(&coarse, 0), "the coarsest level stays");
-    assert!(!over_budget(&db, span));
+    assert!(!due(&db, budget(span), Instant::now()));
 }

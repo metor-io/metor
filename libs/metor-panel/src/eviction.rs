@@ -25,10 +25,9 @@
 //! - **Paused unless every connection is up, and at least one can serve
 //!   history.** A peer that dropped may hold the only other copy, or none:
 //!   an ephemeral gateway deletes its DB when it stops. Spans aren't
-//!   attributed to the connection they came from yet, so one connection
-//!   down pauses eviction for all of them; and data from a peer that was
-//!   disconnected *and removed* is not protected once the remaining
-//!   connections are up. Per-connection attribution is the follow-up.
+//!   tracked per connection, so one connection down pauses eviction for
+//!   all of them; and data from a peer that was disconnected *and removed*
+//!   is not protected once the remaining connections are up.
 //! - **The coarsest LoD level of every source stays.** It is what a
 //!   zoomed-out view reads and is tiny (a month at 4096× is ~10 MB per
 //!   component), so refetching it on every zoom-out would cost more than
@@ -113,47 +112,30 @@ async fn tick(db: &Arc<DB>, eviction: Eviction, cx: &mut AsyncApp) {
 
 /// Whether a pass under `eviction` would find anything to purge.
 fn due(db: &DB, eviction: Eviction, now: Instant) -> bool {
+    let kept = coarsest_lod_levels(db);
+    let evictable = |id, _: &_| !kept.contains(&id);
     match eviction {
-        Eviction::WorkingSet { grace } => any_idle(db, now, grace),
-        Eviction::Budget { max_bytes } => over_budget(db, max_bytes),
+        Eviction::WorkingSet { grace } => evict::any_idle(db, now, grace, evictable),
+        Eviction::Budget { max_bytes } => evict::over_budget(db, max_bytes, evictable),
         Eviction::Off => false,
     }
 }
 
+/// Purge what `eviction` lets go: under a working set everything idle past
+/// its grace period; under a budget the least recently read history until
+/// the rest fits, sparing what was read within the default grace period.
+/// Each source's coarsest LoD level never goes and never counts toward a
+/// budget.
 fn purge(db: &DB, eviction: Eviction, now: Instant) -> Evicted {
+    let kept = coarsest_lod_levels(db);
+    let evictable = |id, _: &_| !kept.contains(&id);
     match eviction {
-        Eviction::WorkingSet { grace } => sweep(db, now, grace),
-        Eviction::Budget { max_bytes } => trim(db, now, max_bytes),
+        Eviction::WorkingSet { grace } => evict::sweep(db, now, grace, evictable),
+        Eviction::Budget { max_bytes } => {
+            evict::budget(db, now, max_bytes, evict::DEFAULT_GRACE, evictable)
+        }
         Eviction::Off => Evicted::default(),
     }
-}
-
-/// Whether [`trim`] would purge anything.
-fn over_budget(db: &DB, max_bytes: u64) -> bool {
-    let kept = coarsest_lod_levels(db);
-    evict::over_budget(db, max_bytes, |id, _| !kept.contains(&id))
-}
-
-/// Purge the least recently read history until the rest fits `max_bytes`.
-/// What was read within the default grace period stays, and each source's
-/// coarsest LoD level neither goes nor counts toward the budget.
-fn trim(db: &DB, now: Instant, max_bytes: u64) -> Evicted {
-    let kept = coarsest_lod_levels(db);
-    evict::budget(db, now, max_bytes, evict::DEFAULT_GRACE, |id, _| {
-        !kept.contains(&id)
-    })
-}
-
-/// Whether [`sweep`] would find anything to purge.
-fn any_idle(db: &DB, now: Instant, grace: Duration) -> bool {
-    let kept = coarsest_lod_levels(db);
-    evict::any_idle(db, now, grace, |id, _| !kept.contains(&id))
-}
-
-/// Purge everything idle past `grace` but each source's coarsest LoD level.
-fn sweep(db: &DB, now: Instant, grace: Duration) -> Evicted {
-    let kept = coarsest_lod_levels(db);
-    evict::sweep(db, now, grace, |id, _| !kept.contains(&id))
 }
 
 fn peers_reachable(cx: &App) -> bool {
