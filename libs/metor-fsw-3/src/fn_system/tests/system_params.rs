@@ -333,8 +333,13 @@ fn two_caps(a: Port<'_>, b: Port<'_>) {
 }
 
 #[crate::system]
-fn named_apart(a: [Noise<'_>; 2], b: [Port<'_>; 2]) {
-    let _ = (a, b);
+fn rngs_apart(a: [Noise<'_>; 2]) {
+    let _ = a;
+}
+
+#[crate::system]
+fn caps_in_array(b: [Port<'_>; 2]) {
+    let _ = b;
 }
 
 #[test]
@@ -348,8 +353,14 @@ fn test_flattened_params_of_one_name_are_refused() {
 }
 
 #[test]
-fn test_params_in_arrays_are_named_apart() {
-    let def = def_in(named_apart(), &DefCx::empty()).expect("distinct names");
-    let grants: Vec<_> = def.grants.iter().map(|g| g.param.to_string()).collect();
-    assert_eq!(grants, ["b.0.uart", "b.1.uart"]);
+fn test_rngs_in_arrays_are_named_apart() {
+    let def = def_in(rngs_apart(), &DefCx::empty());
+    assert!(def.is_ok(), "{:?}", def.err());
+}
+
+#[test]
+fn test_nested_cap_is_refused() {
+    let err = def_in(caps_in_array(), &DefCx::empty()).err();
+    let nested = matches!(&err, Some(DefError::NestedCap { name }) if name == "b.0.uart");
+    assert!(nested, "{err:?}");
 }

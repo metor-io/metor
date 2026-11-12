@@ -169,7 +169,8 @@ impl Defs {
         Ok(defs)
     }
 
-    /// Refuses an empty name, and two `Cap`s or two `Rng`s of one name.
+    /// Refuses an empty name, a `Cap` whose name has more than one segment,
+    /// and two `Cap`s or two `Rng`s of one name.
     fn check_names(&self) -> Result<(), DefError> {
         let grants: Vec<&str> = self.grants.iter().map(|g| &*g.param).collect();
         let rngs: Vec<&str> = self.rngs.iter().map(|r| &**r).collect();
@@ -179,6 +180,10 @@ impl Defs {
             .chain(grants.iter().chain(&rngs).copied());
         if all.any(str::is_empty) {
             return Err(DefError::EmptyName);
+        }
+        if let Some(name) = grants.iter().find(|name| name.contains('.')) {
+            let name = name.to_string();
+            return Err(DefError::NestedCap { name });
         }
         for (kind, names) in [("Cap", grants), ("Rng", rngs)] {
             if let Some(name) = duplicate(names) {

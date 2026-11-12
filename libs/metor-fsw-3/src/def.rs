@@ -179,8 +179,15 @@ pub enum DefError {
     #[error("output `{port}` cannot carry its frame under its own path: {message}")]
     Reroot { port: String, message: String },
 
-    #[error("a port or parameter has an empty name; only a struct of params is flattened")]
+    #[error(
+        "a port or parameter has an empty name; `flatten` belongs only on a field holding a `SystemParams` struct"
+    )]
     EmptyName,
+
+    #[error(
+        "`Cap` parameter `{name}` sits under a field or an array; a `Cap` is a config keyword, so it must be a fn argument or a field of a struct passed as one"
+    )]
+    NestedCap { name: String },
 
     #[error("two `{kind}` parameters are named `{name}`")]
     DuplicateParam { kind: String, name: String },
