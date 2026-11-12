@@ -102,11 +102,15 @@ pub fn select(config: &ResolvedDeployment, name: Option<&str>) -> Result<Selecti
         None if config.targets.len() == 1 => (Some(0), name),
         None => (None, name),
     };
-    let found = target.and_then(|target| {
+    let find = |target: usize, system: &str| {
         let systems = &config.targets[target].coordinator.systems;
         let index = systems.iter().position(|s| s.id == system)?;
         Some(Selection::System(target, index))
-    });
+    };
+    // On one target, a bare id may start with the target's namespace.
+    let found = target
+        .and_then(|target| find(target, system))
+        .or_else(|| (config.targets.len() == 1).then(|| find(0, name)).flatten());
     found.ok_or_else(|| RunError::NoSuchName {
         name: name.to_string(),
         known: names(config),
@@ -449,6 +453,9 @@ mod tests {
         assert_eq!(select(&one, Some("fsw.gnc.nav")).ok(), nav);
         assert_eq!(select(&one, Some("gnc.nav")).ok(), nav);
         assert!(select(&one, Some("gnc.navv")).is_err());
+        let mut own = one.clone();
+        own.targets[0].coordinator.systems[0].id = "fsw.nav".into();
+        assert_eq!(select(&own, Some("fsw.nav")).ok(), nav, "an id under the namespace");
         assert!(
             select(&deployment(), Some("gnc.nav")).is_err(),
             "bare ids need one target"
