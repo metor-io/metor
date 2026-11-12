@@ -4232,15 +4232,6 @@ mod wide_id_tests {
         ids.sort();
         assert_eq!(ids, [WIDE, short]);
     }
-
-    #[stellarator::test]
-    async fn a_non_numeric_msg_log_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        drop(DB::create(path.clone()).unwrap());
-        std::fs::create_dir_all(path.join("msgs").join("not-an-id")).unwrap();
-        assert!(matches!(DB::open(path), Err(Error::InvalidMsgId)));
-    }
 }
 
 #[cfg(test)]

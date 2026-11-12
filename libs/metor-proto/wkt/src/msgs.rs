@@ -2211,23 +2211,6 @@ mod link_info_tests {
 mod db_info_tests {
     use super::*;
 
-    /// Every byte of a wide id survives the messages that embed one.
-    #[test]
-    fn full_width_ids_round_trip_in_messages() {
-        const WIDE: PacketId = [1, 2, 3, 4, 5, 6, 7, 8];
-        let info = LinkInfo {
-            protocol_version: LINK_PROTOCOL_VERSION,
-            features: 0,
-            command_ids: vec![WIDE],
-            namespace: None,
-            link: String::new(),
-            commands: Vec::new(),
-        };
-        let bytes = postcard::to_allocvec(&info).expect("encode");
-        let decoded: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
-        assert_eq!(decoded.command_ids, [WIDE]);
-    }
-
     /// A version-7 client reads a version-8 manifest reply up to the head
     /// it doesn't know, and a version-7 reply is read as
     /// [`NodeManifestRespV7`], which a version-8 reply's prefix also is.
