@@ -72,17 +72,11 @@ pub enum CalParam {
     Table(Vec<(f64, f64)>),
     /// Cold-junction-compensated volts to °C.
     Thermocouple { kind: TcKind },
-    /// `src / excitation` scaled from `span` to `eng`.
+    /// `src / excitation` scaled from `span` to `eng`; `excitation` is the
+    /// path of a scalar `f64` in the mapping's own input.
     Ratiometric {
-        excitation: SourceParam,
+        excitation: String,
         span: (f64, f64),
         eng: (f64, f64),
     },
-}
-
-/// One field of one input.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-pub struct SourceParam {
-    pub input: String,
-    pub src: String,
 }

@@ -9,7 +9,7 @@ pub mod plan;
 mod step;
 
 pub use cal::{Cal, TcKind};
-pub use params::{CalParam, FieldMap, MuxParams, OutParam, SourceParam, StampParam, TriggerParam};
+pub use params::{CalParam, FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
 pub use plan::{MuxError, Plan};
 pub use step::Mux;
 

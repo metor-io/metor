@@ -49,7 +49,7 @@ class CalTest(unittest.TestCase):
             cal.to_json(),
             {
                 "ratiometric": {
-                    "excitation": {"input": "nav.est", "src": "bias.a"},
+                    "excitation": "bias.a",
                     "span": [0.0, 0.003],
                     "eng": [0.0, 500.0],
                 }

@@ -47,16 +47,6 @@ fn test_cubic_poly() {
 }
 
 #[test]
-fn test_poly_sizes() {
-    let one = Cal::poly(&[7.0]).expect("finite");
-    assert_eq!(eval(&one, 123.0), 7.0);
-    let five = Cal::poly(&[1.0, 1.0, 1.0, 1.0, 1.0]).expect("finite");
-    assert!(matches!(&five, Cal::Poly(c) if c.spilled()));
-    assert_eq!(eval(&five, 2.0), 31.0);
-    assert!(matches!(&one, Cal::Poly(c) if !c.spilled()));
-}
-
-#[test]
 fn test_table_interpolates() {
     let cal = Cal::table(&[(0.0, 0.0), (1.0, 10.0), (3.0, 30.0)]).expect("sorted");
     assert_eq!(eval(&cal, 0.5), 5.0);

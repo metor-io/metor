@@ -128,7 +128,7 @@ class MuxTest(unittest.TestCase):
                     "src": "gains.0",
                     "cal": {
                         "ratiometric": {
-                            "excitation": {"input": "nav.est", "src": "gains.1"},
+                            "excitation": "gains.1",
                             "span": [0.0, 1.0],
                             "eng": [0.0, 10.0],
                         }

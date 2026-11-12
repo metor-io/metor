@@ -4,7 +4,6 @@ mod its90;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use smallvec::SmallVec;
 
 /// A thermocouple type, by its letter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -20,7 +19,7 @@ pub enum TcKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cal {
     /// Ascending coefficients: `c0 + c1·x + ..`.
-    Poly(SmallVec<[f64; 2]>),
+    Poly(Box<[f64]>),
     /// Points in strictly increasing `x`, interpolated and clamped at the ends.
     Table(Box<[(f64, f64)]>),
     /// Cold-junction-compensated volts to °C.
@@ -141,8 +140,13 @@ pub(crate) const F64_LEN: u32 = 8;
 
 /// The byte range of an `f64` at `at`.
 pub(crate) fn f64_at(at: u32) -> Option<core::ops::Range<usize>> {
+    byte_range(at, F64_LEN)
+}
+
+/// The byte range of `len` bytes at `at`; `None` when it overflows.
+pub(crate) fn byte_range(at: u32, len: u32) -> Option<core::ops::Range<usize>> {
     let start = usize::try_from(at).ok()?;
-    Some(start..start.checked_add(usize::try_from(F64_LEN).ok()?)?)
+    Some(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
 /// An `f64` at `at`, little-endian.

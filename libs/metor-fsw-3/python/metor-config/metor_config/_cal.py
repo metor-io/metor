@@ -94,9 +94,7 @@ class Cal:
         ratio = self._param.get("ratiometric")
         if not ratio:
             return self._param
-        source = ratio["excitation"]
-        excitation = {"input": source.port.name, "src": source.path}
-        return {"ratiometric": {**ratio, "excitation": excitation}}
+        return {"ratiometric": {**ratio, "excitation": ratio["excitation"].path}}
 
 
 @dataclass(frozen=True)

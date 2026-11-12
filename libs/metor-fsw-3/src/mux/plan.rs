@@ -8,15 +8,16 @@ use crate::fn_system::Bound;
 use crate::frame_fields::{ElementError, FieldError, FieldTable, Leaf};
 use crate::system::PortDef;
 
-use super::cal::{Cal, F64_LEN, f64_at, read_f64};
+use super::cal::{Cal, F64_LEN, byte_range, f64_at, read_f64};
 use super::params::{CalParam, FieldMap, MuxParams, OutParam, StampParam, TriggerParam};
 
 /// The most inputs a mux takes; each is one bit of a `u64` mask.
 pub const MAX_INPUTS: usize = 64;
 
 /// Copies `len` bytes from offset `src` of input `input`'s record to offset
-/// `dst` of an output's staging, or writes `Plan::cals[cal]` of the `f64` at
-/// `src` as an `f64` at `dst`.
+/// `dst` of an output's staging. When `cal` is set, it instead evaluates
+/// `Plan::cals[cal]` on the `f64` at `src` and writes the result as an `f64`
+/// at `dst`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Copy {
     pub input: u16,
@@ -72,7 +73,7 @@ pub struct Plan {
     pub outs: Vec<OutSpec>,
     /// The order inputs drain in: inputs that trigger no output first.
     pub order: Vec<usize>,
-    /// The calibrations copies index.
+    /// Calibrations, indexed by `Copy::cal`.
     pub cals: Vec<Cal>,
 }
 
@@ -103,8 +104,6 @@ pub enum MuxError {
     },
     #[error("`{port}.{path}` is not a scalar f64; a calibration maps f64 to f64")]
     CalType { port: String, path: String },
-    #[error("`{dst}`'s excitation is in `{input}`, not the mapping's input")]
-    CalInput { dst: String, input: String },
     #[error("`{dst}`'s calibration is empty, unsorted, or has a zero-width span")]
     CalTable { dst: String },
     #[error("a mux takes at most {MAX_CALS} calibrations, got {0}")]
@@ -204,8 +203,9 @@ fn map_copies(
 }
 
 /// Refuses two mappings writing a byte in common, given each copy's
-/// `(start, end, dst path)`.
+/// `(start, end, dst path)`. An empty copy writes no byte.
 fn disjoint(mut dsts: Vec<(u32, u32, &str)>, port: &str) -> Result<(), MuxError> {
+    dsts.retain(|&(start, end, _)| start < end);
     dsts.sort_by_key(|&(start, ..)| start);
     match dsts.windows(2).find(|w| w[1].0 < w[0].1) {
         Some([a, b]) => Err(MuxError::Overlap {
@@ -382,23 +382,18 @@ fn calibrated_copy(
 
 /// The offset of the scalar `f64` leaf or element at `path`.
 fn scalar_f64(table: &FieldTable, path: &str, port: &str) -> Result<u32, MuxError> {
-    let cal_type = || MuxError::CalType {
-        port: port.to_string(),
-        path: path.to_string(),
-    };
-    let leaf = match table.leaves.iter().find(|leaf| leaf.path == path) {
-        Some(leaf) => Cow::Borrowed(leaf),
-        None if table.under(path).next().is_some() => return Err(cal_type()),
-        None => Cow::Owned(table.element(path).map_err(|e| named(e, port, path))?),
-    };
-    if leaf.ty == PrimType::F64 && leaf.shape.is_empty() {
-        Ok(leaf.offset)
-    } else {
-        Err(cal_type())
+    match side(table, path, port)?.as_slice() {
+        [(rel, leaf)] if rel.is_empty() && leaf.ty == PrimType::F64 && leaf.shape.is_empty() => {
+            Ok(leaf.offset)
+        }
+        _ => Err(MuxError::CalType {
+            port: port.to_string(),
+            path: path.to_string(),
+        }),
     }
 }
 
-/// Builds `param` for `map`, resolving an excitation in `src`.
+/// Builds `param` for `map`, resolving an excitation in the mapping's input.
 fn lower(param: &CalParam, map: &FieldMap, src: &FieldTable, port: &str) -> Result<Cal, MuxError> {
     let bad = || MuxError::CalTable {
         dst: format!("{port}.{}", map.dst),
@@ -412,13 +407,7 @@ fn lower(param: &CalParam, map: &FieldMap, src: &FieldTable, port: &str) -> Resu
             span,
             eng,
         } => {
-            if excitation.input != map.input {
-                return Err(MuxError::CalInput {
-                    dst: format!("{port}.{}", map.dst),
-                    input: excitation.input.clone(),
-                });
-            }
-            let at = scalar_f64(src, &excitation.src, &map.input)?;
+            let at = scalar_f64(src, excitation, &map.input)?;
             Cal::ratiometric(at, *span, *eng).ok_or_else(bad)
         }
     }
@@ -443,11 +432,7 @@ pub fn apply(c: &Copy, cals: &[Cal], src: &[u8], dst: &mut [u8]) -> bool {
 }
 
 fn copy_bytes(c: &Copy, src: &[u8], dst: &mut [u8]) -> bool {
-    let range = |at: u32| {
-        let start = usize::try_from(at).ok()?;
-        Some(start..start.checked_add(usize::try_from(c.len).ok()?)?)
-    };
-    let (Some(from), Some(to)) = (range(c.src), range(c.dst)) else {
+    let (Some(from), Some(to)) = (byte_range(c.src, c.len), byte_range(c.dst, c.len)) else {
         return false;
     };
     match (src.get(from), dst.get_mut(to)) {

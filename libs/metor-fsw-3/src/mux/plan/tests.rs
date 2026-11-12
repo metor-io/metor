@@ -1,7 +1,6 @@
 use super::*;
 use crate::def::{DefCx, Records};
 use crate::mux::cal::TcKind;
-use crate::mux::params::SourceParam;
 use crate::port::Output;
 use crate::record::Record;
 use crate::system::SystemDef;
@@ -366,12 +365,9 @@ fn linear() -> CalParam {
     CalParam::Poly(vec![1.0, 2.0])
 }
 
-fn ratio(input: &str, src: &str, span: (f64, f64)) -> CalParam {
+fn ratio(excitation: &str, span: (f64, f64)) -> CalParam {
     CalParam::Ratiometric {
-        excitation: SourceParam {
-            input: input.into(),
-            src: src.into(),
-        },
+        excitation: excitation.into(),
         span,
         eng: (0.0, 100.0),
     }
@@ -418,9 +414,9 @@ fn test_calibrated_and_plain_in_one_output() {
 }
 
 #[test]
-fn test_ratiometric_excitation_in_the_same_input() {
+fn test_ratiometric_excitation() {
     let plan = calibrated(
-        vec![cal_map("s", "v.0", ratio("g", "v.3", (0.0, 1.0)))],
+        vec![cal_map("s", "v.0", ratio("v.3", (0.0, 1.0)))],
         Vec::new(),
     );
     let want = Cal::ratiometric(40, (0.0, 1.0), (0.0, 100.0)).expect("finite");
@@ -466,13 +462,8 @@ fn test_calibration_types_refused() {
 #[test]
 fn test_excitation_refusals() {
     let one = |cal| calibrated(vec![cal_map("s", "s", cal)], Vec::new());
-    let other = MuxError::CalInput {
-        dst: "o.s".into(),
-        input: "src.pair".into(),
-    };
-    assert_eq!(one(ratio("src.pair", "a", (0.0, 1.0))), Err(other));
-    assert_eq!(one(ratio("g", "v", (0.0, 1.0))), Err(cal_type("g", "v")));
-    assert_eq!(one(ratio("g", "n", (0.0, 1.0))), Err(cal_type("g", "n")));
+    assert_eq!(one(ratio("v", (0.0, 1.0))), Err(cal_type("g", "v")));
+    assert_eq!(one(ratio("n", (0.0, 1.0))), Err(cal_type("g", "n")));
 }
 
 #[test]
@@ -481,7 +472,7 @@ fn test_calibration_table_refusals() {
     assert_eq!(one(CalParam::Poly(Vec::new())), Err(cal_table()));
     let unsorted = CalParam::Table(vec![(1.0, 0.0), (0.0, 1.0)]);
     assert_eq!(one(unsorted), Err(cal_table()));
-    let flat = ratio("g", "v.0", (1.0, 1.0));
+    let flat = ratio("v.0", (1.0, 1.0));
     assert_eq!(one(flat), Err(cal_table()));
     let message = cal_table().to_string();
     assert_eq!(
@@ -534,6 +525,11 @@ fn test_destination_edges() {
         calibrated(Vec::new(), quad).is_ok(),
         "last and first elements"
     );
+}
+
+#[test]
+fn test_empty_destination_overlaps_nothing() {
+    assert_eq!(disjoint(vec![(8, 40, "v"), (16, 16, "z")], "o"), Ok(()));
 }
 
 #[test]
