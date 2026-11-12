@@ -27,9 +27,10 @@ def gateway(
     """Records telemetry from other targets.
 
     Subscribes to each link in ``peers``, named for its target's namespace,
-    and records everything it receives in a `Db` on the thread ``db``, which
-    clients reach on ``listen``. ``keep`` says whether the db survives the
-    run stopping; by default it is deleted unless ``path`` is given.
+    and adds a `Db` on the thread ``db``, which clients reach on ``listen``.
+    The `Db` records every system added before it on the target, not only
+    the subscribers. ``keep`` says whether the db survives the run
+    stopping; by default it is deleted unless ``path`` is given.
     """
     for peer in peers:
         s.add(_namespace(peer), Subscribe(transport=Peer(peer)))

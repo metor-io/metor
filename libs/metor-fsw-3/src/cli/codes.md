@@ -384,6 +384,10 @@ host.
 Give some of that host's listeners fixed ports below the first port, or set
 `METOR_FIRST_PORT` lower.
 
+Every host that evaluates the target file must use the same
+`METOR_FIRST_PORT`, or the ports they assign disagree. Running one prebuilt
+`.json` on every host avoids this.
+
 ## M0301
 
 **A deterministic run needs a simulated clock**

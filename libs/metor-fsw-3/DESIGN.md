@@ -353,11 +353,10 @@ nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 A subscriber faults each frame port whose table the publisher never
 announced, so a peer built against other definitions shows up on `log`.
 
-A gateway is a target whose `Db` embeds a metor-db. It subscribes to every
-peer and records what arrives. The ground reads one database, not each
-target's stream, and a slow reader never holds a target's rings.
-`gateway(..)` is a composite that adds the subscribers and the db to a
-target.
+A gateway is a `Db` that embeds a metor-db, subscribes to every peer, and
+records what arrives. The ground reads one database, not each target's
+stream, and a slow reader never holds a target's rings. `gateway(..)` is a
+composite that adds the subscribers and the db to any target.
 
 The ground commands a target through a `Subscribe` whose records are
 commands. Each command is described by its id and either its message

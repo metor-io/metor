@@ -33,19 +33,19 @@ Groups sit one level above composites:
 from typing import NamedTuple
 from metor_config import Deployment, Group, Listen, Loop, OutPort, Peer, Publish, Subscribe, Target, group
 
-class Radio(NamedTuple):
+class RadioOut(NamedTuple):
     target: Target
     link: Publish
     cmd: OutPort[Cmd]
     est: Loop[Est]
 
 @group
-def radio(g: Group) -> Radio:
+def radio(g: Group) -> RadioOut:
     t = g.target(cycle_rate=50.0)          # namespace: the group's path
     est = g.loop(Est)
-    radio = t.add("radio", Radio(est=est))
-    link = t.add("pub", Publish([radio], transport=Listen("[::]:0")))
-    return Radio(t, link, radio.cmd, est)
+    r = t.add("radio", Radio(est=est))     # `Radio` is a system
+    link = t.add("pub", Publish([r], transport=Listen("[::]:0")))
+    return RadioOut(t, link, r.cmd, est)
 
 class Cpu(NamedTuple):
     link: Publish
@@ -94,13 +94,13 @@ function returns; use a `NamedTuple`, as for a composite.
 
 ### Deployment
 
-`Deployment` gains `add`. `targets=` still takes targets built outside any
-group, and both forms can be mixed.
+`targets=` takes targets made outside any group, and `add` adds a group's;
+the two can be mixed.
 
 - `d.add(name, group(..))` adds a group at the top of the tree.
 - `hosts` keys may name a group. The longest matching path wins, so
   `{"flight": a, "flight.cpus.cpu3": b}` puts `cpu3` on `b` and the rest of
-  `flight` on `a`. The emitted config lists one host per target, as now. A key
+  `flight` on `a`. The emitted config lists one host per target. A key
   that matches no target raises `ConfigError`.
 
 ### Ports
@@ -116,8 +116,12 @@ that no other listener on its host uses, in step order. It writes that port
 into the listener's address and every dialer's. Every process reads the same
 resolved config, so they agree; a port held by another program fails at
 bind, as a hand-written one does. `metor build` and `metor show --format
-json` give the assigned ports. A hand-written port works as before, and a
-listener on port 0 that no peer dials still lets the OS pick.
+json` give the assigned ports. A hand-written port is kept, and a listener on
+port 0 that no peer dials lets the OS pick.
+
+Hosts that each evaluate the target file must use the same
+`METOR_FIRST_PORT`, or their ports disagree and the links keep redialing.
+Running one prebuilt `.json` everywhere avoids this.
 
 ### Names
 
@@ -156,8 +160,7 @@ its id with `.` replaced by `_`, then `_ep`.
 
 ### Gateways
 
-`gateway()` is now a composite. It no longer makes its own target, so it goes
-on any target, inside a group or not:
+`gateway()` is a composite, so it goes on any target, inside a group or not:
 
 ```python
 gse = g.target(cycle_rate=10.0)
@@ -166,8 +169,8 @@ rec.db  # the db's handle, for a `Subscribe` that commands through it
 ```
 
 It adds one `Subscribe` per peer, named for the peer's namespace, and a `Db`
-on the thread `db`. `adcs-fsw3`, the echo-pack deploy fixture, and
-`DESIGN.md` move to it.
+on the thread `db`. The `Db` records every system added before it on that
+target, not only the subscribers.
 
 ## Selecting targets
 
@@ -183,7 +186,7 @@ metor run deploy.json --target flight.cpus.cpu1     # one host, prebuilt config
 - `--target P` selects each target whose namespace is `P` or starts with
   `P.`. It can repeat. `--except P` removes targets the same way. A pattern
   that matches nothing is an error.
-- One selected target runs in this process; several run as children, as now.
+- One selected target runs in this process; several run as child processes.
 - A link to a peer that was not selected keeps redialing and logging the
   failure, and the systems reading it get no samples.
 - `metor show P` shows a group's targets; `metor show flight.cpus.cpu1.gnc`
@@ -193,15 +196,6 @@ metor run deploy.json --target flight.cpus.cpu1     # one host, prebuilt config
 
 Replacing a target, such as running the CPUs against a simulated RF link,
 is a function argument, such as `flight(rf=sim_rf)`, not a selection.
-
-## What changes
-
-| Part | Change |
-|---|---|
-| `metor_config` | `group`, `Group`, `Deployment.add`, `hosts` prefixes, dotted link ids, `gateway` as a composite, the nesting check |
-| `metor` CLI | `--target` as a repeatable prefix, `--except`, `show` by longest namespace, completions |
-| `deploy` resolver | ports for dialed listeners on port 0 |
-| Config format, host, runtime | none |
 
 ## Not covered
 

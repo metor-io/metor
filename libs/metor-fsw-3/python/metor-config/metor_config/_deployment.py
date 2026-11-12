@@ -22,8 +22,8 @@ _emitted = False
 class Deployment:
     """A group of targets that are deployed together and talk to each other.
 
-    ``targets`` lists targets built outside any group, and `add` adds a
-    group's. ``hosts`` maps a namespace, or a group's path, to the address
+    ``targets`` are targets made outside any group; `add` adds a group's
+    targets. ``hosts`` maps a namespace, or a group's path, to the address
     peers dial; the longest match wins. A target that no key matches is
     dialed on loopback. Every `Target` the file creates must be in the
     deployment. Each target in a deployment of more than one needs its own
@@ -84,7 +84,7 @@ def _hosts(names: Sequence[str], hosts: Mapping[str, str]) -> dict[str, str]:
     matches no target."""
     for key in hosts:
         if not any(_under(name, key) for name in names):
-            raise ConfigError(f"hosts names `{key}`, which is not a target or group")
+            raise ConfigError(f"hosts names `{key}`, which matches no target")
     resolved: dict[str, str] = {}
     for name in names:
         keys = [key for key in hosts if _under(name, key)]
