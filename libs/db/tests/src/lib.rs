@@ -278,9 +278,9 @@ mod tests {
         // Buckets stop at the sealed frontier and stamp midpoints.
         assert!(latest.timestamp().0 < 1_064 + bucket_us);
 
-        // A mirror syncs the hidden metadata but must not materialize the
-        // LoD component from the live stream — its data arrives only via
-        // sealed-span seeding + hydration.
+        // A mirror syncs the hidden metadata, and may list the companion's
+        // unsealed head as remote-only history to fetch, but never takes its
+        // samples from the live stream, which carries no hidden components.
         let local_dir =
             std::env::temp_dir().join(format!("metor_db_lod_local_{}", fastrand::u64(..)));
         let local_db = Arc::new(DB::create(local_dir).unwrap());
@@ -300,7 +300,11 @@ mod tests {
         }
         assert!(metadata_synced, "mirror never synced lod metadata");
         assert!(
-            local_db.with_state(|state| state.get_component(lod_id).is_none()),
+            local_db.with_state(|state| {
+                state
+                    .get_component(lod_id)
+                    .is_none_or(|c| c.time_series.latest().is_none())
+            }),
             "lod component leaked onto the mirror through the live stream"
         );
         std::fs::remove_dir_all(&scratch).ok();
