@@ -84,18 +84,8 @@ impl InspectorRegistry {
                     max,
                     integer: !matches!(val, TypedScalar::F32(_) | TypedScalar::F64(_)),
                     on_change: Arc::new(move |v, _w, cx| {
-                        let value = if matches!(val, TypedScalar::F32(_) | TypedScalar::F64(_)) {
-                            v
-                        } else {
-                            v.round()
-                        };
-                        write_value(
-                            &write_entity,
-                            field_idx,
-                            scalar,
-                            TypedScalar::from_f64(value, val.dtype()),
-                            cx,
-                        );
+                        let value = TypedScalar::from_f64(v, val.dtype());
+                        write_value(&write_entity, field_idx, scalar, value, cx);
                     }),
                 }));
             }

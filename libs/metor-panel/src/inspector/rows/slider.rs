@@ -1,53 +1,43 @@
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, SharedString, Window};
 
-use super::{BOX_HEIGHT, InspectorRow, LABEL_SIZE, RowAction, box_slot, boxed_row, edit_on_click};
-use crate::theme::theme;
-use crate::views::scrubber::{self, Scrubber};
+use super::{InspectorRow, RowAction, boxed_row, passive, row_box};
+use crate::views::scrubber::Scrubber;
+use crate::views::value_box::ValueBox;
 
 /// Inspector row for a bounded numeric field, drawn as a scrubber: drag the
-/// box to move the value, click or press Enter to type one, and Left/Right
-/// to step it.
+/// box to move the value, click it or press Enter to type one, and press
+/// Left or Right to step it.
 ///
-/// `on_change` runs on every drag tick and nudge, with the value snapped to
-/// the step so the readout stays stable.
+/// `on_change` runs whenever a drag or a step changes the value, with the
+/// value snapped to the step (a tenth of it while Shift is held), and when
+/// a typed value is committed, kept within the range.
 pub struct SliderRow {
     pub label: SharedString,
     pub read_value: Arc<dyn Fn(&App) -> f64>,
     pub min: f64,
     pub max: f64,
-    /// Whole numbers only: the step is never below one.
+    /// Keep the value whole: the step is at least one, and Shift slows a
+    /// drag without making the step finer.
     pub integer: bool,
     pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
 }
 
 impl SliderRow {
-    fn step(&self) -> f64 {
-        let step = scrubber::default_step(self.min, self.max);
-        match self.integer {
-            true => step.max(1.0),
-            false => step,
-        }
-    }
-
-    fn scrubber(&self, row_ix: usize, cx: &App) -> Scrubber {
+    /// The row's scrubber; a drag changes the value only when `scrubs`.
+    fn scrubber(&self, scrubs: bool, cx: &App) -> Scrubber {
         Scrubber::new(
-            ("slider", row_ix),
             (self.read_value)(cx),
-            self.min,
-            self.max,
-            BOX_HEIGHT,
+            (self.min, self.max),
+            self.integer,
+            scrubs.then(|| self.on_change.clone()),
         )
-        .step(self.step())
-        .text_size(f32::from(LABEL_SIZE))
-        .align_end()
     }
 
-    fn row(&self, row_ix: usize, selected: bool, scrubber: Scrubber, cx: &App) -> AnyElement {
-        let scrubber = scrubber.apply(box_slot(), &theme(cx));
-        boxed_row(row_ix, selected, self.label.clone(), scrubber, cx)
+    fn boxed(&self, row_ix: usize, cx: &App) -> ValueBox {
+        let scrubber = self.scrubber(!passive(cx), cx);
+        row_box(row_ix, scrubber.text(), cx).scrubber(scrubber)
     }
 }
 
@@ -63,34 +53,16 @@ impl InspectorRow for SliderRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let mut scrubber = self.scrubber(row_ix, cx);
-        if !super::passive(cx) {
-            let on_change = self.on_change.clone();
-            scrubber = scrubber
-                .on_change(Rc::new(move |value, window, cx| {
-                    on_change(value, window, cx)
-                }))
-                .on_edit(edit_on_click());
-        }
-        self.row(row_ix, selected, scrubber, cx)
+        boxed_row(row_ix, selected, &self.label, self.boxed(row_ix, cx), cx)
     }
 
-    fn render_editing(
-        &self,
-        row_ix: usize,
-        selected: bool,
-        field: AnyElement,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> AnyElement {
-        let scrubber = self.scrubber(row_ix, cx).editing(field);
-        self.row(row_ix, selected, scrubber, cx)
+    fn value_box(&self, row_ix: usize, cx: &App) -> Option<ValueBox> {
+        Some(self.boxed(row_ix, cx))
     }
 
     fn nudge(&mut self, direction: f64, fine: bool, window: &mut Window, cx: &mut App) -> bool {
         let value = (self.read_value)(cx);
-        let fine = fine && !self.integer;
-        let next = scrubber::nudged(value, (self.min, self.max), self.step(), direction, fine);
+        let next = self.scrubber(false, cx).nudged(direction, fine);
         if next != value {
             (self.on_change)(next, window, cx);
         }
@@ -101,7 +73,7 @@ impl InspectorRow for SliderRow {
         let (min, max, integer) = (self.min, self.max, self.integer);
         let on_change = self.on_change.clone();
         RowAction::StartEdit {
-            current_text: scrubber::format_value((self.read_value)(cx), self.step()),
+            current_text: self.scrubber(false, cx).text(),
             on_commit: Box::new(move |text, window, cx| {
                 let Ok(value) = text.trim().parse::<f64>() else {
                     return;
@@ -109,7 +81,8 @@ impl InspectorRow for SliderRow {
                 if !value.is_finite() {
                     return;
                 }
-                let value = value.clamp(min, max);
+                // Not `clamp`, which panics on an inverted or NaN range.
+                let value = value.max(min).min(max);
                 on_change(if integer { value.round() } else { value }, window, cx);
             }),
         }

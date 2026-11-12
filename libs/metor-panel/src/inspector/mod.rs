@@ -58,10 +58,9 @@ pub struct EditInspectorQuery {
     pub text: String,
 }
 
-/// A row's own control asks for the selected row to be activated as Enter
-/// would. A scrubber keeps its press from the row, since the press may
-/// become a drag, and only once it is released as a click does it ask
-/// this; the press already selected the row.
+/// Activate the selected row as Enter would. A row's value box stops the
+/// mouse-down that would activate the row, since the press may become a
+/// drag, and dispatches this instead when the press is released as a click.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub struct ActivateSelectedRow;
@@ -1195,24 +1194,23 @@ impl Inspector {
                                     let row_element =
                                         rows[row_idx].render_row(vis_ix, selected, window, cx);
                                     let row_idx_click = row_idx;
-                                    div()
-                                        // Before any control in the row can
-                                        // keep the press to itself: the row
-                                        // it lands on is selected and the
-                                        // inspector takes the keys.
-                                        .capture_any_mouse_down(cx.listener(
-                                            move |this, _, window, cx| {
-                                                if this.dismissed {
-                                                    return;
-                                                }
+                                    // Select the row and take focus in the
+                                    // capture phase, because a value box
+                                    // stops the mouse-down from bubbling up
+                                    // to the row.
+                                    let select = cx.listener(
+                                        move |this, e: &gpui::MouseDownEvent, window, cx| {
+                                            if e.button == gpui::MouseButton::Left {
                                                 this.selected_index = vis_ix;
                                                 this.focus_handle.focus(window, cx);
-                                            },
-                                        ))
+                                            }
+                                        },
+                                    );
+                                    div()
+                                        .capture_any_mouse_down(select)
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
                                             cx.listener(move |this, _, window, cx| {
-                                                this.selected_index = vis_ix;
                                                 this.activate_row(row_idx_click, window, cx);
                                             }),
                                         )
@@ -1654,17 +1652,39 @@ mod scrubber_tests {
     use std::rc::Rc;
 
     use super::*;
-    use gpui::Entity;
+    use gpui::{Entity, Modifiers, MouseButton, Point, VisualTestContext};
 
-    use crate::inspector::rows::SliderRow;
+    use crate::inspector::rows::{InspectorRow, SliderRow, TextRow};
 
-    fn open(
+    fn slider(
+        value: &Rc<Cell<f64>>,
+        (min, max): (f64, f64),
+        integer: bool,
+    ) -> Box<dyn InspectorRow> {
+        let (read, write) = (value.clone(), value.clone());
+        Box::new(SliderRow {
+            label: "Opacity".into(),
+            read_value: Arc::new(move |_| read.get()),
+            min,
+            max,
+            integer,
+            on_change: Arc::new(move |v, _, _| write.set(v)),
+        })
+    }
+
+    fn inspector(row: Box<dyn InspectorRow>, cx: &mut Context<Inspector>) -> Inspector {
+        Inspector::new(
+            vec![row],
+            InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
+            cx,
+        )
+    }
+
+    /// A window showing the inspector `build` makes, and its context.
+    fn open<V: Render>(
         cx: &mut gpui::TestAppContext,
-    ) -> (
-        Rc<Cell<f64>>,
-        Entity<Inspector>,
-        &mut gpui::VisualTestContext,
-    ) {
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V + 'static,
+    ) -> (Entity<V>, &mut VisualTestContext) {
         cx.update(|cx| {
             crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
             cx.set_global(crate::theme::FontSettings {
@@ -1672,57 +1692,38 @@ mod scrubber_tests {
                 config: Default::default(),
             });
         });
-        let value = Rc::new(Cell::new(0.5));
-        let (inspector, cx) = cx.add_window_view({
-            let value = value.clone();
-            move |_, cx| {
-                let read = value.clone();
-                let row = SliderRow {
-                    label: "Opacity".into(),
-                    read_value: Arc::new(move |_| read.get()),
-                    min: 0.0,
-                    max: 1.0,
-                    integer: false,
-                    on_change: Arc::new(move |v, _, _| value.set(v)),
-                };
-                Inspector::new(
-                    vec![Box::new(row)],
-                    InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
-                    cx,
-                )
-            }
-        });
+        let (view, cx) = cx.add_window_view(build);
         cx.refresh().unwrap();
-        (value, inspector, cx)
+        (view, cx)
     }
 
-    fn scrubber(cx: &mut gpui::VisualTestContext) -> Bounds<Pixels> {
+    fn value_box(cx: &mut VisualTestContext) -> Bounds<Pixels> {
         cx.refresh().unwrap();
-        cx.debug_bounds("scrubber")
-            .expect("the row draws a scrubber")
+        cx.debug_bounds("value-box")
+            .expect("the row draws a value box")
+    }
+
+    /// Press at `start`, move `dx` to the right in two steps, and release.
+    fn drag(cx: &mut VisualTestContext, start: Point<Pixels>, dx: f32, modifiers: Modifiers) {
+        cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+        for x in [4.0, dx] {
+            let at = start + gpui::point(px(x), px(0.0));
+            cx.simulate_mouse_move(at, MouseButton::Left, modifiers);
+        }
+        cx.simulate_mouse_up(
+            start + gpui::point(px(dx), px(0.0)),
+            MouseButton::Left,
+            modifiers,
+        );
     }
 
     #[gpui::test]
     fn dragging_a_slider_row_scrubs_without_opening_an_edit(cx: &mut gpui::TestAppContext) {
-        let (value, inspector, cx) = open(cx);
-        let start = scrubber(cx).origin + gpui::point(px(10.0), px(10.0));
-        let none = gpui::Modifiers::default();
-        cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
-        cx.simulate_mouse_move(
-            start + gpui::point(px(4.0), px(0.0)),
-            gpui::MouseButton::Left,
-            none,
-        );
-        cx.simulate_mouse_move(
-            start + gpui::point(px(30.0), px(0.0)),
-            gpui::MouseButton::Left,
-            none,
-        );
-        cx.simulate_mouse_up(
-            start + gpui::point(px(30.0), px(0.0)),
-            gpui::MouseButton::Left,
-            none,
-        );
+        let value = Rc::new(Cell::new(0.5));
+        let row = slider(&value, (0.0, 1.0), false);
+        let (inspector, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let start = value_box(cx).origin + gpui::point(px(10.0), px(10.0));
+        drag(cx, start, 30.0, Modifiers::default());
         assert!(
             value.get() > 0.6,
             "moved right from the middle: {}",
@@ -1732,12 +1733,52 @@ mod scrubber_tests {
     }
 
     #[gpui::test]
+    fn shift_dragging_an_integer_slider_keeps_it_whole(cx: &mut gpui::TestAppContext) {
+        let value = Rc::new(Cell::new(100.0));
+        let row = slider(&value, (25.0, 200.0), true);
+        let (_, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let start = value_box(cx).origin + gpui::point(px(10.0), px(10.0));
+        drag(cx, start, 30.0, Modifiers::shift());
+        assert!(value.get() > 100.0, "moved: {}", value.get());
+        assert_eq!(value.get().fract(), 0.0, "whole: {}", value.get());
+    }
+
+    struct Pair(Entity<Inspector>, Entity<Inspector>);
+
+    impl Render for Pair {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let column = |inspector: &Entity<Inspector>| {
+                div().w(px(300.0)).h(px(100.0)).child(inspector.clone())
+            };
+            div().flex().child(column(&self.0)).child(column(&self.1))
+        }
+    }
+
+    #[gpui::test]
+    fn a_drag_moves_only_the_slider_it_began_in(cx: &mut gpui::TestAppContext) {
+        let (a, b) = (Rc::new(Cell::new(0.5)), Rc::new(Cell::new(0.5)));
+        let rows = (slider(&a, (0.0, 1.0), false), slider(&b, (0.0, 1.0), false));
+        let (_, cx) = open(cx, move |_, cx| {
+            let inline = |row, cx: &mut Context<Pair>| {
+                cx.new(|cx| Inspector::new(vec![row], InspectorMode::Inline, cx))
+            };
+            Pair(inline(rows.0, cx), inline(rows.1, cx))
+        });
+        let start = value_box(cx).origin + gpui::point(px(10.0), px(10.0));
+        drag(cx, start, 30.0, Modifiers::default());
+        let moved = [a.get(), b.get()].iter().filter(|&&v| v != 0.5).count();
+        assert_eq!(moved, 1, "a: {}, b: {}", a.get(), b.get());
+    }
+
+    #[gpui::test]
     fn clicking_a_slider_row_types_into_its_box(cx: &mut gpui::TestAppContext) {
-        let (value, inspector, cx) = open(cx);
-        let center = scrubber(cx).center();
-        cx.simulate_click(center, gpui::Modifiers::default());
+        let value = Rc::new(Cell::new(0.5));
+        let row = slider(&value, (0.0, 1.0), false);
+        let (inspector, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let center = value_box(cx).center();
+        cx.simulate_click(center, Modifiers::default());
         assert!(cx.read(|cx| inspector.read(cx).editing.is_some()));
-        scrubber(cx);
+        value_box(cx);
 
         cx.update(|_, cx| {
             inspector.update(cx, |i, _| {
@@ -1755,35 +1796,20 @@ mod scrubber_tests {
 
     #[gpui::test]
     fn clicking_a_text_row_types_into_its_box(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
-            });
-        });
         let text = Rc::new(std::cell::RefCell::new(String::from("hello")));
-        let (inspector, cx) = cx.add_window_view({
+        let row = {
             let text = text.clone();
-            move |_, cx| {
-                let row = crate::inspector::rows::TextRow::new(
-                    "Title".into(),
-                    "hello".into(),
-                    Arc::new(move |value, _, _| *text.borrow_mut() = value),
-                );
-                Inspector::new(
-                    vec![Box::new(row)],
-                    InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
-                    cx,
-                )
-            }
-        });
-        cx.refresh().unwrap();
-        let center = cx.debug_bounds("value-box").expect("a text box").center();
-        cx.simulate_click(center, gpui::Modifiers::default());
+            Box::new(TextRow::new(
+                "Title".into(),
+                "hello".into(),
+                Arc::new(move |value, _, _| *text.borrow_mut() = value),
+            ))
+        };
+        let (inspector, cx) = open(cx, move |_, cx| self::inspector(row, cx));
+        let center = value_box(cx).center();
+        cx.simulate_click(center, Modifiers::default());
         assert!(cx.read(|cx| inspector.read(cx).editing.is_some()));
-        cx.refresh().unwrap();
-        assert!(cx.debug_bounds("value-box").is_some(), "edited in its box");
+        value_box(cx);
 
         cx.update(|_, cx| {
             inspector.update(cx, |i, _| {

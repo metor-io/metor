@@ -1,133 +1,106 @@
-//! The panel's one editable value box: a value on a box's surface that a
-//! click asks to type into, and that shows the edit field in its place
-//! while it is typed. The [`Scrubber`](super::scrubber::Scrubber) is this
-//! box with a fill, a handle and a drag on top; inspector text and number
-//! rows are the bare box. Like [`Switch`](super::switch::Switch) it is
-//! sized by its height.
-
-use std::rc::Rc;
+//! An inspector row's value drawn in a box. A click on the box asks the
+//! inspector to edit the row, and while the row is edited the edit field
+//! takes the value's place inside the box. A [`Scrubber`] adds a fill, a
+//! hover handle and a drag.
 
 use gpui::{
-    AnyElement, App, ContentMask, CursorStyle, ElementId, MouseButton, SharedString, Stateful,
-    TextRun, Window, canvas, div, point, prelude::*, px,
+    AnyElement, CursorStyle, ElementId, MouseButton, SharedString, Stateful, TextRun, TruncateFrom,
+    canvas, div, point, prelude::*, px,
 };
 
+use crate::inspector::ActivateSelectedRow;
+use crate::inspector::rows::LABEL_SIZE;
 use crate::theme::Theme;
+use crate::views::scrubber::Scrubber;
 use crate::views::value_strip::BOX_RADIUS;
 
-/// Called when a click (a press released without dragging) asks to type a
-/// value.
-pub(crate) type OnEdit = Rc<dyn Fn(&mut Window, &mut App)>;
+/// Height of a value box: it fits inside an inspector row's selection pill
+/// and matches the edit field's 20px line.
+pub(crate) const HEIGHT: f32 = 20.0;
+/// Width of every value box, so the values of different rows line up in
+/// one column.
+const WIDTH: f32 = 140.0;
+/// Horizontal padding inside the box, the same as the edit field's, so the
+/// text doesn't move when an edit starts.
+const PADDING: f32 = HEIGHT / 3.0;
 
-/// The hover group every value box opens, so what is layered in it (a
-/// scrubber's handle) can show on hover.
+/// Hover-group name set on every value box, so the scrubber's handle inside
+/// it can appear on hover.
 pub(crate) const HOVER_GROUP: &str = "value-box";
 
-/// How a value box looks and what a click on it asks; the caller owns the
-/// value and the edit, and styles its own element with [`ValueBox::apply`].
-pub(crate) struct ValueBox {
+pub struct ValueBox {
     id: ElementId,
     text: SharedString,
-    height: f32,
-    text_size: Option<f32>,
-    align_end: bool,
-    on_edit: Option<OnEdit>,
+    editable: bool,
     editing: Option<AnyElement>,
-    layers: Vec<AnyElement>,
+    scrubber: Option<Scrubber>,
 }
 
 impl ValueBox {
-    /// A box `height` pixels tall showing `text`.
+    /// A box showing `text`. When `editable`, a click on it dispatches
+    /// [`ActivateSelectedRow`].
     pub(crate) fn new(
         id: impl Into<ElementId>,
         text: impl Into<SharedString>,
-        height: f32,
+        editable: bool,
     ) -> Self {
         Self {
             id: id.into(),
             text: text.into(),
-            height,
-            text_size: None,
-            align_end: false,
-            on_edit: None,
+            editable,
             editing: None,
-            layers: Vec::new(),
+            scrubber: None,
         }
     }
 
-    /// The text size, where the host's text is a fixed size rather than
-    /// the switch's 11/24 of the height.
-    pub(crate) fn text_size(mut self, size: f32) -> Self {
-        self.text_size = Some(size);
+    /// Show the edit field `field` in place of the text.
+    pub(crate) fn editing(mut self, field: AnyElement) -> Self {
+        self.editing = Some(field);
         self
     }
 
-    /// Set the value against the right edge, where it lines up with other
-    /// values in a column (an inspector's), rather than centred.
-    pub(crate) fn align_end(mut self) -> Self {
-        self.align_end = true;
+    /// Make the box a slider over the scrubber's range.
+    pub(crate) fn scrubber(mut self, scrubber: Scrubber) -> Self {
+        self.scrubber = Some(scrubber);
         self
     }
 
-    /// Let a click ask to type a value.
-    pub(crate) fn on_edit(mut self, edit: OnEdit) -> Self {
-        self.on_edit = Some(edit);
-        self
-    }
-
-    /// Show `field` inside the box in place of the value while the caller
-    /// edits it as text.
-    pub(crate) fn editing(mut self, field: impl IntoElement) -> Self {
-        self.editing = Some(field.into_any_element());
-        self
-    }
-
-    /// Lay `layer` across the box beneath the value, positioned against
-    /// the box: a scrubber's fill and handle.
-    pub(crate) fn layer(mut self, layer: impl IntoElement) -> Self {
-        self.layers.push(layer.into_any_element());
-        self
-    }
-
-    /// Style `el` as this box. A press on it doesn't reach the elements
-    /// behind it, so a host that acts on mouse-down (an inspector row)
-    /// leaves the box to decide between a click and a drag.
-    pub(crate) fn apply(self, el: gpui::Div, theme: &Theme) -> Stateful<gpui::Div> {
-        let h = self.height;
+    /// The box as an element. It stops left mouse-downs from reaching the
+    /// row behind it, which acts on mouse-down, so a press here can still
+    /// become either a click or a drag.
+    pub(crate) fn render(self, theme: &Theme) -> Stateful<gpui::Div> {
         let editing = self.editing.is_some();
-        // The value is shaped and painted the way the edit field paints its
-        // text, against the same edge of the same padded area, so starting
-        // an edit doesn't move it.
-        let area = div()
+        let scrubs = !editing && self.scrubber.as_ref().is_some_and(Scrubber::scrubs);
+        let body = div()
             .relative()
             .size_full()
             .flex()
             .items_center()
-            .px(px(h / 3.0));
+            .px(px(PADDING));
         let body = match self.editing {
-            Some(field) => area.child(field),
-            None => area.child(painted_text(
-                self.text,
-                px(self.text_size.unwrap_or(h * 11.0 / 24.0)),
-                theme.text_primary,
-                self.align_end,
-            )),
+            Some(field) => body.child(field),
+            None => body.child(painted_text(self.text, theme.text_primary)),
         };
-        let el = el
+        let el = div()
             .id(self.id)
             .debug_selector(|| "value-box".into())
             .group(HOVER_GROUP)
             .relative()
+            .flex_none()
+            .w(px(WIDTH))
+            .h(px(HEIGHT))
             .flex()
             .items_center()
-            .h(px(h))
             .rounded(px(BOX_RADIUS))
             .overflow_hidden()
             .bg(theme.bg_secondary)
-            .children(self.layers)
+            .children(self.scrubber.as_ref().map(|s| s.fill(theme)))
+            .when_some(self.scrubber.as_ref().filter(|_| scrubs), |el, s| {
+                el.child(s.handle(theme))
+            })
             .child(body)
-            // The edit ring is drawn over the box, not as its border, so the
-            // value doesn't shift inward when editing starts.
+            // Drawn over the box rather than as its border, so the text
+            // doesn't shift inward when an edit starts.
             .when(editing, |el| {
                 el.child(
                     div()
@@ -141,52 +114,56 @@ impl ValueBox {
         if editing {
             return el;
         }
-        el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when_some(self.on_edit, |el, edit| {
-                el.cursor(CursorStyle::IBeam)
-                    .on_click(move |_, window, cx| edit(window, cx))
-            })
+        let el = el
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(self.editable, |el| {
+                el.cursor(CursorStyle::IBeam).on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(ActivateSelectedRow), cx)
+                })
+            });
+        match self.scrubber {
+            Some(scrubber) if scrubs => scrubber.attach(el),
+            _ => el,
+        }
     }
 }
 
-/// `text` shaped and painted against the area's right edge or centre, on a
-/// line as tall as the area, clipped to it.
-fn painted_text(
-    text: SharedString,
-    font_size: gpui::Pixels,
-    color: gpui::Hsla,
-    align_end: bool,
-) -> impl IntoElement {
+/// `text` against the right edge of its area, ending in an ellipsis when it
+/// doesn't fit. It is shaped and painted the way the edit field paints its
+/// text, so starting an edit doesn't move it.
+fn painted_text(text: SharedString, color: gpui::Hsla) -> impl IntoElement {
     canvas(
-        move |_, window, _| {
+        move |bounds, window, _| {
+            let font = window.text_style().font();
             let run = TextRun {
                 len: text.len(),
-                font: window.text_style().font(),
+                font: font.clone(),
                 color,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            window
-                .text_system()
-                .shape_line(text.clone(), font_size, &[run], None)
+            let runs = [run];
+            let text_system = window.text_system();
+            let (text, runs) = text_system.line_wrapper(font, LABEL_SIZE).truncate_line(
+                text.clone(),
+                bounds.size.width,
+                "…",
+                &runs,
+                TruncateFrom::End,
+            );
+            text_system.shape_line(text, LABEL_SIZE, &runs, None)
         },
         move |bounds, shaped, window, cx| {
-            let x = match align_end {
-                true => bounds.right() - shaped.width,
-                false => bounds.origin.x + (bounds.size.width - shaped.width) / 2.0,
-            };
-            let origin = point(x.max(bounds.origin.x), bounds.origin.y);
-            window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                let _ = shaped.paint(
-                    origin,
-                    bounds.size.height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-            });
+            let x = (bounds.right() - shaped.width).max(bounds.origin.x);
+            let _ = shaped.paint(
+                point(x, bounds.origin.y),
+                bounds.size.height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
         },
     )
     .size_full()

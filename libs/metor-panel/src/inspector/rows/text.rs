@@ -3,10 +3,10 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 use gpui::{AnyElement, App, Hsla, SharedString, Window, prelude::*, px};
 
 use super::{
-    InspectorRow, RowAction, box_slot, boxed_row, row_base, row_label, row_value, value_box,
-    value_row,
+    InspectorRow, RowAction, boxed_row, row_base, row_box, row_label, row_value, value_row,
 };
 use crate::theme::theme;
+use crate::views::value_box::ValueBox;
 
 /// Inspector row for a string field.
 ///
@@ -109,22 +109,17 @@ impl InspectorRow for TextRow {
             )
             .into_any_element();
         }
-        let value_box = value_box(row_ix, self.current(cx), cx).apply(box_slot(), &theme(cx));
-        boxed_row(row_ix, selected, self.label.clone(), value_box, cx)
+        boxed_row(
+            row_ix,
+            selected,
+            &self.label,
+            row_box(row_ix, self.current(cx), cx),
+            cx,
+        )
     }
 
-    fn render_editing(
-        &self,
-        row_ix: usize,
-        selected: bool,
-        field: AnyElement,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> AnyElement {
-        let value_box = value_box(row_ix, self.current(cx), cx)
-            .editing(field)
-            .apply(box_slot(), &theme(cx));
-        boxed_row(row_ix, selected, self.label.clone(), value_box, cx)
+    fn value_box(&self, row_ix: usize, cx: &App) -> Option<ValueBox> {
+        Some(row_box(row_ix, self.current(cx), cx))
     }
 
     fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
