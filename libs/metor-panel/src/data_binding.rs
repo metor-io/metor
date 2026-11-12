@@ -268,9 +268,13 @@ impl InputChanges {
     }
 }
 
-/// Input samples a view that has no budget of its own (maps, XY plots) lets
-/// one window's expression replay read; the time-series plot's raw budget.
-pub const REPLAY_SAMPLE_BUDGET: u64 = 1_000_000;
+/// Per-trace sample budget for raw rendering: a quarter of the GPU value
+/// capacity, leaving room for several traces per plot. Windows estimated
+/// above it render from a min/max LoD component, whose buckets each render
+/// two points and so count double against the same budget. Maps and XY
+/// plots, which have no budget of their own, also cap the input samples one
+/// window's expression replay may read with it.
+pub const RAW_SAMPLE_BUDGET: u64 = 1_000_000;
 
 /// History orchestration shared by plots, maps and sample tables. Rendering
 /// and LoD selection stay with the consumer; replay ownership stays here.

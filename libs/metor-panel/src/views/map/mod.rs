@@ -323,7 +323,7 @@ impl Map {
             return;
         }
         if let Some(history) = history {
-            history.request(range.clone(), crate::data_binding::REPLAY_SAMPLE_BUDGET, cx);
+            history.request(range.clone(), crate::data_binding::RAW_SAMPLE_BUDGET, cx);
         }
 
         // Raw-vs-LoD choice, the plots' `update_lod_state` in miniature.
