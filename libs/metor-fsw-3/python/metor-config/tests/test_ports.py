@@ -203,6 +203,14 @@ class GroupTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "`wheels.0` takes a port group"):
             Adcs(wheels=[port, Adcs.Wheels()])
 
+    def test_group_of_another_class_is_refused(self) -> None:
+        class Other(PortGroup):
+            _input_ports = {"torque": Imu}
+
+        other: Any = Other(torque=self.a.imu)
+        with self.assertRaisesRegex(ConfigError, "`wheels.0` takes another group than `.*Other`"):
+            Adcs(wheels=[other, Adcs.Wheels()])
+
     def test_output_groups_read_as_attributes(self) -> None:
         adcs = self.target.add("adcs", Adcs())
         self.assertEqual(adcs.wheels[1].cmd.name, "adcs.wheels.1.cmd")

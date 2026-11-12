@@ -372,7 +372,11 @@ def _flatten_input(
         for i, item in enumerate(_list_of(path, value, len(children))):
             _flatten_input(ports, f"{path}.{i}", item, flat)
     elif isinstance(value, PortGroup):
-        flat.update({f"{path}.{child}": item for child, item in value._flat.items()})
+        for child, item in value._flat.items():
+            if f"{path}.{child}" not in ports:
+                group = type(value).__qualname__
+                raise ConfigError(f"input `{path}` takes another group than `{group}`")
+            flat[f"{path}.{child}"] = item
     else:
         raise ConfigError(f"input `{path}` takes a port group, got {value!r}")
 
