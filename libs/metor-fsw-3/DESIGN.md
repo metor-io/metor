@@ -316,7 +316,9 @@ on a wall clock: real devices see real time, and models run between
 model may hold a real resource, such as a rig model driving a real UART.
 A simulated clock does not pace a real device: cycles run as fast as the
 CPU allows, and timeouts fire on cycle time. A run that holds a real
-resource is not deterministic. Neither is refused at build.
+resource is not deterministic. The build accepts both a simulated clock
+with a real resource and `--deterministic` with a real resource; both are
+user errors.
 
 Drivers stamp records with the cycle time, so every stamp in a target
 shares one clock. Device time, such as GNSS time, goes in a field.

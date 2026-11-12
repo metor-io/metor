@@ -3,7 +3,7 @@
 A target runs on several hardware setups: an in-process sim, VMs, the
 vehicle's computers with their ground equipment, and HITL rigs. Everything
 but the hardware binding is the same in each. This doc gives the Python
-conventions that keep it that way, and two core changes they need.
+conventions that keep it that way.
 
 ## Problem
 
@@ -67,8 +67,7 @@ prop/
 
 The pack `prop_pack` and its systems (`UbloxDriver`, `DaqDriver`, `Nav`,
 ...) are hypothetical. The sketches use `@composite`, `Scope`, and
-`Composite` from the composites design (`docs/composites.md` on
-`sphw/fsw3-composite`, not on main).
+`Composite` from [composites](composites.md).
 
 ## Leaves
 
@@ -195,9 +194,9 @@ A DAQ driver emits `Volts { v: [f64; 32] }`: every channel in volts, with
 the DAQ's channel calibration applied. A logical frame such as
 `FeedPressures { pt101, pt102, pt201 }` is the tag list for a set of
 signals. A `Mux` maps channel elements to tag fields, using
-[mux element paths](#core-change-mux-element-paths), and applies each
+[mux element paths](muxes.md), and applies each
 sensor's calibration on the way, using
-[calibrated mappings](#core-change-calibrated-mux-mappings). Each component
+[calibrated mappings](muxes.md). Each component
 keeps one unit: `Volts` is all volts, and each field of `FeedPressures` has
 one unit.
 
@@ -291,7 +290,7 @@ by serial number, loaded by the setup.
 
 ```python
 SN_0042 = {
-    "pt101": Cal.two_point(volts=(0.5, 4.5), eng=(0, 1000)),
+    "pt101": Cal.two_point(raw=(0.5, 4.5), eng=(0, 1000)),
     "pt201": Cal.table([(0.5, 0), (1.5, 752), (2.5, 1499), (3.5, 2251), (4.5, 3000)]),
     "tc101": Cal.thermocouple("K"),
 }
@@ -401,7 +400,7 @@ io = slots(hw)._replace(valves=PlantValves())
 fsw.add("prop", propulsion(io=io, world=world))
 ```
 
-`SimCan` does not exist yet (`TODO.md:169`), so this setup binds the valves
+There is no `SimCan`, so this setup binds the valves
 at the logical frame.
 
 **(b) Logical frame.** A sim part feeds the logical frame from truth. No
@@ -420,8 +419,8 @@ device models. Both go through the same slot boundary, so there is no
 framework concept of where the cut lies.
 
 **HITL.** Real valves on the bench, sensors from the in-process plant. The
-target holds real and sim resources, so it needs the
-[second core change](#core-change-targets-that-mix-real-and-sim-resources).
+target holds real and sim resources, so it runs on a wall clock (see
+[framework support](#framework-support)).
 
 ```python
 # setups/hitl.py
@@ -486,277 +485,27 @@ def test_parity(setup: str, tmp_path: Path) -> None:
 Off-nominal and failure cases: a setup that adds a system outside a slot,
 or changes a param of `nav`, fails the test.
 
-## Core change: mux element paths
+## Framework support
 
-A mux source or destination may name one element of an array leaf. This
-covers DAQ channels and arrays generally.
+The conventions above are user code. They rely on these framework features:
 
-### Today
-
-`FieldTable::of` (`src/frame_fields.rs:51`) lists a frame's leaves. Arrays
-come in two forms:
-
-- A plain `[T; N]`, of structs or primitives, is split into leaves
-  `x.0` ... `x.{N-1}` by `[T; N]: AsVTable`
-  (`libs/metor-component/src/vtable.rs:45`). In Rust, `v.5` of
-  `v: [f64; 32]` already resolves. In Python, `v` is a group, so `raw.v[5]`
-  does not.
-- A nox tensor (`Tensor`, `V3`, `Matrix6`) or a `FrameArray` is one shaped
-  leaf, such as `f64[32]` or `f64[6,6]`. `relative` (`src/mux/plan.rs:229`)
-  finds leaves equal to or under a path, so `v.5` matches nothing and fails
-  as `UnknownField`.
-
-Element paths cover both: shaped leaves need the Rust change below, and both
-need the Python and stubgen changes.
-
-### Python API
-
-A source indexes a field:
-
-```python
-raw.v[5]            # Field(daq0.drv.channels.v.5: f64)
-cov.p[1][2]         # f64[6,6] -> f64[6] -> f64
-raw.field("v.5")    # the same, by path
-```
-
-A destination names elements with a mapping from index to field:
-
-```python
-BoardCmd(open={0: cmd.sv101, 1: cmd.sv102})   # dst paths open.0, open.1
-```
-
-- `ArrayField.__getitem__(i)` takes an `int` and returns
-  `port.field("{path}.{i}")`: the element of a shaped leaf, whose signature
-  drops the first dimension, or child `i` of a split array. A negative
-  index or an index past the end raises `ConfigError`. A scalar or a group
-  whose children are not `0..N` is a plain `Field`, which has no
-  `__getitem__`; `OutPort.field` returns an `ArrayField` for the others.
-- `signature` (`metor_config/_fields.py:28`) resolves element paths, so
-  `OutPort.field` and `Record.__init__` accept them.
-- Stubgen types elements. An array port property returns a generated
-  `ArrayField` whose `__getitem__` returns the element's signature, so
-  `raw.v[5]` is `Field[Literal["f64"]]` and `cov.p[1]` is
-  `Field[Literal["f64[6]"]]`. A generated `__init__` types an array keyword as
-  `Field[Literal["bool[16]"]] | Mapping[int, Field[Literal["bool"]]] | None`.
-  Bounds are checked at runtime.
-- A record that maps a leaf whole and one of its elements, or one element
-  twice, raises `ConfigError`. Make refuses the same in a hand-written
-  config: two copies of one output whose destination bytes intersect fail
-  with `MuxError::Overlap { port, a, b }`.
-
-### Semantics
-
-- An element of `ty[d0, d1, ..]` is `ty[d1, ..]`, and a scalar when the
-  leaf is one-dimensional. Each index segment drops one dimension, so
-  `m.1.2` of `f64[3,3]` is `f64`.
-- Type and shape match exactly, as for whole leaves.
-- Element paths use the separator that struct arrays use, so a path names
-  the same element whether the array holds structs or primitives.
-- Unmapped elements stay zero, as unmapped fields do.
-
-### Lowering
-
-`FieldTable` gains `element(path) -> Option<Leaf>`: find the leaf that is a
-proper prefix of `path`, parse the remaining segments as indices, check each
-against the shape, and return a `Leaf` with
-
-```
-offset = leaf.offset + flat(indices) * stride
-len    = ty.size() * product(shape[k..])
-shape  = shape[k..]
-```
-
-where `k` is the number of indices and `stride = len`. `relative` falls back
-to `element` when no leaf is under the path, and returns the one leaf at
-relative path `""`. `field_copies` is unchanged, and so is `Copy`: an
-element lowers to one `(input, src, dst, len)` byte copy. `step.rs` and
-`apply` (`src/mux/plan.rs:277`) are unchanged.
-
-`MuxError` gains `Index { port, path, len }` for an index past a dimension,
-and `Overlap { port, a, b }` for two mappings whose destination bytes
-intersect.
-A segment that is not a decimal index stays `UnknownField`. Make checks
-bounds again, since a hand-written config skips Python.
-
-Adjacent copies could be merged; this is not needed for correctness.
-
-### Tests
-
-- Nominal: `v.5` to a scalar; `p.1` of `f64[6,6]` to `f64[6]`; `open.0` as a
-  destination; whole and element mappings to different leaves of one
-  output.
-- Edge: the last index; index 0 of a `[f64; 1]`; a struct array path still
-  resolves to its leaves.
-- Failure: index out of range at config and at make; a non-numeric segment;
-  indexing a scalar; a whole leaf and its element both mapped.
-
-`docs/muxes.md` gains the element rules.
-
-## Core change: calibrated mux mappings
-
-A mux mapping may apply a calibration: a scalar `f64` source to a scalar
-`f64` destination. Plain mappings stay byte copies. This needs element
-paths, so a channel such as `v.5` is a scalar leaf.
-
-### Python API
-
-```python
-Mux(out=FeedPressures(
-    pt101=Calibrated(volts.v[5], Cal.two_point(volts=(0.5, 4.5), eng=(0, 1000))),
-    pt102=other.p,                                   # a plain copy
-))
-```
-
-Constructors:
-
-| Constructor | Lowers to |
-|---|---|
-| `Cal.poly([c0, c1, ..])` | `Poly`, ascending: `c0 + c1·x + ..` |
-| `Cal.linear(gain, offset)` | `Poly([offset, gain])` |
-| `Cal.two_point(volts, eng)` | `Poly`, gain and offset computed in Python |
-| `Cal.table([(x, y), ..])` | `Table`, sorted by `x` |
-| `Cal.thermocouple("K")` | `Thermocouple { kind }` |
-| `Cal.ratiometric(excitation, span, eng)` | `Ratiometric`, `excitation` a field of the same input |
-
-### Semantics
-
-```rust
-pub enum Cal {
-    Poly(SmallVec<[f64; 2]>),
-    Table(Box<[(f64, f64)]>),
-    Thermocouple { kind: TcKind },
-    Ratiometric { excitation: u32, span: (f64, f64), eng: (f64, f64) },
-}
-```
-
-- `Poly` evaluates by Horner. Linear is a two-term `Poly`, held inline.
-- `Table` interpolates linearly between points and clamps at the ends.
-- `Thermocouple` applies the NIST ITS-90 inverse for `kind`. Coefficients
-  are `const` slices; the piecewise ranges are internal. The input is a
-  cold-junction-compensated voltage: the DAQ compensates.
-- `Ratiometric` reads `excitation` from the same record and scales
-  `v / excitation` from `span` to `eng`.
-- A NaN source gives a NaN destination.
-
-### Lowering
-
-`FieldMap` (`src/mux/params.rs:54`) gains `#[serde(default)] cal:
-Option<CalParam>`. `Copy` (`src/mux/plan.rs:15`) gains `cal: Option<u16>`,
-an index into `Plan::cals`. `apply` (`plan.rs:277`) copies bytes when `cal`
-is `None`, and otherwise reads an `f64` at `src`, evaluates, and writes an
-`f64` at `dst`. `take` applies copies one record at a time, so a
-calibration's extra source, such as `excitation`, must be in the same input.
-`step.rs` is unchanged.
-
-All tables and polynomials are allocated at make. `smallvec` is a new
-dependency. `MuxError` gains
-`CalType` (source or destination not a scalar `f64`), `CalInput` (an extra
-source in another input), and `CalTable` (unsorted or empty).
-
-### Tests
-
-- Nominal: each kind against reference values, including NIST type K
-  points.
-- Edge: table ends clamp; a one-coefficient `Poly`; `Poly` spilling past two
-  coefficients.
-- Failure: a calibrated mapping to an `i32` or an array; excitation from
-  another input; an unsorted table.
-- Prover: Kani on `Poly` and `Table` evaluation for no panics over all
-  inputs.
-
-`docs/muxes.md` states that a mapping is a copy or a calibration.
-
-## Core change: targets that mix real and sim resources
-
-### What the code does today
-
-`TODO.md:168` says build refuses a target that mixes real and sim
-resources. On main nothing refuses it:
-
-- `python/metor-config/tests/test_io.py:261`
-  (`test_real_and_sim_resources_mix`) renders a target holding a `Tty` and a
-  `SimUart`.
-- `Bindings::collect` (`src/coordinator/build.rs:609`) binds real grants and
-  sim holders in one pass. The only sim refusal is `SimGrant`
-  (`build.rs:651`), a sim resource granted directly.
-- `IoState::build` (`src/io/host/mod.rs:257`) makes one `Dispatch` over every
-  resource. `Resource::new` (`mod.rs:297`) makes a wire for a held sim
-  resource and a recipe for a held real one.
-
-The line dates from the first fsw3 commit (`ec71ee2c4`). The mechanism has
-since handled both. The problem is time, not wiring.
-
-### What breaks
-
-**A simulated clock with a real resource.** `run`
-(`src/coordinator/run.rs:90`) does not pace a simulated clock:
-`cycle_budget` (`build.rs:896`) returns `None` and each cycle only yields.
-The target runs as fast as the CPU allows.
-
-- A real device sees cycles at CPU speed, not at `sim_dt`.
-- `Op::Timeout` deadlines are cycle times (`src/io/host/dispatch.rs:348`),
-  landed by `expire` (`dispatch.rs:504`). A 1 s read timeout fires after 1 s
-  of sim time, which may be milliseconds of wall time. `Reconnect` backoff
-  does the same.
-- Real completions arrive in whichever io pass follows the kernel, so the
-  cycle a reply lands in depends on CPU speed.
-
-Links are real resources (`tcp_listen`, `tcp_dial`), so every sim with a
-`Publish` already holds one. That is acceptable for telemetry. It is not for
-a device in the loop.
-
-**Determinism.** `check_deterministic` (`build.rs:873`) checks only the
-clock. A `--deterministic` run that holds a real resource builds and is not
-reproducible.
-
-**A wall clock with a sim resource.** This works. Models run between
-`io_submit` and `io_complete` (`metor_config/_target.py:295`); a driver's
-request reaches its model the cycle it is sent, and the answer reaches the
-driver the next cycle. `adcs-fsw3/sim.py` already runs this way. The costs:
-
-- A plant integrates over the time between cycle stamps (`Plant.last` in
-  `adcs-fsw3/systems/adcs/src/plant.rs`), so an overrun is a longer step and
-  jitter enters the dynamics.
-- Runs are not reproducible.
-
-**Stamps.** A mux's `max_age` assumes every stamped input shares the
-target's clock (`src/mux/step.rs:15`). A driver that copies a device's own
-time, such as GNSS time, into a stamp breaks that under a simulated epoch.
-
-### Proposal
-
-A mixed target is one that holds at least one real and one sim resource,
-links excluded. It means: real devices at real time, models stepped by the
-same cycle.
-
-1. A mixed target runs on a wall clock. A simulated clock with a real device
-   is not refused; it is documented as unpaced, and setups do not do it.
-2. Models in a mixed target step once per wall cycle and read the cycle
-   time, as on a pure-sim wall target. No new scheduling.
-3. A model may hold a real resource, such as a rig model driving a real
-   UART. `_target.py` allows it today; this makes it intended.
-4. Drivers stamp records with the cycle time. Device time goes in a field.
-5. `TODO.md:168` is reworded to the rules above.
-
-None of these rules adds a build check. A simulated clock with a real
-device, and `--deterministic` with a real resource, are user errors.
-
-## Dependencies
-
-- Composites (`docs/composites.md`, not on main).
-- Optional inputs in composites: `Sources[T] | None`, so a slot reads truth
-  only in a sim. The sketches use it.
+- Element paths and calibrated mappings in a `Mux`: `raw.v[5]`,
+  `BoardCmd(open={3: f})`, and `Calibrated(source, cal)`. See
+  [muxes](muxes.md).
+- Targets that hold real and sim resources at once. Such a target runs on a
+  wall clock. See the IO section of `DESIGN.md`.
+- Optional composite inputs, `Sources[T] | None`, so a slot reads truth only
+  in a sim. See [composites](composites.md).
 
 ## Future
 
 - Rendering the hardware config to NixOS: udev rules that make
   `/dev/metor/<ref>` symlinks, systemd `.link` files for NICs, through a Nix
-  to serde bridge. Python writes data; Nix modules decide (see the prior-art
-  report, NixOS section). Leaves would then hold `/dev/metor/gps1` and the
+  to serde bridge. Python writes data; Nix modules decide. Leaves would then hold `/dev/metor/gps1` and the
   match spec.
 - A machine and network model, with hosts from target groups.
 - VM emulation of a setup from the same data, as NixOS `build-vm` does.
-- `SimCan`, `SimUdp`, and the rest (`TODO.md:169`), so wiring (a) covers
+- `SimCan`, `SimUdp`, and the rest (see `TODO.md`), so wiring (a) covers
   every slot.
 - Taring: offsetting one component by another, such as a PT read at ambient
   before a test. Cold-junction compensation from a separate channel may fit
