@@ -171,7 +171,10 @@ impl Hydrators {
         cx: &gpui::App,
     ) {
         match range_fetch(manifest, gap) {
-            Some(range) => self.request_range(component_id, range, priority),
+            Some(range) => {
+                self.request_range(component_id, range, priority);
+                self.renew_later(cx);
+            }
             None => self.request(component_id, gap.range.clone(), priority, cx),
         }
     }
@@ -267,6 +270,11 @@ mod tests {
     }
 
     fn gap_in(source: SpanSource, bytes: u64, range: Range<i64>) -> Option<Range<i64>> {
+        let (manifest, gap) = remote_gap(source, bytes, range);
+        range_fetch(&manifest, &gap).map(|r| r.start.0..r.end.0)
+    }
+
+    fn remote_gap(source: SpanSource, bytes: u64, range: Range<i64>) -> (ComponentManifest, Gap) {
         let seal = SealRecord {
             start_ts: Timestamp(0),
             end_ts: Timestamp(999_999),
@@ -286,7 +294,26 @@ mod tests {
             start_ts: Timestamp(0),
             seal_start: Timestamp(0),
         };
-        range_fetch(&manifest, &gap).map(|r| r.start.0..r.end.0)
+        (manifest, gap)
+    }
+
+    /// Range fetches expire like node requests, so asking for one schedules
+    /// the repaint that renews it while the hydrator is backlogged.
+    #[gpui::test]
+    fn a_range_fetched_gap_is_renewed(cx: &mut gpui::TestAppContext) {
+        let (manifest, gap) = remote_gap(SpanSource::RemoteFetch, 64 * MB, 1000..2000);
+        let hydrators = Hydrators::default();
+        hydrators.insert(TargetId("peer".into()), Hydrator::new());
+        cx.update(|cx| {
+            hydrators.request_gap(
+                ComponentId::new("rpm"),
+                &manifest,
+                &gap,
+                HydratePriority::Visible,
+                cx,
+            )
+        });
+        assert!(hydrators.0.renewing.load(Ordering::Acquire));
     }
 
     #[test]
