@@ -164,10 +164,17 @@ impl PeerStore {
             (0..requests.len()).map(|_| None).collect();
         let mut pending = requests.len();
         while pending > 0 {
-            let pkt = bounded(REPLY_TIMEOUT, client.rx.next_grow(vec![0u8; 1024]))
-                .await
-                .map_err(unavailable)?
-                .map_err(unavailable)?;
+            // Each reply keeps its buffer, so none is reused; the length
+            // the peer declares is checked before the buffer grows to it.
+            let pkt = bounded(
+                REPLY_TIMEOUT,
+                client
+                    .rx
+                    .next_grow_max(vec![0u8; 1024], crate::series::SERIES_BUDGET),
+            )
+            .await
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
             let Some(slot) = (pkt.req_id() as usize)
                 .checked_sub(1)
                 .and_then(|i| replies.get_mut(i))
