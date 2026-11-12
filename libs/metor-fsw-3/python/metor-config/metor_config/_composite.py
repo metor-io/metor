@@ -38,11 +38,15 @@ def composite(fn: Callable[Concatenate[Scope, P], R]) -> Callable[P, Composite[R
     that do not fit ``fn`` raise `TypeError` at the call.
     """
 
+    signature = inspect.signature(fn)
+
     @wraps(fn)
     def bind(*args: P.args, **kwargs: P.kwargs) -> Composite[R]:
-        inspect.signature(fn).bind(None, *args, **kwargs)
+        signature.bind(None, *args, **kwargs)
         return Composite(lambda scope: fn(scope, *args, **kwargs))
 
+    params = list(signature.parameters.values())[1:]
+    bind.__signature__ = signature.replace(parameters=params)  # type: ignore[attr-defined]
     return bind
 
 
@@ -91,14 +95,15 @@ class Scope:
 
     def resource(self, name: str, kind: Kind) -> ResourceHandle:
         """Creates a resource named ``{prefix}_{name}``. See `Target.resource`."""
-        prefix = self._prefix.replace(".", "_")
-        return self._target.resource(f"{prefix}_{name}", kind)
+        full = f"{self._prefix.replace('.', '_')}_{name}"
+        if full in self._target._resources:
+            taken = f"resource `{name}` of composite `{self._prefix}` is `{full}`, which is taken"
+            raise ConfigError(taken)
+        return self._target.resource(full, kind)
 
     def loop(self, record: type[T]) -> Loop[T]:
         """Creates a feedback edge. See `Target.loop`."""
         return self._target.loop(record)
 
     def _path(self, name: str) -> str:
-        if not name.isidentifier():
-            raise ConfigError(f"a name in composite `{self._prefix}` is an identifier, got {name!r}")
         return f"{self._prefix}.{name}"

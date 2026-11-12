@@ -190,11 +190,15 @@ class Target:
         channel's state at boot: ``"running"`` (the default) or ``"stopped"``.
 
         A `Composite` adds its systems here, under ``{name}.``, and returns
-        its function's result. It takes no adapter; its systems set their own.
+        its function's result. It takes no ``thread``, ``channel``, or
+        ``start``; its body sets them on its systems.
         """
         if isinstance(system, Composite):
             if thread is not None or channel is not None or start is not None:
-                raise ConfigError(f"composite `{name}` takes no adapter; set it on its systems")
+                raise ConfigError(
+                    f"composite `{name}` takes no `thread`, `channel`, or `start`; "
+                    "pass them to the `s.add` calls in its body"
+                )
             return self._add_composite(name, system)
         return self._add(self._systems, name, system, _adapter(thread, channel, start))
 
@@ -209,17 +213,23 @@ class Target:
         return self._add(self._sims, name, system, None)
 
     def _add_composite(self, name: str, composite: Composite[R]) -> R:
-        if not all(part.isidentifier() for part in name.split(".")):
-            raise ConfigError(f"a composite's name is an identifier, got {name!r}")
         self._check_free(name)
+        result = composite._build(Scope(self, name))
         self._composites.add(name)
-        return composite._build(Scope(self, name))
+        return result
 
     def _check_free(self, name: str) -> None:
-        """Raises `ConfigError` if ``name`` is taken, or if one system's id
-        would sit under another's, since their port names could then match."""
+        """Raises `ConfigError` unless ``name`` is identifiers joined by ``.``
+        and free. It is not free if taken, if it is under a composite added
+        earlier, or if one system's id would sit under another's, since `a`'s
+        port `b` and `a.b`'s ports would then share component paths."""
+        if not all(part.isidentifier() for part in name.split(".")):
+            raise ConfigError(f"an id is identifiers joined by `.`, got {name!r}")
         if name in self._handles or name in self._composites:
             raise ConfigError(f"system `{name}` is already added")
+        for other in self._composites:
+            if name.startswith(f"{other}."):
+                raise ConfigError(f"`{name}` is under composite `{other}`, added earlier")
         for other in self._handles:
             if name.startswith(f"{other}.") or other.startswith(f"{name}."):
                 raise ConfigError(f"`{name}` overlaps system `{other}`")
