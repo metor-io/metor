@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Mapping
 
-from ._fields import Field, _given
+from ._cal import Calibrated
+from ._fields import ArrayField, Field, _given
 from ._model import OutPort, Pack, Record, System
 
 ABI_VERSION = 15
@@ -37,14 +38,14 @@ class ChannelMessage(Record):
     _pack = PACK
     _fields = {"text": "u8[128]"}
 
-    def __init__(self, *, text: Field[Literal["u8[128]"]] | None = None) -> None:
+    def __init__(self, *, text: Field[Literal["u8[128]"]] | Mapping[int, Field[Literal["u8"]]] | None = None) -> None:
         super().__init__(**_given({"text": text}))
 
 
 class ChannelMessagePort(OutPort[ChannelMessage]):
     @property
-    def text(self) -> Field[Literal["u8[128]"]]:
-        return self.field("text")
+    def text(self) -> ArrayField[Literal["u8[128]"], Field[Literal["u8"]]]:
+        return ArrayField(self, "text", "u8[128]")
 
 
 ChannelMessage._port = ChannelMessagePort
@@ -56,7 +57,7 @@ class ChannelStatus(Record):
     _pack = PACK
     _fields = {"state": "u32", "loaded": "u32", "artifact": "u8[64]", "hash": "u8[32]", "elapsed": "f64", "abort_elapsed": "f64", "accepts": "u32"}
 
-    def __init__(self, *, state: Field[Literal["u32"]] | None = None, loaded: Field[Literal["u32"]] | None = None, artifact: Field[Literal["u8[64]"]] | None = None, hash: Field[Literal["u8[32]"]] | None = None, elapsed: Field[Literal["f64"]] | None = None, abort_elapsed: Field[Literal["f64"]] | None = None, accepts: Field[Literal["u32"]] | None = None) -> None:
+    def __init__(self, *, state: Field[Literal["u32"]] | None = None, loaded: Field[Literal["u32"]] | None = None, artifact: Field[Literal["u8[64]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, hash: Field[Literal["u8[32]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, elapsed: Field[Literal["f64"]] | Calibrated | None = None, abort_elapsed: Field[Literal["f64"]] | Calibrated | None = None, accepts: Field[Literal["u32"]] | None = None) -> None:
         super().__init__(**_given({"state": state, "loaded": loaded, "artifact": artifact, "hash": hash, "elapsed": elapsed, "abort_elapsed": abort_elapsed, "accepts": accepts}))
 
 
@@ -70,12 +71,12 @@ class ChannelStatusPort(OutPort[ChannelStatus]):
         return self.field("loaded")
 
     @property
-    def artifact(self) -> Field[Literal["u8[64]"]]:
-        return self.field("artifact")
+    def artifact(self) -> ArrayField[Literal["u8[64]"], Field[Literal["u8"]]]:
+        return ArrayField(self, "artifact", "u8[64]")
 
     @property
-    def hash(self) -> Field[Literal["u8[32]"]]:
-        return self.field("hash")
+    def hash(self) -> ArrayField[Literal["u8[32]"], Field[Literal["u8"]]]:
+        return ArrayField(self, "hash", "u8[32]")
 
     @property
     def elapsed(self) -> Field[Literal["f64"]]:
@@ -159,14 +160,14 @@ class ResourceStatus(Record):
     _pack = PACK
     _fields = {"resource": "u8[64]", "submitted": "u64", "completed": "u64", "failed": "u64", "bytes_in": "u64", "bytes_out": "u64", "dropped": "u64", "rejected": "u64"}
 
-    def __init__(self, *, resource: Field[Literal["u8[64]"]] | None = None, submitted: Field[Literal["u64"]] | None = None, completed: Field[Literal["u64"]] | None = None, failed: Field[Literal["u64"]] | None = None, bytes_in: Field[Literal["u64"]] | None = None, bytes_out: Field[Literal["u64"]] | None = None, dropped: Field[Literal["u64"]] | None = None, rejected: Field[Literal["u64"]] | None = None) -> None:
+    def __init__(self, *, resource: Field[Literal["u8[64]"]] | Mapping[int, Field[Literal["u8"]]] | None = None, submitted: Field[Literal["u64"]] | None = None, completed: Field[Literal["u64"]] | None = None, failed: Field[Literal["u64"]] | None = None, bytes_in: Field[Literal["u64"]] | None = None, bytes_out: Field[Literal["u64"]] | None = None, dropped: Field[Literal["u64"]] | None = None, rejected: Field[Literal["u64"]] | None = None) -> None:
         super().__init__(**_given({"resource": resource, "submitted": submitted, "completed": completed, "failed": failed, "bytes_in": bytes_in, "bytes_out": bytes_out, "dropped": dropped, "rejected": rejected}))
 
 
 class ResourceStatusPort(OutPort[ResourceStatus]):
     @property
-    def resource(self) -> Field[Literal["u8[64]"]]:
-        return self.field("resource")
+    def resource(self) -> ArrayField[Literal["u8[64]"], Field[Literal["u8"]]]:
+        return ArrayField(self, "resource", "u8[64]")
 
     @property
     def submitted(self) -> Field[Literal["u64"]]:

@@ -5,9 +5,9 @@ from __future__ import annotations
 
 {% if dataclasses %}from dataclasses import dataclass, field
 {% endif %}from pathlib import Path
-from typing import {% if takes_groups %}TYPE_CHECKING, {% endif %}Literal{% if takes_sequences %}, Sequence{% endif %}
+from typing import {% if takes_groups %}TYPE_CHECKING, {% endif %}Literal, Mapping{% if takes_sequences %}, Sequence{% endif %}
 
-from metor_config import Field, {% if takes_ports %}Item, {% endif %}{% if takes_groups %}OutGroup, {% endif %}OutPort, Pack, {% if takes_groups %}PortGroup, {% endif %}Record, {% if takes_caps %}ResourceHandle, {% endif %}Sources, System
+from metor_config import ArrayField, Calibrated, Field, {% if takes_ports %}Item, {% endif %}{% if takes_groups %}OutGroup, {% endif %}OutPort, Pack, {% if takes_groups %}PortGroup, {% endif %}Record, {% if takes_caps %}ResourceHandle, {% endif %}Sources, System
 from metor_config._fields import _given
 
 PACK = Pack(

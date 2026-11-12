@@ -165,7 +165,9 @@ Design `docs/plans/18-io.md`, plan `18-io-plan.md`, chunk plans
   ops to the coordinator's device ends.
 - The `sim` resolver and links over simulated resources (`SimListen`,
   `SimDial`). Needs async systems on the reactor.
-- Targets that mix real and sim resources. Build refuses them today.
+- A paced simulated clock: fixed `dt` for models, paced to wall for real
+  devices. Until then a mixed target runs on a wall clock, and a simulated
+  clock with a real device is unpaced.
 - More sim kinds (`SimCan`, `SimUdp`, `SimDir`, `SimListen`, `SimDial`),
   each with its driver.
 - Windows in the `Os`. `PollOs` is Unix-only.

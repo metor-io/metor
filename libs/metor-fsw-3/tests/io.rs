@@ -285,13 +285,16 @@ mod connects {
 mod through_the_io_steps {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
     use metor_fsw_3::io::{
-        Backing, Cap, IO_STATUS_PORT, IO_TYPE, RealKind, Reconnect, RecvOp, SendOp, Udp,
+        Backing, Cap, Holder, IO_STATUS_PORT, IO_TYPE, RealKind, Reconnect, RecvOp, SendOp,
+        SimKind, SimResource, Udp,
     };
-    use metor_fsw_3::{Input, IoInit, ResourceStatus, Slot, Timestamp, system};
+    use metor_fsw_3::{Coordinator, Input, IoInit, ResourceStatus, Slot, Timestamp, system};
+
+    use super::gps::{Gps, GpsState, UartScript, gps, uart_script};
 
     type Got = Rc<RefCell<Vec<Vec<u8>>>>;
 
@@ -333,6 +336,14 @@ mod through_the_io_steps {
         seen.borrow_mut().extend(st.drain().flatten().copied());
     }
 
+    /// Counts the fixes it reads.
+    #[system]
+    fn fixes(#[state] n: &mut Rc<RefCell<usize>>, fix: &mut Input<Gps>) {
+        *n.borrow_mut() += fix.drain().flatten().count();
+    }
+
+    const GGA: &str = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
+
     /// A free local UDP port.
     fn free_port() -> u16 {
         std::net::UdpSocket::bind("127.0.0.1:0")
@@ -342,46 +353,91 @@ mod through_the_io_steps {
             .port()
     }
 
-    #[test]
-    fn datagram_to_itself_completes_a_recv() {
-        let (got, status) = (
-            Got::default(),
-            Rc::<RefCell<Vec<ResourceStatus>>>::default(),
-        );
+    /// A UDP socket on a free loopback port that sends to itself.
+    fn udp_loop() -> Backing {
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        Backing::Real(RealKind::Udp {
+            bind: addr,
+            connect: Some(addr),
+        })
+    }
+
+    /// A sim UART between the `gps` driver and the `receiver` model.
+    fn gps_line() -> Backing {
+        Backing::Sim(SimResource {
+            kind: SimKind::Uart,
+            host: Holder::new("gps", "uart"),
+            device: Holder::new("receiver", "uart"),
+        })
+    }
+
+    /// The builtins, `pinger` keeping what it receives in `got`, `gps`, and
+    /// `uart_script`.
+    fn table(got: &Got) -> SystemTable {
         let mut table = SystemTable::new();
         metor_fsw_3::builtins::register_builtins(&mut table).unwrap();
-        let g = got.clone();
+        let got = got.clone();
         let make = move |io: &mut IoInit<'_>| {
             Ok(Pinger {
                 link: Reconnect::new(),
                 tx: Slot::Idle(io.alloc_from(b"ping")?),
                 rx: Slot::Idle(io.alloc(64)?),
                 sent: false,
-                got: g.clone(),
+                got: got.clone(),
             })
         };
         table.register("pinger", pinger(), make).unwrap();
+        table.register("gps", gps(), GpsState::new).unwrap();
+        table
+            .register("uart_script", uart_script(), UartScript::new)
+            .unwrap();
+        table
+    }
+
+    fn pinger_on(resource: &str) -> SystemConfig {
+        SystemConfig {
+            grants: [("udp".into(), resource.into())].into(),
+            ..SystemConfig::new("p", "pinger")
+        }
+    }
+
+    fn receiver() -> SystemConfig {
+        SystemConfig {
+            params: serde_json::json!({ "script": [GGA, GGA, GGA] }),
+            ..SystemConfig::new("receiver", "uart_script")
+        }
+    }
+
+    /// Steps on cycle time from the wall clock until `done` holds, for at
+    /// most five seconds. Returns whether `done` held.
+    fn run_until(c: &mut Coordinator, done: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            c.step(Timestamp(start.elapsed().as_micros() as i64));
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    #[test]
+    fn datagram_to_itself_completes_a_recv() {
+        let (got, status) = (
+            Got::default(),
+            Rc::<RefCell<Vec<ResourceStatus>>>::default(),
+        );
+        let mut table = table(&got);
         let st = status.clone();
         table
             .register("status_probe", status_probe(), move || st.clone())
             .unwrap();
 
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         let config = CoordinatorConfig {
-            resources: [(
-                "loop".to_string(),
-                Backing::Real(RealKind::Udp {
-                    bind: addr,
-                    connect: Some(addr),
-                }),
-            )]
-            .into_iter()
-            .collect(),
+            resources: [("loop".to_string(), udp_loop())].into_iter().collect(),
             systems: vec![
-                SystemConfig {
-                    grants: [("udp".into(), "loop".into())].into(),
-                    ..SystemConfig::new("p", "pinger")
-                },
+                pinger_on("loop"),
                 SystemConfig::new("io_submit", IO_TYPE),
                 SystemConfig {
                     params: serde_json::json!({ "status": true }),
@@ -395,17 +451,62 @@ mod through_the_io_steps {
             ..CoordinatorConfig::default()
         };
         let mut coordinator = config.build(&table).unwrap();
-        for t in 0..500 {
-            coordinator.step(Timestamp(t));
-            if !got.borrow().is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        assert!(run_until(&mut coordinator, || !got.borrow().is_empty()));
         assert_eq!(got.borrow().as_slice(), [b"ping".to_vec()]);
         let last = *status.borrow().last().expect("an io_status record");
         assert_eq!(last.resource.to_str().unwrap(), "loop");
         assert_eq!((last.bytes_out, last.bytes_in), (4, 4));
+    }
+
+    /// A real UDP socket and a sim UART in one target, both delivering.
+    #[test]
+    fn mixed_target_delivers_real_and_sim() {
+        let (got, seen) = (Got::default(), Rc::<RefCell<usize>>::default());
+        let mut table = table(&got);
+        let s = seen.clone();
+        table.register("fixes", fixes(), move || s.clone()).unwrap();
+        let config = CoordinatorConfig {
+            resources: [
+                ("loop".to_string(), udp_loop()),
+                ("gps1".to_string(), gps_line()),
+            ]
+            .into_iter()
+            .collect(),
+            systems: vec![
+                pinger_on("loop"),
+                SystemConfig::new("gps", "gps"),
+                SystemConfig::new("io_submit", IO_TYPE),
+                receiver(),
+                SystemConfig::new("io_complete", IO_TYPE),
+                SystemConfig {
+                    inputs: vec![InputConfig::new("fix", "gps", "fix")],
+                    ..SystemConfig::new("fixes", "fixes")
+                },
+            ],
+            ..CoordinatorConfig::default()
+        };
+        let mut c = config.build(&table).unwrap();
+        let both = || !got.borrow().is_empty() && *seen.borrow() > 0;
+        assert!(run_until(&mut c, both), "a ping and a fix arrive");
+        assert_eq!(got.borrow().as_slice(), [b"ping".to_vec()]);
+    }
+
+    /// A system between the io steps may hold a real resource.
+    #[test]
+    fn model_holding_a_real_resource_runs() {
+        let got = Got::default();
+        let config = CoordinatorConfig {
+            resources: [("loop".to_string(), udp_loop())].into_iter().collect(),
+            systems: vec![
+                SystemConfig::new("io_submit", IO_TYPE),
+                pinger_on("loop"),
+                SystemConfig::new("io_complete", IO_TYPE),
+            ],
+            ..CoordinatorConfig::default()
+        };
+        let mut c = config.build(&table(&got)).unwrap();
+        assert!(run_until(&mut c, || !got.borrow().is_empty()));
+        assert_eq!(got.borrow().as_slice(), [b"ping".to_vec()]);
     }
 }
 

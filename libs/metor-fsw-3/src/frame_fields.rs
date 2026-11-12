@@ -107,6 +107,84 @@ impl FieldTable {
         });
         Ok(())
     }
+
+    /// The element of a shaped leaf at `path`, as its own leaf.
+    pub fn element(&self, path: &str) -> Result<Leaf, ElementError> {
+        let (leaf, rest) = self.prefix_of(path).ok_or(ElementError::Unknown)?;
+        let indices = indices(rest).ok_or(ElementError::Unknown)?;
+        let (off, len) = locate(&leaf.shape, leaf.ty.size(), &indices)?;
+        let shape = leaf
+            .shape
+            .get(indices.len()..)
+            .ok_or(ElementError::Unknown)?;
+        let offset = u32::try_from(off)
+            .ok()
+            .and_then(|off| leaf.offset.checked_add(off));
+        Ok(Leaf {
+            path: path.to_string(),
+            ty: leaf.ty,
+            shape: shape.to_vec(),
+            offset: offset.ok_or(ElementError::Unknown)?,
+            len: u32::try_from(len).map_err(|_| ElementError::Unknown)?,
+        })
+    }
+
+    /// The leaf that is a proper prefix of `path`, and the rest after its `.`.
+    fn prefix_of<'a>(&self, path: &'a str) -> Option<(&Leaf, &'a str)> {
+        self.leaves.iter().find_map(|leaf| {
+            let rest = path.strip_prefix(leaf.path.as_str())?.strip_prefix('.')?;
+            Some((leaf, rest))
+        })
+    }
+}
+
+/// Why an element path does not resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElementError {
+    /// No leaf is a proper prefix, a segment is not a canonical decimal
+    /// index, or there are more indices than dimensions.
+    Unknown,
+    /// An index at or past its dimension, of length `len`.
+    Index { len: usize },
+}
+
+/// `rest`'s segments as indices.
+fn indices(rest: &str) -> Option<Vec<usize>> {
+    rest.split('.').map(index).collect()
+}
+
+/// `(offset, len)` in bytes of the element at `indices` of a `shape` of
+/// `size`-byte elements, relative to the leaf.
+fn locate(shape: &[usize], size: usize, indices: &[usize]) -> Result<(usize, usize), ElementError> {
+    let unknown = ElementError::Unknown;
+    let (head, tail) = (
+        shape.get(..indices.len()).ok_or(unknown)?,
+        shape.get(indices.len()..).ok_or(unknown)?,
+    );
+    if let Some((_, &len)) = indices.iter().zip(head).find(|(i, d)| i >= d) {
+        return Err(ElementError::Index { len });
+    }
+    let len = tail
+        .iter()
+        .try_fold(size, |acc, &d| acc.checked_mul(d))
+        .ok_or(unknown)?;
+    let mut stride = len;
+    let mut off = 0usize;
+    for (&i, &d) in indices.iter().zip(head).rev() {
+        off = i
+            .checked_mul(stride)
+            .and_then(|step| off.checked_add(step))
+            .ok_or(unknown)?;
+        stride = stride.checked_mul(d).ok_or(unknown)?;
+    }
+    Ok((off, len))
+}
+
+/// A canonical decimal index: digits only, no leading zero but "0".
+fn index(segment: &str) -> Option<usize> {
+    let canonical = segment.bytes().all(|b| b.is_ascii_digit())
+        && (segment == "0" || !segment.starts_with('0'));
+    canonical.then(|| segment.parse().ok()).flatten()
 }
 
 /// Whether `leaf` is `path` or lies under `path.`.
@@ -172,3 +250,28 @@ impl From<metor_proto::error::Error> for Walk {
 
 #[cfg(all(test, feature = "host"))]
 mod tests;
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn locate_in_bounds() {
+        let dims: [usize; 2] = [kani::any(), kani::any()];
+        let idx: [usize; 2] = [kani::any(), kani::any()];
+        let (rank, count): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(rank <= 2 && count <= rank);
+        kani::assume(dims.iter().all(|&d| d <= 8));
+        let size = if kani::any() { 1 } else { 8 };
+        let (shape, indices) = (&dims[..rank], &idx[..count]);
+        let inside = indices.iter().zip(shape).all(|(i, d)| i < d);
+        match locate(shape, size, indices) {
+            Ok((off, len)) => {
+                assert!(inside);
+                assert!(off + len <= size * shape.iter().product::<usize>());
+            }
+            Err(e) => assert!(!inside && matches!(e, ElementError::Index { .. })),
+        }
+    }
+}

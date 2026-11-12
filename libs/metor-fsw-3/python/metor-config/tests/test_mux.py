@@ -7,7 +7,7 @@ from typing import Any
 
 from adcs_stub import PACK, ModeCmd, MotorCmd, Nav, Plant
 
-from metor_config import ConfigError, Mux, Target
+from metor_config import Cal, Calibrated, ConfigError, Mux, Target
 
 
 def entry(target: Target, name: str) -> dict[str, Any]:
@@ -88,6 +88,78 @@ class MuxTest(unittest.TestCase):
             ("frame record instance", lambda: Mux(cmd=MotorCmd)),  # pyright: ignore[reportArgumentType]
             ("frame record instance", lambda: Mux(cmd=object.__new__(ModeCmd))),
             ("message", lambda: Mux(cmd=ModeCmd())),
+        ]
+        for message, make in cases:
+            with self.subTest(message), self.assertRaisesRegex(ConfigError, message):
+                make()
+
+    def test_element_paths(self) -> None:
+        gyro = self.plant.imu.field("gyro")
+        cmd = MotorCmd(torque={0: gyro[1]}, **{"trim.a": self.nav.est.field("p")[2][3]})
+        self.target.add("mix", Mux(cmd=cmd, on="cycle"))
+        fields = entry(self.target, "mix")["params"]["outputs"][0]["fields"]
+        self.assertEqual(
+            fields,
+            [
+                {"dst": "torque.0", "input": "plant.imu", "src": "gyro.1"},
+                {"dst": "trim.a", "input": "nav.est", "src": "p.2.3"},
+            ],
+        )
+
+    def test_calibrated_mappings(self) -> None:
+        est = self.nav.est
+        linear = Cal.linear(gain=2.0, offset=1.0)
+        ratio = Cal.ratiometric(excitation=est.field("gains.1"), span=(0, 1), eng=(0, 10))
+        cmd = MotorCmd(
+            torque={0: Calibrated(est.field("bias.a"), linear), 1: est.field("gains.0")},
+            **{"trim.a": Calibrated(est.field("gains.0"), ratio)},
+        )
+        self.target.add("mix", Mux(cmd=cmd))
+        params = entry(self.target, "mix")["params"]
+        self.assertEqual(params["inputs"], ["nav.est"])
+        self.assertEqual(
+            params["outputs"][0]["fields"],
+            [
+                {"dst": "torque.0", "input": "nav.est", "src": "bias.a", "cal": {"poly": [1.0, 2.0]}},
+                {"dst": "torque.1", "input": "nav.est", "src": "gains.0"},
+                {
+                    "dst": "trim.a",
+                    "input": "nav.est",
+                    "src": "gains.0",
+                    "cal": {
+                        "ratiometric": {
+                            "excitation": "gains.1",
+                            "span": [0.0, 1.0],
+                            "eng": [0.0, 10.0],
+                        }
+                    },
+                },
+            ],
+        )
+
+    def test_calibrated_source_is_an_input(self) -> None:
+        cal = Calibrated(self.plant.imu.field("gyro")[2], Cal.thermocouple("J"))
+        cmd = MotorCmd(torque=self.nav.est.field("bias.b"), **{"trim.a": cal})
+        self.target.add("mix", Mux(cmd=cmd, on="any"))
+        params = entry(self.target, "mix")["params"]
+        self.assertEqual(params["inputs"], ["nav.est", "plant.imu"])
+        trim = params["outputs"][0]["fields"][1]
+        self.assertEqual(trim["src"], "gyro.2")
+        self.assertEqual(trim["cal"], {"thermocouple": {"kind": "j"}})
+
+    def test_calibrated_refusals(self) -> None:
+        est, gyro = self.nav.est, self.plant.imu.field("gyro")
+        linear = Cal.linear(gain=1.0, offset=0.0)
+        other = Cal.ratiometric(excitation=gyro[0], span=(0, 1), eng=(0, 1))
+        cases: list[tuple[str, Any]] = [
+            ("f64 to f64", lambda: MotorCmd(torque=Calibrated(est.field("bias.a"), linear))),
+            ("f64 to f64", lambda: MotorCmd(**{"trim.a": Calibrated(gyro, linear)})),
+            ("f64 to f64", lambda: MotorCmd(trim=Calibrated(est.field("bias.a"), linear))),
+            ("not on `nav.est`", lambda: MotorCmd(**{"trim.a": Calibrated(est.field("bias.a"), other)})),
+            ("calibrates a port field", lambda: MotorCmd(**{"trim.a": Calibrated(1.0, linear)})),  # pyright: ignore[reportArgumentType]
+            ("takes a `Cal`", lambda: MotorCmd(**{"trim.a": Calibrated(est.field("bias.a"), "k")})),  # pyright: ignore[reportArgumentType]
+            ("has no field", lambda: MotorCmd(trim_x=Calibrated(est.field("bias.a"), linear))),
+            ("maps", lambda: MotorCmd(torque={0: Calibrated(gyro[0], linear), 1: gyro[1]}, **{"torque.0": gyro[2]})),
         ]
         for message, make in cases:
             with self.subTest(message), self.assertRaisesRegex(ConfigError, message):

@@ -6,21 +6,23 @@ import dataclasses
 import os
 import sys
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
     Generic,
-    Iterable,
+    Mapping,
     Sequence,
     TypeAlias,
     TypeVar,
     Union,
 )
 
+from ._cal import Cal, Calibrated
 from ._config import ConfigError
-from ._fields import Field, signature
+from ._fields import ArrayField, Field, _children, _is_index_run, index, indexable, signature
 
 T = TypeVar("T", bound="Record")
 
@@ -39,34 +41,89 @@ class Record:
     _kind: str = "msg"
     _pack: Pack | None = None
     _fields: dict[str, str] = {}
-    _mapping: dict[str, Field[Any]]
+    _mapping: dict[str, Field[Any] | Calibrated]
     _port: ClassVar[type[OutPort[Any]]]
     """The class of a port that carries this record."""
 
-    def __init__(self, **fields: Field[Any]) -> None:
+    def __init__(
+        self, **fields: Field[Any] | Calibrated | Mapping[int, Field[Any] | Calibrated]
+    ) -> None:
         """Maps each destination path to a source `Field`, for a `Mux` output.
 
+        A `Mapping` from index to `Field` maps elements of the destination. A
+        `Calibrated` source maps a scalar ``f64`` through its calibration.
         Raises `ConfigError` for a message record, an unknown path, a value
-        that is not a `Field`, or a signature that differs from the source's.
+        that is not a `Field` or `Calibrated`, a signature that differs from
+        the source's, or two destinations that overlap.
         """
         cls = type(self)
         if cls._kind != "frame":
             raise ConfigError(f"`{cls.__name__}` is a message; only a frame maps fields")
-        for path, source in fields.items():
+        pairs = [pair for path, value in fields.items() for pair in _expand(cls, path, value)]
+        for path, source in pairs:
             _check_mapping(cls, path, source)
-        self._mapping = dict(fields)
+        _check_overlap(cls, [path for path, _ in pairs])
+        self._mapping = dict(pairs)
+
+
+def _expand(record: type[Record], path: str, value: Any) -> list[tuple[str, Any]]:
+    """``value`` by destination path; a `Mapping` gives one path per index."""
+    if not isinstance(value, Mapping):
+        return [(path, value)]
+    where = f"{record.__name__}.{path}"
+    return [(f"{path}.{index(i, where)}", source) for i, source in value.items()]
+
+
+def _check_overlap(record: type[Record], paths: list[str]) -> None:
+    """Refuses a path twice, or a path and one under it.
+
+    Sorted by segments, the paths under a path follow it directly.
+    """
+    for a, b in pairwise(sorted(paths, key=lambda path: path.split("."))):
+        if a == b or b.startswith(f"{a}."):
+            raise ConfigError(f"`{record.__name__}` maps `{a}` and `{b}`")
 
 
 def _check_mapping(record: type[Record], path: str, source: Any) -> None:
+    if isinstance(source, Calibrated):
+        _check_calibrated(record, path, source)
+        return
     if not isinstance(source, Field):
         raise ConfigError(f"`{record.__name__}.{path}` takes a port field, got {source!r}")
-    expected = signature(record._fields, path)
-    if expected is None:
-        raise ConfigError(f"`{record.__name__}` has no field `{path}`")
+    expected = _destination(record, path)
     if expected != source.signature:
         raise ConfigError(
             f"`{record.__name__}.{path}` is `{expected}`, but "
             f"`{source.port.name}.{source.path}` is `{source.signature}`"
+        )
+
+
+def _destination(record: type[Record], path: str) -> str:
+    found = signature(record._fields, path)
+    if found is None:
+        raise ConfigError(f"`{record.__name__}` has no field `{path}`")
+    return found
+
+
+def _check_calibrated(record: type[Record], path: str, value: Calibrated) -> None:
+    """A scalar ``f64`` to a scalar ``f64``, with any excitation on the source's port."""
+    where = f"`{record.__name__}.{path}`"
+    source = value.source
+    if not isinstance(source, Field):
+        raise ConfigError(f"{where} calibrates a port field, got {source!r}")
+    if not isinstance(value.cal, Cal):
+        raise ConfigError(f"{where} takes a `Cal`, got {value.cal!r}")
+    dst = _destination(record, path)
+    if dst != "f64" or source.signature != "f64":
+        raise ConfigError(
+            f"{where} calibrates f64 to f64, but `{source.port.name}.{source.path}` "
+            f"is `{source.signature}` and {where} is `{dst}`"
+        )
+    excitation = value.cal.excitation
+    if excitation is not None and excitation.port.name != source.port.name:
+        raise ConfigError(
+            f"{where}: the excitation `{excitation.port.name}.{excitation.path}` "
+            f"is not on `{source.port.name}`"
         )
 
 
@@ -116,6 +173,8 @@ class OutPort(Generic[T]):
         found = signature(self.record._fields, path)
         if found is None:
             raise ConfigError(f"`{self.name}` has no field `{path}`")
+        if indexable(self.record._fields, path, found):
+            return ArrayField(self, path, found)
         return Field(self, path, found)
 
 
@@ -336,20 +395,6 @@ def _record_name(record: type[Record]) -> str:
     if not record._name:
         raise ConfigError(f"record class `{record.__name__}` names no record")
     return record._name
-
-
-def _children(names: Iterable[str], path: str) -> list[str]:
-    """The distinct segments right under ``path`` in ``names``, in order."""
-    prefix = path + "."
-    found: dict[str, None] = {}
-    for name in names:
-        if name.startswith(prefix):
-            found.setdefault(name[len(prefix) :].split(".", 1)[0])
-    return list(found)
-
-
-def _is_index_run(children: list[str]) -> bool:
-    return children == [str(i) for i in range(len(children))]
 
 
 def _flatten_inputs(ports: dict[str, type[Record]], given: dict[str, Any]) -> dict[str, Any]:

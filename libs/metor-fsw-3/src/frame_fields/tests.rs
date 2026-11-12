@@ -127,3 +127,88 @@ fn test_refusals() {
     }
     assert!(matches!(refused(bare), Some(FieldError::Unnamed { .. })));
 }
+
+fn leaf(path: &str, shape: &[usize], offset: u32) -> Leaf {
+    let count: usize = shape.iter().product();
+    Leaf {
+        path: path.into(),
+        ty: PrimType::F64,
+        shape: shape.to_vec(),
+        offset,
+        len: (8 * count) as u32,
+    }
+}
+
+/// `a: f64`, `p: f64[6,6]`, `v: f64[4]`, `one: f64[1]`, `css: [f64; 2]`.
+fn shaped() -> FieldTable {
+    let leaves = vec![
+        leaf("a", &[], 8),
+        leaf("p", &[6, 6], 16),
+        leaf("v", &[4], 304),
+        leaf("one", &[1], 336),
+        leaf("css.0", &[], 344),
+        leaf("css.1", &[], 352),
+    ];
+    FieldTable {
+        leaves,
+        len: 360,
+        stamp_at: Some(0),
+    }
+}
+
+#[test]
+fn test_element_of_a_shaped_leaf() {
+    let table = shaped();
+    assert_eq!(table.element("v.2"), Ok(leaf("v.2", &[], 304 + 16)));
+    assert_eq!(table.element("p.1"), Ok(leaf("p.1", &[6], 16 + 48)));
+    assert_eq!(table.element("p.1.2"), Ok(leaf("p.1.2", &[], 16 + 64)));
+}
+
+#[test]
+fn test_element_edges() {
+    let table = shaped();
+    assert_eq!(table.element("v.3"), Ok(leaf("v.3", &[], 304 + 24)));
+    assert_eq!(table.element("p.5.5"), Ok(leaf("p.5.5", &[], 16 + 280)));
+    assert_eq!(table.element("one.0"), Ok(leaf("one.0", &[], 336)));
+    assert_eq!(table.element("css.0"), Err(ElementError::Unknown));
+    assert_eq!(table.under("css.0").count(), 1);
+}
+
+#[test]
+fn test_element_refusals() {
+    let table = shaped();
+    assert_eq!(table.element("v.4"), Err(ElementError::Index { len: 4 }));
+    assert_eq!(table.element("p.6.0"), Err(ElementError::Index { len: 6 }));
+    assert_eq!(table.element("p.0.9"), Err(ElementError::Index { len: 6 }));
+    for path in [
+        "v.x", "v.+1", "v.01", "v.-1", "v.", "v", "a.0", "p.1.2.0", "w.0",
+    ] {
+        assert_eq!(table.element(path), Err(ElementError::Unknown), "{path}");
+    }
+    let huge = format!("v.{}0", usize::MAX);
+    assert_eq!(table.element(&huge), Err(ElementError::Unknown));
+}
+
+#[test]
+fn test_locate() {
+    assert_eq!(locate(&[6, 6], 8, &[]), Ok((0, 288)));
+    assert_eq!(locate(&[6, 6], 8, &[2, 3]), Ok((120, 8)));
+    assert_eq!(
+        locate(&[6, 6], 8, &[6]),
+        Err(ElementError::Index { len: 6 })
+    );
+    assert_eq!(locate(&[2], 1, &[0, 0]), Err(ElementError::Unknown));
+    assert_eq!(
+        locate(&[2, usize::MAX], 8, &[1]),
+        Err(ElementError::Unknown)
+    );
+}
+
+#[test]
+fn test_index() {
+    assert_eq!(index("0"), Some(0));
+    assert_eq!(index("17"), Some(17));
+    for bad in ["", "00", "07", "+1", "-1", "1x", " 1"] {
+        assert_eq!(index(bad), None, "{bad:?}");
+    }
+}
