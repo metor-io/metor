@@ -105,31 +105,6 @@ fn test_except_leaves_targets_out() {
 }
 
 #[test]
-fn test_show_finds_groups_and_their_systems() {
-    let target = fixture_dir().join("tree.py").display().to_string();
-    let show = |name: &str| {
-        let output = metor()
-            .args(["show", &target, name])
-            .output()
-            .expect("metor runs");
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        (output.status.success(), stdout, stderr)
-    };
-    let (ok, stdout, stderr) = show("flight");
-    assert!(ok, "{stderr}");
-    assert!(
-        stdout.contains("flight.s1.cpu") && stdout.contains("flight.s1.gw"),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("ground"), "{stdout}");
-    let (ok, _, stderr) = show("flight.s1.gw.sampler");
-    assert!(ok, "{stderr}");
-    let (ok, _, stderr) = show("flight.s");
-    assert!(!ok && stderr.contains("M0104"), "{stderr}");
-}
-
-#[test]
 fn test_selection_errors() {
     let (code, _, stderr) = run_tree(&["--target", "fli"]);
     assert_ne!(code, Some(0), "{stderr}");

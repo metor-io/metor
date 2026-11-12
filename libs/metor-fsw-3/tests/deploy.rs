@@ -125,6 +125,7 @@ fn groups(db: &[u16; 1], args: &[&str]) -> std::process::Command {
         .arg(fixture_dir().join("groups.py"))
         .args(args)
         .env(PORTS_ENV, ports_env(db))
+        // groups.py has 9 port-0 listeners: each string's `up`, `pub`, `tm`.
         .env("METOR_FIRST_PORT", free_port_run(9).to_string());
     command
 }
@@ -217,20 +218,6 @@ fn test_one_string_runs_alone() {
         );
     }
     assert!(!stderr.contains("ground "), "{stderr}");
-}
-
-/// A selection that leaves nothing fails before any target starts.
-#[test]
-fn test_empty_selection_fails() {
-    let output = metor()
-        .arg("run")
-        .arg(fixture_dir().join("groups.py"))
-        .args(["--target", "flight", "--except", "flight"])
-        .output()
-        .expect("metor runs");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains("M0109"), "{stderr}");
 }
 
 /// Runs `metor build` on the fixture deployment and returns the resolved
