@@ -115,10 +115,7 @@ mod tests {
 
     #[test]
     fn matches_component_id_new() {
-        assert_eq!(
-            via_hasher(&["processes", "htop", "pid"]),
-            ComponentId::new("processes.htop.pid")
-        );
+        assert_eq!(via_hasher(&["processes", "htop", "pid"]), ComponentId::new("processes.htop.pid"));
         assert_eq!(via_hasher(&["a"]), ComponentId::new("a"));
         assert_eq!(via_hasher(&[]), ComponentId::new(""));
         // empty segments are skipped, matching ChainPath join rules
@@ -146,9 +143,7 @@ mod tests {
         // Small deterministic LCG so the test needs no rng dependency.
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             state >> 33
         };
         const ALPHABET: &[u8] = b"abcdefABCDEF0123_";

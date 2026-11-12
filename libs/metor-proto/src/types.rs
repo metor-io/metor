@@ -542,17 +542,7 @@ impl ElementValue {
 }
 
 #[derive(
-    TryFromBytes,
-    Unaligned,
-    Immutable,
-    KnownLayout,
-    PartialEq,
-    Eq,
-    Hash,
-    Debug,
-    Clone,
-    Copy,
-    IntoBytes,
+    TryFromBytes, Unaligned, Immutable, KnownLayout, PartialEq, Eq, Hash, Debug, Clone, Copy, IntoBytes,
 )]
 #[repr(u8)]
 pub enum PacketTy {
@@ -627,6 +617,8 @@ pub trait Msg: Serialize {
     const ID: PacketId;
 }
 
+/// Note that this blanket id is the bare fold: unlike [`msg_id`] it does not apply the
+/// reserved-row remap, so a schema name whose fold lands on `[224, _]` keeps it.
 impl<T: Serialize + postcard_schema::Schema> Msg for T {
     const ID: PacketId = short_id(const_fnv1a_hash::fnv1a_hash_str_16_xor(T::SCHEMA.name).to_le_bytes());
 }
