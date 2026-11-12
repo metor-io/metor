@@ -179,7 +179,7 @@ class Publish(_Sink, Link, _generated.Publish):
     publishes every system added before this one.
 
     ``conn_cap`` sizes each connection's buffers and the batch. It must
-    be at least the largest record published plus 8 bytes, so an image link
+    be at least the largest record published plus 16 bytes, so an image link
     needs one above its image's size; the build checks it.
     """
 
@@ -277,7 +277,7 @@ class Subscribe(Link, _generated.Subscribe):
     publishes. Use `port()` to get this subscriber's copy of a peer's port.
 
     ``conn_cap`` sizes each connection's buffers. It must be at least
-    the largest record received plus 8 bytes, so an image link needs one
+    the largest record received plus 16 bytes, so an image link needs one
     above its image's size; the build checks it.
     """
 
