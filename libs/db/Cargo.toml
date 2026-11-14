@@ -101,6 +101,15 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3.13.0"
 postcard-schema = { version = "0.2", features = ["use-std", "derive"] }
+criterion = "0.5"
+
+[[bench]]
+name = "state"
+harness = false
+
+[[bench]]
+name = "hot_paths"
+harness = false
 
 [lints]
 workspace = true

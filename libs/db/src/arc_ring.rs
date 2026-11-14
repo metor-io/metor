@@ -106,6 +106,13 @@ impl<T> AtomicStack<T> {
         let _guard = self.lock.read().unwrap();
         self.head.load_ref(Ordering::Acquire)
     }
+
+    /// Whether `node` is the head, without taking a reference to the head.
+    /// Holding `node` keeps its address from being reused, so a match is
+    /// never another node.
+    pub fn is_head(&self, node: &Arc<AtomicNode<T>>) -> bool {
+        std::ptr::eq(self.head.ptr.load(Ordering::Acquire), Arc::as_ptr(node))
+    }
 }
 
 impl<T: Clone> AtomicStack<T> {
