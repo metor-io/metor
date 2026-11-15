@@ -186,7 +186,7 @@ fn transport_and_layout_keep_range_and_view_time_independent(cx: &mut gpui::Test
         dispatch(TimeAction::Play { from_start: true }, cx).unwrap();
         assert!(snapshot(cx).unwrap().playing);
         dispatch(TimeAction::Display(TimeDisplay::Elapsed), cx).unwrap();
-        dispatch(TimeAction::T0(Some(1_234_567)), cx).unwrap();
+        dispatch(TimeAction::T0(T0::Fixed(1_234_567)), cx).unwrap();
         let saved = save_layout(cx);
         let mut legacy = serde_json::to_value(&saved).unwrap();
         legacy.as_object_mut().unwrap().remove("elapsed_display");
@@ -194,12 +194,13 @@ fn transport_and_layout_keep_range_and_view_time_independent(cx: &mut gpui::Test
         let legacy: metor_proto_wkt::TemporalLayout = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.elapsed_display);
         assert_eq!(legacy.t0, None);
+        assert_eq!(legacy.t0_anchor, None);
         restore_layout(&saved, cx);
         assert!(!snapshot(cx).unwrap().playing);
         assert!(!is_live(cx));
         assert_eq!(config(cx).range, range);
         assert_eq!(config(cx).display, TimeDisplay::Elapsed);
-        assert_eq!(config(cx).t0, Some(1_234_567));
+        assert_eq!(config(cx).t0, T0::Fixed(1_234_567));
         dispatch(TimeAction::Live, cx).unwrap();
         assert!(is_live(cx));
         assert_eq!(config(cx).range, range);
@@ -255,7 +256,7 @@ fn compact_time_display_preserves_exact_values_and_dst_labels() {
         display::timestamp(Timestamp(90_000_000), &config, &clock),
         "T+01:30"
     );
-    config.t0 = Some(120_000_000);
+    config.t0 = T0::Fixed(120_000_000);
     assert_eq!(
         display::timestamp(Timestamp(90_000_000), &config, &clock),
         "T-30"
@@ -278,7 +279,7 @@ fn compact_time_display_preserves_exact_values_and_dst_labels() {
 fn compact_elapsed_labels_round_trip_at_millisecond_precision() {
     let config = TemporalConfig {
         display: TimeDisplay::Elapsed,
-        t0: Some(0),
+        t0: T0::Fixed(0),
         ..Default::default()
     };
     let clock = context();
@@ -299,7 +300,7 @@ fn compact_elapsed_labels_round_trip_at_millisecond_precision() {
     ] {
         let label = display::timestamp(Timestamp(micros), &config, &clock);
         assert_eq!(label, expected);
-        let input = display::expand_input(&label, &config, &clock).unwrap();
+        let input = display::expand_input(&label, &config, &clock, false).unwrap();
         assert_eq!(
             parse_instant(&input, &ParseContext::utc(), false)
                 .unwrap()
@@ -314,7 +315,7 @@ fn compact_elapsed_labels_round_trip_at_millisecond_precision() {
 #[test]
 fn elapsed_input_resolves_exact_instants_and_range_endpoints() {
     let config = TemporalConfig {
-        t0: Some(120_000_123),
+        t0: T0::Fixed(120_000_123),
         ..Default::default()
     };
     let clock = context();
@@ -325,7 +326,7 @@ fn elapsed_input_resolves_exact_instants_and_range_endpoints() {
         ("T-30s", 90_000_123),
         ("T+00:01:30", 210_000_123),
     ] {
-        let text = display::expand_input(input, &config, &clock).unwrap();
+        let text = display::expand_input(input, &config, &clock, false).unwrap();
         assert_eq!(
             parse_instant(&text, &parse, false)
                 .unwrap()
@@ -334,7 +335,7 @@ fn elapsed_input_resolves_exact_instants_and_range_endpoints() {
             Timestamp(expected)
         );
     }
-    let text = display::expand_input("T-30s .. T+1m", &config, &clock).unwrap();
+    let text = display::expand_input("T-30s .. T+1m", &config, &clock, false).unwrap();
     assert_eq!(
         parse_range(&text, &parse).unwrap().resolve(&clock).unwrap(),
         Timestamp(90_000_123)..Timestamp(180_000_123)
@@ -346,17 +347,17 @@ fn elapsed_input_resolves_exact_instants_and_range_endpoints() {
         "T-",
         "T0 potato",
     ] {
-        assert!(display::expand_input(bad, &config, &clock).is_err());
+        assert!(display::expand_input(bad, &config, &clock, false).is_err());
     }
     assert_eq!(
-        display::expand_input("today 12:00", &config, &clock).unwrap(),
+        display::expand_input("today 12:00", &config, &clock, false).unwrap(),
         "today 12:00"
     );
     let empty = TimeContext {
         extent: None,
         ..clock
     };
-    assert!(display::expand_input("T0", &TemporalConfig::default(), &empty).is_err());
+    assert!(display::expand_input("T0", &TemporalConfig::default(), &empty, false).is_err());
 }
 
 #[gpui::test]
@@ -756,5 +757,81 @@ fn session_start_is_latched_from_the_peer_head_not_its_last_seal(cx: &mut gpui::
             c.apply(TimeAction::Scope("other.".into()), cx).unwrap();
             assert_eq!(c.snapshot.context.session, None);
         });
+    });
+}
+
+/// Each T0 choice zeroes the elapsed labels at its own instant; a live
+/// window labelled from its end reads as how long ago.
+#[test]
+fn t0_choices_zero_their_own_instant() {
+    let clock = TimeContext {
+        session: Some(Timestamp(50_000_000)),
+        ..context()
+    };
+    let last_30s = parse_range("last 30s", &ParseContext::utc()).unwrap();
+    for (t0, zero) in [
+        (T0::Session, 50_000_000),
+        (T0::DataStart, 0),
+        (T0::RangeStart, 570_000_000),
+        (T0::RangeEnd, 600_000_000),
+        (T0::Fixed(7), 7),
+    ] {
+        let config = TemporalConfig {
+            display: TimeDisplay::Elapsed,
+            range: last_30s,
+            t0,
+            ..Default::default()
+        };
+        assert_eq!(display::origin(&config, &clock), Some(Timestamp(zero)), "{t0}");
+        assert_eq!(T0::named(&t0.to_string()).unwrap_or(t0), t0);
+    }
+    let from_end = TemporalConfig {
+        display: TimeDisplay::Elapsed,
+        range: last_30s,
+        t0: T0::RangeEnd,
+        ..Default::default()
+    };
+    assert_eq!(
+        display::timestamp(Timestamp(570_000_000), &from_end, &clock),
+        "T-30"
+    );
+    // Before the session has seen data, its zero is the data start.
+    let fresh = TemporalConfig::default();
+    assert_eq!(display::origin(&fresh, &context()), Some(Timestamp(0)));
+}
+
+#[test]
+fn range_following_t0_cannot_place_the_range() {
+    let config = TemporalConfig {
+        range: parse_range("last 30s", &ParseContext::utc()).unwrap(),
+        t0: T0::RangeStart,
+        ..Default::default()
+    };
+    let clock = context();
+    assert!(display::expand_input("T0 .. data end", &config, &clock, true).is_err());
+    assert!(display::expand_input("T+5s", &config, &clock, false).is_ok());
+    assert!(display::expand_input("data start .. live", &config, &clock, true).is_ok());
+}
+
+#[gpui::test]
+fn layout_keeps_a_named_t0_and_reads_legacy_fixed_ones(cx: &mut gpui::TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(DB::create(tmp.path().join("db")).unwrap());
+    cx.update(|cx| {
+        TemporalController::init(db, cx);
+        dispatch(TimeAction::T0(T0::RangeEnd), cx).unwrap();
+        let saved = save_layout(cx);
+        assert_eq!(saved.t0, None);
+        dispatch(TimeAction::T0(T0::DataStart), cx).unwrap();
+        restore_layout(&saved, cx);
+        assert_eq!(config(cx).t0, T0::RangeEnd);
+
+        let legacy = metor_proto_wkt::TemporalLayout {
+            t0: Some(42),
+            t0_anchor: None,
+            ..saved.clone()
+        };
+        restore_layout(&legacy, cx);
+        assert_eq!(config(cx).t0, T0::Fixed(42));
     });
 }
