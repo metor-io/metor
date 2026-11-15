@@ -46,8 +46,13 @@ pub struct TemporalLayout {
     pub timezone: String,
     #[serde(default)]
     pub elapsed_display: bool,
+    /// A fixed T0; absent when [`t0_anchor`](Self::t0_anchor) names one.
     #[serde(default)]
     pub t0: Option<i64>,
+    /// A T0 that follows the data, session or range, by name (such as
+    /// `"range end"`). Layouts from before it existed carry only `t0`.
+    #[serde(default)]
+    pub t0_anchor: Option<String>,
     pub source_clock: Option<u64>,
     #[serde(default)]
     pub wall_clock: bool,

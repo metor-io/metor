@@ -171,9 +171,9 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
 /// Iterator of X-axis tick values (microseconds) aligned to
 /// human-readable offsets from `anchor`.
 ///
-/// `anchor` is the earliest sample for relative labels (so ticks don't
-/// crawl during pan) and Unix epoch `0` for absolute labels (so ticks land
-/// on wall-clock boundaries like `:00`/`:30`).
+/// `anchor` is T0 for relative labels (so ticks keep their place during
+/// pan) and Unix epoch `0` for absolute labels (so ticks land on wall-clock
+/// boundaries like `:00`/`:30`).
 pub(crate) fn x_ticks(
     view: &PlotBounds,
     target_count: usize,
@@ -993,8 +993,8 @@ impl PlotStyle {
 
 /// How the X axis renders timestamps.
 ///
-/// `Relative` (the default) labels ticks as offsets from the earliest
-/// sample (`"T+0"`, `"T+01:30"`). The absolute variants render wall-clock
+/// `Relative` (the default) labels ticks as offsets from the time controls'
+/// [`T0`](crate::temporal::T0) (`"T+0"`, `"T+01:30"`). The absolute variants render wall-clock
 /// time so events can be read against real-world clocks; `Utc` uses UTC and
 /// `Local` the machine's timezone. Data positions are unchanged — only the
 /// tick labels and their anchoring differ.

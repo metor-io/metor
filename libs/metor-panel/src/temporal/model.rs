@@ -147,6 +147,71 @@ impl TimeContext {
     }
 }
 
+/// The instant elapsed labels (`T+01:30`) count from.
+///
+/// Each choice answers a different question. Data and session start give
+/// a stable clock to read events against; the range edges count within
+/// the visible window, so a live "last 3m" reads either `T+0 … T+03:00`
+/// (from its start) or `T-03:00 … T-0`, how long ago (from its end).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum T0 {
+    /// When this session first saw data, so a long history doesn't turn
+    /// every label into hundreds of hours.
+    #[default]
+    Session,
+    DataStart,
+    RangeStart,
+    RangeEnd,
+    Fixed(i64),
+}
+
+impl T0 {
+    const NAMED: [(&str, T0); 4] = [
+        ("session start", T0::Session),
+        ("data start", T0::DataStart),
+        ("range start", T0::RangeStart),
+        ("range end", T0::RangeEnd),
+    ];
+
+    /// Range-relative zeros can't help define the range they follow.
+    pub fn follows_range(self) -> bool {
+        matches!(self, T0::RangeStart | T0::RangeEnd)
+    }
+
+    /// The named choices by their canonical text; anything else is an
+    /// instant, resolved once and pinned by the caller.
+    pub fn named(text: &str) -> Option<Self> {
+        let text = text.trim();
+        Self::NAMED
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(text))
+            .map(|(_, t0)| *t0)
+    }
+
+    pub fn resolve(self, range: TimeRangeSpec, context: &TimeContext) -> Option<Timestamp> {
+        let extent = || context.extent.as_ref().map(|e| e.start);
+        match self {
+            T0::Session => context.session.or_else(extent),
+            T0::DataStart => extent(),
+            T0::RangeStart => range.resolve(context).ok().map(|r| r.start),
+            T0::RangeEnd => range.resolve(context).ok().map(|r| r.end),
+            T0::Fixed(t) => Some(Timestamp(t)),
+        }
+    }
+}
+
+impl fmt::Display for T0 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            T0::Fixed(t) => f.write_str(&timestamp_text(Timestamp(*t), "UTC")),
+            named => {
+                let (name, _) = Self::NAMED.iter().find(|(_, t0)| t0 == named).unwrap();
+                f.write_str(name)
+            }
+        }
+    }
+}
+
 /// Editing context freezes shorthand dates while Live previews continue moving.
 #[derive(Clone)]
 pub struct ParseContext {

@@ -10,7 +10,7 @@ pub use display::TimeDisplay;
 use gpui::{App, AppContext, Context, Entity, Global};
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
-pub use model::{Anchor, DEFAULT_SESSION_LOOKBACK, TimeContext, TimeExpr, TimeRangeSpec};
+pub use model::{Anchor, DEFAULT_SESSION_LOOKBACK, T0, TimeContext, TimeExpr, TimeRangeSpec};
 use serde::{Deserialize, Serialize};
 use std::{
     ops::Range,
@@ -33,7 +33,7 @@ pub struct TemporalConfig {
     pub range: TimeRangeSpec,
     pub timezone: String,
     pub display: TimeDisplay,
-    pub t0: Option<i64>,
+    pub t0: T0,
     pub source_clock: Option<ComponentId>,
     pub wall_clock: bool,
     pub scope_prefix: String,
@@ -48,7 +48,7 @@ impl Default for TemporalConfig {
             range: TimeRangeSpec::SESSION,
             timezone: "UTC".into(),
             display: TimeDisplay::Timestamp,
-            t0: None,
+            t0: T0::default(),
             source_clock: None,
             wall_clock: false,
             scope_prefix: String::new(),
@@ -517,7 +517,7 @@ pub enum TimeAction {
     StepSize(i64),
     Timezone(String),
     Display(TimeDisplay),
-    T0(Option<i64>),
+    T0(T0),
     Scope(String),
     Clock(Option<ComponentId>),
     WallClock,
@@ -594,7 +594,11 @@ pub(crate) fn save_layout(cx: &App) -> metor_proto_wkt::TemporalLayout {
         range_end: c.range.end.to_string(),
         timezone: c.timezone,
         elapsed_display: c.display == TimeDisplay::Elapsed,
-        t0: c.t0,
+        t0: match c.t0 {
+            T0::Fixed(t) => Some(t),
+            _ => None,
+        },
+        t0_anchor: (!matches!(c.t0, T0::Fixed(_))).then(|| c.t0.to_string()),
         source_clock: c.source_clock.map(|id| id.0),
         wall_clock: c.wall_clock,
         scope_prefix: c.scope_prefix,
@@ -623,7 +627,11 @@ pub(crate) fn restore_layout(saved: &metor_proto_wkt::TemporalLayout, cx: &mut A
             } else {
                 TimeDisplay::Timestamp
             },
-            t0: saved.t0,
+            t0: match (&saved.t0_anchor, saved.t0) {
+                (Some(name), _) => T0::named(name).ok_or("Unknown T0")?,
+                (None, Some(t)) => T0::Fixed(t),
+                (None, None) => T0::default(),
+            },
             source_clock: saved.source_clock.map(ComponentId),
             wall_clock: saved.wall_clock,
             scope_prefix: saved.scope_prefix.clone(),

@@ -50,10 +50,7 @@ impl Target {
             Self::End => c.range.end.to_string(),
             Self::Zone => c.timezone.clone(),
             Self::Format => c.display.label().into(),
-            Self::T0 => {
-                c.t0.map(|t| model::timestamp_text(Timestamp(t), "UTC"))
-                    .unwrap_or_else(|| "data start".into())
-            }
+            Self::T0 => c.t0.to_string(),
             Self::Scope => {
                 if c.scope_prefix.is_empty() {
                     "all".into()
@@ -93,9 +90,9 @@ impl Target {
             {
                 format!("{} .. {}", expr(config.range.start), expr(config.range.end))
             }
-            Self::T0 if config.t0.is_some() => {
+            Self::T0 if let super::T0::Fixed(t0) = config.t0 => {
                 display.display = super::TimeDisplay::Timestamp;
-                super::display::timestamp(Timestamp(config.t0.unwrap()), &display, context)
+                super::display::timestamp(Timestamp(t0), &display, context)
             }
             _ => self.text(config),
         }
@@ -203,7 +200,7 @@ fn summary(target: Target, cx: &App) -> String {
         return super::display::range(config.range, &config, &snapshot.context);
     }
     if target == Target::T0
-        && let Some(t0) = config.t0
+        && let super::T0::Fixed(t0) = config.t0
     {
         let mut absolute = config.clone();
         absolute.display = super::TimeDisplay::Timestamp;
@@ -430,7 +427,12 @@ impl Provider {
             self.target,
             Target::View | Target::Range | Target::Start | Target::End
         ) {
-            super::display::expand_input(query, &config, &snapshot.context)?
+            super::display::expand_input(
+                query,
+                &config,
+                &snapshot.context,
+                self.target != Target::View,
+            )?
         } else {
             query.to_string()
         };
@@ -490,24 +492,22 @@ impl Provider {
                 (TimeAction::Display(display), preview)
             }
             Target::T0 => {
-                let t0 = if query.trim().eq_ignore_ascii_case("data start") {
-                    None
-                } else {
-                    Some(
+                let t0 = match super::T0::named(query) {
+                    Some(t0) => t0,
+                    None => super::T0::Fixed(
                         model::parse_instant(query, &self.context, true)?
                             .resolve(&snapshot.context)?
                             .0,
-                    )
+                    ),
                 };
-                (
-                    TimeAction::T0(t0),
-                    if t0.is_none() {
-                        "Zero follows data start"
-                    } else {
-                        "Fixed zero; selected time stays unchanged"
-                    }
-                    .into(),
-                )
+                let preview = match t0 {
+                    super::T0::Session => "Zero at the start of this session",
+                    super::T0::DataStart => "Zero follows data start",
+                    super::T0::RangeStart => "Zero at the left edge of the range",
+                    super::T0::RangeEnd => "Zero at the right edge; earlier times read T-",
+                    super::T0::Fixed(_) => "Fixed zero; selected time stays unchanged",
+                };
+                (TimeAction::T0(t0), preview.into())
             }
             Target::Zone => {
                 ParseContext::new(query.trim(), Timestamp::now(), Timestamp::now())?;
@@ -637,7 +637,7 @@ impl Provider {
                                 .map(|t| super::display::label(t, cx))
                                 .unwrap_or_else(|_| query.into())
                         }
-                        (TimeAction::T0(Some(t)), Some(s)) => {
+                        (TimeAction::T0(super::T0::Fixed(t)), Some(s)) => {
                             let absolute = TemporalConfig {
                                 display: super::TimeDisplay::Timestamp,
                                 ..config
@@ -873,7 +873,13 @@ fn complete(
             "Asia/Tokyo",
         ],
         Target::Format => &["timestamp", "elapsed / T0"],
-        Target::T0 => &["data start", "view time"],
+        Target::T0 => &[
+            "session start",
+            "data start",
+            "range start",
+            "range end",
+            "view time",
+        ],
         Target::Clock => &["session", "wall"],
         Target::Scope => &["all"],
         Target::Rate => &["0.1x", "0.25x", "0.5x", "1x", "2x", "5x", "10x"],
@@ -1074,7 +1080,7 @@ mod tests {
                 TimeAction::Range(TimeRangeSpec::fixed(
                     Timestamp(1_123_456)..Timestamp(61_550_789),
                 )),
-                TimeAction::T0(Some(1_123_456)),
+                TimeAction::T0(super::super::T0::Fixed(1_123_456)),
             ] {
                 super::super::dispatch(action, cx).unwrap();
             }
