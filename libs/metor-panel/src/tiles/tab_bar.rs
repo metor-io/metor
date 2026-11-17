@@ -57,9 +57,10 @@ pub(super) struct DragPreview {
     pub extent: Pixels,
 }
 
-/// The tab the dragged one lands before, judged from committed slot
-/// centres rather than animated hitboxes, so a still pointer cannot keep
-/// swapping the target as neighbours slide past it.
+/// The tab the dragged one lands before, judged from slot centres along
+/// the bar as it shows while the tab is lifted — its own slot closed, no
+/// gap open yet — rather than from animated hitboxes, so a still pointer
+/// cannot keep swapping the target as neighbours slide past it.
 fn insertion_before(
     slots: impl IntoIterator<Item = (TabId, Pixels)>,
     dragged: TabId,
@@ -67,7 +68,10 @@ fn insertion_before(
 ) -> Option<TabId> {
     let mut start = px(0.0);
     for (id, extent) in slots {
-        if id != dragged && pointer < start + extent / 2.0 {
+        if id == dragged {
+            continue;
+        }
+        if pointer < start + extent / 2.0 {
             return Some(id);
         }
         start += extent;
@@ -549,7 +553,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn insertion_follows_slot_centres_and_skips_the_dragged_tab() {
+    fn insertion_follows_the_centres_of_the_bar_without_the_lifted_tab() {
         let slots = [
             (TabId(1), px(100.0)),
             (TabId(2), px(100.0)),
@@ -559,5 +563,8 @@ mod tests {
         assert_eq!(insertion_before(slots, TabId(9), px(60.0)), Some(TabId(2)));
         assert_eq!(insertion_before(slots, TabId(2), px(140.0)), Some(TabId(3)));
         assert_eq!(insertion_before(slots, TabId(9), px(290.0)), None);
+        // With 1 lifted, 3 shows at 100..200: past its centre is the end.
+        assert_eq!(insertion_before(slots, TabId(1), px(160.0)), None);
+        assert_eq!(insertion_before(slots, TabId(1), px(40.0)), Some(TabId(2)));
     }
 }

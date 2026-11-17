@@ -2526,6 +2526,46 @@ mod window_tests {
     }
 
     #[gpui::test]
+    fn a_tab_dragged_along_the_bar_of_a_real_window_lands_in_the_gap(cx: &mut TestAppContext) {
+        let (tiles, window, _dir) = open(3, cx);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let moved = cx.update(|_, cx| {
+            let tiles = tiles.read(cx);
+            tiles.tab_index(tiles.active_tab()).unwrap()
+        });
+        let id = cx.update(|_, cx| tiles.read(cx).active_tab());
+        const TABS: [&str; 3] = ["top-tab-0", "top-tab-1", "top-tab-2"];
+        let start = cx.debug_bounds(TABS[moved]).unwrap().center();
+        let target = if moved == 0 { 2 } else { 0 };
+        let over = cx.debug_bounds(TABS[target]).unwrap();
+        let end = if target == 2 {
+            point(over.right() - px(4.0), over.center().y)
+        } else {
+            point(over.left() + px(4.0), over.center().y)
+        };
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            start + point(px(12.0), px(0.0)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| tiles.read(cx).tab_index(id)),
+            Some(target),
+            "the tab lands at the far end"
+        );
+    }
+
+    #[gpui::test]
     fn cmd_w_closes_the_focused_panel_and_the_window_only_once_nothing_is_left(
         cx: &mut TestAppContext,
     ) {

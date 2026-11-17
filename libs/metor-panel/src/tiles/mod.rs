@@ -2200,15 +2200,18 @@ mod tests {
     fn dragging_a_tab_reorders_the_bar(cx: &mut TestAppContext) {
         let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
         let first = cx.debug_bounds("top-tab-0").unwrap().center();
-        let last = cx.debug_bounds("top-tab-2").unwrap().center();
-        drag(cx, first, last);
-        cx.simulate_mouse_up(last, MouseButton::Left, Default::default());
+        // Once a lifts, b slides into its slot and c follows, so the seam
+        // between them shows just inside where b began.
+        let b = cx.debug_bounds("top-tab-1").unwrap();
+        let seam = point(b.left() + px(4.0), b.center().y);
+        drag(cx, first, seam);
+        cx.simulate_mouse_up(seam, MouseButton::Left, Default::default());
         cx.refresh().unwrap();
         cx.update(|_, cx| {
             assert_eq!(
                 titles(&group, cx),
                 ["b", "a", "c"],
-                "a lands where c's left half was"
+                "a lands in the gap between b and c as the bar shows them"
             );
             assert_eq!(group.read(cx).active_tab, 1, "the moved tab shows");
         });
