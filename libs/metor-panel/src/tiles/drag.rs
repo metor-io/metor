@@ -79,8 +79,16 @@ pub(super) struct DragGhost {
 impl Render for DragGhost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        // The drag-out preview grows out of the ghost, so it needs the
-        // ghost's size, and hides it while it is out.
+        // gpui draws the drag view in every window it redraws, the
+        // drag-out preview among them; the ghost belongs to the window the
+        // drag began in, and hides there while the preview is out.
+        let this = window.window_handle();
+        let here = active_drag(cx).is_some_and(|drag| drag.source_window == this)
+            && !crate::tear_out::expanded(this, cx);
+        if !here {
+            return div();
+        }
+        // The drag-out preview grows out of the ghost, so it needs its size.
         let measure = gpui::canvas(
             |bounds, _, cx| {
                 if cx.has_global::<ActiveDrag>() {
@@ -91,11 +99,9 @@ impl Render for DragGhost {
         )
         .absolute()
         .size_full();
-        let out = crate::tear_out::expanded(window.window_handle(), cx);
         div()
             .debug_selector(|| "drag-ghost".into())
             .relative()
-            .when(out, |ghost| ghost.opacity(0.0))
             .child(measure)
             .when_some(
                 cx.try_global::<crate::theme::FontSettings>()

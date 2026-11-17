@@ -7,8 +7,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, DragMoveEvent, Entity, MouseButton, Pixels, ScrollHandle,
-    SharedString, div, prelude::*, px,
+    AnyElement, App, ClickEvent, DragMoveEvent, Entity, MouseButton, Pixels, Point, ScrollHandle,
+    SharedString, div, point, prelude::*, px,
 };
 
 use super::TileGroup;
@@ -89,6 +89,22 @@ pub(crate) fn set_placement(placement: TabPlacement, cx: &mut App) {
         tracing::error!(%error, "save tab placement failed");
     }
     cx.refresh_windows();
+}
+
+/// Where the first tab sits in `group`'s window, as of its last frame —
+/// where a window torn out with one tab shows it.
+pub(crate) fn first_tab_origin(group: &Entity<TileGroup>, cx: &App) -> Option<Point<Pixels>> {
+    let bounds = group.read(cx).bar.scroll.bounds();
+    if bounds.size.width <= px(0.0) {
+        return None;
+    }
+    Some(match placement(cx) {
+        TabPlacement::Top => point(
+            bounds.origin.x,
+            bounds.origin.y + (bounds.size.height - px(CONTROL_HEIGHT)) / 2.0,
+        ),
+        TabPlacement::Side => point(bounds.origin.x + px(6.0), bounds.origin.y),
+    })
 }
 
 pub(crate) fn sidebar_width(cx: &App) -> Pixels {

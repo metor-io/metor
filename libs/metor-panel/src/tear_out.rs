@@ -79,12 +79,20 @@ pub(crate) fn preview_size(torn: Size<Pixels>, cx: &App) -> Size<Pixels> {
     }
 }
 
-/// Where the pointer holds a preview (or a torn window) of `extent`: where
-/// it held the ghost, kept on the window's titlebar.
-pub(crate) fn grab_point(grab: Point<Pixels>, extent: Size<Pixels>) -> Point<Pixels> {
+/// Where the pointer holds a preview, or the window torn out where it
+/// stood: by its tab, at `tab` in the window, just where it held the ghost
+/// (`grab` from the ghost's corner) — so the tab stays put under the
+/// pointer while the window appears around it.
+pub(crate) fn grab_point(grab: Point<Pixels>, tab: Point<Pixels>) -> Point<Pixels> {
+    tab + grab
+}
+
+/// Where a torn-out window shows its one tab when the source window's bar
+/// hasn't been measured.
+pub(crate) fn default_tab_origin() -> Point<Pixels> {
     point(
-        grab.x.clamp(px(12.0), (extent.width * 0.5).max(px(12.0))),
-        grab.y.clamp(px(8.0), px(crate::app::TITLEBAR_HEIGHT - 8.0)),
+        px(8.0),
+        px((crate::app::TITLEBAR_HEIGHT - CONTROL_HEIGHT) / 2.0),
     )
 }
 
@@ -101,10 +109,13 @@ pub(crate) fn riding(source: AnyWindowHandle, cx: &App) -> bool {
 }
 
 /// What a preview shows and where: `bounds` on screen, growing out of the
-/// ghost at `ghost` (window coordinates).
+/// ghost, which sits where the window's tab will (`tab`, in window
+/// coordinates).
 pub(crate) struct Spec {
     pub bounds: Bounds<Pixels>,
-    pub ghost: Bounds<Pixels>,
+    pub tab: Bounds<Pixels>,
+    /// The tab sidebar's width, when tabs sit down the side.
+    pub sidebar: Option<Pixels>,
     pub title: SharedString,
     pub replica: Replica,
 }
@@ -121,7 +132,8 @@ pub(crate) fn open(source: AnyWindowHandle, spec: Spec, cx: &mut App) {
     cx.defer(move |cx| {
         let Spec {
             bounds,
-            ghost,
+            tab,
+            sidebar,
             title,
             replica,
         } = spec;
@@ -142,7 +154,8 @@ pub(crate) fn open(source: AnyWindowHandle, spec: Spec, cx: &mut App) {
                 cx.new(|_| DragOutPreview {
                     title,
                     replica,
-                    ghost,
+                    tab,
+                    sidebar,
                     fade: Fade::entrance(GROW),
                 })
             },
@@ -243,9 +256,11 @@ fn follow(window: &mut Window, cx: &mut App) {
 struct DragOutPreview {
     title: SharedString,
     replica: Replica,
-    /// Where the drag ghost sits in this window: the preview grows out of
-    /// it and shrinks back into it.
-    ghost: Bounds<Pixels>,
+    /// Where the drag ghost sits in this window, which is where the
+    /// window's tab goes: the preview grows out of it and shrinks back
+    /// into it, and the tab holds still there throughout.
+    tab: Bounds<Pixels>,
+    sidebar: Option<Pixels>,
     fade: Fade,
 }
 
@@ -265,7 +280,7 @@ impl Render for DragOutPreview {
         }
         let theme = theme(cx);
         let full = window.viewport_size();
-        let from = self.ghost;
+        let from = self.tab;
         let lerp = |a: Pixels, b: Pixels| a + (b - a) * t;
         let left = lerp(from.origin.x, px(0.0));
         let top = lerp(from.origin.y, px(0.0));
@@ -275,27 +290,14 @@ impl Render for DragOutPreview {
         let titlebar = div()
             .h(px(crate::app::TITLEBAR_HEIGHT))
             .flex_shrink_0()
-            .flex()
-            .items_center()
-            .px(px(8.0))
             .bg(theme.bg_secondary)
             .border_b_1()
-            .border_color(theme.border_primary)
-            .child(
-                div()
-                    .h(px(CONTROL_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .px(px(8.0))
-                    .max_w(px(crate::tiles::tab_bar::TAB_MAX_WIDTH))
-                    .rounded(px(CONTROL_RADIUS))
-                    .bg(theme.bg_primary)
-                    .border_1()
-                    .border_color(theme.border_primary)
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(div().truncate().child(self.title.clone())),
-            );
+            .border_color(theme.border_primary);
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(render_replica(&self.replica, cx));
         // Laid out at the full size throughout, and uncovered as the frame
         // grows, so the panes never reflow mid-animation.
         let content = div()
@@ -305,17 +307,47 @@ impl Render for DragOutPreview {
             .w(full.width)
             .h(full.height)
             .flex()
-            .flex_col()
             .bg(theme.bg_secondary)
             .opacity(t)
-            .child(titlebar)
+            .when_some(self.sidebar, |content, width| {
+                content.child(
+                    div()
+                        .w(width)
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(theme.bg_secondary)
+                        .border_r_1()
+                        .border_color(theme.border_primary),
+                )
+            })
             .child(
                 div()
                     .flex_1()
-                    .min_h_0()
+                    .min_w_0()
                     .flex()
-                    .child(render_replica(&self.replica, cx)),
+                    .flex_col()
+                    .child(titlebar)
+                    .child(body),
             );
+        // Drawn over the frame and never faded: the tab the pointer holds
+        // stays put while its window appears around it.
+        let tab = div()
+            .absolute()
+            .left(self.tab.origin.x)
+            .top(self.tab.origin.y)
+            .w(self.tab.size.width)
+            .h(px(CONTROL_HEIGHT))
+            .flex()
+            .items_center()
+            .pl(px(8.0))
+            .pr(px(8.0))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(theme.bg_primary)
+            .border_1()
+            .border_color(theme.border_primary)
+            .text_size(px(12.0))
+            .text_color(theme.text_primary)
+            .child(div().min_w_0().truncate().child(self.title.clone()));
         root.child(
             div()
                 .absolute()
@@ -331,6 +363,7 @@ impl Render for DragOutPreview {
                 .shadow_lg()
                 .child(content),
         )
+        .child(tab)
     }
 }
 
@@ -426,10 +459,14 @@ mod native {
         }
     }
 
-    /// Let clicks and the pointer pass through to whatever lies beneath.
+    /// Let clicks and the pointer pass through to whatever lies beneath,
+    /// and leave the window no outline of its own.
     pub fn ignore_mouse(window: &Window) {
         if let Some(ns_window) = ns_window(window) {
             ns_window.setIgnoresMouseEvents(true);
+            // The frame draws its own shadow; AppKit's would trace the
+            // whole window, visible or not.
+            ns_window.setHasShadow(false);
         }
     }
 }

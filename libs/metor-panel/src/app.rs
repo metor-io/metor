@@ -528,7 +528,7 @@ impl AppRoot {
         // titlebar where it held the ghost, as it held the preview.
         let window_size = torn_size(&drag.source, window, cx);
         let origin = window.bounds().origin + event.position
-            - crate::tear_out::grab_point(drag.grab, window_size);
+            - crate::tear_out::grab_point(drag.grab, self.torn_tab_origin(cx));
         let db = self.db.clone();
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
@@ -576,6 +576,13 @@ impl AppRoot {
 
     /// Show the window a drag would tear out, in miniature, while the drag
     /// is outside this window, and put it away when the drag comes back.
+    /// Where a window torn out of this one shows its tab: where this
+    /// window's first tab sits, since the new window lays its bar out alike.
+    fn torn_tab_origin(&self, cx: &App) -> Point<Pixels> {
+        crate::tiles::tab_bar::first_tab_origin(&self.tiles, cx)
+            .unwrap_or_else(crate::tear_out::default_tab_origin)
+    }
+
     fn preview_drag_out(
         &mut self,
         position: Point<Pixels>,
@@ -607,20 +614,23 @@ impl AppRoot {
             return;
         };
         let extent = tear_out::preview_size(torn_size(&drag.source, window, cx), cx);
-        let grab = tear_out::grab_point(drag.grab, extent);
-        let ghost = Bounds {
-            origin: grab - drag.grab,
-            size: drag.ghost.unwrap_or(size(
-                px(crate::tiles::tab_bar::TAB_MAX_WIDTH),
-                px(crate::theme::CONTROL_HEIGHT),
-            )),
-        };
+        let tab = self.torn_tab_origin(cx);
+        let grab = tear_out::grab_point(drag.grab, tab);
+        let sidebar = (crate::tiles::tab_bar::placement(cx) == crate::config::TabPlacement::Side)
+            .then(|| crate::tiles::tab_bar::sidebar_width(cx));
         let spec = tear_out::Spec {
             bounds: Bounds {
                 origin: window.bounds().origin + position - grab,
                 size: extent,
             },
-            ghost,
+            tab: Bounds {
+                origin: tab,
+                size: drag.ghost.unwrap_or(size(
+                    px(crate::tiles::tab_bar::TAB_MAX_WIDTH),
+                    px(crate::theme::CONTROL_HEIGHT),
+                )),
+            },
+            sidebar,
             title,
             replica,
         };
@@ -2550,12 +2560,17 @@ mod window_tests {
         assert_eq!(windows(cx), (1, 2), "a preview, nothing torn out yet");
         assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 2);
         assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
+        assert!(
+            cx.debug_bounds("drag-ghost").is_none(),
+            "the preview stands in for the ghost"
+        );
 
         // Coming back tucks the preview into the ghost; the drag carries on.
         cx.simulate_mouse_move(start, MouseButton::Left, Default::default());
         cx.run_until_parked();
         assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
         assert!(cx.update(|_, cx| cx.has_active_drag()));
+        assert!(cx.debug_bounds("drag-ghost").is_some());
 
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
