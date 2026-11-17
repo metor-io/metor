@@ -2508,6 +2508,17 @@ mod window_tests {
             cx.debug_bounds("drag-ghost").is_none(),
             "which stands in for gpui's ghost"
         );
+        let previews = cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .filter(|handle| {
+                    handle
+                        .update(cx, |_, window, cx| crate::tear_out::is_preview(window, cx))
+                        .unwrap_or(false)
+                })
+                .count()
+        });
+        assert_eq!(previews, 1, "views know which window only previews them");
         assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
 
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());

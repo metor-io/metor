@@ -879,6 +879,16 @@ impl Render for Viewer3d {
                     {
                         let this = cx.entity().downgrade();
                         move |bounds: Bounds<Pixels>, window, cx| {
+                            // A drag preview shows the frame the viewer's
+                            // own window last rendered, scaled: one render
+                            // target can't serve two sizes, and resizing it
+                            // each frame would fight that window.
+                            if crate::tear_out::is_preview(window, cx) {
+                                let frame = this
+                                    .upgrade()
+                                    .and_then(|this| this.read(cx).current_frame.clone());
+                                return (bounds, frame);
+                            }
                             let scale = window.scale_factor();
                             let new_size = Viewer3d::quantize(bounds.size, scale);
 

@@ -12,10 +12,16 @@
 //! each move pins the preview to the pointer. Other platforms go without
 //! the preview.
 //!
-//! The preview draws the panes' own views a second time, so it can't be a
-//! scaled picture: gpui has no transform for live elements and no readback
-//! of a window's pixels outside tests. At full size the views draw at the
-//! size they already have; the mini preview lays them out small.
+//! The preview draws the panes' own views a second time, laid out small:
+//! gpui has no transform for live elements and no readback of a window's
+//! pixels outside tests. Views that render on the GPU at their own size
+//! (plots, the 3D viewer) check [`is_preview`] and show their last frame
+//! instead of rendering again at the preview's size — doing so would
+//! reallocate their targets twice a frame, fighting the source window.
+//!
+//! The preview is moved behind gpui's back: with its window delegate
+//! detached, AppKit doesn't report the moves, which gpui would otherwise
+//! answer with a full redraw on every pointer move.
 
 use std::time::Duration;
 
@@ -26,7 +32,6 @@ use gpui::{
     prelude::*, px, relative, size,
 };
 
-use crate::config::DragPreview;
 use crate::motion::Fade;
 use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, theme};
 use crate::tiles::Replica;
@@ -34,7 +39,7 @@ use crate::tiles::drag::DragSource;
 
 const GROW: Duration = Duration::from_millis(180);
 const SHRINK: Duration = Duration::from_millis(120);
-/// Width the mini preview scales the panes down to.
+/// Width the preview scales the panes down to.
 const MINI_WIDTH: f32 = 420.0;
 /// How far the panes sit inside the preview's frame. gpui clips children
 /// to rectangles, so this keeps their square corners within the frame's
@@ -55,6 +60,8 @@ struct Riding {
     expanded: bool,
     /// Where the pointer holds the preview window, from its top-left.
     grab: Point<Pixels>,
+    /// The preview window, known from its first frame on.
+    preview: Option<AnyWindowHandle>,
 }
 
 impl Global for Riding {}
@@ -62,20 +69,6 @@ impl Global for Riding {}
 /// Whether this platform can carry a preview under the pointer.
 pub(crate) fn supported() -> bool {
     cfg!(target_os = "macos")
-}
-
-pub(crate) fn preference(cx: &App) -> DragPreview {
-    cx.try_global::<crate::theme::FontSettings>()
-        .map(|settings| settings.config.drag_preview)
-        .unwrap_or_default()
-}
-
-pub(crate) fn set_preference(preview: DragPreview, cx: &mut App) {
-    let settings = cx.global_mut::<crate::theme::FontSettings>();
-    settings.config.drag_preview = preview;
-    if let Err(error) = crate::config::save(&settings.config) {
-        tracing::error!(%error, "save drag preview failed");
-    }
 }
 
 /// The size of the window a pane or tab tears out into: a pane keeps its
@@ -103,15 +96,11 @@ pub(crate) fn window_chrome(cx: &App) -> Size<Pixels> {
     size(sidebar, px(crate::app::TITLEBAR_HEIGHT))
 }
 
-/// The size the preview draws panes of `panes` size at.
-fn body_size(panes: Size<Pixels>, cx: &App) -> Size<Pixels> {
-    match preference(cx) {
-        DragPreview::Full => panes,
-        DragPreview::Mini => {
-            let scale = (MINI_WIDTH / f32::from(panes.width)).min(1.0);
-            size(panes.width * scale, panes.height * scale)
-        }
-    }
+/// The size the preview draws panes of `panes` size at: small enough to
+/// carry, in the same proportions.
+fn body_size(panes: Size<Pixels>) -> Size<Pixels> {
+    let scale = (MINI_WIDTH / f32::from(panes.width)).min(1.0);
+    size(panes.width * scale, panes.height * scale)
 }
 
 /// Where the preview's panes start, from the pointer: just below the
@@ -126,6 +115,13 @@ pub(crate) fn panes_offset(grab: Point<Pixels>) -> Point<Pixels> {
 fn frame_size(body: Size<Pixels>) -> Size<Pixels> {
     let edge = px(BORDER + INSET) * 2.0;
     size(body.width + edge, body.height + edge)
+}
+
+/// Whether `window` is a drag preview, where views show what they last
+/// rendered rather than render again.
+pub(crate) fn is_preview(window: &Window, cx: &App) -> bool {
+    cx.try_global::<Riding>()
+        .is_some_and(|riding| riding.preview == Some(window.window_handle()))
 }
 
 /// Whether a drag from `source` has its panes out, below the tab.
@@ -161,7 +157,7 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
     let Some(replica) = replica else {
         return;
     };
-    let body = body_size(torn_size(&drag.source, window, cx) - window_chrome(cx), cx);
+    let body = body_size(torn_size(&drag.source, window, cx) - window_chrome(cx));
     let closable = drag.closable;
     let source = window.window_handle();
     let margin = point(px(MARGIN), px(MARGIN));
@@ -180,6 +176,7 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
         window: None,
         expanded: false,
         grab,
+        preview: None,
     });
     // Deferred: opening a window mid-dispatch re-enters the platform layer.
     cx.defer(move |cx| {
@@ -196,7 +193,10 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
                 ..Default::default()
             },
             |window, cx| {
-                native::ignore_mouse(window);
+                if cx.has_global::<Riding>() {
+                    cx.global_mut::<Riding>().preview = Some(window.window_handle());
+                }
+                native::detach(window);
                 native::pin(window, grab);
                 cx.new(|_| DragOutPreview {
                     title,
@@ -478,14 +478,18 @@ mod native {
         ns_window.setFrameTopLeftPoint(top_left);
     }
 
-    /// Let clicks and the pointer pass through to whatever lies beneath,
-    /// and leave the window no outline of its own.
-    pub fn ignore_mouse(window: &Window) {
+    /// Make `window` a pure overlay: clicks and the pointer pass through
+    /// it, it has no outline of its own, and moving it goes unreported.
+    pub fn detach(window: &Window) {
         if let Some(ns_window) = ns_window(window) {
             ns_window.setIgnoresMouseEvents(true);
             // The frame draws its own shadow; AppKit's would trace the
             // whole window, visible or not.
             ns_window.setHasShadow(false);
+            // gpui's delegate answers every move with a full redraw. The
+            // window never resizes, takes focus or closes itself, and gpui
+            // detaches the delegate on close anyway.
+            ns_window.setDelegate(None);
         }
     }
 }
@@ -496,5 +500,5 @@ mod native {
 
     pub fn pin(_: &Window, _: Point<Pixels>) {}
 
-    pub fn ignore_mouse(_: &Window) {}
+    pub fn detach(_: &Window) {}
 }
