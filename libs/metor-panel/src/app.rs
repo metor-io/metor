@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::config::TabPlacement;
 use crate::connections::{
     AddressResolver, ConnectionOption, ConnectionTarget, OptionSpec, RegistryHandle, TargetId,
 };
@@ -34,7 +35,8 @@ actions!(
         OpenLeader,
         CycleTabForward,
         CycleTabBackward,
-        CloseTab,
+        NewTab,
+        ClosePanel,
         ToggleCmdLock,
         OpenReviewEdits,
         OpenConnections,
@@ -81,6 +83,9 @@ pub(crate) struct AppRoot {
     /// drag to the compositor via `start_window_move` (Linux — macOS and
     /// Windows drag natively through the transparent titlebar / HTCAPTION).
     should_move: bool,
+    /// Left edge of the tab sidebar at its last paint, which a drag on its
+    /// resize edge measures the new width from.
+    sidebar_left: std::rc::Rc<std::cell::Cell<Pixels>>,
     focus_handle: FocusHandle,
 }
 
@@ -132,6 +137,7 @@ impl AppRoot {
             connection_picker: None,
             pending_connection_picker,
             should_move: false,
+            sidebar_left: Default::default(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -271,10 +277,8 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
-            return;
-        };
-        pane.update(cx, |pane, cx| pane.cycle_forward(cx));
+        self.tiles
+            .update(cx, |tiles, cx| tiles.cycle_tab(true, cx));
     }
 
     fn cycle_tab_backward(
@@ -283,21 +287,25 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
-            return;
-        };
-        pane.update(cx, |pane, cx| pane.cycle_backward(cx));
+        self.tiles
+            .update(cx, |tiles, cx| tiles.cycle_tab(false, cx));
     }
 
-    /// Close the current pane's shown tab, or the window once it has no
-    /// tabs left.
-    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn new_tab(&mut self, _: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.tiles.update(cx, |tiles, cx| {
+            tiles.new_tab(cx);
+        });
+    }
+
+    /// Close the current panel — and its tab with it when it was the tab's
+    /// last — or the window once nothing is open.
+    fn close_panel(&mut self, _: &ClosePanel, window: &mut Window, cx: &mut Context<Self>) {
         if !self.tiles.read(cx).has_items(cx) {
             crate::window_controls::close_window(window, cx);
             return;
         }
         if let Some(pane) = self.tiles.read(cx).active_pane(cx) {
-            pane.update(cx, |pane, cx| pane.close_active_tab(cx));
+            pane.update(cx, |pane, cx| pane.close(cx));
         }
     }
 
@@ -342,9 +350,10 @@ impl AppRoot {
         }
     }
 
-    /// Anchored inspector for a tab-bar right-click: the pane's own settings
-    /// plus a "New Tab" submenu reusing the palette's new-panel rows, so both
-    /// entry points create tabs through the same wizards.
+    /// Anchored inspector for an empty pane's header right-click: the
+    /// pane's own settings plus an "Add View" submenu reusing the palette's
+    /// new-panel rows, so both entry points create views through the same
+    /// wizards.
     fn open_pane_inspector(
         &mut self,
         pane: Entity<crate::tiles::Pane>,
@@ -358,7 +367,7 @@ impl AppRoot {
         let db = self.db.clone();
         let on_open_inspector = crate::inspector::open_inspector(cx);
         rows.push(Box::new(crate::inspector::rows::NavRow::new(
-            "New Tab",
+            "Add View",
             SharedString::new_static(""),
             Box::new(move |_| {
                 crate::tiles::panels::new_panel_rows(
@@ -491,14 +500,14 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// A left-button release outside this window's viewport while a tab drag
-    /// is live: tear the tab out into its own window at the drop point.
+    /// A left-button release outside this window's viewport while a pane or
+    /// tab drag is live: tear it out into its own window at the drop point.
     ///
     /// Registered as `on_mouse_up_out`, which also fires for a release over
     /// occluded chrome (the titlebar, an overlay) — the viewport test is what
     /// separates "dropped on nothing in this window" (a no-op, as before)
     /// from "dropped on the desktop".
-    fn handle_tab_drag_out(
+    fn handle_drag_out(
         &mut self,
         event: &MouseUpEvent,
         window: &mut Window,
@@ -507,7 +516,7 @@ impl AppRoot {
         if !cx.has_active_drag() {
             return;
         }
-        let Some(drag) = crate::tiles::take_active_tab_drag(cx) else {
+        let Some(drag) = crate::tiles::take_active_drag(cx) else {
             return;
         };
         let viewport = window.viewport_size();
@@ -519,23 +528,36 @@ impl AppRoot {
             return;
         }
         // Screen-space drop point, nudged so the cursor lands on the new
-        // window's tab strip rather than its top-left corner.
+        // window's titlebar rather than its top-left corner.
         let origin = window.bounds().origin + event.position - point(px(60.0), px(20.0));
-        let outer = drag.pane.read(cx).current_outer_size();
-        let window_size = size(
-            px(outer.width.max(400.0)),
-            px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
-        );
+        let window_size = match &drag.source {
+            crate::tiles::drag::DragSource::Pane(pane) => {
+                let outer = pane.read(cx).current_outer_size();
+                size(
+                    px(outer.width.max(400.0)),
+                    px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
+                )
+            }
+            crate::tiles::drag::DragSource::Tab(..) => window.bounds().size,
+        };
         let db = self.db.clone();
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
         cx.defer(move |cx: &mut App| {
-            let Some(index) = drag.pane.read(cx).index_of(drag.item.entity_id()) else {
+            let tiles = match drag.source {
+                crate::tiles::drag::DragSource::Pane(pane) => {
+                    let Some(owner) = pane.read(cx).owner() else {
+                        return;
+                    };
+                    owner.update(cx, |owner, cx| owner.split_off_pane(pane, cx))
+                }
+                crate::tiles::drag::DragSource::Tab(group, id) => {
+                    group.update(cx, |group, cx| group.split_off_tab(id, cx))
+                }
+            };
+            let Some(tiles) = tiles else {
                 return;
             };
-            drag.pane.update(cx, |pane, cx| pane.remove_item(index, cx));
-            let pane = cx.new(|cx| crate::tiles::Pane::new(vec![drag.item], cx));
-            let tiles = cx.new(|cx| TileGroup::from_pane(pane, cx));
             crate::workspace::open_panel_window(
                 db,
                 Some(Bounds {
@@ -546,8 +568,9 @@ impl AppRoot {
                 false,
                 cx,
             );
-            // Tearing out a window's only tab reads as moving the window:
-            // close the emptied source unless the picker is holding it open.
+            // Tearing out a window's only content reads as moving the
+            // window: close the emptied source unless the picker is holding
+            // it open.
             if let Some(source) = drag.source_window.downcast::<AppRoot>() {
                 let _ = source.update(cx, |root, window, cx| {
                     let picker_up = root
@@ -645,7 +668,10 @@ impl Render for AppRoot {
 
         let theme = crate::theme::theme(cx);
         let font_family = crate::theme::font_family(cx);
-        let titlebar = self.render_titlebar(&theme, window, cx);
+        let placement = crate::tiles::tab_bar::placement(cx);
+        let titlebar = self.render_titlebar(&theme, placement, window, cx);
+        let sidebar = (placement == crate::config::TabPlacement::Side)
+            .then(|| self.render_tab_sidebar(&theme, window, cx));
 
         let mut root = div()
             .id("app-root")
@@ -665,7 +691,8 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::open_leader))
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
-            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
                 this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
             }))
@@ -709,21 +736,30 @@ impl Render for AppRoot {
             // exactly when `on_mouse_up_out` below doesn't (hover is the
             // gate for both, in opposite directions).
             .capture_any_mouse_up(|_, _, cx| {
-                crate::tiles::take_active_tab_drag(cx);
+                crate::tiles::take_active_drag(cx);
             })
-            .on_mouse_up_out(
-                gpui::MouseButton::Left,
-                cx.listener(Self::handle_tab_drag_out),
-            )
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(Self::handle_drag_out))
+            .on_drop(|_: &crate::tiles::drag::SidebarResizeDrag, _, cx| {
+                crate::tiles::tab_bar::save_sidebar_width(cx)
+            })
             .font_family(font_family)
             .flex()
-            .flex_col()
+            .flex_row()
             .size_full()
             // Linux client-side decorations render into a transparent surface,
             // so the root must paint its own opaque background.
             .bg(theme.bg_primary)
-            .child(titlebar)
-            .child(div().flex_1().min_h_0().child(self.tiles.clone()));
+            .children(sidebar)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(titlebar)
+                    .child(div().flex_1().min_h_0().child(self.tiles.clone())),
+            );
 
         if let Some(inspector) = &self.inspector {
             root = root.child(inspector.clone());
@@ -844,11 +880,10 @@ impl AppRoot {
     /// what the user was looking at rather than empty.
     fn show_inspector(&mut self, _: &ShowInspector, _window: &mut Window, cx: &mut Context<Self>) {
         use crate::inspector::target::{self, INSPECTOR_PANE_KEY};
-        let open = self.tiles.read(cx).panes().iter().any(|pane| {
+        let open = self.tiles.read(cx).all_panes().any(|pane| {
             pane.read(cx)
-                .items()
-                .iter()
-                .any(|item| item.serialization_key() == INSPECTOR_PANE_KEY)
+                .item()
+                .is_some_and(|item| item.serialization_key() == INSPECTOR_PANE_KEY)
         });
         if open {
             self.tiles.update(cx, |tiles, cx| {
@@ -861,11 +896,9 @@ impl AppRoot {
         };
         target::select_pane(&active, cx);
         let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
-        let pane = cx.new(|cx| crate::tiles::Pane::new(Vec::new(), cx));
-        pane.update(cx, |pane, cx| {
-            if let Some(item) = registry.deserialize(INSPECTOR_PANE_KEY, "{}", cx) {
-                pane.add_item(item, cx);
-            }
+        let pane = cx.new(|cx| {
+            let item = registry.deserialize(INSPECTOR_PANE_KEY, "{}", cx);
+            crate::tiles::Pane::new(item, cx)
         });
         self.tiles.update(cx, |tiles, cx| {
             tiles.split_pane(&active, pane, crate::tiles::SplitDirection::Right, cx)
@@ -883,28 +916,170 @@ impl AppRoot {
     }
 
     /// A flat, borderless titlebar control: quiet at rest, background on
-    /// hover. The titlebar reads as one surface instead of a row of pills.
+    /// hover. The titlebar reads as one surface instead of a row of pills,
+    /// and stays compact so the tabs beside it get the room.
     fn titlebar_segment(
         theme: &crate::theme::Theme,
         id: &'static str,
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
-            .px(px(8.0))
-            .py(px(3.0))
+            .px(px(6.0))
+            .py(px(2.0))
             .rounded(px(4.0))
             .flex()
+            .flex_shrink_0()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .text_size(px(12.0))
+            .gap(px(5.0))
+            .text_size(px(11.0))
             .text_color(theme.text_primary)
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
     }
 
     fn titlebar_separator(theme: &crate::theme::Theme) -> gpui::Div {
-        div().w(px(1.0)).h(px(14.0)).bg(theme.border_primary)
+        div()
+            .w(px(1.0))
+            .h(px(12.0))
+            .flex_shrink_0()
+            .bg(theme.border_primary)
+    }
+
+    /// Make `area` drag the window the way the titlebar does: natively on
+    /// macOS and Windows, by handing the gesture to the compositor on Linux,
+    /// with a double-click zooming the window.
+    fn window_drag_area(
+        &self,
+        area: gpui::Stateful<gpui::Div>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        area.window_control_area(gpui::WindowControlArea::Drag)
+            // Occluded so a press never hovers the root's `track_focus`
+            // hitbox: gpui's focus-transfer listener calls
+            // `prevent_default()`, and the Windows backend treats a
+            // default-prevented mouse-down as handled — swallowing the
+            // WM_NCLBUTTONDOWN that starts the native caption drag.
+            .occlude()
+            // Drag gesture for compositors that need an explicit hand-off:
+            // mouse-down arms, the first mouse-move starts the compositor
+            // drag. macOS drags natively via the transparent titlebar and
+            // Windows via the HTCAPTION hit-test, so these never fire there.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = true),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.should_move {
+                    this.should_move = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = false),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else {
+                        window.zoom_window();
+                    }
+                }
+            })
+            .when(
+                matches!(
+                    window.window_decorations(),
+                    gpui::Decorations::Client { .. }
+                ) && window.window_controls().window_menu,
+                |bar| {
+                    bar.on_mouse_down(gpui::MouseButton::Right, |event, window, _| {
+                        window.show_window_menu(event.position);
+                    })
+                },
+            )
+    }
+
+    /// The tabs as a sidebar the full height of the window. Its top row
+    /// sits level with the titlebar, holds the macOS traffic lights, and
+    /// drags the window like the titlebar does.
+    fn render_tab_sidebar(
+        &self,
+        theme: &crate::theme::Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::tiles::tab_bar;
+        let width = tab_bar::sidebar_width(cx);
+        let header = self.window_drag_area(
+            div()
+                .id("tab-sidebar-header")
+                .w_full()
+                .h(px(TITLEBAR_HEIGHT))
+                .flex_shrink_0(),
+            window,
+            cx,
+        );
+        let left = self.sidebar_left.clone();
+        let hover_color = theme.text_tertiary;
+        let handle = div()
+            .id("tab-sidebar-resize")
+            .debug_selector(|| "tab-sidebar-resize".into())
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(px(5.0))
+            .occlude()
+            .cursor(gpui::CursorStyle::ResizeColumn)
+            .group("tab-sidebar-resize")
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_full()
+                    .w(px(1.0))
+                    .group_hover("tab-sidebar-resize", move |s| s.bg(hover_color)),
+            )
+            .on_drag(crate::tiles::drag::SidebarResizeDrag, |drag, _, _, cx| {
+                cx.new(|_| drag.clone())
+            })
+            .on_drag_move(
+                move |event: &gpui::DragMoveEvent<crate::tiles::drag::SidebarResizeDrag>, _, cx| {
+                    tab_bar::set_sidebar_width(event.event.position.x - left.get(), cx);
+                },
+            );
+        let left = self.sidebar_left.clone();
+        div()
+            .id("tab-sidebar")
+            .relative()
+            .flex()
+            .flex_col()
+            .h_full()
+            .w(width)
+            .flex_shrink_0()
+            .pb(px(6.0))
+            .bg(theme.bg_secondary)
+            .border_r_1()
+            .border_color(theme.border_primary)
+            .child(
+                gpui::canvas(move |bounds, _, _| left.set(bounds.origin.x), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(header)
+            .child(tab_bar::tab_list(
+                &self.tiles,
+                crate::config::TabPlacement::Side,
+                window,
+                cx,
+            ))
+            .child(handle)
+            .into_any_element()
     }
 
     /// The titlebar's identity: which system(s) this panel is looking at.
@@ -963,6 +1138,7 @@ impl AppRoot {
     fn render_titlebar(
         &self,
         theme: &crate::theme::Theme,
+        placement: crate::config::TabPlacement,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -985,10 +1161,11 @@ impl AppRoot {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(28.0))
-            .h(px(24.0))
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex_shrink_0()
             .rounded(px(3.0))
-            .child(icon.svg(14.0, icon_color))
+            .child(icon.svg(13.0, icon_color))
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
             .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
@@ -1001,20 +1178,39 @@ impl AppRoot {
         // Windows resolves clicks over the segments to the surrounding
         // titlebar drag area (HTCAPTION) and drags the window instead of
         // clicking. Left: the panel's identity — what it's connected to.
+        // With tabs in the sidebar, the traffic lights sit above it.
+        let traffic_lights = cfg!(target_os = "macos") && placement == TabPlacement::Top;
         let left = div()
             .occlude()
             .flex()
+            .flex_shrink_0()
             .flex_row()
             .items_center()
-            .pl(px(if cfg!(target_os = "macos") { 78.0 } else { 8.0 }))
+            .pl(px(if traffic_lights { 78.0 } else { 8.0 }))
             .child(self.render_connection_segment(theme, cx));
+        let tabs = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .px(px(6.0))
+            .when(placement == TabPlacement::Top, |tabs| {
+                tabs.child(crate::tiles::tab_bar::tab_list(
+                    &self.tiles,
+                    placement,
+                    window,
+                    cx,
+                ))
+            });
 
         let mut right = div()
             .occlude()
             .flex()
+            .flex_shrink_0()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(4.0))
             .pr(px(8.0));
 
         let time = crate::temporal::snapshot(cx);
@@ -1152,15 +1348,7 @@ impl AppRoot {
         right = right.child(Self::titlebar_separator(theme));
         right = right.child(lock_button);
 
-        div()
-            .id("titlebar")
-            .window_control_area(gpui::WindowControlArea::Drag)
-            // Occluded so a titlebar press never hovers the root's
-            // `track_focus` hitbox: gpui's focus-transfer listener calls
-            // `prevent_default()`, and the Windows backend treats a
-            // default-prevented mouse-down as handled — swallowing the
-            // WM_NCLBUTTONDOWN that starts the native caption drag.
-            .occlude()
+        self.window_drag_area(div().id("titlebar"), window, cx)
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary)
@@ -1170,47 +1358,8 @@ impl AppRoot {
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
-            // Drag gesture for compositors that need an explicit hand-off:
-            // mouse-down arms, the first mouse-move starts the compositor
-            // drag. macOS drags natively via the transparent titlebar and
-            // Windows via the HTCAPTION hit-test, so these never fire there.
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.should_move = true),
-            )
-            .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.should_move {
-                    this.should_move = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_mouse_up(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.should_move = false),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    if cfg!(target_os = "macos") {
-                        window.titlebar_double_click();
-                    } else {
-                        window.zoom_window();
-                    }
-                }
-            })
-            .when(
-                matches!(
-                    window.window_decorations(),
-                    gpui::Decorations::Client { .. }
-                ) && window.window_controls().window_menu,
-                |bar| {
-                    bar.on_mouse_down(gpui::MouseButton::Right, |event, window, _| {
-                        window.show_window_menu(event.position);
-                    })
-                },
-            )
             .child(left)
+            .child(tabs)
             .child(right)
             .when(
                 crate::window_controls::needs_window_controls(window),
@@ -1847,7 +1996,8 @@ impl PanelApp {
                 gpui::MenuItem::action("Save snapshot", crate::session::SaveSnapshot),
                 gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
                 gpui::MenuItem::separator(),
-                gpui::MenuItem::action("Close tab", CloseTab),
+                gpui::MenuItem::action("New tab", NewTab),
+                gpui::MenuItem::action("Close panel", ClosePanel),
             ]),
         ]);
         cx.bind_keys([
@@ -1866,7 +2016,8 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-            KeyBinding::new("secondary-w", CloseTab, None),
+            KeyBinding::new("secondary-w", ClosePanel, None),
+            KeyBinding::new("secondary-t", NewTab, None),
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
             KeyBinding::new("secondary-i", ShowInspector, None),

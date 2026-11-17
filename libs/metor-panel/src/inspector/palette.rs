@@ -73,7 +73,7 @@ fn palette_tiles(cx: &App) -> Option<Entity<TileGroup>> {
     }
 }
 
-type PaneStamp = (gpui::EntityId, usize, Vec<(gpui::EntityId, SharedString)>);
+type PaneStamp = (gpui::EntityId, Option<(gpui::EntityId, SharedString)>);
 
 /// Tracks the palette's owning tree so background window updates cannot retarget it.
 pub(super) struct LivePalette {
@@ -95,18 +95,12 @@ impl LivePalette {
         let tiles = self.tiles.upgrade()?;
         let tree = tiles.read(cx);
         let panes = tree
-            .panes()
-            .iter()
+            .all_panes()
             .map(|pane| {
-                let state = pane.read(cx);
+                let item = pane.read(cx).item();
                 (
                     pane.entity_id(),
-                    state.active_index(),
-                    state
-                        .items()
-                        .iter()
-                        .map(|item| (item.entity_id(), item.tab_title(cx)))
-                        .collect(),
+                    item.map(|item| (item.entity_id(), item.tab_title(cx))),
                 )
             })
             .collect();
@@ -295,12 +289,12 @@ fn register_pane_settings_provider(cx: &mut App) {
         let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
-        let panes = tiles.read(cx).panes().to_vec();
+        let panes: Vec<_> = tiles.read(cx).all_panes().cloned().collect();
         panes
             .iter()
             .enumerate()
             .map(|(ix, pane)| {
-                let label = match pane.read(cx).items().first() {
+                let label = match pane.read(cx).item() {
                     Some(item) => SharedString::from(format!("Pane: {}", item.tab_title(cx))),
                     None => SharedString::from(format!("Pane {}", ix + 1)),
                 };
@@ -320,12 +314,11 @@ fn register_panel_provider(cx: &mut App) {
         let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
-        let panes = tiles.read(cx).panes().to_vec();
+        let panes: Vec<_> = tiles.read(cx).all_panes().cloned().collect();
         let multi_pane = panes.len() > 1;
         let mut items = Vec::new();
         for (pane_ix, pane) in panes.iter().enumerate() {
-            let pane_items = pane.read(cx).items();
-            for item in pane_items.iter() {
+            if let Some(item) = pane.read(cx).item() {
                 let label = item.tab_title(cx);
                 let summary = if multi_pane {
                     SharedString::from(format!("Pane {}", pane_ix + 1))
@@ -349,11 +342,10 @@ fn register_widget_provider(cx: &mut App) {
         let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
-        let panes = tiles.read(cx).panes().to_vec();
+        let panes: Vec<_> = tiles.read(cx).all_panes().cloned().collect();
         let mut items = Vec::new();
         for pane in panes.iter() {
-            let pane_items = pane.read(cx).items();
-            for item in pane_items.iter() {
+            if let Some(item) = pane.read(cx).item() {
                 let entity = item.entity_any(cx);
                 let Ok(dashboard) = entity.downcast::<DashboardPanel>() else {
                     continue;
@@ -371,6 +363,23 @@ fn register_widget_provider(cx: &mut App) {
         items
     });
     ItemRegistry::register(cx, Category::Widget, provider);
+}
+
+/// Where every window's tabs sit, as one row per placement.
+pub(crate) fn tab_placement_rows() -> Vec<Box<dyn InspectorRow>> {
+    use crate::config::TabPlacement;
+    [
+        ("Tabs on top", TabPlacement::Top),
+        ("Tabs in sidebar", TabPlacement::Side),
+    ]
+    .into_iter()
+    .map(|(label, placement)| {
+        Box::new(CommandRow::new(
+            label,
+            Arc::new(move |_, cx| crate::tiles::tab_bar::set_placement(placement, cx)),
+        )) as Box<dyn InspectorRow>
+    })
+    .collect()
 }
 
 /// One row per image component, each opening an image view.
@@ -415,6 +424,17 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
                         pane.clone(),
                         new_open.clone(),
                     )
+                }),
+            });
+        }
+
+        if let Some(tiles) = palette_tiles(cx) {
+            items.push(InspectionItem::Command {
+                label: SharedString::new_static("New Tab"),
+                callback: Arc::new(move |_window, cx| {
+                    tiles.update(cx, |tiles, cx| {
+                        tiles.new_tab(cx);
+                    });
                 }),
             });
         }
@@ -499,6 +519,12 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
             label: "Font".into(),
             summary: SharedString::new_static("Pick the UI font"),
             build: Arc::new(font_rows),
+        });
+
+        items.push(InspectionItem::SubMenu {
+            label: "Tabs".into(),
+            summary: "Along the titlebar, or down a sidebar".into(),
+            build: Arc::new(|_| tab_placement_rows()),
         });
 
         items.push(InspectionItem::SubMenu {
@@ -763,7 +789,7 @@ mod live_tests {
                 cx.notify();
             });
             let pane = tiles.read(cx).panes()[0].clone();
-            pane.update(cx, |pane, cx| pane.remove_item(0, cx));
+            pane.update(cx, |pane, cx| pane.close(cx));
             let other = cx.new(|cx| TileGroup::new(vec![Box::new(first.clone())], cx));
             let _ = ItemRegistry::root_rows_for(&db, &other, cx);
         });

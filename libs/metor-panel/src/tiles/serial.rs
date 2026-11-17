@@ -8,8 +8,7 @@ use gpui::{
 use metor_db::DB;
 
 pub use metor_proto_wkt::{
-    SplitAxis, TILE_LAYOUT_VERSION, TabOrientation, TileItem, TileLayout, TileNode, TilePane,
-    TileSplit,
+    SplitAxis, TILE_LAYOUT_VERSION, TileItem, TileLayout, TileNode, TilePane, TileSplit, TileTab,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -258,82 +257,75 @@ impl PaneItemHandle for UnknownPaneHandle {
 mod tests {
     use super::*;
 
+    fn pane(kind: &str, state: &str) -> TileNode {
+        TileNode::Pane(TilePane {
+            item: Some(TileItem {
+                kind: kind.into(),
+                state: state.into(),
+            }),
+            ..Default::default()
+        })
+    }
+
     fn sample_layout() -> TileLayout {
         TileLayout {
             version: TILE_LAYOUT_VERSION,
             global_time_range: String::new(),
             temporal: None,
-            root: TileNode::Split(TileSplit {
-                axis: SplitAxis::Horizontal,
-                flexes: vec![1.0, 2.0],
-                children: vec![
-                    TileNode::Pane(TilePane {
-                        active_index: 0,
-                        tab_orientation: TabOrientation::Horizontal,
-                        hide_tab_bar: false,
-                        locked_size: None,
-                        tab_rail_width: None,
-                        items: vec![TileItem {
-                            kind: "component_text".into(),
-                            state: r#"{"component":"foo"}"#.into(),
-                        }],
-                    }),
-                    TileNode::Pane(TilePane {
-                        active_index: 1,
-                        tab_orientation: TabOrientation::Vertical,
-                        hide_tab_bar: true,
-                        locked_size: Some((300.0, 200.0)),
-                        tab_rail_width: Some(220.0),
-                        items: vec![
-                            TileItem {
-                                kind: "component_outline".into(),
-                                state: "{}".into(),
-                            },
-                            TileItem {
-                                kind: "time_series_plot".into(),
-                                state: r#"{"label":"speed"}"#.into(),
-                            },
+            tabs: vec![
+                TileTab {
+                    root: TileNode::Split(TileSplit {
+                        axis: SplitAxis::Horizontal,
+                        flexes: vec![1.0, 2.0],
+                        children: vec![
+                            pane("component_text", r#"{"component":"foo"}"#),
+                            TileNode::Pane(TilePane {
+                                item: None,
+                                hide_header: true,
+                                locked_size: Some((300.0, 200.0)),
+                            }),
                         ],
                     }),
-                ],
-            }),
+                },
+                TileTab {
+                    root: pane("time_series_plot", r#"{"label":"speed"}"#),
+                },
+            ],
+            active_tab: 1,
         }
     }
 
     #[test]
-    fn round_trip_preserves_tree_shape() {
-        let original = sample_layout();
-        let json = serde_json::to_string(&original).expect("serialize");
+    fn round_trip_preserves_tabs_and_tree_shape() {
+        let json = serde_json::to_string(&sample_layout()).expect("serialize");
         let parsed: TileLayout = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(parsed.version, TILE_LAYOUT_VERSION);
-        let TileNode::Split(split) = parsed.root else {
+        assert_eq!(parsed.tabs.len(), 2);
+        assert_eq!(parsed.active_tab, 1);
+        let TileNode::Split(split) = &parsed.tabs[0].root else {
             panic!("expected split");
         };
         assert!(matches!(split.axis, SplitAxis::Horizontal));
         assert_eq!(split.flexes, vec![1.0, 2.0]);
-        assert_eq!(split.children.len(), 2);
 
         let TileNode::Pane(p0) = &split.children[0] else {
             panic!("expected pane");
         };
-        assert_eq!(p0.active_index, 0);
-        assert!(matches!(p0.tab_orientation, TabOrientation::Horizontal));
-        assert!(!p0.hide_tab_bar);
-        assert_eq!(p0.locked_size, None);
-        assert_eq!(p0.tab_rail_width, None);
-        assert_eq!(p0.items.len(), 1);
-        assert_eq!(p0.items[0].kind, "component_text");
-        assert_eq!(p0.items[0].state, r#"{"component":"foo"}"#);
+        let item = p0.item.as_ref().unwrap();
+        assert_eq!(item.kind, "component_text");
+        assert_eq!(item.state, r#"{"component":"foo"}"#);
+        assert!(!p0.hide_header);
 
         let TileNode::Pane(p1) = &split.children[1] else {
             panic!("expected pane");
         };
-        assert_eq!(p1.active_index, 1);
-        assert!(matches!(p1.tab_orientation, TabOrientation::Vertical));
-        assert!(p1.hide_tab_bar);
+        assert!(p1.item.is_none());
+        assert!(p1.hide_header);
         assert_eq!(p1.locked_size, Some((300.0, 200.0)));
-        assert_eq!(p1.tab_rail_width, Some(220.0));
-        assert_eq!(p1.items.len(), 2);
+        assert!(
+            !json.contains(r#""item":null"#),
+            "an empty pane leaves its item out"
+        );
     }
 }

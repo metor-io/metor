@@ -1,66 +1,71 @@
 use super::SplitPath;
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Empty, Entity, Global, IntoElement, Pixels, Point,
-    Render, Window, prelude::*,
+    Render, Window, div, prelude::*, px,
 };
 
-use super::item::PaneItemHandle;
+use super::TileGroup;
 use super::pane::Pane;
+use super::tab_bar::TabId;
 use crate::theme::theme;
 
-/// Payload carried by gpui while a tab is being dragged.
+/// Payload carried by gpui while a pane is dragged by its header.
 ///
-/// The source pane and item identity locate the tab even if live updates
-/// change its index while the pointer is moving.
-pub struct DraggedTab {
+/// The pane moves as a whole — it holds one item — so the payload is the
+/// pane itself; the group that owns it is looked up at drop time, since a
+/// drag can end in another window.
+pub struct DraggedPane {
     pub pane: Entity<Pane>,
-    pub item: Box<dyn PaneItemHandle>,
 }
 
-/// The tab drag in flight, mirrored app-side because gpui's own payload
-/// (`App::active_drag`) is crate-private and a mouse-up outside every drop
-/// target discards it without telling anyone. The ghost constructor sets
-/// this at drag start; the window root takes it on mouse-up — outside the
-/// window to tear the tab out, inside merely to clear it.
-pub struct ActiveTabDrag {
-    pub pane: Entity<Pane>,
-    pub item: Box<dyn PaneItemHandle>,
+/// Payload carried by gpui while a top-level tab is dragged along its bar.
+pub struct DraggedTab {
+    pub group: Entity<TileGroup>,
+    pub tab: TabId,
+}
+
+/// What an in-flight drag carries, mirrored app-side because gpui's own
+/// payload (`App::active_drag`) is crate-private and a mouse-up outside
+/// every drop target discards it without telling anyone. The ghost
+/// constructor sets this at drag start; the window root takes it on
+/// mouse-up — outside the window to tear the pane or tab out, inside merely
+/// to clear it.
+pub enum DragSource {
+    Pane(Entity<Pane>),
+    Tab(Entity<TileGroup>, TabId),
+}
+
+pub struct ActiveDrag {
+    pub source: DragSource,
     pub source_window: AnyWindowHandle,
 }
 
-impl Global for ActiveTabDrag {}
+impl Global for ActiveDrag {}
 
-pub(crate) fn set_active_tab_drag(drag: ActiveTabDrag, cx: &mut App) {
+pub(crate) fn set_active_drag(drag: ActiveDrag, cx: &mut App) {
     cx.set_global(drag);
 }
 
-/// Take the in-flight tab drag, if any. Callers still gate on
+/// Take the in-flight drag, if any. Callers still gate on
 /// `cx.has_active_drag()` — a leftover mirror from a drag that ended
 /// without a mouse-up reaching us must not tear anything out.
-pub(crate) fn take_active_tab_drag(cx: &mut App) -> Option<ActiveTabDrag> {
-    let drag = cx
-        .has_global::<ActiveTabDrag>()
-        .then(|| cx.remove_global::<ActiveTabDrag>())?;
-    // A cancellation in another window must also restore the source strip.
-    // Defer until drop handlers have consumed their insertion previews.
-    let source = drag.pane.clone();
-    cx.defer(move |cx| source.update(cx, |_, cx| cx.notify()));
-    Some(drag)
+pub(crate) fn take_active_drag(cx: &mut App) -> Option<ActiveDrag> {
+    cx.has_global::<ActiveDrag>()
+        .then(|| cx.remove_global::<ActiveDrag>())
 }
 
-pub(super) struct TabDragGhost {
+/// The floating title that follows the pointer while a pane or tab is
+/// dragged.
+pub(super) struct DragGhost {
     pub title: gpui::SharedString,
-    pub size: gpui::Size<Pixels>,
     pub text_style: gpui::TextStyle,
-    pub can_close: bool,
-    pub orientation: super::TabOrientation,
 }
 
-impl Render for TabDragGhost {
+impl Render for DragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let mut header = super::tab::header(&theme, self.orientation);
-        *header.text_style() = gpui::TextStyleRefinement {
+        let mut ghost = div();
+        *ghost.text_style() = gpui::TextStyleRefinement {
             font_family: Some(self.text_style.font_family.clone()),
             font_features: Some(self.text_style.font_features.clone()),
             font_fallbacks: self.text_style.font_fallbacks.clone(),
@@ -69,17 +74,21 @@ impl Render for TabDragGhost {
             line_height: Some(self.text_style.line_height),
             ..Default::default()
         };
-        header
-            .debug_selector(|| "tab-drag-ghost".into())
-            .w(self.size.width)
-            .h(self.size.height)
-            .bg(theme.bg_primary)
-            .text_size(gpui::px(12.0))
+        ghost
+            .debug_selector(|| "drag-ghost".into())
+            .flex()
+            .items_center()
+            .h(px(super::tab_bar::TAB_HEIGHT))
+            .max_w(px(super::tab_bar::TAB_MAX_WIDTH))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_primary)
+            .bg(theme.bg_elevated)
+            .shadow_md()
+            .text_size(px(12.0))
             .text_color(theme.text_primary)
-            .child(super::tab::title(self.title.clone()))
-            .when(self.can_close, |header| {
-                header.child(super::tab::close_icon(&theme))
-            })
+            .child(div().truncate().child(self.title.clone()))
     }
 }
 
@@ -99,20 +108,17 @@ impl Render for ResizeDrag {
     }
 }
 
-/// Payload identifying whose vertical tab rail is being resized. Every rail
-/// hears every rail drag, so the owning pane's id picks the one that answers.
+/// Payload for a drag on the tab sidebar's resize edge.
 #[derive(Clone)]
-pub struct RailResizeDrag {
-    pub pane: gpui::EntityId,
-}
+pub struct SidebarResizeDrag;
 
-impl Render for RailResizeDrag {
+impl Render for SidebarResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
 }
 
-/// Side of a pane a tab was dropped against.
+/// Side of a pane a dragged pane is dropped against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
     Up,
@@ -134,29 +140,33 @@ impl SplitDirection {
     pub fn increasing(self) -> bool {
         matches!(self, Self::Down | Self::Right)
     }
+
+    /// The split that suits a pane of `size`: beside it when it is wider
+    /// than tall, below it otherwise, so repeated adds stay legible.
+    pub fn along_longer(size: gpui::Size<Pixels>) -> Self {
+        if size.width >= size.height {
+            Self::Right
+        } else {
+            Self::Down
+        }
+    }
 }
 
-/// Classify a drop position inside a pane's content area.
-///
-/// The pane is divided into four edge strips (25% deep) plus a central
-/// region. A drop on an edge splits the pane; a drop in the center yields
-/// `None`, signalling the caller to insert the tab instead.
-pub fn detect_split_zone(cursor: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<SplitDirection> {
-    let margin = 0.25;
+/// The edge of `bounds` nearest `cursor`, measured as a fraction of the
+/// pane's extent so a wide pane still splits sideways near its sides.
+pub fn nearest_edge(cursor: Point<Pixels>, bounds: Bounds<Pixels>) -> SplitDirection {
     let rel_x = (cursor.x - bounds.origin.x) / bounds.size.width;
     let rel_y = (cursor.y - bounds.origin.y) / bounds.size.height;
-
-    if rel_x < margin {
-        Some(SplitDirection::Left)
-    } else if rel_x > 1.0 - margin {
-        Some(SplitDirection::Right)
-    } else if rel_y < margin {
-        Some(SplitDirection::Up)
-    } else if rel_y > 1.0 - margin {
-        Some(SplitDirection::Down)
-    } else {
-        None
-    }
+    [
+        (rel_x, SplitDirection::Left),
+        (1.0 - rel_x, SplitDirection::Right),
+        (rel_y, SplitDirection::Up),
+        (1.0 - rel_y, SplitDirection::Down),
+    ]
+    .into_iter()
+    .min_by(|a, b| a.0.total_cmp(&b.0))
+    .map(|(_, direction)| direction)
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -173,42 +183,30 @@ mod tests {
         }
     }
 
-    fn zone_at(x: f32, y: f32) -> Option<SplitDirection> {
-        detect_split_zone(point(px(x), px(y)), unit_bounds())
+    fn edge_at(x: f32, y: f32) -> SplitDirection {
+        nearest_edge(point(px(x), px(y)), unit_bounds())
     }
 
     #[test]
-    fn center_yields_no_split() {
-        assert_eq!(zone_at(50.0, 50.0), None);
+    fn every_point_splits_toward_its_nearest_edge() {
+        assert_eq!(edge_at(10.0, 50.0), SplitDirection::Left);
+        assert_eq!(edge_at(90.0, 50.0), SplitDirection::Right);
+        assert_eq!(edge_at(50.0, 10.0), SplitDirection::Up);
+        assert_eq!(edge_at(50.0, 90.0), SplitDirection::Down);
+        assert_eq!(edge_at(45.0, 40.0), SplitDirection::Up);
     }
 
     #[test]
-    fn edges_map_to_their_direction() {
-        assert_eq!(zone_at(10.0, 50.0), Some(SplitDirection::Left));
-        assert_eq!(zone_at(90.0, 50.0), Some(SplitDirection::Right));
-        assert_eq!(zone_at(50.0, 10.0), Some(SplitDirection::Up));
-        assert_eq!(zone_at(50.0, 90.0), Some(SplitDirection::Down));
-    }
-
-    #[test]
-    fn horizontal_edges_win_over_vertical_in_corners() {
-        // A corner sits in both an x- and a y-strip; the x-check runs first, so
-        // Left/Right take precedence.
-        assert_eq!(zone_at(10.0, 10.0), Some(SplitDirection::Left));
-        assert_eq!(zone_at(90.0, 90.0), Some(SplitDirection::Right));
-    }
-
-    #[test]
-    fn bounds_origin_is_honored() {
-        let bounds = Bounds {
-            origin: point(px(200.0), px(200.0)),
-            size: size(px(100.0), px(100.0)),
+    fn edges_are_relative_to_the_pane_extent() {
+        let wide = Bounds {
+            origin: point(px(200.0), px(0.0)),
+            size: size(px(1000.0), px(100.0)),
         };
-        // Absolute (250,250) is the center of an origin-shifted pane.
-        assert_eq!(detect_split_zone(point(px(250.0), px(250.0)), bounds), None);
+        // 100px from the left but 30px from the top: the left edge is still
+        // nearer as a share of the pane.
         assert_eq!(
-            detect_split_zone(point(px(210.0), px(250.0)), bounds),
-            Some(SplitDirection::Left)
+            nearest_edge(point(px(300.0), px(30.0)), wide),
+            SplitDirection::Left
         );
     }
 }

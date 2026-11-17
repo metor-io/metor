@@ -43,7 +43,7 @@ impl Target {
     fn active_in(pane: &Entity<Pane>, cx: &App) -> Option<Self> {
         Some(Self {
             pane: pane.downgrade(),
-            item: pane.read(cx).active_item()?.entity_id(),
+            item: pane.read(cx).item()?.entity_id(),
         })
     }
 
@@ -51,9 +51,8 @@ impl Target {
         let pane = self.pane.upgrade()?;
         let item = pane
             .read(cx)
-            .items()
-            .iter()
-            .find(|item| item.entity_id() == self.item)?
+            .item()
+            .filter(|item| item.entity_id() == self.item)?
             .clone_handle();
         Some((pane, item))
     }
@@ -486,7 +485,7 @@ mod tests {
         let (pane, cx) = cx.add_window_view(|_, cx| {
             test_support::install(&db, cx);
             let dashboard = test_support::dashboard(&db, cx);
-            let dashboard_pane = cx.new(|cx| Pane::new(vec![Box::new(dashboard.clone())], cx));
+            let dashboard_pane = cx.new(|cx| Pane::new(Some(Box::new(dashboard.clone())), cx));
             target::select_pane(&dashboard_pane, cx);
             fixture = Some((dashboard, dashboard_pane));
             InspectorPane::from_config(InspectorPaneConfig {}, db.clone(), cx)
@@ -613,7 +612,7 @@ mod tests {
             let mut registry = crate::tiles::ItemRegistry::default();
             registry.register_view(spec, f.db.clone());
             let inspector_pane = cx.new(|cx| {
-                let mut pane = Pane::new(Vec::new(), cx);
+                let mut pane = Pane::new(None, cx);
                 let item = registry
                     .deserialize(target::INSPECTOR_PANE_KEY, "{}", cx)
                     .unwrap();
@@ -631,7 +630,7 @@ mod tests {
         pane.update(cx, |p, cx| p.toggle_pin(cx));
         let _other_pane = cx.update(|_, cx| {
             let other = test_support::dashboard(&f.db, cx);
-            let other_pane = cx.new(|cx| Pane::new(vec![Box::new(other)], cx));
+            let other_pane = cx.new(|cx| Pane::new(Some(Box::new(other)), cx));
             target::select_pane(&other_pane, cx);
             other_pane
         });

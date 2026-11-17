@@ -319,7 +319,7 @@ fn bounds_visible(bounds: &Bounds<Pixels>, displays: &[Bounds<Pixels>]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiles::serial::{TileNode, TilePane};
+    use crate::tiles::serial::{TileNode, TilePane, TileTab};
     use gpui::{point, px, size};
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
@@ -334,14 +334,10 @@ mod tests {
             version,
             global_time_range: String::new(),
             temporal: None,
-            root: TileNode::Pane(TilePane {
-                active_index: 0,
-                tab_orientation: Default::default(),
-                hide_tab_bar: false,
-                locked_size: None,
-                tab_rail_width: None,
-                items: Vec::new(),
-            }),
+            tabs: vec![TileTab {
+                root: TileNode::Pane(TilePane::default()),
+            }],
+            active_tab: 0,
         }
     }
 

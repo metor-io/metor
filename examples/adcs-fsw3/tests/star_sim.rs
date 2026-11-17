@@ -78,8 +78,7 @@ fn preset_components() -> Vec<ComponentId> {
         if let Some(children) = node.pointer("/Split/children").and_then(Value::as_array) {
             children.iter().for_each(|child| walk(child, out));
         }
-        let items = node.pointer("/Pane/items").and_then(Value::as_array);
-        for item in items.into_iter().flatten() {
+        if let Some(item) = node.pointer("/Pane/item") {
             let state: Value = serde_json::from_str(item["state"].as_str().unwrap()).unwrap();
             for overlay in state["overlays"].as_array().into_iter().flatten() {
                 for field in ["u", "v", "count", "cat_id"] {
@@ -96,10 +95,10 @@ fn preset_components() -> Vec<ComponentId> {
     }
     let preset = std::fs::read_to_string(manifest().join("presets/star-tracker.json")).unwrap();
     let mut out = Vec::new();
-    walk(
-        &serde_json::from_str::<Value>(&preset).unwrap()["root"],
-        &mut out,
-    );
+    let preset: Value = serde_json::from_str(&preset).unwrap();
+    for tab in preset["tabs"].as_array().unwrap() {
+        walk(&tab["root"], &mut out);
+    }
     out
 }
 

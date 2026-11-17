@@ -53,6 +53,8 @@ impl AssetSource for IconAssets {
             "icons/right-side-bar.svg" => {
                 Some(include_bytes!("../assets/icons/right-side-bar.svg"))
             }
+            "icons/split-down.svg" => Some(include_bytes!("../assets/icons/split-down.svg")),
+            "icons/split-right.svg" => Some(include_bytes!("../assets/icons/split-right.svg")),
             "icons/scrub.svg" => Some(include_bytes!("../assets/icons/scrub.svg")),
             "icons/skip-forward.svg" => Some(include_bytes!("../assets/icons/skip-forward.svg")),
             "icons/search.svg" => Some(include_bytes!("../assets/icons/search.svg")),
@@ -124,6 +126,8 @@ pub enum Icon {
     Restore,
     RightSideBar,
     Scrub,
+    SplitDown,
+    SplitRight,
     SkipForward,
     Search,
     Setting,
@@ -179,6 +183,8 @@ impl Icon {
             Icon::Restore => "icons/restore.svg",
             Icon::RightSideBar => "icons/right-side-bar.svg",
             Icon::Scrub => "icons/scrub.svg",
+            Icon::SplitDown => "icons/split-down.svg",
+            Icon::SplitRight => "icons/split-right.svg",
             Icon::SkipForward => "icons/skip-forward.svg",
             Icon::Search => "icons/search.svg",
             Icon::Setting => "icons/setting.svg",
