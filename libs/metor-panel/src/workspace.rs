@@ -129,29 +129,6 @@ pub(crate) fn open_panel_window(
     show_picker_if_disconnected: bool,
     cx: &mut App,
 ) -> Option<WindowHandle<AppRoot>> {
-    open_window(db, bounds, tiles, show_picker_if_disconnected, true, cx)
-}
-
-/// Open a window for content torn out mid-drag. It opens behind the
-/// pointer's window without taking focus, so the drag carrying it keeps
-/// its events; [`crate::tear_out`] brings it forward on release.
-pub(crate) fn open_torn_window(
-    db: Arc<DB>,
-    bounds: Bounds<Pixels>,
-    tiles: Entity<TileGroup>,
-    cx: &mut App,
-) -> Option<WindowHandle<AppRoot>> {
-    open_window(db, Some(bounds), Some(tiles), false, false, cx)
-}
-
-fn open_window(
-    db: Arc<DB>,
-    bounds: Option<Bounds<Pixels>>,
-    tiles: Option<Entity<TileGroup>>,
-    show_picker_if_disconnected: bool,
-    focus: bool,
-    cx: &mut App,
-) -> Option<WindowHandle<AppRoot>> {
     let bounds = bounds
         .filter(|b| bounds_visible(b, &display_bounds(cx)))
         .unwrap_or_else(|| Bounds::centered(None, size(px(1024.), px(600.)), cx));
@@ -175,7 +152,6 @@ fn open_window(
             // there. The window root moves the window itself instead.
             app_owns_titlebar_drag: true,
             app_id: Some("metor-panel".into()),
-            focus,
             ..Default::default()
         },
         move |window, cx| {
