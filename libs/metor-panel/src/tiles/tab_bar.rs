@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, DragMoveEvent, Entity, MouseButton, Pixels, ScrollHandle,
-    SharedString, Window, div, prelude::*, px,
+    SharedString, div, prelude::*, px,
 };
 
 use super::TileGroup;
@@ -22,6 +22,10 @@ use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
 /// and reordered around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub(super) u64);
+
+/// The motion slot of the "new tab" button, which slides along behind the
+/// last tab. Groups number their tabs from 1, so this never names one.
+const NEW_TAB_SLOT: TabId = TabId(0);
 
 /// A tab along the titlebar sizes to its title up to this width, then
 /// ellipsizes so one long title can't crowd every other tab off the bar.
@@ -134,7 +138,6 @@ fn slot_extent(sizes: &TabSizes, tab: TabId, vertical: bool) -> Pixels {
 pub(crate) fn tab_list(
     group: &Entity<TileGroup>,
     placement: TabPlacement,
-    window: &Window,
     cx: &mut App,
 ) -> AnyElement {
     let theme = theme(cx);
@@ -244,7 +247,6 @@ pub(crate) fn tab_list(
                         vertical,
                     },
                     &theme,
-                    window,
                 );
                 list = list.child(MovingTab::new(id, tab, rail.clone(), animate, vertical));
             }
@@ -288,7 +290,13 @@ pub(crate) fn tab_list(
                 });
             })
     };
-    list = list.child(new_tab);
+    list = list.child(MovingTab::new(
+        NEW_TAB_SLOT,
+        new_tab,
+        rail.clone(),
+        animate,
+        vertical,
+    ));
 
     // Open bar past the last tab. Not occluded, so it stays part of the
     // titlebar's window-drag area.
@@ -359,12 +367,7 @@ struct TabView {
     vertical: bool,
 }
 
-fn render_tab(
-    group: &Entity<TileGroup>,
-    tab: TabView,
-    theme: &Theme,
-    window: &Window,
-) -> impl IntoElement {
+fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl IntoElement {
     let TabView {
         id,
         ix,
@@ -374,7 +377,6 @@ fn render_tab(
         vertical,
     } = tab;
     let hover_group: SharedString = format!("top-tab-{}", id.0).into();
-    let text_style = window.text_style();
     let bg_primary = theme.bg_primary;
     let text_primary = theme.text_primary;
     let border_primary = theme.border_primary;
@@ -415,21 +417,14 @@ fn render_tab(
             .hover(move |s| s.bg(bg_primary).text_color(text_primary))
     };
 
-    let close = div()
+    let close = close_icon(theme)
         .id(("top-tab-close", id.0 as usize))
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(16.0))
-        .flex_shrink_0()
-        .rounded(px(3.0))
         .when(!active, |close| {
             close
                 .opacity(0.0)
                 .group_hover(hover_group.clone(), |s| s.opacity(1.0))
         })
         .hover(move |s| s.bg(border_primary))
-        .child(Icon::Close.svg(9.0, theme.text_secondary))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click({
             let group = group.clone();
@@ -484,7 +479,7 @@ fn render_tab(
                 cx.new(|_| DragGhost {
                     title,
                     width: size.map(|size| size.width),
-                    text_style: text_style.clone(),
+                    closable: can_close,
                 })
             },
         )
@@ -507,6 +502,18 @@ fn render_tab(
         .on_drop(move |dragged: &DraggedTab, _, cx| drop_tab(&tab_group, dragged, cx))
         .child(div().flex_1().min_w_0().truncate().child(title))
         .when(can_close, |tab| tab.child(close))
+}
+
+/// A tab's close button, shared with the ghost a dragged tab lifts as.
+pub(super) fn close_icon(theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(16.0))
+        .flex_shrink_0()
+        .rounded(px(3.0))
+        .child(Icon::Close.svg(9.0, theme.text_secondary))
 }
 
 /// Land a dragged tab in `group` where its preview gap was (last without

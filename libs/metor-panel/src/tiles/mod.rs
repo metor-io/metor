@@ -150,24 +150,20 @@ impl SplitAxis {
 }
 
 impl Member {
-    /// Insert `new_pane` next to `target` along `direction`.
+    /// Insert `new` (a pane, or a whole tab's tree) next to `target` along
+    /// `direction`.
     ///
-    /// If `target` already sits in a split along the matching axis, the new
-    /// pane is appended as a sibling; otherwise a new `SplitAxis` wraps both.
+    /// If `target` already sits in a split along the matching axis, `new`
+    /// is inserted as a sibling; otherwise a new `SplitAxis` wraps both.
     /// Returns `true` if `target` was found.
-    fn split(
-        &mut self,
-        target: &Entity<Pane>,
-        new_pane: &Entity<Pane>,
-        direction: SplitDirection,
-    ) -> bool {
+    fn split(&mut self, target: &Entity<Pane>, new: &Member, direction: SplitDirection) -> bool {
         match self {
             Member::Pane(pane) => {
                 if pane.entity_id() != target.entity_id() {
                     return false;
                 }
                 let old = Member::Pane(pane.clone());
-                let new = Member::Pane(new_pane.clone());
+                let new = new.clone();
                 let (first, second) = if direction.increasing() {
                     (old, new)
                 } else {
@@ -182,7 +178,7 @@ impl Member {
                         && pane.entity_id() == target.entity_id()
                         && axis.axis == direction.axis()
                     {
-                        let new = Member::Pane(new_pane.clone());
+                        let new = new.clone();
                         let insert_at = if direction.increasing() { i + 1 } else { i };
                         axis.members.insert(insert_at, new);
                         axis.flexes.insert(insert_at, 1.0);
@@ -190,7 +186,7 @@ impl Member {
                     }
                 }
                 for member in &mut axis.members {
-                    if member.split(target, new_pane, direction) {
+                    if member.split(target, new, direction) {
                         return true;
                     }
                 }
@@ -981,7 +977,10 @@ impl TileGroup {
         let Some(ix) = self.tab_of(target) else {
             return;
         };
-        if !self.tabs[ix].root.split(target, &new_pane, direction) {
+        if !self.tabs[ix]
+            .root
+            .split(target, &Member::Pane(new_pane.clone()), direction)
+        {
             return;
         }
         self.adopt(&new_pane, cx);
@@ -1314,6 +1313,74 @@ impl TileGroup {
         cx.notify();
     }
 
+    fn handle_tab_dock_drop(
+        &mut self,
+        dragged: &drag::DraggedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.split_preview.drop_target(window.mouse_position());
+        self.split_preview.clear();
+        if let Some((pane, direction)) = target
+            && self.tab().panes.contains(&pane)
+        {
+            self.merge_tab(&dragged.group, dragged.tab, &pane, direction, cx);
+        }
+        cx.notify();
+    }
+
+    /// The panes a drag can land on: the zoomed one alone while zoomed,
+    /// since hidden panes keep stale bounds from before the zoom.
+    fn droppable_panes(&self) -> Vec<Entity<Pane>> {
+        let tab = self.tab();
+        match &tab.zoomed {
+            Some(pane) => vec![pane.clone()],
+            None => tab.panes.clone(),
+        }
+    }
+
+    /// Fold tab `id` of `source` (this group or another window's) into the
+    /// layout beside `target`, splitting toward `direction`. The tab's own
+    /// split tree comes along whole, and the tab closes.
+    pub fn merge_tab(
+        &mut self,
+        source: &Entity<TileGroup>,
+        id: TabId,
+        target: &Entity<Pane>,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        let take = |group: &mut TileGroup, cx: &mut Context<TileGroup>| {
+            let ix = group.tab_index(id)?;
+            (!group.tabs[ix].panes.contains(target)).then(|| group.remove_tab_at(ix, cx))
+        };
+        let tab = if source.entity_id() == cx.entity_id() {
+            take(self, cx)
+        } else {
+            source.update(cx, take)
+        };
+        let Some(tab) = tab else {
+            return;
+        };
+        let Some(ix) = self.tab_of(target) else {
+            return;
+        };
+        if !self.tabs[ix].root.split(target, &tab.root, direction) {
+            return;
+        }
+        for pane in &tab.panes {
+            self.adopt(pane, cx);
+        }
+        let focus = tab.active_pane();
+        let into = &mut self.tabs[ix];
+        into.zoomed = None;
+        into.panes.extend(tab.panes);
+        into.focused_pane = focus;
+        let id = into.id;
+        self.activate_tab(id, cx);
+        cx.notify();
+    }
+
     fn handle_pane_event(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
         match event {
             PaneEvent::Split { direction, item } => {
@@ -1452,14 +1519,30 @@ impl Render for TileGroup {
             .bg(theme.bg_secondary)
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<drag::DraggedPane>, _, cx| {
-                    // Hidden panes keep stale bounds from before the zoom,
-                    // so only the zoomed one can take a drop.
-                    let tab = this.tab();
-                    let panes = match &tab.zoomed {
-                        Some(pane) => vec![pane.clone()],
-                        None => tab.panes.clone(),
+                    let panes = this.droppable_panes();
+                    let source = Some(event.drag(cx).pane.clone());
+                    if this
+                        .split_preview
+                        .drag_move(&panes, source, event.event.position, cx)
+                    {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<drag::DraggedTab>, _, cx| {
+                    // A tab can't split into itself.
+                    let dragged = event.drag(cx);
+                    let own = dragged.group == cx.entity() && dragged.tab == this.active_tab();
+                    let panes = if own {
+                        Vec::new()
+                    } else {
+                        this.droppable_panes()
                     };
-                    if this.split_preview.drag_move(&panes, event, cx) {
+                    if this
+                        .split_preview
+                        .drag_move(&panes, None, event.event.position, cx)
+                    {
                         cx.notify();
                     }
                 }),
@@ -1515,7 +1598,8 @@ impl Render for TileGroup {
                     .w(bounds.size.width)
                     .h(bounds.size.height)
                     .occlude()
-                    .on_drop(cx.listener(Self::handle_dock_drop)),
+                    .on_drop(cx.listener(Self::handle_dock_drop))
+                    .on_drop(cx.listener(Self::handle_tab_dock_drop)),
             );
         }
         root
@@ -1980,7 +2064,7 @@ mod tests {
     }
 
     impl Render for Host {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .flex()
                 .flex_col()
@@ -1988,7 +2072,6 @@ mod tests {
                 .child(div().h(px(36.0)).flex().child(tab_bar::tab_list(
                     &self.group,
                     crate::config::TabPlacement::Top,
-                    window,
                     cx,
                 )))
                 .child(div().flex_1().child(self.group.clone()))
@@ -2180,6 +2263,80 @@ mod tests {
         );
         let scroll = cx.update(|_, cx| group.read(cx).bar.scroll.offset());
         assert!(scroll.x < px(0.0), "the bar scrolled sideways");
+    }
+
+    #[gpui::test]
+    fn a_tab_dropped_on_a_pane_folds_its_layout_in_beside_it(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let (a, b, c_tab) = cx.update(|_, cx| {
+            let b = group.read(cx).tabs[1].panes[0].clone();
+            let extra = pane("b2", cx);
+            group.update(cx, |group, cx| {
+                group.split_pane(&b, extra, SplitDirection::Down, cx)
+            });
+            let group = group.read(cx);
+            (
+                group.tabs[0].panes[0].clone(),
+                group.tabs[1].id,
+                group.tabs[2].id,
+            )
+        });
+        cx.refresh().unwrap();
+        let target = cx.update(|_, cx| a.read(cx).bounds());
+        let end = point(target.right() - px(10.0), target.center().y);
+        let tab = cx.debug_bounds("top-tab-1").unwrap().center();
+        drag(cx, tab, end);
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.update(|_, cx| {
+            let preview = group.read(cx).split_preview.target.clone();
+            assert_eq!(preview, Some((a.clone(), SplitDirection::Right)));
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let group = group.read(cx);
+            assert_eq!(group.tab_count(), 2, "the dropped tab closed");
+            assert!(group.tab_index(b).is_none());
+            assert!(group.tab_index(c_tab).is_some());
+            assert_eq!(group.panes().len(), 3, "both of its panes came along");
+            let Member::Axis(axis) = &group.tab().root else {
+                panic!("expected a split");
+            };
+            assert_eq!(axis.axis, Axis::Horizontal);
+            assert!(
+                matches!(axis.members[1], Member::Axis(_)),
+                "its own split stays whole"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_tab_cannot_fold_into_itself(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx)], cx);
+        let a = cx.update(|_, cx| group.read(cx).panes()[0].clone());
+        let target = cx.update(|_, cx| a.read(cx).bounds());
+        let tab = cx.debug_bounds("top-tab-0").unwrap().center();
+        let end = point(target.right() - px(10.0), target.center().y);
+        drag(cx, tab, end);
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.update(|_, cx| assert_eq!(group.read(cx).tab_count(), 2));
+    }
+
+    #[gpui::test]
+    fn the_new_tab_button_slides_with_the_tabs(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx)], cx);
+        let before = cx.debug_bounds("new-top-tab").unwrap();
+        let first = cx.update(|_, cx| group.read(cx).tabs[0].id);
+        cx.update(|_, cx| group.update(cx, |group, cx| group.close_tab(first, cx)));
+        cx.refresh().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        // A test window draws as an update's effects flush.
+        cx.update(|window, _| window.refresh());
+        let moving = cx.debug_bounds("new-top-tab").unwrap();
+        assert!(
+            moving.origin.x < before.origin.x && moving.origin.x > px(100.0),
+            "the button glides left rather than jumping"
+        );
     }
 
     #[gpui::test]

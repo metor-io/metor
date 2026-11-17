@@ -193,7 +193,7 @@ impl Pane {
         cx.notify();
     }
 
-    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let title = self
             .item
@@ -201,7 +201,6 @@ impl Pane {
             .map(|item| item.tab_title(cx))
             .unwrap_or_else(|| SharedString::new_static("New panel"));
         let can_close = self.item.as_ref().is_none_or(|item| item.can_close(cx));
-        let text_style = window.text_style();
 
         let button = |id: &'static str, icon: Icon, tooltip: &'static str| {
             let hover_bg = theme.bg_primary;
@@ -232,9 +231,8 @@ impl Pane {
             .flex_shrink_0()
             .pl(px(8.0))
             .pr(px(3.0))
-            .bg(theme.bg_secondary)
-            .border_b_1()
-            .border_color(theme.border_primary)
+            // Part of the panel rather than a strip above it, as in Rex.
+            .bg(theme.bg_primary)
             .text_size(px(12.0))
             .text_color(theme.text_secondary)
             .on_click(cx.listener(|_, event: &ClickEvent, _, cx| {
@@ -318,7 +316,7 @@ impl Pane {
                     cx.new(|_| super::drag::DragGhost {
                         title: title.clone(),
                         width: None,
-                        text_style: text_style.clone(),
+                        closable: can_close,
                     })
                 },
             );
@@ -359,9 +357,7 @@ impl Render for Pane {
             .flex_col()
             .size_full()
             .child(bounds_tracker)
-            .when(!self.hide_header, |pane| {
-                pane.child(self.render_header(window, cx))
-            })
+            .when(!self.hide_header, |pane| pane.child(self.render_header(cx)))
             .child(content)
     }
 }

@@ -55,35 +55,35 @@ pub(crate) fn take_active_drag(cx: &mut App) -> Option<ActiveDrag> {
 }
 
 /// The floating title that follows the pointer while a pane or tab is
-/// dragged.
+/// dragged, drawn like the tab it lifted.
+///
+/// gpui draws a drag view as its own root, outside the window root that
+/// sets the UI font, so the ghost names the font itself.
 pub(super) struct DragGhost {
     pub title: gpui::SharedString,
     /// The width of the tab being dragged, so it lifts at its own size.
     pub width: Option<Pixels>,
-    pub text_style: gpui::TextStyle,
+    pub closable: bool,
 }
 
 impl Render for DragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let mut ghost = div();
-        *ghost.text_style() = gpui::TextStyleRefinement {
-            font_family: Some(self.text_style.font_family.clone()),
-            font_features: Some(self.text_style.font_features.clone()),
-            font_fallbacks: self.text_style.font_fallbacks.clone(),
-            font_weight: Some(self.text_style.font_weight),
-            font_style: Some(self.text_style.font_style),
-            line_height: Some(self.text_style.line_height),
-            ..Default::default()
-        };
-        ghost
+        div()
             .debug_selector(|| "drag-ghost".into())
+            .when_some(
+                cx.try_global::<crate::theme::FontSettings>()
+                    .map(|font| font.family.clone()),
+                |ghost, family| ghost.font_family(family),
+            )
             .flex()
             .items_center()
+            .gap(px(4.0))
             .h(px(crate::theme::CONTROL_HEIGHT))
             .max_w(px(super::tab_bar::TAB_MAX_WIDTH))
             .when_some(self.width, |ghost, width| ghost.w(width))
-            .px(px(8.0))
+            .pl(px(8.0))
+            .pr(px(if self.closable { 4.0 } else { 8.0 }))
             .rounded(px(crate::theme::CONTROL_RADIUS))
             .border_1()
             .border_color(theme.border_primary)
@@ -91,7 +91,16 @@ impl Render for DragGhost {
             .shadow_md()
             .text_size(px(12.0))
             .text_color(theme.text_primary)
-            .child(div().truncate().child(self.title.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.title.clone()),
+            )
+            .when(self.closable, |ghost| {
+                ghost.child(super::tab_bar::close_icon(&theme))
+            })
     }
 }
 

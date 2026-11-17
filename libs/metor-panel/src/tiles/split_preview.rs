@@ -1,12 +1,9 @@
 //! Temporary split layout, using the same insertion rules as the committed tree.
 use std::{collections::HashMap, time::Duration};
 
-use gpui::{App, AppContext, Bounds, DragMoveEvent, Entity, EntityId, Pixels, Point, Window};
+use gpui::{App, AppContext, Bounds, Entity, EntityId, Pixels, Point, Window};
 
-use super::{
-    Member, Pane, SplitDirection,
-    drag::{DraggedPane, nearest_edge},
-};
+use super::{Member, Pane, SplitDirection, drag::nearest_edge};
 use crate::motion::Fade;
 
 const DURATION: Duration = Duration::from_millis(120);
@@ -30,14 +27,19 @@ pub(super) struct SplitPreview {
     /// the target out from under a still pointer.
     regions: Vec<(Entity<Pane>, Bounds<Pixels>)>,
     gaps: Vec<Gap>,
+    /// The pane being dragged, which can't be its own target; `None` while
+    /// a whole tab is dragged.
     source: Option<Entity<Pane>>,
 }
 
 impl SplitPreview {
+    /// Follow a drag of `source` (a pane, or a whole tab when `None`) to
+    /// `position` over `panes`.
     pub fn drag_move(
         &mut self,
         panes: &[Entity<Pane>],
-        event: &DragMoveEvent<DraggedPane>,
+        source: Option<Entity<Pane>>,
+        position: Point<Pixels>,
         cx: &mut App,
     ) -> bool {
         // A tab opened mid-drag has panes never drawn before; measure again
@@ -51,22 +53,21 @@ impl SplitPreview {
                 .map(|pane| (pane.clone(), pane.read(cx).bounds()))
                 .collect();
         }
-        let dragged = event.drag(cx).pane.clone();
-        let target = self.hit(panes, &dragged, event.event.position);
-        self.source = Some(dragged);
+        let target = self.hit(panes, source.as_ref(), position);
+        self.source = source;
         self.set_target(target, cx)
     }
 
     fn hit(
         &self,
         panes: &[Entity<Pane>],
-        dragged: &Entity<Pane>,
+        dragged: Option<&Entity<Pane>>,
         position: Point<Pixels>,
     ) -> Option<(Entity<Pane>, SplitDirection)> {
         self.regions
             .iter()
             .find(|(pane, bounds)| {
-                pane != dragged
+                Some(pane) != dragged
                     && panes.contains(pane)
                     && bounds.contains(&position)
                     && bounds.size.width > gpui::px(0.0)
@@ -131,11 +132,11 @@ impl SplitPreview {
             if amount == 0.0 && !active {
                 return false;
             }
-            if !root
-                .as_mut()
-                .unwrap()
-                .split(&gap.target, &gap.placeholder, gap.direction)
-            {
+            if !root.as_mut().unwrap().split(
+                &gap.target,
+                &Member::Pane(gap.placeholder.clone()),
+                gap.direction,
+            ) {
                 return false;
             }
             weights.insert(gap.placeholder.entity_id(), amount);
@@ -164,9 +165,8 @@ impl SplitPreview {
     }
 
     pub fn drop_target(&self, position: Point<Pixels>) -> Option<(Entity<Pane>, SplitDirection)> {
-        let source = self.source.as_ref()?;
         let panes: Vec<_> = self.regions.iter().map(|(pane, _)| pane.clone()).collect();
-        self.hit(&panes, source, position)
+        self.hit(&panes, self.source.as_ref(), position)
     }
 
     /// Measure the panes again on the next move, for a tree that changed

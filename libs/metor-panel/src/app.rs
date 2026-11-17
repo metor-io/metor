@@ -1085,7 +1085,6 @@ impl AppRoot {
             .child(tab_bar::tab_list(
                 &self.tiles,
                 crate::config::TabPlacement::Side,
-                window,
                 cx,
             ))
             .child(handle)
@@ -1206,12 +1205,7 @@ impl AppRoot {
             .items_center()
             .px(px(6.0))
             .when(placement == TabPlacement::Top, |tabs| {
-                tabs.child(crate::tiles::tab_bar::tab_list(
-                    &self.tiles,
-                    placement,
-                    window,
-                    cx,
-                ))
+                tabs.child(crate::tiles::tab_bar::tab_list(&self.tiles, placement, cx))
             });
 
         let mut right = div()
