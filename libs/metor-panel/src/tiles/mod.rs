@@ -2218,6 +2218,24 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_lifted_tab_leaves_its_gap_while_the_pointer_is_off_the_bar(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let a = cx.debug_bounds("top-tab-0").unwrap();
+        let b_before = cx.debug_bounds("top-tab-1").unwrap();
+        let away = point(a.center().x, a.bottom() + px(200.0));
+        drag(cx, a.center(), away);
+        cx.update(|_, cx| assert!(group.read(cx).bar.lifted.is_some()));
+        assert_eq!(
+            cx.debug_bounds("top-tab-1").unwrap().origin,
+            b_before.origin,
+            "b holds its place beside the gap"
+        );
+        cx.simulate_mouse_up(away, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| assert_eq!(titles(&group, cx), ["a", "b", "c"]));
+    }
+
+    #[gpui::test]
     fn a_dragged_tab_opens_a_gap_and_its_neighbours_slide(cx: &mut TestAppContext) {
         let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
         let ids: Vec<TabId> = cx.update(|_, cx| group.read(cx).tabs.iter().map(|t| t.id).collect());

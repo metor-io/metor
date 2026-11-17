@@ -214,17 +214,23 @@ pub(crate) fn tab_list(
         })
         .map(Some)
         .collect();
-    if let Some(preview) = preview {
+    // A lifted tab leaves its slot open until the pointer, over the bar,
+    // picks another; off the bar the gap waits where the tab came from.
+    let landing = preview.or_else(|| {
+        let tab = lifted?;
+        let ix = tabs.iter().position(|(id, ..)| *id == tab)?;
+        Some(DragPreview {
+            tab,
+            before: tabs.get(ix + 1).map(|(id, ..)| *id),
+            extent: slot_extent(&sizes, tab, vertical),
+        })
+    });
+    if let Some(landing) = landing {
         let slot = order
             .iter()
-            .position(|ix| Some(tabs[ix.unwrap()].0) == preview.before)
+            .position(|ix| Some(tabs[ix.unwrap()].0) == landing.before)
             .unwrap_or(order.len());
-        let original_slot = tabs.iter().position(|tab| tab.0 == preview.tab);
-        // Lifting closes the source gap at once; open an insertion gap only
-        // over a different slot or another window's bar.
-        if original_slot != Some(slot) {
-            order.insert(slot, None);
-        }
+        order.insert(slot, None);
     }
     if reveal
         && let Some(slot) = order
@@ -255,7 +261,7 @@ pub(crate) fn tab_list(
                 list = list.child(MovingTab::new(id, tab, rail.clone(), animate, vertical));
             }
             None => {
-                let extent = preview.map(|preview| preview.extent - px(TAB_GAP));
+                let extent = landing.map(|landing| landing.extent - px(TAB_GAP));
                 let gap = div().flex_shrink_0();
                 list = list.child(match (vertical, extent) {
                     (true, Some(extent)) => gap.w_full().h(extent),
