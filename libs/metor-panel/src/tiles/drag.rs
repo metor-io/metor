@@ -80,11 +80,11 @@ impl Render for DragGhost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // gpui draws the drag view in every window it redraws, and only
         // within each; the ghost belongs to the window the drag began in,
-        // and where a preview window rides the pointer, that stands in
-        // for it, unclipped by the window's edge.
+        // and where the chip rides the pointer in a window of its own
+        // (`drag_chip`), that stands in for it, unclipped by the edge.
         let this = window.window_handle();
         let here = active_drag(cx).is_some_and(|drag| drag.source_window == this)
-            && !crate::tear_out::riding(this, cx);
+            && !crate::drag_chip::riding(this, cx);
         if !here {
             return div();
         }
@@ -94,8 +94,8 @@ impl Render for DragGhost {
     }
 }
 
-/// A lifted tab: the ghost under the pointer, and the header of the
-/// drag-out preview that grows from it, so the two read as one thing.
+/// A lifted tab, as the ghost draws it and the chip that stands in for the
+/// ghost on macOS.
 pub(crate) fn ghost_chip(title: gpui::SharedString, closable: bool, cx: &App) -> gpui::Div {
     let theme = theme(cx);
     div()

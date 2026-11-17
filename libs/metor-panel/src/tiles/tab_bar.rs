@@ -480,7 +480,7 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
                     (title, group.bar.sizes.borrow().get(&dragged.tab).copied())
                 });
                 let width = size.map(|size| size.width);
-                crate::tear_out::begin(title.clone(), width, window, cx);
+                crate::drag_chip::begin(title.clone(), width, window, cx);
                 cx.new(|_| DragGhost {
                     title,
                     width,

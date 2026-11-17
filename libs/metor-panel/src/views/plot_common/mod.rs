@@ -279,29 +279,16 @@ pub(crate) fn gpu_frame<T: 'static>(
     canvas(
         move |bounds, window, cx| {
             let scale_factor = window.scale_factor();
-            // A drag preview shows a frame the plot's own window rendered,
-            // scaled: rendering at the preview's size too would reallocate
-            // the target twice a frame. Releasing frames is that window's
-            // business.
-            let preview = crate::tear_out::is_preview(window, cx);
             let (frame, released) = entity
                 .update(cx, |plot, cx| {
-                    if !preview && let Some(handle) = submit(plot, bounds, scale_factor, cx) {
+                    if let Some(handle) = submit(plot, bounds, scale_factor, cx) {
                         handle.spawn_and_set(cx, gpu_state);
                     }
-                    let view = cx.entity_id();
                     let state = gpu_state(plot);
-                    let placement = state.placement(bounds, scale_factor);
-                    let mut image = state.current_frame();
-                    let released = if preview {
-                        None
-                    } else {
-                        state.take_pending_release()
-                    };
-                    if preview {
-                        image = crate::tear_out::preview_frame(view, image, cx);
-                    }
-                    (image.map(|img| (img, placement)), released)
+                    let frame = state
+                        .current_frame()
+                        .map(|img| (img, state.placement(bounds, scale_factor)));
+                    (frame, state.take_pending_release())
                 })
                 .unwrap_or((None, None));
             if let Some(img) = released {

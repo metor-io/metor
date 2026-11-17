@@ -24,7 +24,7 @@ use crate::tiles::{
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, MouseUpEvent,
-    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
+    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use stellarator::net::TcpListener;
@@ -45,7 +45,7 @@ actions!(
     ]
 );
 
-pub(crate) const TITLEBAR_HEIGHT: f32 = 36.0;
+const TITLEBAR_HEIGHT: f32 = 36.0;
 
 /// Window-level view that owns the tile tree and any active inspector overlay.
 ///
@@ -524,15 +524,14 @@ impl AppRoot {
         let Some(drag) = crate::tiles::take_active_drag(cx) else {
             return;
         };
-        // Screen-space drop point: the pointer holds the new window by its
-        // titlebar where it held the ghost, as it held the preview.
-        // The pointer holds the new window's panes where it held the
-        // preview's, just below the tab it dragged.
-        let window_size = crate::tear_out::torn_size(&drag.source, window, cx);
-        let chrome = crate::tear_out::window_chrome(cx);
-        let origin =
-            window.bounds().origin + event.position + crate::tear_out::panes_offset(drag.grab)
-                - point(chrome.width, chrome.height);
+        // Screen-space drop point: the new window's titlebar lands where
+        // the chip was, the pointer holding it as it held the chip.
+        let window_size = torn_size(&drag.source, window, cx);
+        let titlebar_inset = point(
+            px(0.0),
+            px((TITLEBAR_HEIGHT - crate::theme::CONTROL_HEIGHT) / 2.0),
+        );
+        let origin = window.bounds().origin + event.position - drag.grab - titlebar_inset;
         let db = self.db.clone();
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
@@ -580,21 +579,6 @@ impl AppRoot {
 
     /// Show the window a drag would tear out, in miniature, while the drag
     /// is outside this window, and put it away when the drag comes back.
-    /// Unfold the dragged content's panes below its tab while the drag is
-    /// outside this window, and fold them away when it comes back.
-    fn preview_drag_out(
-        &mut self,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let this = window.window_handle();
-        let outside = !in_viewport(position, window);
-        if crate::tear_out::riding(this, cx) && outside != crate::tear_out::expanded(this, cx) {
-            crate::tear_out::set_expanded(outside, cx);
-        }
-    }
-
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -749,20 +733,10 @@ impl Render for AppRoot {
                 crate::tiles::take_active_drag(cx);
             })
             .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(Self::handle_drag_out))
-            .on_drag_move(cx.listener(
-                |this, event: &gpui::DragMoveEvent<crate::tiles::drag::DraggedTab>, window, cx| {
-                    this.preview_drag_out(event.event.position, window, cx)
-                },
-            ))
-            .on_drag_move(cx.listener(
-                |this, event: &gpui::DragMoveEvent<crate::tiles::drag::DraggedPane>, window, cx| {
-                    this.preview_drag_out(event.event.position, window, cx)
-                },
-            ))
             .child(
                 gpui::canvas(
                     |_, _, _| (),
-                    |_, _, window, _| crate::tear_out::listen(window),
+                    |_, _, window, _| crate::drag_chip::listen(window),
                 )
                 .absolute()
                 .size_0(),
@@ -2295,6 +2269,21 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
+/// The size of the window a pane or tab tears out into: a pane keeps its
+/// own size (with room for a titlebar), a tab takes its window's.
+fn torn_size(source: &DragSource, window: &Window, cx: &App) -> gpui::Size<Pixels> {
+    match source {
+        DragSource::Pane(pane) => {
+            let outer = pane.read(cx).current_outer_size();
+            size(
+                px(outer.width.max(400.0)),
+                px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
+            )
+        }
+        DragSource::Tab(..) => window.bounds().size,
+    }
+}
+
 /// Whether `position` (window coordinates) lies within the window's content.
 fn in_viewport(position: Point<Pixels>, window: &Window) -> bool {
     let viewport = window.viewport_size();
@@ -2474,7 +2463,7 @@ mod window_tests {
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
-    fn a_tab_dragged_outside_shows_its_window_and_tears_out_only_on_release(
+    fn a_dragged_tab_rides_in_its_own_chip_window_and_tears_out_on_release(
         cx: &mut TestAppContext,
     ) {
         let (tiles, window, _dir) = open(2, cx);
@@ -2489,7 +2478,6 @@ mod window_tests {
                 )
             })
         };
-        let source = window.into();
         let start = cx.debug_bounds("top-tab-1").unwrap().center();
         let outside = point(px(-80.0), start.y);
         cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
@@ -2499,51 +2487,42 @@ mod window_tests {
             Default::default(),
         );
         cx.run_until_parked();
-        assert_eq!(
-            windows(cx),
-            (1, 2),
-            "the dragged tab rides in its own window"
-        );
+        assert_eq!(windows(cx), (1, 2), "the chip rides in its own window");
         assert!(
             cx.debug_bounds("drag-ghost").is_none(),
             "which stands in for gpui's ghost"
         );
-        let previews = cx.update(|_, cx| {
-            cx.windows()
-                .into_iter()
-                .filter(|handle| {
-                    handle
-                        .update(cx, |_, window, cx| crate::tear_out::is_preview(window, cx))
-                        .unwrap_or(false)
-                })
-                .count()
-        });
-        assert_eq!(previews, 1, "views know which window only previews them");
-        assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
 
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
-        assert_eq!(
-            windows(cx),
-            (1, 2),
-            "its panes unfold; nothing torn out yet"
-        );
         assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 2);
-        assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
-
-        // Coming back folds the panes away; the drag carries on.
-        cx.simulate_mouse_move(start, MouseButton::Left, Default::default());
-        cx.run_until_parked();
-        assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
-        assert!(cx.update(|_, cx| cx.has_active_drag()));
-
-        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
-        cx.run_until_parked();
-        assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
         cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
-        assert_eq!(windows(cx), (2, 2), "the tab's window, and no preview");
+        assert_eq!(windows(cx), (2, 2), "the tab's window, and no chip");
         assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn the_chip_goes_when_a_tab_is_dropped_back_on_the_bar(cx: &mut TestAppContext) {
+        let (_tiles, window, _dir) = open(2, cx);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let start = cx.debug_bounds("top-tab-1").unwrap().center();
+        let over = cx.debug_bounds("top-tab-0").unwrap().center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            start + point(px(12.0), px(0.0)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        cx.simulate_mouse_move(over, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+        cx.simulate_mouse_up(over, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 1, "the chip is gone");
     }
 
     #[gpui::test]

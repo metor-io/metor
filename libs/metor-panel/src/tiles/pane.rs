@@ -315,7 +315,7 @@ impl Pane {
                         },
                         cx,
                     );
-                    crate::tear_out::begin(title.clone(), None, window, cx);
+                    crate::drag_chip::begin(title.clone(), None, window, cx);
                     cx.new(|_| super::drag::DragGhost {
                         title: title.clone(),
                         width: None,

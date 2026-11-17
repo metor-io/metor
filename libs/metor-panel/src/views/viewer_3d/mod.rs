@@ -879,19 +879,6 @@ impl Render for Viewer3d {
                     {
                         let this = cx.entity().downgrade();
                         move |bounds: Bounds<Pixels>, window, cx| {
-                            // A drag preview shows a frame the viewer's own
-                            // window rendered, scaled: one render
-                            // target can't serve two sizes, and resizing it
-                            // each frame would fight that window.
-                            if crate::tear_out::is_preview(window, cx) {
-                                let Some(this) = this.upgrade() else {
-                                    return (bounds, None);
-                                };
-                                let latest = this.read(cx).current_frame.clone();
-                                let frame =
-                                    crate::tear_out::preview_frame(this.entity_id(), latest, cx);
-                                return (bounds, frame);
-                            }
                             let scale = window.scale_factor();
                             let new_size = Viewer3d::quantize(bounds.size, scale);
 
