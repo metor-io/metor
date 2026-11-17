@@ -147,6 +147,10 @@ pub(crate) fn open_panel_window(
             // wraps itself in resize borders and a shadow via
             // `window_controls::client_side_decorations`.
             window_decorations: Some(gpui::WindowDecorations::Client),
+            // macOS would otherwise drag the window from anywhere in the
+            // titlebar strip, taking the pointer from the tabs that live
+            // there. The window root moves the window itself instead.
+            app_owns_titlebar_drag: true,
             app_id: Some("metor-panel".into()),
             ..Default::default()
         },

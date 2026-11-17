@@ -151,7 +151,7 @@ impl Pane {
         cx.notify();
     }
 
-    pub(super) fn bounds(&self) -> Bounds<Pixels> {
+    pub(crate) fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
     }
 

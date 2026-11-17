@@ -79,9 +79,9 @@ pub(crate) struct AppRoot {
     /// something connects (the first-open case). Drained in `render` like
     /// the other pending requests so focus transfer has a `Window`.
     pending_connection_picker: Option<bool>,
-    /// Armed by mouse-down on the titlebar; the next mouse-move hands the
-    /// drag to the compositor via `start_window_move` (Linux — macOS and
-    /// Windows drag natively through the transparent titlebar / HTCAPTION).
+    /// Armed by mouse-down on the titlebar's open space; the next mouse-move
+    /// moves the window via `start_window_move` (macOS and Linux — Windows
+    /// drags natively through the HTCAPTION hit-test).
     should_move: bool,
     /// Left edge of the tab sidebar at its last paint, which a drag on its
     /// resize edge measures the new width from.
@@ -296,9 +296,11 @@ impl AppRoot {
         });
     }
 
-    /// Close the current tab, or the window once nothing is open.
+    /// Close the current tab, or the window once it is down to one empty
+    /// tab.
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tiles.read(cx).has_items(cx) {
+        let tiles = self.tiles.read(cx);
+        if tiles.tab_count() == 1 && !tiles.has_items(cx) {
             crate::window_controls::close_window(window, cx);
             return;
         }
@@ -945,9 +947,9 @@ impl AppRoot {
             .bg(theme.border_primary)
     }
 
-    /// Make `area` drag the window the way the titlebar does: natively on
-    /// macOS and Windows, by handing the gesture to the compositor on Linux,
-    /// with a double-click zooming the window.
+    /// Make `area` drag the window: natively on Windows (the HTCAPTION
+    /// hit-test), and by handing the press to the platform on macOS and
+    /// Linux, with a double-click zooming the window.
     fn window_drag_area(
         &self,
         area: gpui::Stateful<gpui::Div>,
@@ -961,20 +963,26 @@ impl AppRoot {
             // default-prevented mouse-down as handled — swallowing the
             // WM_NCLBUTTONDOWN that starts the native caption drag.
             .occlude()
-            // Drag gesture for compositors that need an explicit hand-off:
-            // mouse-down arms, the first mouse-move starts the compositor
-            // drag. macOS drags natively via the transparent titlebar and
-            // Windows via the HTCAPTION hit-test, so these never fire there.
+            // Mouse-down arms, the first mouse-move with the button still
+            // held starts the window move. A press on a tab never arms it
+            // (tabs stop it), and a pane or tab drag passing over the bar
+            // must not be taken over by an arm left from an earlier press.
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, _| this.should_move = true),
             )
-            .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.should_move {
-                    this.should_move = false;
-                    window.start_window_move();
-                }
-            }))
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if this.should_move {
+                        this.should_move = false;
+                        if event.pressed_button == Some(gpui::MouseButton::Left)
+                            && !cx.has_active_drag()
+                        {
+                            window.start_window_move();
+                        }
+                    }
+                }),
+            )
             .on_mouse_up(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, _| this.should_move = false),
@@ -2331,5 +2339,138 @@ mod keybinding_tests {
             &["AppRoot PaneZoomed", "Inspector TextInput"]
         ));
         assert!(!fires(EXIT_ZOOM, &["AppRoot PaneZoomed", "Transient"]));
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::tiles::{Pane, PaneItem, PaneItemHandle, SplitDirection};
+    use gpui::{MouseButton, TestAppContext, VisualTestContext};
+
+    struct Item(&'static str);
+
+    impl Render for Item {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    impl PaneItem for Item {
+        type Config = ();
+        fn tab_title(&self, _: &App) -> SharedString {
+            self.0.into()
+        }
+        fn serialization_key() -> &'static str {
+            "window-test-item"
+        }
+        fn to_config(&self, _: &App) {}
+    }
+
+    fn item(title: &'static str, cx: &mut App) -> Box<dyn PaneItemHandle> {
+        Box::new(cx.new(|_| Item(title)))
+    }
+
+    /// A real panel window holding `tabs` tabs, the first split in two.
+    fn open(
+        tabs: usize,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<TileGroup>,
+        gpui::WindowHandle<AppRoot>,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(directory.path().join("db")).unwrap());
+        let (tiles, window) = cx.update(|cx| {
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
+            cx.set_global(crate::theme::ActiveTheme(Arc::new(
+                crate::theme::DARK.clone(),
+            )));
+            cx.set_global(crate::tiles::ItemRegistry::default());
+            crate::inspector::edits::init(cx);
+            crate::temporal::TemporalController::init(db.clone(), cx);
+            cx.bind_keys([KeyBinding::new("secondary-w", CloseTab, None)]);
+            let tiles = cx.new(|cx| {
+                let items = (0..tabs).map(|_| item("tab", cx)).collect();
+                let mut tiles = TileGroup::new(items, cx);
+                let first = tiles.panes()[0].clone();
+                let right = cx.new(|cx| Pane::new(Some(item("right", cx)), cx));
+                tiles.split_pane(&first, right, SplitDirection::Right, cx);
+                tiles
+            });
+            let window =
+                crate::workspace::open_panel_window(db, None, Some(tiles.clone()), false, cx)
+                    .unwrap();
+            (tiles, window)
+        });
+        (tiles, window, directory)
+    }
+
+    #[gpui::test]
+    fn a_pane_dragged_by_its_header_in_a_real_window_splits_its_target(cx: &mut TestAppContext) {
+        let (tiles, window, _dir) = open(1, cx);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let (left, right) = cx.update(|_, cx| {
+            let panes = tiles.read(cx).panes().to_vec();
+            (panes[0].clone(), panes[1].clone())
+        });
+        let target = cx.update(|_, cx| left.read(cx).bounds());
+        let start = cx.update(|_, cx| right.read(cx).bounds().origin) + point(px(40.0), px(14.0));
+        let end = point(target.center().x, target.bottom() - px(10.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            start + point(px(8.0), px(0.0)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        let below = cx.update(|_, cx| {
+            let left = left.read(cx).bounds();
+            let right = right.read(cx).bounds();
+            right.origin.y > left.origin.y && right.origin.x == left.origin.x
+        });
+        assert!(below, "the dragged pane now sits below its target");
+    }
+
+    #[gpui::test]
+    fn cmd_w_closes_one_tab_and_the_window_only_once_nothing_is_left(cx: &mut TestAppContext) {
+        let (tiles, window, _dir) = open(1, cx);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        window
+            .update(cx, |root, window, cx| root.focus_handle.focus(window, cx))
+            .unwrap();
+        cx.update(|_, cx| {
+            tiles.update(cx, |tiles, cx| {
+                tiles.new_tab(cx);
+                tiles.new_tab(cx);
+            })
+        });
+        // Two empty tabs and one with panes: each press takes one tab.
+        for remaining in [2, 1] {
+            cx.simulate_keystrokes("cmd-w");
+            assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), remaining);
+        }
+        cx.simulate_keystrokes("cmd-w");
+        assert!(cx.update(|_, cx| !tiles.read(cx).has_items(cx)));
+        assert!(
+            window.update(cx, |_, _, _| ()).is_ok(),
+            "one empty tab keeps the window"
+        );
+        cx.simulate_keystrokes("cmd-w");
+        assert!(
+            window.update(cx, |_, _, _| ()).is_err(),
+            "then the window closes"
+        );
     }
 }
