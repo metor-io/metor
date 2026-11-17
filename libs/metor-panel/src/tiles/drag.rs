@@ -43,6 +43,8 @@ pub struct ActiveDrag {
     pub grab: Point<Pixels>,
     /// The ghost's size once it has been laid out.
     pub ghost: Option<gpui::Size<Pixels>>,
+    /// Whether the ghost shows a close button, as its tab does.
+    pub closable: bool,
 }
 
 impl Global for ActiveDrag {}
@@ -78,7 +80,6 @@ pub(super) struct DragGhost {
 
 impl Render for DragGhost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme(cx);
         // gpui draws the drag view in every window it redraws, the
         // drag-out preview among them; the ghost belongs to the window the
         // drag began in, and hides there while the preview is out.
@@ -99,41 +100,42 @@ impl Render for DragGhost {
         )
         .absolute()
         .size_full();
-        div()
+        ghost_chip(self.title.clone(), self.closable, cx)
             .debug_selector(|| "drag-ghost".into())
             .relative()
             .child(measure)
-            .when_some(
-                cx.try_global::<crate::theme::FontSettings>()
-                    .map(|font| font.family.clone()),
-                |ghost, family| ghost.font_family(family),
-            )
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .h(px(crate::theme::CONTROL_HEIGHT))
-            .max_w(px(super::tab_bar::TAB_MAX_WIDTH))
             .when_some(self.width, |ghost, width| ghost.w(width))
-            .pl(px(8.0))
-            .pr(px(if self.closable { 4.0 } else { 8.0 }))
-            .rounded(px(crate::theme::CONTROL_RADIUS))
-            .border_1()
-            .border_color(theme.border_primary)
-            .bg(theme.bg_elevated)
-            .shadow_md()
-            .text_size(px(12.0))
-            .text_color(theme.text_primary)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(self.title.clone()),
-            )
-            .when(self.closable, |ghost| {
-                ghost.child(super::tab_bar::close_icon(&theme))
-            })
     }
+}
+
+/// A lifted tab: the ghost under the pointer, and the header of the
+/// drag-out preview that grows from it, so the two read as one thing.
+pub(crate) fn ghost_chip(title: gpui::SharedString, closable: bool, cx: &App) -> gpui::Div {
+    let theme = theme(cx);
+    div()
+        .when_some(
+            cx.try_global::<crate::theme::FontSettings>()
+                .map(|font| font.family.clone()),
+            |ghost, family| ghost.font_family(family),
+        )
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .h(px(crate::theme::CONTROL_HEIGHT))
+        .max_w(px(super::tab_bar::TAB_MAX_WIDTH))
+        .pl(px(8.0))
+        .pr(px(if closable { 4.0 } else { 8.0 }))
+        .rounded(px(crate::theme::CONTROL_RADIUS))
+        .border_1()
+        .border_color(theme.border_primary)
+        .bg(theme.bg_elevated)
+        .shadow_md()
+        .text_size(px(12.0))
+        .text_color(theme.text_primary)
+        .child(div().flex_1().min_w_0().truncate().child(title))
+        .when(closable, |ghost| {
+            ghost.child(super::tab_bar::close_icon(&theme))
+        })
 }
 
 /// Payload identifying which split handle is being dragged.

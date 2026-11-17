@@ -312,6 +312,7 @@ impl Pane {
                             source_window: window.window_handle(),
                             grab,
                             ghost: None,
+                            closable: can_close,
                         },
                         cx,
                     );

@@ -24,7 +24,7 @@ use crate::tiles::{
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, MouseUpEvent,
-    Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, size,
+    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use stellarator::net::TcpListener;
@@ -526,9 +526,13 @@ impl AppRoot {
         };
         // Screen-space drop point: the pointer holds the new window by its
         // titlebar where it held the ghost, as it held the preview.
+        // The pointer holds the new window's panes where it held the
+        // preview's, just below the tab it dragged.
         let window_size = torn_size(&drag.source, window, cx);
-        let origin = window.bounds().origin + event.position
-            - crate::tear_out::grab_point(drag.grab, self.torn_tab_origin(cx));
+        let chrome = window_chrome(cx);
+        let origin =
+            window.bounds().origin + event.position + crate::tear_out::panes_offset(drag.grab)
+                - point(chrome.width, chrome.height);
         let db = self.db.clone();
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
@@ -576,13 +580,6 @@ impl AppRoot {
 
     /// Show the window a drag would tear out, in miniature, while the drag
     /// is outside this window, and put it away when the drag comes back.
-    /// Where a window torn out of this one shows its tab: where this
-    /// window's first tab sits, since the new window lays its bar out alike.
-    fn torn_tab_origin(&self, cx: &App) -> Point<Pixels> {
-        crate::tiles::tab_bar::first_tab_origin(&self.tiles, cx)
-            .unwrap_or_else(crate::tear_out::default_tab_origin)
-    }
-
     fn preview_drag_out(
         &mut self,
         position: Point<Pixels>,
@@ -613,28 +610,18 @@ impl AppRoot {
         let Some((title, replica)) = replica else {
             return;
         };
-        let extent = tear_out::preview_size(torn_size(&drag.source, window, cx), cx);
-        let tab = self.torn_tab_origin(cx);
-        let grab = tear_out::grab_point(drag.grab, tab);
-        let sidebar = (crate::tiles::tab_bar::placement(cx) == crate::config::TabPlacement::Side)
-            .then(|| crate::tiles::tab_bar::sidebar_width(cx));
         let spec = tear_out::Spec {
-            bounds: Bounds {
-                origin: window.bounds().origin + position - grab,
-                size: extent,
-            },
-            tab: Bounds {
-                origin: tab,
-                size: drag.ghost.unwrap_or(size(
-                    px(crate::tiles::tab_bar::TAB_MAX_WIDTH),
-                    px(crate::theme::CONTROL_HEIGHT),
-                )),
-            },
-            sidebar,
             title,
+            closable: drag.closable,
+            tab: drag.ghost.unwrap_or(size(
+                px(crate::tiles::tab_bar::TAB_MAX_WIDTH),
+                px(crate::theme::CONTROL_HEIGHT),
+            )),
+            grab: drag.grab,
+            panes: torn_size(&drag.source, window, cx) - window_chrome(cx),
             replica,
         };
-        tear_out::open(this, spec, cx);
+        tear_out::open(this, window.bounds().origin + position, spec, cx);
     }
 
     fn handle_tile_event(
@@ -2350,6 +2337,16 @@ fn torn_size(source: &DragSource, window: &Window, cx: &App) -> gpui::Size<Pixel
         }
         DragSource::Tab(..) => window.bounds().size,
     }
+}
+
+/// What a panel window's frame takes from its panes: the titlebar, and the
+/// tab sidebar when tabs sit down the side.
+fn window_chrome(cx: &App) -> gpui::Size<Pixels> {
+    let sidebar = match crate::tiles::tab_bar::placement(cx) {
+        crate::config::TabPlacement::Side => crate::tiles::tab_bar::sidebar_width(cx),
+        crate::config::TabPlacement::Top => px(0.0),
+    };
+    size(sidebar, px(TITLEBAR_HEIGHT))
 }
 
 /// Whether `position` (window coordinates) lies within the window's content.
