@@ -38,6 +38,7 @@ pub mod presets;
 pub mod query;
 pub mod sequences;
 pub(crate) mod session;
+pub(crate) mod tear_out;
 pub mod temporal;
 pub mod theme;
 pub mod tiles;

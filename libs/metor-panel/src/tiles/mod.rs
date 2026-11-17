@@ -1143,6 +1143,16 @@ impl TileGroup {
     /// Whether any pane holds an item. A fresh group keeps one empty pane
     /// around, so "no items anywhere" is the real test for an untouched
     /// layout (used to decide if loading a saved one needs consent).
+    /// Whether anything outside tab `id` would keep this window worth
+    /// having once that tab leaves it.
+    pub fn has_items_outside_tab(&self, id: TabId, cx: &App) -> bool {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.id != id)
+            .flat_map(|tab| &tab.panes)
+            .any(|pane| !pane.read(cx).is_empty())
+    }
+
     pub fn has_items(&self, cx: &App) -> bool {
         self.all_panes().any(|pane| !pane.read(cx).is_empty())
     }

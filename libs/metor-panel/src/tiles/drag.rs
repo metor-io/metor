@@ -46,6 +46,11 @@ pub(crate) fn set_active_drag(drag: ActiveDrag, cx: &mut App) {
     cx.set_global(drag);
 }
 
+/// The in-flight drag, if any, left in place.
+pub(crate) fn active_drag(cx: &App) -> Option<&ActiveDrag> {
+    cx.try_global::<ActiveDrag>()
+}
+
 /// Take the in-flight drag, if any. Callers still gate on
 /// `cx.has_active_drag()` — a leftover mirror from a drag that ended
 /// without a mouse-up reaching us must not tear anything out.

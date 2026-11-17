@@ -506,6 +506,8 @@ impl AppRoot {
 
     /// A left-button release outside this window's viewport while a pane or
     /// tab drag is live: tear it out into its own window at the drop point.
+    /// (On macOS the drag has usually torn out already, the moment it left
+    /// the window — see [`Self::handle_drag_leaving`].)
     ///
     /// Registered as `on_mouse_up_out`, which also fires for a release over
     /// occluded chrome (the titlebar, an overlay) — the viewport test is what
@@ -517,61 +519,104 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !cx.has_active_drag() {
-            return;
+        if cx.has_active_drag() && !in_viewport(event.position, window) {
+            self.tear_out(event.position, false, window, cx);
         }
+    }
+
+    /// A pane or tab dragged past this window's edge tears out there and
+    /// then, as a live window carried under the pointer, where the platform
+    /// can carry one.
+    fn handle_drag_leaving(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from_here = crate::tiles::drag::active_drag(cx)
+            .is_some_and(|drag| drag.source_window == window.window_handle());
+        if crate::tear_out::supported() && from_here && !in_viewport(position, window) {
+            self.tear_out(position, true, window, cx);
+        }
+    }
+
+    /// Move the dragged pane or tab into a window of its own, opened under
+    /// `position`. A `live` tear-out ends gpui's drag here and hands the
+    /// window to [`crate::tear_out`] to carry until release.
+    fn tear_out(
+        &mut self,
+        position: Point<Pixels>,
+        live: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::tiles::drag::DragSource;
         let Some(drag) = crate::tiles::take_active_drag(cx) else {
             return;
         };
-        let viewport = window.viewport_size();
-        let inside = event.position.x >= px(0.)
-            && event.position.y >= px(0.)
-            && event.position.x <= viewport.width
-            && event.position.y <= viewport.height;
-        if inside {
-            return;
+        if live {
+            cx.stop_active_drag(window);
+            // Carrying away all a window holds is moving the window.
+            let everything = match &drag.source {
+                DragSource::Pane(pane) => !self
+                    .tiles
+                    .read(cx)
+                    .all_panes()
+                    .any(|other| other != pane && !other.read(cx).is_empty()),
+                DragSource::Tab(group, id) => {
+                    group == &self.tiles && !group.read(cx).has_items_outside_tab(*id, cx)
+                }
+            };
+            let this = window.window_handle();
+            crate::tear_out::begin(this, everything.then_some(this), cx);
+            if everything {
+                return;
+            }
         }
         // Screen-space drop point, nudged so the cursor lands on the new
         // window's titlebar rather than its top-left corner.
-        let origin = window.bounds().origin + event.position - point(px(60.0), px(20.0));
+        let origin = window.bounds().origin + position - point(px(60.0), px(20.0));
         let window_size = match &drag.source {
-            crate::tiles::drag::DragSource::Pane(pane) => {
+            DragSource::Pane(pane) => {
                 let outer = pane.read(cx).current_outer_size();
                 size(
                     px(outer.width.max(400.0)),
                     px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
                 )
             }
-            crate::tiles::drag::DragSource::Tab(..) => window.bounds().size,
+            DragSource::Tab(..) => window.bounds().size,
         };
         let db = self.db.clone();
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
         cx.defer(move |cx: &mut App| {
             let tiles = match drag.source {
-                crate::tiles::drag::DragSource::Pane(pane) => {
+                DragSource::Pane(pane) => {
                     let Some(owner) = pane.read(cx).owner() else {
                         return;
                     };
                     owner.update(cx, |owner, cx| owner.split_off_pane(pane, cx))
                 }
-                crate::tiles::drag::DragSource::Tab(group, id) => {
+                DragSource::Tab(group, id) => {
                     group.update(cx, |group, cx| group.split_off_tab(id, cx))
                 }
             };
             let Some(tiles) = tiles else {
                 return;
             };
-            crate::workspace::open_panel_window(
-                db,
-                Some(Bounds {
-                    origin,
-                    size: window_size,
-                }),
-                Some(tiles),
-                false,
-                cx,
-            );
+            let bounds = Bounds {
+                origin,
+                size: window_size,
+            };
+            if live {
+                // Unfocused while it rides the pointer; it comes forward on
+                // release.
+                if let Some(torn) = crate::workspace::open_torn_window(db, bounds, tiles, cx) {
+                    crate::tear_out::opened(torn.into(), cx);
+                }
+                return;
+            }
+            crate::workspace::open_panel_window(db, Some(bounds), Some(tiles), false, cx);
             // Tearing out a window's only content reads as moving the
             // window: close the emptied source unless the picker is holding
             // it open.
@@ -743,6 +788,24 @@ impl Render for AppRoot {
                 crate::tiles::take_active_drag(cx);
             })
             .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(Self::handle_drag_out))
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::tiles::drag::DraggedTab>, window, cx| {
+                    this.handle_drag_leaving(event.event.position, window, cx)
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::tiles::drag::DraggedPane>, window, cx| {
+                    this.handle_drag_leaving(event.event.position, window, cx)
+                },
+            ))
+            .child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    |_, _, window, _| crate::tear_out::listen(window),
+                )
+                .absolute()
+                .size_0(),
+            )
             .on_drop(|_: &crate::tiles::drag::SidebarResizeDrag, _, cx| {
                 crate::tiles::tab_bar::save_sidebar_width(cx)
             })
@@ -2271,6 +2334,15 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
+/// Whether `position` (window coordinates) lies within the window's content.
+fn in_viewport(position: Point<Pixels>, window: &Window) -> bool {
+    let viewport = window.viewport_size();
+    position.x >= px(0.)
+        && position.y >= px(0.)
+        && position.x <= viewport.width
+        && position.y <= viewport.height
+}
+
 #[cfg(test)]
 mod keybinding_tests {
     use super::{EXIT_ZOOM, NOT_TYPING, TEXT_INPUT};
@@ -2437,6 +2509,39 @@ mod window_tests {
             right.origin.y > left.origin.y && right.origin.x == left.origin.x
         });
         assert!(below, "the dragged pane now sits below its target");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_tab_dragged_past_the_window_edge_tears_out_before_release(cx: &mut TestAppContext) {
+        let (tiles, window, _dir) = open(2, cx);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let start = cx.debug_bounds("top-tab-1").unwrap().center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            start + point(px(12.0), px(0.0)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        let outside = point(px(-80.0), start.y);
+        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 1);
+        assert_eq!(
+            cx.update(|_, cx| crate::workspace::panel_windows(cx).len()),
+            2,
+            "the tab has its own window while the button is still down"
+        );
+        assert!(!cx.update(|_, cx| cx.has_active_drag()));
+        cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| crate::workspace::panel_windows(cx).len()),
+            2,
+            "release opens nothing more"
+        );
     }
 
     #[gpui::test]
