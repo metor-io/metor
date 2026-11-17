@@ -466,7 +466,6 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
                         source: DragSource::Tab(dragged.group.clone(), dragged.tab),
                         source_window: window.window_handle(),
                         grab,
-                        ghost: None,
                         closable: can_close,
                     },
                     cx,
@@ -480,9 +479,11 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
                         .unwrap_or_default();
                     (title, group.bar.sizes.borrow().get(&dragged.tab).copied())
                 });
+                let width = size.map(|size| size.width);
+                crate::tear_out::begin(title.clone(), width, window, cx);
                 cx.new(|_| DragGhost {
                     title,
-                    width: size.map(|size| size.width),
+                    width,
                     closable: can_close,
                 })
             },

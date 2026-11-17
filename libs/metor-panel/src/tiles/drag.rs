@@ -41,8 +41,6 @@ pub struct ActiveDrag {
     /// Where the pointer took hold, from the dragged element's top-left;
     /// gpui draws the ghost this far up and left of the pointer.
     pub grab: Point<Pixels>,
-    /// The ghost's size once it has been laid out.
-    pub ghost: Option<gpui::Size<Pixels>>,
     /// Whether the ghost shows a close button, as its tab does.
     pub closable: bool,
 }
@@ -80,30 +78,18 @@ pub(super) struct DragGhost {
 
 impl Render for DragGhost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // gpui draws the drag view in every window it redraws, the
-        // drag-out preview among them; the ghost belongs to the window the
-        // drag began in, and hides there while the preview is out.
+        // gpui draws the drag view in every window it redraws, and only
+        // within each; the ghost belongs to the window the drag began in,
+        // and where a preview window rides the pointer, that stands in
+        // for it, unclipped by the window's edge.
         let this = window.window_handle();
         let here = active_drag(cx).is_some_and(|drag| drag.source_window == this)
-            && !crate::tear_out::expanded(this, cx);
+            && !crate::tear_out::riding(this, cx);
         if !here {
             return div();
         }
-        // The drag-out preview grows out of the ghost, so it needs its size.
-        let measure = gpui::canvas(
-            |bounds, _, cx| {
-                if cx.has_global::<ActiveDrag>() {
-                    cx.global_mut::<ActiveDrag>().ghost = Some(bounds.size);
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full();
         ghost_chip(self.title.clone(), self.closable, cx)
             .debug_selector(|| "drag-ghost".into())
-            .relative()
-            .child(measure)
             .when_some(self.width, |ghost, width| ghost.w(width))
     }
 }

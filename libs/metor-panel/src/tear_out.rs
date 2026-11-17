@@ -1,12 +1,13 @@
-//! While a pane or tab is dragged outside its window, its live panes ride
-//! the pointer, hanging from the dragged tab. Nothing has moved yet: bring
-//! the pointer back and the panes fold back up into the tab and the drag
-//! carries on; release outside and the window root tears the content out
-//! for real, its panes where the preview's were.
+//! A dragged pane or tab rides the pointer in a window of its own: its tab,
+//! drawn as the drag ghost, and — once the drag leaves its window — its
+//! live panes unfolding below it. Nothing has moved yet: bring the pointer
+//! back and the panes fold back up into the tab and the drag carries on;
+//! release outside and the window root tears the content out for real,
+//! its panes where the preview's were.
 //!
-//! gpui draws a drag ghost inside its source window only and can't place a
-//! window once it is open, so the preview is a window of its own placed
-//! through AppKit. The source window keeps receiving the dragged pointer
+//! gpui draws a drag ghost inside its source window only, clipped at its
+//! edge, and can't place a window once it is open, so the preview — the
+//! ghost included — is a window of its own placed through AppKit. The source window keeps receiving the dragged pointer
 //! (AppKit sends a drag's events to the window the press began in), and
 //! each move pins the preview to the pointer. Other platforms go without
 //! the preview.
@@ -29,12 +30,14 @@ use crate::config::DragPreview;
 use crate::motion::Fade;
 use crate::theme::{CONTROL_HEIGHT, theme};
 use crate::tiles::Replica;
+use crate::tiles::drag::DragSource;
 
 const GROW: Duration = Duration::from_millis(180);
 const SHRINK: Duration = Duration::from_millis(120);
 /// Width the mini preview scales the panes down to.
 const MINI_WIDTH: f32 = 420.0;
-/// Room around the preview's frame for its shadow, inside the window.
+/// Room around the preview inside its window: for the shadow, and clear of
+/// the corners AppKit rounds off every window.
 const MARGIN: f32 = 16.0;
 
 struct Riding {
@@ -68,6 +71,31 @@ pub(crate) fn set_preference(preview: DragPreview, cx: &mut App) {
     }
 }
 
+/// The size of the window a pane or tab tears out into: a pane keeps its
+/// own size (with room for a titlebar), a tab takes its window's.
+pub(crate) fn torn_size(source: &DragSource, window: &Window, cx: &App) -> Size<Pixels> {
+    match source {
+        DragSource::Pane(pane) => {
+            let outer = pane.read(cx).current_outer_size();
+            size(
+                px(outer.width.max(400.0)),
+                px(outer.height.max(300.0) + crate::app::TITLEBAR_HEIGHT),
+            )
+        }
+        DragSource::Tab(..) => window.bounds().size,
+    }
+}
+
+/// What a panel window's frame takes from its panes: the titlebar, and the
+/// tab sidebar when tabs sit down the side.
+pub(crate) fn window_chrome(cx: &App) -> Size<Pixels> {
+    let sidebar = match crate::tiles::tab_bar::placement(cx) {
+        crate::config::TabPlacement::Side => crate::tiles::tab_bar::sidebar_width(cx),
+        crate::config::TabPlacement::Top => px(0.0),
+    };
+    size(sidebar, px(crate::app::TITLEBAR_HEIGHT))
+}
+
 /// The size the preview draws panes of `panes` size at.
 fn body_size(panes: Size<Pixels>, cx: &App) -> Size<Pixels> {
     match preference(cx) {
@@ -86,52 +114,58 @@ pub(crate) fn panes_offset(grab: Point<Pixels>) -> Point<Pixels> {
     point(px(0.0), px(CONTROL_HEIGHT)) - grab
 }
 
-/// Whether a drag from `source` has its preview out, which hides the ghost.
+/// Whether a drag from `source` has its panes out, below the tab.
 pub(crate) fn expanded(source: AnyWindowHandle, cx: &App) -> bool {
     cx.try_global::<Riding>()
         .is_some_and(|riding| riding.source == source && riding.expanded)
 }
 
-/// Whether a drag from `source` has opened a preview, out or tucked away.
+/// Whether a drag from `source` rides in a preview window, which stands in
+/// for gpui's ghost.
 pub(crate) fn riding(source: AnyWindowHandle, cx: &App) -> bool {
     cx.try_global::<Riding>()
         .is_some_and(|riding| riding.source == source)
 }
 
-/// What a preview shows: the dragged tab as its ghost showed it, and below
-/// it the panes it carries, laid out at `panes` size.
-pub(crate) struct Spec {
-    pub title: SharedString,
-    pub closable: bool,
-    /// The ghost's size, held at `grab` by the pointer.
-    pub tab: Size<Pixels>,
-    pub grab: Point<Pixels>,
-    pub panes: Size<Pixels>,
-    pub replica: Replica,
-}
-
-/// Open the preview for a drag from `source`, the pointer at `pointer`
-/// (screen coordinates), growing out of its ghost.
-pub(crate) fn open(source: AnyWindowHandle, pointer: Point<Pixels>, spec: Spec, cx: &mut App) {
-    let body = body_size(spec.panes, cx);
-    let margin = px(MARGIN);
-    // The window's top-left corner is the tab's, so the tab sits where the
-    // ghost did; the margin runs right and down, where the shadow falls.
+/// A pane or tab drag just started in `window`: open its preview, folded
+/// up to the tab — `title`, `width` wide when the tab's width is known —
+/// under the pointer. Reads the drag from the [`ActiveDrag`] mirror, so
+/// call it once that is set.
+///
+/// [`ActiveDrag`]: crate::tiles::drag::ActiveDrag
+pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window, cx: &mut App) {
+    if !supported() {
+        return;
+    }
+    let Some(drag) = crate::tiles::drag::active_drag(cx) else {
+        return;
+    };
+    let replica = match &drag.source {
+        DragSource::Pane(pane) => Some(Replica::titled_pane(pane, cx).1),
+        DragSource::Tab(group, id) => group.read(cx).tab_replica(*id, cx).map(|(_, r)| r),
+    };
+    let Some(replica) = replica else {
+        return;
+    };
+    let body = body_size(torn_size(&drag.source, window, cx) - window_chrome(cx), cx);
+    let closable = drag.closable;
+    let source = window.window_handle();
+    let margin = point(px(MARGIN), px(MARGIN));
+    let grab = drag.grab + margin;
     let extent = size(
-        body.width.max(spec.tab.width) + margin,
-        px(CONTROL_HEIGHT) + body.height + margin,
+        body.width.max(width.unwrap_or_default()) + px(MARGIN) * 2.0,
+        px(CONTROL_HEIGHT) + body.height + px(MARGIN) * 2.0,
     );
-    let grab = spec.grab;
+    let bounds = Bounds {
+        origin: window.bounds().origin + window.mouse_position() - grab,
+        size: extent,
+    };
     cx.set_global(Riding {
         source,
         window: None,
-        expanded: true,
+        expanded: false,
         grab,
     });
-    let bounds = Bounds {
-        origin: pointer - grab,
-        size: extent,
-    };
     // Deferred: opening a window mid-dispatch re-enters the platform layer.
     cx.defer(move |cx| {
         let opened = cx.open_window(
@@ -150,12 +184,12 @@ pub(crate) fn open(source: AnyWindowHandle, pointer: Point<Pixels>, spec: Spec, 
                 native::ignore_mouse(window);
                 native::pin(window, grab);
                 cx.new(|_| DragOutPreview {
-                    title: spec.title,
-                    closable: spec.closable,
-                    tab: spec.tab,
+                    title,
+                    closable,
+                    tab: width,
                     body,
-                    replica: spec.replica,
-                    fade: Fade::entrance(GROW),
+                    replica,
+                    fade: Fade::settled(0.0),
                 })
             },
         );
@@ -169,8 +203,8 @@ pub(crate) fn open(source: AnyWindowHandle, pointer: Point<Pixels>, spec: Spec, 
         match state {
             Some(expanded) => {
                 cx.global_mut::<Riding>().window = Some(opened);
-                if !expanded {
-                    set_expanded(false, cx);
+                if expanded {
+                    set_expanded(true, cx);
                 }
             }
             None => close(opened.into(), cx),
@@ -250,7 +284,9 @@ fn follow(window: &mut Window, cx: &mut App) {
 struct DragOutPreview {
     title: SharedString,
     closable: bool,
-    tab: Size<Pixels>,
+    /// The tab's width, when the bar measured it; otherwise it fits its
+    /// title, as the ghost does.
+    tab: Option<Pixels>,
     body: Size<Pixels>,
     replica: Replica,
     fade: Fade,
@@ -259,56 +295,64 @@ struct DragOutPreview {
 impl Render for DragOutPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.fade.opacity(window, cx);
-        let root = div()
+        let theme = theme(cx);
+        let margin = px(MARGIN);
+        let tab = crate::tiles::drag::ghost_chip(self.title.clone(), self.closable, cx)
+            .absolute()
+            .left(margin)
+            .top(margin)
+            .when_some(self.tab, |tab, width| tab.w(width));
+        let lerp = |a: Pixels, b: Pixels| a + (b - a) * t;
+        // Unfolds downward from under the tab, laid out at its full size
+        // throughout and uncovered as the frame grows, so the panes never
+        // reflow mid-animation.
+        let body = (t > 0.0).then(|| {
+            let folded = self.tab.unwrap_or(px(120.0)).min(self.body.width);
+            div()
+                .absolute()
+                .left(margin)
+                .top(margin + px(CONTROL_HEIGHT - 1.0))
+                .w(lerp(folded, self.body.width))
+                .h(lerp(px(0.0), self.body.height))
+                .overflow_hidden()
+                .rounded_b(px(8.0))
+                .rounded_tr(px(8.0))
+                .border_1()
+                .border_color(theme.border_primary)
+                .bg(theme.bg_secondary)
+                .shadow_lg()
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .w(self.body.width)
+                        .h(self.body.height)
+                        .flex()
+                        .opacity(t)
+                        // A lone pane goes without its header: the tab
+                        // above already names it.
+                        .child(render_replica(
+                            &self.replica,
+                            matches!(self.replica, Replica::Split { .. }),
+                            cx,
+                        )),
+                )
+        });
+        div()
             .when_some(
                 cx.try_global::<crate::theme::FontSettings>()
                     .map(|font| font.family.clone()),
                 |root, family| root.font_family(family),
             )
             .size_full()
-            .relative();
-        if t <= 0.0 {
-            return root;
-        }
-        let theme = theme(cx);
-        let lerp = |a: Pixels, b: Pixels| a + (b - a) * t;
-        // Unfolds downward from under the tab, laid out at its full size
-        // throughout and uncovered as the frame grows, so the panes never
-        // reflow mid-animation.
-        let body = div()
-            .absolute()
-            .left_0()
-            .top(px(CONTROL_HEIGHT - 1.0))
-            .w(lerp(self.tab.width, self.body.width))
-            .h(lerp(px(0.0), self.body.height))
-            .overflow_hidden()
-            .rounded_b(px(8.0))
-            .rounded_tr(px(8.0))
-            .border_1()
-            .border_color(theme.border_primary)
-            .bg(theme.bg_secondary)
-            .shadow_lg()
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .w(self.body.width)
-                    .h(self.body.height)
-                    .flex()
-                    .opacity(t)
-                    .child(render_replica(&self.replica, cx)),
-            );
-        let tab = crate::tiles::drag::ghost_chip(self.title.clone(), self.closable, cx)
-            .absolute()
-            .left_0()
-            .top_0()
-            .w(self.tab.width);
-        root.child(body).child(tab)
+            .relative()
+            .children(body)
+            .child(tab)
     }
 }
 
-fn render_replica(replica: &Replica, cx: &App) -> gpui::AnyElement {
+fn render_replica(replica: &Replica, headed: bool, cx: &App) -> gpui::AnyElement {
     let theme = theme(cx);
     match replica {
         Replica::Pane { title, view } => div()
@@ -317,17 +361,19 @@ fn render_replica(replica: &Replica, cx: &App) -> gpui::AnyElement {
             .flex_col()
             .overflow_hidden()
             .bg(theme.bg_primary)
-            .child(
-                div()
-                    .h(px(CONTROL_HEIGHT))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .px(px(8.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_secondary)
-                    .child(div().truncate().child(title.clone())),
-            )
+            .when(headed, |pane| {
+                pane.child(
+                    div()
+                        .h(px(CONTROL_HEIGHT))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .px(px(8.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_secondary)
+                        .child(div().truncate().child(title.clone())),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -355,7 +401,7 @@ fn render_replica(replica: &Replica, cx: &App) -> gpui::AnyElement {
                         .min_w_0()
                         .min_h_0()
                         .flex()
-                        .child(render_replica(part, cx));
+                        .child(render_replica(part, true, cx));
                     let style = slot.style();
                     style.flex_grow = Some(*flex);
                     style.flex_shrink = Some(*flex);

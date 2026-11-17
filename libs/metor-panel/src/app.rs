@@ -24,7 +24,7 @@ use crate::tiles::{
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, MouseUpEvent,
-    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px, size,
+    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
 };
 use metor_db::{DB, Server};
 use stellarator::net::TcpListener;
@@ -528,8 +528,8 @@ impl AppRoot {
         // titlebar where it held the ghost, as it held the preview.
         // The pointer holds the new window's panes where it held the
         // preview's, just below the tab it dragged.
-        let window_size = torn_size(&drag.source, window, cx);
-        let chrome = window_chrome(cx);
+        let window_size = crate::tear_out::torn_size(&drag.source, window, cx);
+        let chrome = crate::tear_out::window_chrome(cx);
         let origin =
             window.bounds().origin + event.position + crate::tear_out::panes_offset(drag.grab)
                 - point(chrome.width, chrome.height);
@@ -580,48 +580,19 @@ impl AppRoot {
 
     /// Show the window a drag would tear out, in miniature, while the drag
     /// is outside this window, and put it away when the drag comes back.
+    /// Unfold the dragged content's panes below its tab while the drag is
+    /// outside this window, and fold them away when it comes back.
     fn preview_drag_out(
         &mut self,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::tear_out;
         let this = window.window_handle();
-        let Some(drag) = crate::tiles::drag::active_drag(cx)
-            .filter(|drag| tear_out::supported() && drag.source_window == this)
-        else {
-            return;
-        };
         let outside = !in_viewport(position, window);
-        if tear_out::riding(this, cx) {
-            if outside != tear_out::expanded(this, cx) {
-                tear_out::set_expanded(outside, cx);
-            }
-            return;
+        if crate::tear_out::riding(this, cx) && outside != crate::tear_out::expanded(this, cx) {
+            crate::tear_out::set_expanded(outside, cx);
         }
-        if !outside {
-            return;
-        }
-        let replica = match &drag.source {
-            DragSource::Pane(pane) => Some(crate::tiles::Replica::titled_pane(pane, cx)),
-            DragSource::Tab(group, id) => group.read(cx).tab_replica(*id, cx),
-        };
-        let Some((title, replica)) = replica else {
-            return;
-        };
-        let spec = tear_out::Spec {
-            title,
-            closable: drag.closable,
-            tab: drag.ghost.unwrap_or(size(
-                px(crate::tiles::tab_bar::TAB_MAX_WIDTH),
-                px(crate::theme::CONTROL_HEIGHT),
-            )),
-            grab: drag.grab,
-            panes: torn_size(&drag.source, window, cx) - window_chrome(cx),
-            replica,
-        };
-        tear_out::open(this, window.bounds().origin + position, spec, cx);
     }
 
     fn handle_tile_event(
@@ -2324,31 +2295,6 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
-/// The size of the window a pane or tab tears out into: a pane keeps its
-/// own size (with room for a titlebar), a tab takes its window's.
-fn torn_size(source: &DragSource, window: &Window, cx: &App) -> gpui::Size<Pixels> {
-    match source {
-        DragSource::Pane(pane) => {
-            let outer = pane.read(cx).current_outer_size();
-            size(
-                px(outer.width.max(400.0)),
-                px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
-            )
-        }
-        DragSource::Tab(..) => window.bounds().size,
-    }
-}
-
-/// What a panel window's frame takes from its panes: the titlebar, and the
-/// tab sidebar when tabs sit down the side.
-fn window_chrome(cx: &App) -> gpui::Size<Pixels> {
-    let sidebar = match crate::tiles::tab_bar::placement(cx) {
-        crate::config::TabPlacement::Side => crate::tiles::tab_bar::sidebar_width(cx),
-        crate::config::TabPlacement::Top => px(0.0),
-    };
-    size(sidebar, px(TITLEBAR_HEIGHT))
-}
-
 /// Whether `position` (window coordinates) lies within the window's content.
 fn in_viewport(position: Point<Pixels>, window: &Window) -> bool {
     let viewport = window.viewport_size();
@@ -2552,22 +2498,33 @@ mod window_tests {
             MouseButton::Left,
             Default::default(),
         );
-        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
-        assert_eq!(windows(cx), (1, 2), "a preview, nothing torn out yet");
-        assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 2);
-        assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
+        assert_eq!(
+            windows(cx),
+            (1, 2),
+            "the dragged tab rides in its own window"
+        );
         assert!(
             cx.debug_bounds("drag-ghost").is_none(),
-            "the preview stands in for the ghost"
+            "which stands in for gpui's ghost"
         );
+        assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
 
-        // Coming back tucks the preview into the ghost; the drag carries on.
+        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(
+            windows(cx),
+            (1, 2),
+            "its panes unfold; nothing torn out yet"
+        );
+        assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 2);
+        assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
+
+        // Coming back folds the panes away; the drag carries on.
         cx.simulate_mouse_move(start, MouseButton::Left, Default::default());
         cx.run_until_parked();
         assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
         assert!(cx.update(|_, cx| cx.has_active_drag()));
-        assert!(cx.debug_bounds("drag-ghost").is_some());
 
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();

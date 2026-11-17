@@ -311,11 +311,11 @@ impl Pane {
                             source: super::drag::DragSource::Pane(dragged.pane.clone()),
                             source_window: window.window_handle(),
                             grab,
-                            ghost: None,
                             closable: can_close,
                         },
                         cx,
                     );
+                    crate::tear_out::begin(title.clone(), None, window, cx);
                     cx.new(|_| super::drag::DragGhost {
                         title: title.clone(),
                         width: None,
