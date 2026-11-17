@@ -3,8 +3,8 @@ pub(crate) mod item;
 mod motion;
 pub(crate) mod pane;
 pub mod panels;
+mod replica;
 pub(crate) mod serial;
-mod sketch;
 mod split_preview;
 pub(crate) mod starter;
 pub(crate) mod tab_bar;
@@ -31,8 +31,8 @@ pub use pane::{
     OpenImageAction, OpenOutlineAction, OpenPivotTableAction, Pane, PaneEvent, PlotComponentAction,
     PreviewPlotAction,
 };
+pub use replica::Replica;
 pub use serial::{ItemRegistry, TileLayout};
-pub use sketch::Sketch;
 pub use tab_bar::TabId;
 
 /// Sequence of member indices locating a node in the split tree.

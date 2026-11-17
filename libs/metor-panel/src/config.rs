@@ -46,6 +46,17 @@ pub enum TabPlacement {
     Side,
 }
 
+/// What follows the pointer while a tab or pane is dragged out of its
+/// window: the window it would become at full size, or the same scaled
+/// down to a small preview. Both show the live panels.
+#[derive(facet::Facet, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum DragPreview {
+    #[default]
+    Full,
+    Mini,
+}
+
 /// Root of the on-disk panel config document.
 ///
 /// `Default` is hand-written rather than derived: the derived impl would seed
@@ -70,6 +81,8 @@ pub struct PanelConfig {
     /// Width of the tab sidebar the user dragged away from the default.
     #[facet(default)]
     pub tab_sidebar_width: Option<f32>,
+    #[facet(default)]
+    pub drag_preview: DragPreview,
 }
 
 impl Default for PanelConfig {
@@ -81,6 +94,7 @@ impl Default for PanelConfig {
             leader: default_leader(),
             tab_placement: TabPlacement::default(),
             tab_sidebar_width: None,
+            drag_preview: DragPreview::default(),
         }
     }
 }

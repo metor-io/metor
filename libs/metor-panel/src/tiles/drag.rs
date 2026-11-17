@@ -38,6 +38,11 @@ pub enum DragSource {
 pub struct ActiveDrag {
     pub source: DragSource,
     pub source_window: AnyWindowHandle,
+    /// Where the pointer took hold, from the dragged element's top-left;
+    /// gpui draws the ghost this far up and left of the pointer.
+    pub grab: Point<Pixels>,
+    /// The ghost's size once it has been laid out.
+    pub ghost: Option<gpui::Size<Pixels>>,
 }
 
 impl Global for ActiveDrag {}
@@ -72,10 +77,26 @@ pub(super) struct DragGhost {
 }
 
 impl Render for DragGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
+        // The drag-out preview grows out of the ghost, so it needs the
+        // ghost's size, and hides it while it is out.
+        let measure = gpui::canvas(
+            |bounds, _, cx| {
+                if cx.has_global::<ActiveDrag>() {
+                    cx.global_mut::<ActiveDrag>().ghost = Some(bounds.size);
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let out = crate::tear_out::expanded(window.window_handle(), cx);
         div()
             .debug_selector(|| "drag-ghost".into())
+            .relative()
+            .when(out, |ghost| ghost.opacity(0.0))
+            .child(measure)
             .when_some(
                 cx.try_global::<crate::theme::FontSettings>()
                     .map(|font| font.family.clone()),

@@ -460,11 +460,13 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
                 group: drag_group,
                 tab: id,
             },
-            move |dragged, _, window, cx| {
+            move |dragged, grab, window, cx| {
                 set_active_drag(
                     ActiveDrag {
                         source: DragSource::Tab(dragged.group.clone(), dragged.tab),
                         source_window: window.window_handle(),
+                        grab,
+                        ghost: None,
                     },
                     cx,
                 );

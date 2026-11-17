@@ -24,7 +24,7 @@ use crate::tiles::{
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, MouseUpEvent,
-    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px, size,
+    Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use stellarator::net::TcpListener;
@@ -45,7 +45,7 @@ actions!(
     ]
 );
 
-const TITLEBAR_HEIGHT: f32 = 36.0;
+pub(crate) const TITLEBAR_HEIGHT: f32 = 36.0;
 
 /// Window-level view that owns the tile tree and any active inspector overlay.
 ///
@@ -524,10 +524,11 @@ impl AppRoot {
         let Some(drag) = crate::tiles::take_active_drag(cx) else {
             return;
         };
-        // Screen-space drop point, nudged so the cursor lands on the new
-        // window's titlebar rather than its top-left corner.
-        let origin = window.bounds().origin + event.position - point(px(60.0), px(20.0));
+        // Screen-space drop point: the pointer holds the new window by its
+        // titlebar where it held the ghost, as it held the preview.
         let window_size = torn_size(&drag.source, window, cx);
+        let origin = window.bounds().origin + event.position
+            - crate::tear_out::grab_point(drag.grab, window_size);
         let db = self.db.clone();
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
@@ -581,35 +582,49 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use crate::tear_out;
         let this = window.window_handle();
         let Some(drag) = crate::tiles::drag::active_drag(cx)
-            .filter(|drag| crate::tear_out::supported() && drag.source_window == this)
+            .filter(|drag| tear_out::supported() && drag.source_window == this)
         else {
             return;
         };
         let outside = !in_viewport(position, window);
-        if outside == crate::tear_out::showing(this, cx) {
+        if tear_out::riding(this, cx) {
+            if outside != tear_out::expanded(this, cx) {
+                tear_out::set_expanded(outside, cx);
+            }
             return;
         }
         if !outside {
-            crate::tear_out::hide(cx);
             return;
         }
-        let sketched = match &drag.source {
-            DragSource::Pane(pane) => Some(crate::tiles::Sketch::titled_pane(pane, cx)),
-            DragSource::Tab(group, id) => group.read(cx).tab_sketch(*id, cx),
+        let replica = match &drag.source {
+            DragSource::Pane(pane) => Some(crate::tiles::Replica::titled_pane(pane, cx)),
+            DragSource::Tab(group, id) => group.read(cx).tab_replica(*id, cx),
         };
-        let Some((title, sketch)) = sketched else {
+        let Some((title, replica)) = replica else {
             return;
         };
-        let torn = torn_size(&drag.source, window, cx);
-        let width = px(crate::tear_out::PREVIEW_WIDTH);
-        let (grab_x, grab_y) = crate::tear_out::GRAB;
-        let bounds = Bounds {
-            origin: window.bounds().origin + position - point(px(grab_x), px(grab_y)),
-            size: size(width, width * (torn.height / torn.width)),
+        let extent = tear_out::preview_size(torn_size(&drag.source, window, cx), cx);
+        let grab = tear_out::grab_point(drag.grab, extent);
+        let ghost = Bounds {
+            origin: grab - drag.grab,
+            size: drag.ghost.unwrap_or(size(
+                px(crate::tiles::tab_bar::TAB_MAX_WIDTH),
+                px(crate::theme::CONTROL_HEIGHT),
+            )),
         };
-        crate::tear_out::show(this, bounds, title, sketch, cx);
+        let spec = tear_out::Spec {
+            bounds: Bounds {
+                origin: window.bounds().origin + position - grab,
+                size: extent,
+            },
+            ghost,
+            title,
+            replica,
+        };
+        tear_out::open(this, spec, cx);
     }
 
     fn handle_tile_event(
@@ -2408,7 +2423,7 @@ mod keybinding_tests {
 mod window_tests {
     use super::*;
     use crate::tiles::{Pane, PaneItem, PaneItemHandle, SplitDirection};
-    use gpui::{MouseButton, TestAppContext, VisualTestContext};
+    use gpui::{MouseButton, TestAppContext, VisualTestContext, point};
 
     struct Item(&'static str);
 
@@ -2506,7 +2521,7 @@ mod window_tests {
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
-    fn a_tab_dragged_outside_shows_a_miniature_and_tears_out_only_on_release(
+    fn a_tab_dragged_outside_shows_its_window_and_tears_out_only_on_release(
         cx: &mut TestAppContext,
     ) {
         let (tiles, window, _dir) = open(2, cx);
@@ -2521,6 +2536,7 @@ mod window_tests {
                 )
             })
         };
+        let source = window.into();
         let start = cx.debug_bounds("top-tab-1").unwrap().center();
         let outside = point(px(-80.0), start.y);
         cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
@@ -2531,20 +2547,22 @@ mod window_tests {
         );
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
-        assert_eq!(windows(cx), (1, 2), "a miniature, nothing torn out yet");
+        assert_eq!(windows(cx), (1, 2), "a preview, nothing torn out yet");
         assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 2);
+        assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
 
-        // Coming back puts the miniature away and the drag carries on.
+        // Coming back tucks the preview into the ghost; the drag carries on.
         cx.simulate_mouse_move(start, MouseButton::Left, Default::default());
         cx.run_until_parked();
-        assert_eq!(windows(cx), (1, 1));
+        assert!(cx.update(|_, cx| !crate::tear_out::expanded(source, cx)));
         assert!(cx.update(|_, cx| cx.has_active_drag()));
 
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
+        assert!(cx.update(|_, cx| crate::tear_out::expanded(source, cx)));
         cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
         cx.run_until_parked();
-        assert_eq!(windows(cx), (2, 2), "the tab's window, and no miniature");
+        assert_eq!(windows(cx), (2, 2), "the tab's window, and no preview");
         assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), 1);
     }
 

@@ -365,10 +365,11 @@ fn register_widget_provider(cx: &mut App) {
     ItemRegistry::register(cx, Category::Widget, provider);
 }
 
-/// Where every window's tabs sit, as one row per placement.
+/// Where every window's tabs sit, and what a tab dragged out of its window
+/// shows, one row per choice.
 pub(crate) fn tab_placement_rows() -> Vec<Box<dyn InspectorRow>> {
-    use crate::config::TabPlacement;
-    [
+    use crate::config::{DragPreview, TabPlacement};
+    let placements = [
         ("Tabs on top", TabPlacement::Top),
         ("Tabs in sidebar", TabPlacement::Side),
     ]
@@ -378,8 +379,19 @@ pub(crate) fn tab_placement_rows() -> Vec<Box<dyn InspectorRow>> {
             label,
             Arc::new(move |_, cx| crate::tiles::tab_bar::set_placement(placement, cx)),
         )) as Box<dyn InspectorRow>
-    })
-    .collect()
+    });
+    let previews = [
+        ("Full-size drag-out preview", DragPreview::Full),
+        ("Mini drag-out preview", DragPreview::Mini),
+    ]
+    .into_iter()
+    .map(|(label, preview)| {
+        Box::new(CommandRow::new(
+            label,
+            Arc::new(move |_, cx| crate::tear_out::set_preference(preview, cx)),
+        )) as Box<dyn InspectorRow>
+    });
+    placements.chain(previews).collect()
 }
 
 /// One row per image component, each opening an image view.

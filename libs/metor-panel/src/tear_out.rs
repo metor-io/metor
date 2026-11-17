@@ -1,75 +1,130 @@
-//! While a pane or tab is dragged outside its window, a miniature of the
-//! window it would tear out into rides the pointer. Nothing has moved yet:
-//! bring the pointer back and the drag carries on as before; release
-//! outside and the window root tears the content out for real.
+//! While a pane or tab is dragged outside its window, the window it would
+//! tear out into rides the pointer: its live panes, grown out of the drag
+//! ghost. Nothing has moved yet: bring the pointer back and the preview
+//! shrinks back into the ghost and the drag carries on; release outside
+//! and the window root tears the content out for real, where the preview
+//! stood.
 //!
-//! gpui draws a drag preview inside its source window only and can't place
-//! a window once it is open, so the miniature is a window of its own moved
+//! gpui draws a drag ghost inside its source window only and can't place a
+//! window once it is open, so the preview is a window of its own moved
 //! through AppKit. The source window keeps receiving the dragged pointer
 //! (AppKit sends a drag's events to the window the press began in), and
-//! each move shifts the miniature by the pointer's travel. Other platforms
-//! go without the miniature.
+//! each move shifts the preview by the pointer's travel. Other platforms go
+//! without the preview.
+//!
+//! The preview draws the panes' own views a second time, so it can't be a
+//! scaled picture: gpui has no transform for live elements and no readback
+//! of a window's pixels outside tests. At full size the views draw at the
+//! size they already have; the mini preview lays them out small.
+
+use std::time::Duration;
 
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, DispatchPhase, Global, IntoElement,
-    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, prelude::*, px,
-    relative,
+    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Size, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
+    prelude::*, px, relative, size,
 };
 
-use crate::theme::theme;
-use crate::tiles::Sketch;
+use crate::config::DragPreview;
+use crate::motion::Fade;
+use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, theme};
+use crate::tiles::Replica;
 
-/// Width of the miniature; its height follows the torn window's shape.
-pub(crate) const PREVIEW_WIDTH: f32 = 240.0;
-const TITLEBAR: f32 = 18.0;
-/// Where the pointer holds the miniature: on its titlebar, near the left.
-pub(crate) const GRAB: (f32, f32) = (28.0, 9.0);
+const GROW: Duration = Duration::from_millis(180);
+const SHRINK: Duration = Duration::from_millis(120);
+/// Width the mini preview scales a wider window down to.
+const MINI_WIDTH: f32 = 420.0;
 
 struct Riding {
     /// The window the drag began in, which is fed the pointer until release.
     source: AnyWindowHandle,
-    /// Tells a miniature that finishes opening after its drag left the
-    /// desktop (or left and came back) that it is stale.
-    generation: u64,
-    window: Option<AnyWindowHandle>,
-    /// The pointer, in global screen coordinates, when the miniature was
-    /// last placed.
+    window: Option<WindowHandle<DragOutPreview>>,
+    /// Out of the source window, so the preview shows and the ghost hides.
+    expanded: bool,
+    /// The pointer, in global screen coordinates, when the preview was last
+    /// placed.
     cursor: Option<(f64, f64)>,
 }
 
 impl Global for Riding {}
 
-/// Whether this platform can carry a miniature under the pointer.
+/// Whether this platform can carry a preview under the pointer.
 pub(crate) fn supported() -> bool {
     cfg!(target_os = "macos")
 }
 
-pub(crate) fn showing(source: AnyWindowHandle, cx: &App) -> bool {
+pub(crate) fn preference(cx: &App) -> DragPreview {
+    cx.try_global::<crate::theme::FontSettings>()
+        .map(|settings| settings.config.drag_preview)
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_preference(preview: DragPreview, cx: &mut App) {
+    let settings = cx.global_mut::<crate::theme::FontSettings>();
+    settings.config.drag_preview = preview;
+    if let Err(error) = crate::config::save(&settings.config) {
+        tracing::error!(%error, "save drag preview failed");
+    }
+}
+
+/// The preview's size for a window of `torn` size.
+pub(crate) fn preview_size(torn: Size<Pixels>, cx: &App) -> Size<Pixels> {
+    match preference(cx) {
+        DragPreview::Full => torn,
+        DragPreview::Mini => {
+            let scale = (MINI_WIDTH / f32::from(torn.width)).min(1.0);
+            size(torn.width * scale, torn.height * scale)
+        }
+    }
+}
+
+/// Where the pointer holds a preview (or a torn window) of `extent`: where
+/// it held the ghost, kept on the window's titlebar.
+pub(crate) fn grab_point(grab: Point<Pixels>, extent: Size<Pixels>) -> Point<Pixels> {
+    point(
+        grab.x.clamp(px(12.0), (extent.width * 0.5).max(px(12.0))),
+        grab.y.clamp(px(8.0), px(crate::app::TITLEBAR_HEIGHT - 8.0)),
+    )
+}
+
+/// Whether a drag from `source` has its preview out, which hides the ghost.
+pub(crate) fn expanded(source: AnyWindowHandle, cx: &App) -> bool {
+    cx.try_global::<Riding>()
+        .is_some_and(|riding| riding.source == source && riding.expanded)
+}
+
+/// Whether a drag from `source` has opened a preview, out or tucked away.
+pub(crate) fn riding(source: AnyWindowHandle, cx: &App) -> bool {
     cx.try_global::<Riding>()
         .is_some_and(|riding| riding.source == source)
 }
 
-/// Open the miniature at `bounds` (screen coordinates), drawing `title`'s
-/// layout, for a drag from `source`.
-pub(crate) fn show(
-    source: AnyWindowHandle,
-    bounds: Bounds<Pixels>,
-    title: SharedString,
-    sketch: Sketch,
-    cx: &mut App,
-) {
-    let generation = cx
-        .try_global::<Riding>()
-        .map_or(0, |riding| riding.generation + 1);
+/// What a preview shows and where: `bounds` on screen, growing out of the
+/// ghost at `ghost` (window coordinates).
+pub(crate) struct Spec {
+    pub bounds: Bounds<Pixels>,
+    pub ghost: Bounds<Pixels>,
+    pub title: SharedString,
+    pub replica: Replica,
+}
+
+/// Open the preview for a drag from `source`, growing out of its ghost.
+pub(crate) fn open(source: AnyWindowHandle, spec: Spec, cx: &mut App) {
     cx.set_global(Riding {
         source,
-        generation,
         window: None,
+        expanded: true,
         cursor: native::mouse_location(),
     });
     // Deferred: opening a window mid-dispatch re-enters the platform layer.
     cx.defer(move |cx| {
+        let Spec {
+            bounds,
+            ghost,
+            title,
+            replica,
+        } = spec;
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -84,30 +139,60 @@ pub(crate) fn show(
             },
             |window, cx| {
                 native::ignore_mouse(window);
-                cx.new(|_| DragOutPreview { title, sketch })
+                cx.new(|_| DragOutPreview {
+                    title,
+                    replica,
+                    ghost,
+                    fade: Fade::entrance(GROW),
+                })
             },
         );
         let Ok(opened) = opened else {
             return;
         };
-        let current = cx
+        let state = cx
             .try_global::<Riding>()
-            .is_some_and(|riding| riding.generation == generation && riding.window.is_none());
-        if current {
-            cx.global_mut::<Riding>().window = Some(opened.into());
-        } else {
-            close(opened.into(), cx);
+            .filter(|riding| riding.source == source && riding.window.is_none())
+            .map(|riding| riding.expanded);
+        match state {
+            Some(expanded) => {
+                cx.global_mut::<Riding>().window = Some(opened);
+                if !expanded {
+                    set_expanded(false, cx);
+                }
+            }
+            None => close(opened.into(), cx),
         }
     });
 }
 
-/// Put the miniature away: the pointer came back, or the drag ended.
-pub(crate) fn hide(cx: &mut App) {
+/// Grow the preview back out of the ghost, or shrink it into it.
+pub(crate) fn set_expanded(expanded: bool, cx: &mut App) {
     if !cx.has_global::<Riding>() {
         return;
     }
+    let riding = cx.global_mut::<Riding>();
+    riding.expanded = expanded;
+    if let Some(window) = riding.window {
+        let _ = window.update(cx, |preview, _, cx| {
+            if expanded {
+                preview.fade.enter(GROW);
+            } else {
+                preview.fade.exit(SHRINK);
+            }
+            cx.notify();
+        });
+    }
+    if let Some(source) = cx.try_global::<Riding>().map(|riding| riding.source) {
+        let _ = source.update(cx, |_, window, _| window.refresh());
+    }
+}
+
+/// The drag ended: the preview goes, either way. A tear-out opens its
+/// window where the preview stood.
+fn finish(cx: &mut App) {
     if let Some(window) = cx.remove_global::<Riding>().window {
-        close(window, cx);
+        close(window.into(), cx);
     }
 }
 
@@ -117,9 +202,9 @@ fn close(window: AnyWindowHandle, cx: &mut App) {
     });
 }
 
-/// Carry the miniature with the pointer, and drop it on release, for a
-/// drag that began in this window. Registered for every frame of every
-/// panel window, during paint.
+/// Carry the preview with the pointer, and drop it on release, for a drag
+/// that began in this window. Registered for every frame of every panel
+/// window, during paint.
 pub(crate) fn listen(window: &mut Window) {
     window.on_mouse_event(|_: &MouseMoveEvent, phase, window, cx| {
         if phase == DispatchPhase::Bubble {
@@ -129,9 +214,9 @@ pub(crate) fn listen(window: &mut Window) {
     window.on_mouse_event(|event: &MouseUpEvent, phase, window, cx| {
         if phase == DispatchPhase::Bubble
             && event.button == MouseButton::Left
-            && showing(window.window_handle(), cx)
+            && riding(window.window_handle(), cx)
         {
-            hide(cx);
+            finish(cx);
         }
     });
 }
@@ -150,91 +235,142 @@ fn follow(window: &mut Window, cx: &mut App) {
         return;
     };
     let travel = (now.0 - last.0, now.1 - last.1);
-    let _ = cx.update_window(preview, |_, preview, _| native::move_by(preview, travel));
+    let _ = preview.update(cx, |_, preview, _| native::move_by(preview, travel));
     cx.global_mut::<Riding>().cursor = Some(now);
 }
 
-/// The window a drag would tear out, in miniature: its titlebar with the
-/// tab's name, then its panes in proportion, each with its header.
+/// The window a drag would tear out, drawn with its panes' live views.
 struct DragOutPreview {
     title: SharedString,
-    sketch: Sketch,
+    replica: Replica,
+    /// Where the drag ghost sits in this window: the preview grows out of
+    /// it and shrinks back into it.
+    ghost: Bounds<Pixels>,
+    fade: Fade,
 }
 
 impl Render for DragOutPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme(cx);
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.fade.opacity(window, cx);
+        let root = div()
             .when_some(
                 cx.try_global::<crate::theme::FontSettings>()
                     .map(|font| font.family.clone()),
-                |preview, family| preview.font_family(family),
+                |root, family| root.font_family(family),
             )
             .size_full()
+            .relative();
+        if t <= 0.0 {
+            return root;
+        }
+        let theme = theme(cx);
+        let full = window.viewport_size();
+        let from = self.ghost;
+        let lerp = |a: Pixels, b: Pixels| a + (b - a) * t;
+        let left = lerp(from.origin.x, px(0.0));
+        let top = lerp(from.origin.y, px(0.0));
+        let width = lerp(from.size.width, full.width);
+        let height = lerp(from.size.height, full.height);
+
+        let titlebar = div()
+            .h(px(crate::app::TITLEBAR_HEIGHT))
+            .flex_shrink_0()
             .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(theme.border_primary)
+            .items_center()
+            .px(px(8.0))
             .bg(theme.bg_secondary)
-            .opacity(0.94)
+            .border_b_1()
+            .border_color(theme.border_primary)
             .child(
                 div()
-                    .h(px(TITLEBAR))
-                    .flex_shrink_0()
+                    .h(px(CONTROL_HEIGHT))
                     .flex()
                     .items_center()
-                    .px(px(6.0))
-                    .child(
-                        div()
-                            .px(px(6.0))
-                            .rounded(px(3.0))
-                            .bg(theme.bg_primary)
-                            .border_1()
-                            .border_color(theme.border_primary)
-                            .text_size(px(9.0))
-                            .text_color(theme.text_primary)
-                            .max_w(relative(0.6))
-                            .truncate()
-                            .child(self.title.clone()),
-                    ),
-            )
+                    .px(px(8.0))
+                    .max_w(px(crate::tiles::tab_bar::TAB_MAX_WIDTH))
+                    .rounded(px(CONTROL_RADIUS))
+                    .bg(theme.bg_primary)
+                    .border_1()
+                    .border_color(theme.border_primary)
+                    .text_size(px(12.0))
+                    .text_color(theme.text_primary)
+                    .child(div().truncate().child(self.title.clone())),
+            );
+        // Laid out at the full size throughout, and uncovered as the frame
+        // grows, so the panes never reflow mid-animation.
+        let content = div()
+            .absolute()
+            .left(-left)
+            .top(-top)
+            .w(full.width)
+            .h(full.height)
+            .flex()
+            .flex_col()
+            .bg(theme.bg_secondary)
+            .opacity(t)
+            .child(titlebar)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .p(px(3.0))
-                    .pt_0()
-                    .child(render_sketch(&self.sketch, cx)),
-            )
+                    .child(render_replica(&self.replica, cx)),
+            );
+        root.child(
+            div()
+                .absolute()
+                .left(left)
+                .top(top)
+                .w(width)
+                .h(height)
+                .overflow_hidden()
+                .rounded(lerp(px(CONTROL_RADIUS), px(10.0)))
+                .border_1()
+                .border_color(theme.border_primary)
+                .bg(theme.bg_elevated)
+                .shadow_lg()
+                .child(content),
+        )
     }
 }
 
-fn render_sketch(sketch: &Sketch, cx: &App) -> gpui::AnyElement {
+fn render_replica(replica: &Replica, cx: &App) -> gpui::AnyElement {
     let theme = theme(cx);
-    match sketch {
-        Sketch::Pane(title) => div()
+    match replica {
+        Replica::Pane { title, view } => div()
             .size_full()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded(px(3.0))
             .bg(theme.bg_primary)
             .child(
                 div()
-                    .h(px(12.0))
+                    .h(px(CONTROL_HEIGHT))
                     .flex_shrink_0()
-                    .px(px(4.0))
-                    .text_size(px(8.0))
+                    .flex()
+                    .items_center()
+                    .px(px(8.0))
+                    .text_size(px(12.0))
                     .text_color(theme.text_secondary)
-                    .truncate()
-                    .child(title.clone()),
+                    .child(div().truncate().child(title.clone())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .when_some(view.clone(), |slot, view| {
+                        slot.child(div().absolute().size_full().child(view))
+                    }),
             )
             .into_any_element(),
-        Sketch::Split { axis, parts } => {
-            let mut split = div().size_full().flex().gap(px(2.0));
+        Replica::Split { axis, parts } => {
+            let mut split = div()
+                .size_full()
+                .flex()
+                .gap(px(1.0))
+                .bg(theme.border_primary);
             if *axis == gpui::Axis::Vertical {
                 split = split.flex_col();
             }
@@ -245,7 +381,7 @@ fn render_sketch(sketch: &Sketch, cx: &App) -> gpui::AnyElement {
                         .min_w_0()
                         .min_h_0()
                         .flex()
-                        .child(render_sketch(part, cx));
+                        .child(render_replica(part, cx));
                     let style = slot.style();
                     style.flex_grow = Some(*flex);
                     style.flex_shrink = Some(*flex);
@@ -263,7 +399,7 @@ mod native {
     use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
 
     /// The pointer in AppKit's global screen space (y up, spanning every
-    /// display), so a miniature carried across displays never jumps.
+    /// display), so a preview carried across displays never jumps.
     pub fn mouse_location() -> Option<(f64, f64)> {
         let point = NSEvent::mouseLocation();
         Some((point.x, point.y))

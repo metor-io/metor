@@ -302,7 +302,7 @@ impl Pane {
         if self.item.is_some() {
             header = header.cursor_grab().on_drag(
                 DraggedPane { pane: cx.entity() },
-                move |dragged, _, window, cx| {
+                move |dragged, grab, window, cx| {
                     // Mirror the drag app-side so a mouse-up outside the
                     // window (which gpui otherwise swallows) can tear the
                     // pane out.
@@ -310,6 +310,8 @@ impl Pane {
                         super::drag::ActiveDrag {
                             source: super::drag::DragSource::Pane(dragged.pane.clone()),
                             source_window: window.window_handle(),
+                            grab,
+                            ghost: None,
                         },
                         cx,
                     );
