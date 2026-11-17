@@ -286,16 +286,15 @@ impl Member {
                 }
                 if gaps.contains_key(&pane.entity_id()) {
                     let placeholder = pane.read(cx).is_empty();
-                    let color = if placeholder {
-                        crate::theme::Theme::dim(theme(cx).control_active, 0.11)
-                    } else {
-                        theme(cx).bg_secondary
-                    };
+                    let theme = theme(cx);
                     return div()
                         .size_full()
-                        .bg(color)
+                        .when(!placeholder, |gap| gap.bg(theme.bg_secondary))
                         .when(placeholder, |gap| {
                             gap.debug_selector(|| "split-preview-gap".into())
+                                .bg(theme.drop_fill())
+                                .border_1()
+                                .border_color(crate::theme::Theme::dim(theme.drop_accent(), 0.6))
                         })
                         .into_any_element();
                 }
