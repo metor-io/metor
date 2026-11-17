@@ -58,6 +58,8 @@ pub(crate) fn take_active_drag(cx: &mut App) -> Option<ActiveDrag> {
 /// dragged.
 pub(super) struct DragGhost {
     pub title: gpui::SharedString,
+    /// The width of the tab being dragged, so it lifts at its own size.
+    pub width: Option<Pixels>,
     pub text_style: gpui::TextStyle,
 }
 
@@ -78,10 +80,11 @@ impl Render for DragGhost {
             .debug_selector(|| "drag-ghost".into())
             .flex()
             .items_center()
-            .h(px(super::tab_bar::TAB_HEIGHT))
+            .h(px(crate::theme::CONTROL_HEIGHT))
             .max_w(px(super::tab_bar::TAB_MAX_WIDTH))
-            .px(px(10.0))
-            .rounded(px(6.0))
+            .when_some(self.width, |ghost, width| ghost.w(width))
+            .px(px(8.0))
+            .rounded(px(crate::theme::CONTROL_RADIUS))
             .border_1()
             .border_color(theme.border_primary)
             .bg(theme.bg_elevated)

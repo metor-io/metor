@@ -36,7 +36,7 @@ actions!(
         CycleTabForward,
         CycleTabBackward,
         NewTab,
-        ClosePanel,
+        CloseTab,
         ToggleCmdLock,
         OpenReviewEdits,
         OpenConnections,
@@ -277,8 +277,7 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.tiles
-            .update(cx, |tiles, cx| tiles.cycle_tab(true, cx));
+        self.tiles.update(cx, |tiles, cx| tiles.cycle_tab(true, cx));
     }
 
     fn cycle_tab_backward(
@@ -297,16 +296,16 @@ impl AppRoot {
         });
     }
 
-    /// Close the current panel — and its tab with it when it was the tab's
-    /// last — or the window once nothing is open.
-    fn close_panel(&mut self, _: &ClosePanel, window: &mut Window, cx: &mut Context<Self>) {
+    /// Close the current tab, or the window once nothing is open.
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if !self.tiles.read(cx).has_items(cx) {
             crate::window_controls::close_window(window, cx);
             return;
         }
-        if let Some(pane) = self.tiles.read(cx).active_pane(cx) {
-            pane.update(cx, |pane, cx| pane.close(cx));
-        }
+        self.tiles.update(cx, |tiles, cx| {
+            let tab = tiles.active_tab();
+            tiles.close_tab(tab, cx);
+        });
     }
 
     fn toggle_cmd_lock(&mut self, _: &ToggleCmdLock, _window: &mut Window, cx: &mut Context<Self>) {
@@ -692,7 +691,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
             .on_action(cx.listener(Self::new_tab))
-            .on_action(cx.listener(Self::close_panel))
+            .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
                 this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
             }))
@@ -924,15 +923,15 @@ impl AppRoot {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
-            .px(px(6.0))
-            .py(px(2.0))
-            .rounded(px(4.0))
+            .h(px(crate::theme::CONTROL_HEIGHT))
+            .px(px(8.0))
+            .rounded(px(crate::theme::CONTROL_RADIUS))
             .flex()
             .flex_shrink_0()
             .flex_row()
             .items_center()
-            .gap(px(5.0))
-            .text_size(px(11.0))
+            .gap(px(6.0))
+            .text_size(px(12.0))
             .text_color(theme.text_primary)
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
@@ -1067,9 +1066,12 @@ impl AppRoot {
             .border_r_1()
             .border_color(theme.border_primary)
             .child(
-                gpui::canvas(move |bounds, _, _| left.set(bounds.origin.x), |_, _, _, _| {})
-                    .absolute()
-                    .size_full(),
+                gpui::canvas(
+                    move |bounds, _, _| left.set(bounds.origin.x),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
             )
             .child(header)
             .child(tab_bar::tab_list(
@@ -1161,10 +1163,10 @@ impl AppRoot {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(24.0))
-            .h(px(22.0))
+            .w(px(crate::theme::CONTROL_HEIGHT))
+            .h(px(crate::theme::CONTROL_HEIGHT))
             .flex_shrink_0()
-            .rounded(px(3.0))
+            .rounded(px(crate::theme::CONTROL_RADIUS))
             .child(icon.svg(13.0, icon_color))
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
@@ -1997,7 +1999,7 @@ impl PanelApp {
                 gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action("New tab", NewTab),
-                gpui::MenuItem::action("Close panel", ClosePanel),
+                gpui::MenuItem::action("Close tab", CloseTab),
             ]),
         ]);
         cx.bind_keys([
@@ -2016,7 +2018,7 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-            KeyBinding::new("secondary-w", ClosePanel, None),
+            KeyBinding::new("secondary-w", CloseTab, None),
             KeyBinding::new("secondary-t", NewTab, None),
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),

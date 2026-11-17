@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Axis, Context, DragMoveEvent, Entity, EntityId, EventEmitter, IntoElement,
-    Pixels, Point, Render, SharedString, Subscription, Task, Window, actions, div,
-    prelude::*, px, relative,
+    Pixels, Point, Render, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    relative,
 };
 
 use smallvec::SmallVec;
@@ -566,11 +566,9 @@ impl Tab {
     }
 
     fn can_close(&self, cx: &App) -> bool {
-        self.panes.iter().all(|pane| {
-            pane.read(cx)
-                .item()
-                .is_none_or(|item| item.can_close(cx))
-        })
+        self.panes
+            .iter()
+            .all(|pane| pane.read(cx).item().is_none_or(|item| item.can_close(cx)))
     }
 }
 
@@ -600,6 +598,7 @@ pub struct TileGroup {
     /// The background tab a dragged pane is hovering, and the timer that
     /// opens it.
     spring: Option<(TabId, Task<()>)>,
+    bar: tab_bar::BarState,
 }
 
 impl TileGroup {
@@ -639,6 +638,7 @@ impl TileGroup {
             pane_bounds: HashMap::new(),
             split_preview: Default::default(),
             spring: None,
+            bar: Default::default(),
         }
     }
 
@@ -738,16 +738,13 @@ impl TileGroup {
 
     /// Every pane in every tab, active tab first.
     pub fn all_panes(&self) -> impl Iterator<Item = &Entity<Pane>> {
-        self.tab()
-            .panes
-            .iter()
-            .chain(
-                self.tabs
-                    .iter()
-                    .enumerate()
-                    .filter(|(ix, _)| *ix != self.active_tab)
-                    .flat_map(|(_, tab)| tab.panes.iter()),
-            )
+        self.tab().panes.iter().chain(
+            self.tabs
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| *ix != self.active_tab)
+                .flat_map(|(_, tab)| tab.panes.iter()),
+        )
     }
 
     pub fn zoomed(&self) -> Option<&Entity<Pane>> {
@@ -1105,7 +1102,11 @@ impl TileGroup {
     }
 
     /// Lift `pane` out into a group of its own, for a new window.
-    pub fn split_off_pane(&mut self, pane: Entity<Pane>, cx: &mut Context<Self>) -> Option<Entity<Self>> {
+    pub fn split_off_pane(
+        &mut self,
+        pane: Entity<Pane>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Self>> {
         if !self.detach(&pane, cx) {
             return None;
         }
@@ -1449,8 +1450,8 @@ impl Render for TileGroup {
             .relative()
             .size_full()
             .bg(theme.bg_secondary)
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<drag::DraggedPane>, _, cx| {
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<drag::DraggedPane>, _, cx| {
                     // Hidden panes keep stale bounds from before the zoom,
                     // so only the zoomed one can take a drop.
                     let tab = this.tab();
@@ -1461,8 +1462,8 @@ impl Render for TileGroup {
                     if this.split_preview.drag_move(&panes, event, cx) {
                         cx.notify();
                     }
-                },
-            ))
+                }),
+            )
             .child(
                 gpui::canvas(
                     move |bounds, _, cx| {
@@ -1631,9 +1632,8 @@ mod tests {
 
     #[gpui::test]
     fn each_item_opens_as_its_own_tab(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx))
-        });
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
         cx.read(|cx| {
             assert_eq!(titles(&group, cx), ["a", "b"]);
             assert_eq!(group.read(cx).panes().len(), 1);
@@ -1668,14 +1668,24 @@ mod tests {
         let first = cx.read(|cx| group.read(cx).panes()[0].clone());
         cx.update(|cx| first.update(cx, |pane, cx| pane.add_item(item("a", cx), cx)));
         cx.read(|cx| {
-            assert_eq!(group.read(cx).panes().len(), 1, "an empty pane fills in place")
+            assert_eq!(
+                group.read(cx).panes().len(),
+                1,
+                "an empty pane fills in place"
+            )
         });
         cx.update(|cx| first.update(cx, |pane, cx| pane.add_item(item("b", cx), cx)));
         cx.read(|cx| {
             let group = group.read(cx);
             assert_eq!(group.panes().len(), 2, "a full pane splits");
             assert_eq!(
-                group.active_pane(cx).unwrap().read(cx).item().unwrap().tab_title(cx),
+                group
+                    .active_pane(cx)
+                    .unwrap()
+                    .read(cx)
+                    .item()
+                    .unwrap()
+                    .tab_title(cx),
                 "b"
             );
         });
@@ -1683,9 +1693,8 @@ mod tests {
 
     #[gpui::test]
     fn closing_a_tabs_last_pane_closes_the_tab_but_never_the_last(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx))
-        });
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
         let a = cx.read(|cx| group.read(cx).panes()[0].clone());
         cx.update(|cx| a.update(cx, |pane, cx| pane.close(cx)));
         let b = cx.read(|cx| {
@@ -1705,9 +1714,8 @@ mod tests {
 
     #[gpui::test]
     fn a_tab_holding_an_item_that_refuses_to_close_stays(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![fixed("pinned", cx), item("b", cx)], cx))
-        });
+        let group = cx
+            .update(|cx| cx.new(|cx| TileGroup::new(vec![fixed("pinned", cx), item("b", cx)], cx)));
         cx.update(|cx| {
             let id = group.read(cx).tabs[0].id;
             group.update(cx, |group, cx| group.close_tab(id, cx));
@@ -1738,9 +1746,8 @@ mod tests {
 
     #[gpui::test]
     fn moving_a_pane_keeps_its_entity_and_drops_an_emptied_tab(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx))
-        });
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
         cx.update(|cx| {
             let a = group.read(cx).tabs[0].panes[0].clone();
             let b = group.read(cx).tabs[1].panes[0].clone();
@@ -1760,9 +1767,8 @@ mod tests {
 
     #[gpui::test]
     fn dropping_a_pane_on_a_tab_moves_it_there(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx))
-        });
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
         cx.update(|cx| {
             let a = group.read(cx).tabs[0].panes[0].clone();
             let extra = pane("extra", cx);
@@ -1842,9 +1848,8 @@ mod tests {
 
     #[gpui::test]
     fn focus_or_open_reveals_a_panel_in_another_tab(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![item("a", cx), fixed("b", cx)], cx))
-        });
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), fixed("b", cx)], cx)));
         cx.update(|cx| {
             group.update(cx, |group, cx| {
                 group.focus_or_open("test_item", |_| None, cx);
@@ -1876,7 +1881,10 @@ mod tests {
                 group.toggle_zoom(&right, cx);
                 assert_eq!(group.zoomed(), Some(&right));
                 group.remove_pane(&right, cx);
-                assert!(group.zoomed().is_none(), "removing the zoomed pane un-zooms");
+                assert!(
+                    group.zoomed().is_none(),
+                    "removing the zoomed pane un-zooms"
+                );
 
                 let extra = pane("c", cx);
                 group.split_pane(&left, extra.clone(), SplitDirection::Down, cx);
@@ -1889,21 +1897,24 @@ mod tests {
 
     #[gpui::test]
     fn the_layout_round_trips_tabs_and_the_active_one(cx: &mut TestAppContext) {
-        let group = cx.update(|cx| {
-            cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx))
-        });
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
         let json = cx.update(|cx| {
             group.update(cx, |group, cx| {
                 let a = group.tabs[0].panes[0].clone();
-                group.split_pane(&a, cx.new(|cx| Pane::new(None, cx)), SplitDirection::Right, cx);
+                group.split_pane(
+                    &a,
+                    cx.new(|cx| Pane::new(None, cx)),
+                    SplitDirection::Right,
+                    cx,
+                );
                 let b = group.tabs[1].id;
                 group.activate_tab(b, cx);
             });
             group.read(cx).to_json(cx)
         });
-        let restored = cx.update(|cx| {
-            cx.new(|cx| TileGroup::from_json(&json, &registry(), cx).unwrap())
-        });
+        let restored =
+            cx.update(|cx| cx.new(|cx| TileGroup::from_json(&json, &registry(), cx).unwrap()));
         cx.read(|cx| {
             assert_eq!(titles(&restored, cx), ["a", "b"]);
             let restored = restored.read(cx);
@@ -1974,14 +1985,12 @@ mod tests {
                 .flex()
                 .flex_col()
                 .size_full()
-                .child(
-                    div().h(px(36.0)).flex().child(tab_bar::tab_list(
-                        &self.group,
-                        crate::config::TabPlacement::Top,
-                        window,
-                        cx,
-                    )),
-                )
+                .child(div().h(px(36.0)).flex().child(tab_bar::tab_list(
+                    &self.group,
+                    crate::config::TabPlacement::Top,
+                    window,
+                    cx,
+                )))
                 .child(div().flex_1().child(self.group.clone()))
         }
     }
@@ -2035,10 +2044,7 @@ mod tests {
         });
         cx.refresh().unwrap();
         let target = cx.update(|_, cx| a.read(cx).bounds());
-        let end = point(
-            target.center().x,
-            target.bottom() - px(10.0),
-        );
+        let end = point(target.center().x, target.bottom() - px(10.0));
         let start = header_of(&b, cx);
         drag(cx, start, end);
         cx.update(|_, cx| {
@@ -2114,9 +2120,66 @@ mod tests {
         cx.simulate_mouse_up(last, MouseButton::Left, Default::default());
         cx.refresh().unwrap();
         cx.update(|_, cx| {
-            assert_eq!(titles(&group, cx), ["b", "c", "a"]);
-            assert_eq!(group.read(cx).active_tab, 2, "the moved tab shows");
+            assert_eq!(
+                titles(&group, cx),
+                ["b", "a", "c"],
+                "a lands where c's left half was"
+            );
+            assert_eq!(group.read(cx).active_tab, 1, "the moved tab shows");
         });
+    }
+
+    #[gpui::test]
+    fn a_dragged_tab_opens_a_gap_and_its_neighbours_slide(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let ids: Vec<TabId> = cx.update(|_, cx| group.read(cx).tabs.iter().map(|t| t.id).collect());
+        let b_before = cx.debug_bounds("top-tab-1").unwrap();
+        let first = cx.debug_bounds("top-tab-0").unwrap().center();
+        let last = cx.debug_bounds("top-tab-2").unwrap();
+        let end = point(last.right() - px(4.0), last.center().y);
+        drag(cx, first, end);
+        cx.update(|_, cx| {
+            let group = group.read(cx);
+            assert_eq!(group.bar.lifted, Some(ids[0]));
+            let preview = group.bar.preview.expect("the bar previews a landing gap");
+            assert_eq!(preview.before, None);
+            assert_eq!(
+                group.tabs[0].id, ids[0],
+                "the preview leaves the order alone"
+            );
+        });
+        let b_moving = cx.debug_bounds("top-tab-1").unwrap();
+        assert!(
+            b_moving.origin.x < b_before.origin.x && b_moving.origin.x > px(0.0),
+            "b slides left into the lifted tab's slot rather than jumping"
+        );
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            assert_eq!(titles(&group, cx), ["b", "c", "a"]);
+            assert!(group.read(cx).bar.preview.is_none());
+            assert!(group.read(cx).bar.lifted.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn a_crowded_bar_scrolls_the_active_tab_into_view(cx: &mut TestAppContext) {
+        let (group, cx) = host(
+            |cx| (0..30).map(|_| item("a long tab title", cx)).collect(),
+            cx,
+        );
+        let last = cx.update(|_, cx| group.read(cx).tabs.last().unwrap().id);
+        cx.update(|_, cx| group.update(cx, |group, cx| group.activate_tab(last, cx)));
+        cx.refresh().unwrap();
+        cx.refresh().unwrap();
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let shown = cx.debug_bounds("top-tab-29").unwrap();
+        assert!(
+            shown.right() <= viewport.width,
+            "the active tab is on screen"
+        );
+        let scroll = cx.update(|_, cx| group.read(cx).bar.scroll.offset());
+        assert!(scroll.x < px(0.0), "the bar scrolled sideways");
     }
 
     #[gpui::test]
@@ -2231,5 +2294,4 @@ mod tests {
             assert!(item.entity_any(cx).downcast::<RegisteredTestView>().is_ok());
         });
     }
-
 }

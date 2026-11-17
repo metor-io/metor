@@ -58,9 +58,8 @@ pub struct PreviewPlotAction {
     pub anchor: Point<Pixels>,
 }
 
-
 /// Height of a pane's header row.
-pub(super) const HEADER_HEIGHT: f32 = 26.0;
+pub(super) const HEADER_HEIGHT: f32 = crate::theme::CONTROL_HEIGHT;
 
 /// Messages a pane sends to the [`TileGroup`](super::TileGroup) that owns it.
 ///
@@ -212,8 +211,8 @@ impl Pane {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(20.0))
-                .rounded(px(4.0))
+                .size(px(22.0))
+                .rounded(px(crate::theme::CONTROL_RADIUS))
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover_bg))
                 .child(icon.svg(12.0, theme.text_tertiary))
@@ -231,8 +230,8 @@ impl Pane {
             .gap(px(2.0))
             .h(px(HEADER_HEIGHT))
             .flex_shrink_0()
-            .pl(px(10.0))
-            .pr(px(4.0))
+            .pl(px(8.0))
+            .pr(px(3.0))
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary)
@@ -250,8 +249,8 @@ impl Pane {
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                    match &this.item {
+                cx.listener(
+                    |this, event: &gpui::MouseDownEvent, _, cx| match &this.item {
                         Some(item) => cx.emit(PaneEvent::Inspect {
                             item: item.clone_handle(),
                             position: event.position,
@@ -259,26 +258,20 @@ impl Pane {
                         None => cx.emit(PaneEvent::InspectPane {
                             position: event.position,
                         }),
-                    }
-                }),
+                    },
+                ),
             )
+            .child(div().flex_1().min_w_0().truncate().child(title.clone()))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(title.clone()),
-            )
-            .child(
-                button("pane-split-right", Icon::SplitRight, "Split right").on_click(
-                    cx.listener(|_, _, _, cx| {
+                button("pane-split-right", Icon::SplitRight, "Split right").on_click(cx.listener(
+                    |_, _, _, cx| {
                         cx.stop_propagation();
                         cx.emit(PaneEvent::Split {
                             direction: SplitDirection::Right,
                             item: None,
                         });
-                    }),
-                ),
+                    },
+                )),
             )
             .child(
                 button("pane-split-down", Icon::SplitDown, "Split down").on_click(cx.listener(
@@ -292,20 +285,20 @@ impl Pane {
                 )),
             )
             .child(
-                button("pane-zoom", Icon::Maximize, "Zoom").on_click(cx.listener(
-                    |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(PaneEvent::ToggleZoom);
-                    },
-                )),
+                button("pane-zoom", Icon::Maximize, "Zoom").on_click(cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(PaneEvent::ToggleZoom);
+                })),
             )
             .when(can_close, |header| {
-                header.child(button("pane-close", Icon::Close, "Close").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.close(cx);
-                    },
-                )))
+                header.child(
+                    button("pane-close", Icon::Close, "Close").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close(cx);
+                        },
+                    )),
+                )
             });
 
         if self.item.is_some() {
@@ -324,6 +317,7 @@ impl Pane {
                     );
                     cx.new(|_| super::drag::DragGhost {
                         title: title.clone(),
+                        width: None,
                         text_style: text_style.clone(),
                     })
                 },

@@ -7,6 +7,15 @@ use metor_proto_wkt::SequenceChannelState;
 use crate::config::{self, FontConfig, PanelConfig};
 use crate::views::gradient::Palette;
 
+/// Height of the app's one-line controls — inspector rows, titlebar
+/// controls, tabs, pane headers, filter bars — so chrome lines up wherever
+/// two of them meet.
+pub const CONTROL_HEIGHT: f32 = 28.0;
+
+/// Corner radius of a control's surface: hover and selection pills, tabs,
+/// titlebar segments.
+pub const CONTROL_RADIUS: f32 = 4.0;
+
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
 /// Theme tables are `static`, so the conversion has to happen without

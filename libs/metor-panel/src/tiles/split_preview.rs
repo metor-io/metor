@@ -184,4 +184,3 @@ impl SplitPreview {
         self.source = None;
     }
 }
-

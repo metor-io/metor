@@ -4,30 +4,72 @@
 //! own render, because where it sits — in the titlebar beside the other
 //! controls, or as a sidebar the full height of the window — is a global
 //! preference ([`TabPlacement`]) that changes the whole window's frame.
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, ClickEvent, DragMoveEvent, Entity, MouseButton, Pixels, SharedString, Window,
-    div, prelude::*, px,
+    AnyElement, App, ClickEvent, DragMoveEvent, Entity, MouseButton, Pixels, ScrollHandle,
+    SharedString, Window, div, prelude::*, px,
 };
 
 use super::TileGroup;
 use super::drag::{ActiveDrag, DragGhost, DragSource, DraggedPane, DraggedTab, set_active_drag};
+use super::motion::{MovingTab, Rail, TabSizes};
 use crate::config::TabPlacement;
 use crate::icons::Icon;
-use crate::theme::{Theme, theme};
+use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
 
 /// Identity of a tab within its group, stable while tabs are added, closed
 /// and reordered around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub(super) u64);
 
-pub(crate) const TAB_HEIGHT: f32 = 26.0;
 /// A tab along the titlebar sizes to its title up to this width, then
 /// ellipsizes so one long title can't crowd every other tab off the bar.
 pub(crate) const TAB_MAX_WIDTH: f32 = 220.0;
-const TAB_MIN_WIDTH: f32 = 64.0;
+const TAB_MIN_WIDTH: f32 = 80.0;
+/// Space between neighbouring tabs.
+const TAB_GAP: f32 = 2.0;
 const SIDEBAR_WIDTH: f32 = 200.0;
 const MIN_SIDEBAR_WIDTH: f32 = 140.0;
 const MAX_SIDEBAR_WIDTH: f32 = 420.0;
+
+/// What a group's tab bar keeps between frames.
+#[derive(Default)]
+pub(super) struct BarState {
+    pub(super) sizes: TabSizes,
+    pub(super) scroll: ScrollHandle,
+    /// Where a tab dragged over this bar would land, shown as a gap.
+    pub(super) preview: Option<DragPreview>,
+    /// The tab being dragged out of this bar, whose slot closes at once.
+    pub(super) lifted: Option<TabId>,
+    /// The active tab last scrolled into view.
+    pub(super) revealed: Option<TabId>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct DragPreview {
+    pub tab: TabId,
+    pub before: Option<TabId>,
+    pub extent: Pixels,
+}
+
+/// The tab the dragged one lands before, judged from committed slot
+/// centres rather than animated hitboxes, so a still pointer cannot keep
+/// swapping the target as neighbours slide past it.
+fn insertion_before(
+    slots: impl IntoIterator<Item = (TabId, Pixels)>,
+    dragged: TabId,
+    pointer: Pixels,
+) -> Option<TabId> {
+    let mut start = px(0.0);
+    for (id, extent) in slots {
+        if id != dragged && pointer < start + extent / 2.0 {
+            return Some(id);
+        }
+        start += extent;
+    }
+    None
+}
 
 pub(crate) fn placement(cx: &App) -> TabPlacement {
     cx.try_global::<crate::theme::FontSettings>()
@@ -71,10 +113,24 @@ pub(crate) fn save_sidebar_width(cx: &App) {
     }
 }
 
+/// The extent a tab takes along the bar: its measured size plus the gap
+/// after it, or a typical tab's before it has been drawn.
+fn slot_extent(sizes: &TabSizes, tab: TabId, vertical: bool) -> Pixels {
+    let size = sizes.borrow().get(&tab).copied();
+    let extent = match size {
+        Some(size) if vertical => size.height,
+        Some(size) => size.width,
+        None if vertical => px(CONTROL_HEIGHT),
+        None => px(TAB_MAX_WIDTH / 2.0),
+    };
+    extent + px(TAB_GAP)
+}
+
 /// `group`'s tabs laid out for `placement`: a row that scrolls sideways in
 /// the titlebar, or a column for the sidebar. Either ends in a "new tab"
-/// button and a stretch of open bar that takes a dropped pane or tab as a
-/// new last tab.
+/// button and a stretch of open bar that takes a dropped pane as a new
+/// last tab. Tabs slide when the order changes, and a tab dragged over the
+/// bar opens a gap where it would land.
 pub(crate) fn tab_list(
     group: &Entity<TileGroup>,
     placement: TabPlacement,
@@ -83,42 +139,125 @@ pub(crate) fn tab_list(
 ) -> AnyElement {
     let theme = theme(cx);
     let vertical = placement == TabPlacement::Side;
-    let state = group.read(cx);
-    let active = state.active_tab();
-    let tabs: Vec<_> = state
-        .tabs
-        .iter()
-        .map(|tab| (tab.id, tab.title(cx), tab.can_close(cx)))
-        .collect();
+    let dragging = cx.has_active_drag();
+    let (active, tabs, preview, lifted, sizes, scroll, reveal) = group.update(cx, |group, cx| {
+        if !dragging {
+            group.bar.preview = None;
+            group.bar.lifted = None;
+        }
+        let active = group.active_tab();
+        let tabs: Vec<_> = group
+            .tabs
+            .iter()
+            .map(|tab| (tab.id, tab.title(cx), tab.can_close(cx)))
+            .collect();
+        let reveal = group.bar.revealed != Some(active);
+        group.bar.revealed = Some(active);
+        (
+            active,
+            tabs,
+            group.bar.preview,
+            group.bar.lifted,
+            group.bar.sizes.clone(),
+            group.bar.scroll.clone(),
+            reveal,
+        )
+    });
     let lone = tabs.len() == 1;
 
+    let rail = Rc::new(Rail::new(sizes.clone()));
+    let tracker = rail.clone();
     let mut list = div()
         .id("top-tabs")
         .debug_selector(|| "top-tabs".into())
+        .relative()
         .flex()
         .min_w_0()
-        .gap(px(2.0));
+        .gap(px(TAB_GAP))
+        .track_scroll(&scroll)
+        .child(
+            gpui::canvas(
+                move |bounds, _, _| tracker.bounds.set(bounds),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        );
     list = if vertical {
-        list.flex_col().w_full().flex_1().min_h_0().px(px(6.0)).overflow_y_scroll()
+        list.flex_col()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .px(px(6.0))
+            .overflow_y_scroll()
     } else {
-        list.flex_row().items_center().flex_1().h_full().overflow_x_scroll()
+        list.flex_row()
+            .items_center()
+            .flex_1()
+            .h_full()
+            .overflow_x_scroll()
     };
-    list.style().restrict_scroll_to_axis = Some(true);
+    // Along the titlebar a plain wheel scrolls the row sideways.
+    list.style().restrict_scroll_to_axis = Some(vertical);
 
-    for (ix, (id, title, can_close)) in tabs.into_iter().enumerate() {
-        list = list.child(render_tab(
-            group,
-            TabView {
-                id,
-                ix,
-                title,
-                active: id == active,
-                can_close: can_close && !lone,
-                vertical,
-            },
-            &theme,
-            window,
-        ));
+    let mut order: Vec<Option<usize>> = (0..tabs.len())
+        .filter(|ix| {
+            let id = tabs[*ix].0;
+            Some(id) != lifted && preview.is_none_or(|preview| preview.tab != id)
+        })
+        .map(Some)
+        .collect();
+    if let Some(preview) = preview {
+        let slot = order
+            .iter()
+            .position(|ix| Some(tabs[ix.unwrap()].0) == preview.before)
+            .unwrap_or(order.len());
+        let original_slot = tabs.iter().position(|tab| tab.0 == preview.tab);
+        // Lifting closes the source gap at once; open an insertion gap only
+        // over a different slot or another window's bar.
+        if original_slot != Some(slot) {
+            order.insert(slot, None);
+        }
+    }
+    if reveal
+        && let Some(slot) = order
+            .iter()
+            .position(|ix| ix.is_some_and(|ix| tabs[ix].0 == active))
+    {
+        // The measuring canvas is the bar's first child.
+        scroll.scroll_to_item(slot + 1);
+    }
+
+    let animate = !dragging || preview.is_some() || lifted.is_some();
+    for ix in order {
+        match ix {
+            Some(ix) => {
+                let (id, title, can_close) = tabs[ix].clone();
+                let tab = render_tab(
+                    group,
+                    TabView {
+                        id,
+                        ix,
+                        title,
+                        active: id == active,
+                        can_close: can_close && !lone,
+                        vertical,
+                    },
+                    &theme,
+                    window,
+                );
+                list = list.child(MovingTab::new(id, tab, rail.clone(), animate, vertical));
+            }
+            None => {
+                let extent = preview.map(|preview| preview.extent - px(TAB_GAP));
+                let gap = div().flex_shrink_0();
+                list = list.child(match (vertical, extent) {
+                    (true, Some(extent)) => gap.w_full().h(extent),
+                    (false, Some(extent)) => gap.h(px(CONTROL_HEIGHT)).w(extent),
+                    (_, None) => gap,
+                });
+            }
+        }
     }
 
     let bg_primary = theme.bg_primary;
@@ -132,9 +271,9 @@ pub(crate) fn tab_list(
             .flex_shrink_0()
             .items_center()
             .gap(px(6.0))
-            .h(px(TAB_HEIGHT))
-            .px(px(if vertical { 10.0 } else { 6.0 }))
-            .rounded(px(6.0))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(8.0))
+            .rounded(px(CONTROL_RADIUS))
             .cursor_pointer()
             .text_size(px(12.0))
             .text_color(theme.text_tertiary)
@@ -155,29 +294,64 @@ pub(crate) fn tab_list(
     // titlebar's window-drag area.
     let drop_target = theme.drop_target;
     let tail = {
-        let pane_group = group.clone();
-        let tab_group = group.clone();
+        let group = group.clone();
         div()
             .id("top-tabs-tail")
             .debug_selector(|| "top-tabs-tail".into())
             .flex_1()
             .min_w(px(24.0))
             .when(vertical, |tail| tail.min_h(px(24.0)).w_full())
-            .when(!vertical, |tail| tail.h_full())
-            .rounded(px(6.0))
+            .when(!vertical, |tail| tail.h(px(CONTROL_HEIGHT)))
+            .rounded(px(CONTROL_RADIUS))
             .drag_over::<DraggedPane>(move |s, _, _, _| s.bg(drop_target))
             .on_drop(move |dragged: &DraggedPane, _, cx| {
-                pane_group.update(cx, |group, cx| {
+                group.update(cx, |group, cx| {
                     group.move_pane_to_new_tab(dragged.pane.clone(), cx)
                 });
             })
-            .on_drop(move |dragged: &DraggedTab, _, cx| drop_tab(&tab_group, dragged, None, cx))
     };
-    list.child(tail).into_any_element()
+
+    let preview_group = group.clone();
+    let drop_group = group.clone();
+    list.child(tail)
+        .on_drag_move(move |event: &DragMoveEvent<DraggedTab>, _, cx| {
+            let next = event.bounds.contains(&event.event.position).then(|| {
+                let dragged = event.drag(cx);
+                let extent = slot_extent(&dragged.group.read(cx).bar.sizes, dragged.tab, vertical);
+                let bar = &preview_group.read(cx).bar;
+                let relative = event.event.position - event.bounds.origin - bar.scroll.offset();
+                let pointer = if vertical { relative.y } else { relative.x };
+                let before = insertion_before(
+                    preview_group.read(cx).tabs.iter().map(|tab| {
+                        let extent = if tab.id == dragged.tab {
+                            extent
+                        } else {
+                            slot_extent(&bar.sizes, tab.id, vertical)
+                        };
+                        (tab.id, extent)
+                    }),
+                    dragged.tab,
+                    pointer,
+                );
+                DragPreview {
+                    tab: dragged.tab,
+                    before,
+                    extent,
+                }
+            });
+            preview_group.update(cx, |group, cx| {
+                if group.bar.preview != next {
+                    group.bar.preview = next;
+                    cx.notify();
+                }
+            });
+        })
+        .on_drop(move |dragged: &DraggedTab, _, cx| drop_tab(&drop_group, dragged, cx))
+        .into_any_element()
 }
 
 struct TabView {
-    id: super::TabId,
+    id: TabId,
     ix: usize,
     title: SharedString,
     active: bool,
@@ -215,11 +389,11 @@ fn render_tab(
         .flex_row()
         .items_center()
         .gap(px(4.0))
-        .h(px(TAB_HEIGHT))
+        .h(px(CONTROL_HEIGHT))
         .flex_shrink_0()
-        .pl(px(10.0))
+        .pl(px(8.0))
         .pr(px(4.0))
-        .rounded(px(6.0))
+        .rounded(px(CONTROL_RADIUS))
         .border_1()
         .cursor_pointer()
         .text_size(px(12.0));
@@ -231,7 +405,7 @@ fn render_tab(
     element = if active {
         element
             .bg(bg_primary)
-            .border_color(theme.border_primary)
+            .border_color(border_primary)
             .text_color(text_primary)
             .shadow_xs()
     } else {
@@ -268,12 +442,11 @@ fn render_tab(
     let drag_group = group.clone();
     let spring_group = group.clone();
     let pane_group = group.clone();
-    let tab_group = group.clone();
     let click_group = group.clone();
     let middle_group = group.clone();
+    let tab_group = group.clone();
     element
         .drag_over::<DraggedPane>(move |s, _, _, _| s.border_color(control_active))
-        .drag_over::<DraggedTab>(move |s, _, _, _| s.border_color(control_active))
         // Keep the press from arming the titlebar's window move, which would
         // take the pointer before the tab's own drag could start. The tab's
         // click and drag tracking have already seen it.
@@ -299,9 +472,18 @@ fn render_tab(
                     },
                     cx,
                 );
-                let title = title_for_ghost(&dragged.group, dragged.tab, cx);
+                let (title, size) = dragged.group.update(cx, |group, cx| {
+                    group.bar.lifted = Some(dragged.tab);
+                    cx.notify();
+                    let title = group
+                        .tab_index(dragged.tab)
+                        .map(|ix| group.tabs[ix].title(cx))
+                        .unwrap_or_default();
+                    (title, group.bar.sizes.borrow().get(&dragged.tab).copied())
+                });
                 cx.new(|_| DragGhost {
                     title,
+                    width: size.map(|size| size.width),
                     text_style: text_style.clone(),
                 })
             },
@@ -321,41 +503,23 @@ fn render_tab(
                 group.move_pane_to_tab(dragged.pane.clone(), id, cx)
             });
         })
-        .on_drop(move |dragged: &DraggedTab, _, cx| {
-            // Dropped on a later tab, the dragged one lands after it; on an
-            // earlier one, before it — the way the pointer was travelling.
-            let before = tab_group.read(cx).tab_index(id).and_then(|target| {
-                let from = (dragged.group == tab_group)
-                    .then(|| tab_group.read(cx).tab_index(dragged.tab))
-                    .flatten();
-                if from.is_some_and(|from| from < target) {
-                    tab_group.read(cx).tabs.get(target + 1).map(|tab| tab.id)
-                } else {
-                    Some(id)
-                }
-            });
-            drop_tab(&tab_group, dragged, before, cx);
-        })
+        // Tabs occlude the bar beneath them, so they take a tab drop too.
+        .on_drop(move |dragged: &DraggedTab, _, cx| drop_tab(&tab_group, dragged, cx))
         .child(div().flex_1().min_w_0().truncate().child(title))
         .when(can_close, |tab| tab.child(close))
 }
 
-fn title_for_ghost(group: &Entity<TileGroup>, id: super::TabId, cx: &App) -> SharedString {
-    let group = group.read(cx);
-    group
-        .tab_index(id)
-        .map(|ix| group.tabs[ix].title(cx))
-        .unwrap_or_default()
-}
-
-/// Land a dragged tab in `group` before `before` (last without one):
-/// a reorder within its own window, or a move from another.
-fn drop_tab(
-    group: &Entity<TileGroup>,
-    dragged: &DraggedTab,
-    before: Option<super::TabId>,
-    cx: &mut App,
-) {
+/// Land a dragged tab in `group` where its preview gap was (last without
+/// one): a reorder within its own window, or a move from another.
+fn drop_tab(group: &Entity<TileGroup>, dragged: &DraggedTab, cx: &mut App) {
+    let before = group.update(cx, |group, _| {
+        group
+            .bar
+            .preview
+            .take()
+            .filter(|preview| preview.tab == dragged.tab)
+            .and_then(|preview| preview.before)
+    });
     if &dragged.group == group {
         group.update(cx, |group, cx| {
             group.move_tab(dragged.tab, before, cx);
@@ -365,5 +529,23 @@ fn drop_tab(
         let source = dragged.group.clone();
         let tab = dragged.tab;
         group.update(cx, |group, cx| group.adopt_tab(&source, tab, before, cx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insertion_follows_slot_centres_and_skips_the_dragged_tab() {
+        let slots = [
+            (TabId(1), px(100.0)),
+            (TabId(2), px(100.0)),
+            (TabId(3), px(100.0)),
+        ];
+        assert_eq!(insertion_before(slots, TabId(9), px(40.0)), Some(TabId(1)));
+        assert_eq!(insertion_before(slots, TabId(9), px(60.0)), Some(TabId(2)));
+        assert_eq!(insertion_before(slots, TabId(2), px(140.0)), Some(TabId(3)));
+        assert_eq!(insertion_before(slots, TabId(9), px(290.0)), None);
     }
 }
