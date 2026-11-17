@@ -235,6 +235,21 @@ impl Theme {
         }
     }
 
+    /// Where a dragged pane or tab will land: a fixed blue, the same on
+    /// every theme, so a drop reads as "goes here" rather than as any
+    /// palette's status hue.
+    pub fn drop_accent(&self) -> Hsla {
+        hex(0x3d8bfd, 1.0)
+    }
+
+    /// [`drop_accent`](Self::drop_accent) as a fill behind a drop zone.
+    pub fn drop_fill(&self) -> Hsla {
+        Hsla {
+            a: 0.18,
+            ..self.drop_accent()
+        }
+    }
+
     /// Tint for a component-frame edge in the system graph — the blue family,
     /// the calmer of the two edge kinds since frame edges dominate a target.
     pub fn frame_edge_color(&self) -> Hsla {

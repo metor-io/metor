@@ -300,7 +300,7 @@ pub(crate) fn tab_list(
 
     // Open bar past the last tab. Not occluded, so it stays part of the
     // titlebar's window-drag area.
-    let drop_target = theme.drop_target;
+    let drop_fill = theme.drop_fill();
     let tail = {
         let group = group.clone();
         div()
@@ -311,7 +311,7 @@ pub(crate) fn tab_list(
             .when(vertical, |tail| tail.min_h(px(24.0)).w_full())
             .when(!vertical, |tail| tail.h(px(CONTROL_HEIGHT)))
             .rounded(px(CONTROL_RADIUS))
-            .drag_over::<DraggedPane>(move |s, _, _, _| s.bg(drop_target))
+            .drag_over::<DraggedPane>(move |s, _, _, _| s.bg(drop_fill))
             .on_drop(move |dragged: &DraggedPane, _, cx| {
                 group.update(cx, |group, cx| {
                     group.move_pane_to_new_tab(dragged.pane.clone(), cx)
@@ -380,7 +380,8 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
     let bg_primary = theme.bg_primary;
     let text_primary = theme.text_primary;
     let border_primary = theme.border_primary;
-    let control_active = theme.control_active;
+    let drop_accent = theme.drop_accent();
+    let drop_fill = theme.drop_fill();
 
     let mut element = div()
         .id(("top-tab", id.0 as usize))
@@ -441,7 +442,7 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
     let middle_group = group.clone();
     let tab_group = group.clone();
     element
-        .drag_over::<DraggedPane>(move |s, _, _, _| s.border_color(control_active))
+        .drag_over::<DraggedPane>(move |s, _, _, _| s.border_color(drop_accent).bg(drop_fill))
         // Keep the press from arming the titlebar's window move, which would
         // take the pointer before the tab's own drag could start. The tab's
         // click and drag tracking have already seen it.

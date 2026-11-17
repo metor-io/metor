@@ -36,7 +36,7 @@ actions!(
         CycleTabForward,
         CycleTabBackward,
         NewTab,
-        CloseTab,
+        ClosePane,
         ToggleCmdLock,
         OpenReviewEdits,
         OpenConnections,
@@ -298,16 +298,19 @@ impl AppRoot {
 
     /// Close the current tab, or the window once it is down to one empty
     /// tab.
-    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+    /// Cmd-W: close the panel the user last worked in. Its tab goes with
+    /// its last panel, and the window once a lone empty panel is all
+    /// that's left.
+    fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         let tiles = self.tiles.read(cx);
-        if tiles.tab_count() == 1 && !tiles.has_items(cx) {
+        let Some(pane) = tiles.active_pane(cx) else {
+            return;
+        };
+        if tiles.tab_count() == 1 && tiles.panes().len() == 1 && pane.read(cx).is_empty() {
             crate::window_controls::close_window(window, cx);
             return;
         }
-        self.tiles.update(cx, |tiles, cx| {
-            let tab = tiles.active_tab();
-            tiles.close_tab(tab, cx);
-        });
+        pane.update(cx, |pane, cx| pane.close(cx));
     }
 
     fn toggle_cmd_lock(&mut self, _: &ToggleCmdLock, _window: &mut Window, cx: &mut Context<Self>) {
@@ -693,7 +696,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
             .on_action(cx.listener(Self::new_tab))
-            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::close_pane))
             .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
                 this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
             }))
@@ -2001,7 +2004,7 @@ impl PanelApp {
                 gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
                 gpui::MenuItem::separator(),
                 gpui::MenuItem::action("New tab", NewTab),
-                gpui::MenuItem::action("Close tab", CloseTab),
+                gpui::MenuItem::action("Close panel", ClosePane),
             ]),
         ]);
         cx.bind_keys([
@@ -2020,7 +2023,7 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-            KeyBinding::new("secondary-w", CloseTab, None),
+            KeyBinding::new("secondary-w", ClosePane, None),
             KeyBinding::new("secondary-t", NewTab, None),
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
@@ -2387,7 +2390,7 @@ mod window_tests {
             cx.set_global(crate::tiles::ItemRegistry::default());
             crate::inspector::edits::init(cx);
             crate::temporal::TemporalController::init(db.clone(), cx);
-            cx.bind_keys([KeyBinding::new("secondary-w", CloseTab, None)]);
+            cx.bind_keys([KeyBinding::new("secondary-w", ClosePane, None)]);
             let tiles = cx.new(|cx| {
                 let items = (0..tabs).map(|_| item("tab", cx)).collect();
                 let mut tiles = TileGroup::new(items, cx);
@@ -2437,29 +2440,34 @@ mod window_tests {
     }
 
     #[gpui::test]
-    fn cmd_w_closes_one_tab_and_the_window_only_once_nothing_is_left(cx: &mut TestAppContext) {
+    fn cmd_w_closes_the_focused_panel_and_the_window_only_once_nothing_is_left(
+        cx: &mut TestAppContext,
+    ) {
         let (tiles, window, _dir) = open(1, cx);
         let cx = &mut VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
         window
             .update(cx, |root, window, cx| root.focus_handle.focus(window, cx))
             .unwrap();
-        cx.update(|_, cx| {
-            tiles.update(cx, |tiles, cx| {
-                tiles.new_tab(cx);
-                tiles.new_tab(cx);
+        cx.update(|_, cx| tiles.update(cx, |tiles, cx| tiles.new_tab(cx)));
+        let counts = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let tiles = tiles.read(cx);
+                (tiles.tab_count(), tiles.panes().len())
             })
-        });
-        // Two empty tabs and one with panes: each press takes one tab.
-        for remaining in [2, 1] {
-            cx.simulate_keystrokes("cmd-w");
-            assert_eq!(cx.update(|_, cx| tiles.read(cx).tab_count()), remaining);
-        }
+        };
+        // The new tab's lone panel takes its tab with it.
         cx.simulate_keystrokes("cmd-w");
+        assert_eq!(counts(cx), (1, 2));
+        // Then one panel of the split at a time, and the tab stays.
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(counts(cx), (1, 1));
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(counts(cx), (1, 1));
         assert!(cx.update(|_, cx| !tiles.read(cx).has_items(cx)));
         assert!(
             window.update(cx, |_, _, _| ()).is_ok(),
-            "one empty tab keeps the window"
+            "one empty panel keeps the window"
         );
         cx.simulate_keystrokes("cmd-w");
         assert!(
