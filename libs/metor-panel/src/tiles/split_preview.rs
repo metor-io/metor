@@ -7,7 +7,35 @@ use super::{Member, Pane, SplitDirection, drag::nearest_edge};
 use crate::motion::Fade;
 
 const DURATION: Duration = Duration::from_millis(120);
-pub(super) type GapWeights = HashMap<EntityId, f32>;
+
+/// How far each previewed slot is open (gaps opening or closing, and the
+/// dragged pane's own slot closing), and which gap the drop would fill.
+#[derive(Default)]
+pub(super) struct GapWeights {
+    weights: HashMap<EntityId, f32>,
+    /// Only this gap is tinted: one closing behind a pointer that moved on
+    /// shrinks as plain background, rather than streaking colour across
+    /// the pane.
+    pub landing: Option<EntityId>,
+}
+
+impl GapWeights {
+    pub fn contains_key(&self, id: &EntityId) -> bool {
+        self.weights.contains_key(id)
+    }
+
+    pub fn get(&self, id: &EntityId) -> Option<&f32> {
+        self.weights.get(id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.weights.is_empty()
+    }
+
+    fn insert(&mut self, id: EntityId, amount: f32) {
+        self.weights.insert(id, amount);
+    }
+}
 
 struct Gap {
     target: Entity<Pane>,
@@ -140,6 +168,9 @@ impl SplitPreview {
                 return false;
             }
             weights.insert(gap.placeholder.entity_id(), amount);
+            if active {
+                weights.landing = Some(gap.placeholder.entity_id());
+            }
             openness = openness.max(amount);
             true
         });
