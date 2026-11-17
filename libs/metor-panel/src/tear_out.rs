@@ -18,10 +18,6 @@
 //! (plots, the 3D viewer) check [`is_preview`] and show their last frame
 //! instead of rendering again at the preview's size — doing so would
 //! reallocate their targets twice a frame, fighting the source window.
-//!
-//! The preview is moved behind gpui's back: with its window delegate
-//! detached, AppKit doesn't report the moves, which gpui would otherwise
-//! answer with a full redraw on every pointer move.
 
 use std::time::Duration;
 
@@ -196,7 +192,7 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
                 if cx.has_global::<Riding>() {
                     cx.global_mut::<Riding>().preview = Some(window.window_handle());
                 }
-                native::detach(window);
+                native::overlay(window);
                 native::pin(window, grab);
                 cx.new(|_| DragOutPreview {
                     title,
@@ -479,17 +475,18 @@ mod native {
     }
 
     /// Make `window` a pure overlay: clicks and the pointer pass through
-    /// it, it has no outline of its own, and moving it goes unreported.
-    pub fn detach(window: &Window) {
+    /// it, and it has no outline of its own.
+    ///
+    /// gpui answers each move with a full redraw, through the window's
+    /// delegate, but the delegate stays: it is also what starts the
+    /// display link once AppKit reports the window visible, without which
+    /// nothing after the first frame would draw.
+    pub fn overlay(window: &Window) {
         if let Some(ns_window) = ns_window(window) {
             ns_window.setIgnoresMouseEvents(true);
             // The frame draws its own shadow; AppKit's would trace the
             // whole window, visible or not.
             ns_window.setHasShadow(false);
-            // gpui's delegate answers every move with a full redraw. The
-            // window never resizes, takes focus or closes itself, and gpui
-            // detaches the delegate on close anyway.
-            ns_window.setDelegate(None);
         }
     }
 }
@@ -500,5 +497,5 @@ mod native {
 
     pub fn pin(_: &Window, _: Point<Pixels>) {}
 
-    pub fn detach(_: &Window) {}
+    pub fn overlay(_: &Window) {}
 }
