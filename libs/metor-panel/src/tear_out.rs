@@ -28,7 +28,7 @@ use gpui::{
 
 use crate::config::DragPreview;
 use crate::motion::Fade;
-use crate::theme::{CONTROL_HEIGHT, theme};
+use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, theme};
 use crate::tiles::Replica;
 use crate::tiles::drag::DragSource;
 
@@ -36,6 +36,13 @@ const GROW: Duration = Duration::from_millis(180);
 const SHRINK: Duration = Duration::from_millis(120);
 /// Width the mini preview scales the panes down to.
 const MINI_WIDTH: f32 = 420.0;
+/// How far the panes sit inside the preview's frame. gpui clips children
+/// to rectangles, so this keeps their square corners within the frame's
+/// rounded ones.
+const INSET: f32 = 3.0;
+/// The preview frame's rounding, and its border.
+const FRAME_RADIUS: f32 = 8.0;
+const BORDER: f32 = 1.0;
 /// Room around the preview inside its window: for the shadow, and clear of
 /// the corners AppKit rounds off every window.
 const MARGIN: f32 = 16.0;
@@ -111,7 +118,14 @@ fn body_size(panes: Size<Pixels>, cx: &App) -> Size<Pixels> {
 /// ghost the pointer holds `grab` into. A window torn out where the preview
 /// stood puts its panes here too.
 pub(crate) fn panes_offset(grab: Point<Pixels>) -> Point<Pixels> {
-    point(px(0.0), px(CONTROL_HEIGHT)) - grab
+    // The frame tucks its top border under the tab's bottom one.
+    point(px(BORDER + INSET), px(CONTROL_HEIGHT + INSET)) - grab
+}
+
+/// The frame around panes of `body` size: border and inset on every side.
+fn frame_size(body: Size<Pixels>) -> Size<Pixels> {
+    let edge = px(BORDER + INSET) * 2.0;
+    size(body.width + edge, body.height + edge)
 }
 
 /// Whether a drag from `source` has its panes out, below the tab.
@@ -152,9 +166,10 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
     let source = window.window_handle();
     let margin = point(px(MARGIN), px(MARGIN));
     let grab = drag.grab + margin;
+    let frame = frame_size(body);
     let extent = size(
-        body.width.max(width.unwrap_or_default()) + px(MARGIN) * 2.0,
-        px(CONTROL_HEIGHT) + body.height + px(MARGIN) * 2.0,
+        frame.width.max(width.unwrap_or_default()) + px(MARGIN) * 2.0,
+        px(CONTROL_HEIGHT - BORDER) + frame.height + px(MARGIN) * 2.0,
     );
     let bounds = Bounds {
         origin: window.bounds().origin + window.mouse_position() - grab,
@@ -297,26 +312,37 @@ impl Render for DragOutPreview {
         let t = self.fade.opacity(window, cx);
         let theme = theme(cx);
         let margin = px(MARGIN);
-        let tab = crate::tiles::drag::ghost_chip(self.title.clone(), self.closable, cx)
+        let frame = frame_size(self.body);
+        let lerp = |a: Pixels, b: Pixels| a + (b - a) * t;
+        // The tab widens with the panes until it heads the whole preview.
+        let folded = self
+            .tab
+            .unwrap_or_else(|| folded_width(&self.title, self.closable))
+            .min(frame.width);
+        let mut tab = crate::tiles::drag::ghost_chip(self.title.clone(), self.closable, cx)
             .absolute()
             .left(margin)
-            .top(margin)
-            .when_some(self.tab, |tab, width| tab.w(width));
-        let lerp = |a: Pixels, b: Pixels| a + (b - a) * t;
+            .top(margin);
+        tab = if t > 0.0 {
+            tab.w(lerp(folded, frame.width))
+                .max_w(frame.width)
+                .rounded_t(lerp(px(CONTROL_RADIUS), px(FRAME_RADIUS)))
+                .rounded_b(lerp(px(CONTROL_RADIUS), px(0.0)))
+        } else {
+            tab.when_some(self.tab, |tab, width| tab.w(width))
+        };
         // Unfolds downward from under the tab, laid out at its full size
         // throughout and uncovered as the frame grows, so the panes never
         // reflow mid-animation.
         let body = (t > 0.0).then(|| {
-            let folded = self.tab.unwrap_or(px(120.0)).min(self.body.width);
             div()
                 .absolute()
                 .left(margin)
-                .top(margin + px(CONTROL_HEIGHT - 1.0))
-                .w(lerp(folded, self.body.width))
-                .h(lerp(px(0.0), self.body.height))
+                .top(margin + px(CONTROL_HEIGHT - BORDER))
+                .w(lerp(folded, frame.width))
+                .h(lerp(px(0.0), frame.height))
                 .overflow_hidden()
-                .rounded_b(px(8.0))
-                .rounded_tr(px(8.0))
+                .rounded_b(px(FRAME_RADIUS))
                 .border_1()
                 .border_color(theme.border_primary)
                 .bg(theme.bg_secondary)
@@ -324,8 +350,8 @@ impl Render for DragOutPreview {
                 .child(
                     div()
                         .absolute()
-                        .left_0()
-                        .top_0()
+                        .left(px(INSET))
+                        .top(px(INSET))
                         .w(self.body.width)
                         .h(self.body.height)
                         .flex()
@@ -350,6 +376,14 @@ impl Render for DragOutPreview {
             .children(body)
             .child(tab)
     }
+}
+
+/// About how wide a ghost that fits its title draws, for a pane ghost whose
+/// width no bar measured: what the tab widens from as the panes unfold.
+fn folded_width(title: &str, closable: bool) -> Pixels {
+    let text = title.chars().count() as f32 * 7.0;
+    let chrome = if closable { 36.0 } else { 18.0 };
+    px((text + chrome).clamp(80.0, crate::tiles::tab_bar::TAB_MAX_WIDTH))
 }
 
 fn render_replica(replica: &Replica, headed: bool, cx: &App) -> gpui::AnyElement {
