@@ -15,17 +15,18 @@
 //! The preview draws the panes' own views a second time, laid out small:
 //! gpui has no transform for live elements and no readback of a window's
 //! pixels outside tests. Views that render on the GPU at their own size
-//! (plots, the 3D viewer) check [`is_preview`] and show their last frame
-//! instead of rendering again at the preview's size — doing so would
-//! reallocate their targets twice a frame, fighting the source window.
+//! (plots, the 3D viewer) check [`is_preview`] and show a frame their own
+//! window rendered ([`preview_frame`]) instead of rendering again at the
+//! preview's size — doing so would reallocate their targets twice a frame,
+//! fighting the source window.
 
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, DispatchPhase, Global, IntoElement,
-    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Size, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
-    prelude::*, px, relative, size,
+    AnyWindowHandle, App, AppContext, Bounds, Context, DispatchPhase, EntityId, Global,
+    IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage,
+    SharedString, Size, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, div, point, prelude::*, px, relative, size,
 };
 
 use crate::motion::Fade;
@@ -58,6 +59,8 @@ struct Riding {
     grab: Point<Pixels>,
     /// The preview window, known from its first frame on.
     preview: Option<AnyWindowHandle>,
+    /// The frame each GPU-rendered view shows in the preview.
+    frames: HashMap<EntityId, Arc<RenderImage>>,
 }
 
 impl Global for Riding {}
@@ -120,6 +123,29 @@ pub(crate) fn is_preview(window: &Window, cx: &App) -> bool {
         .is_some_and(|riding| riding.preview == Some(window.window_handle()))
 }
 
+/// The image a GPU-rendered `view` shows in the preview, given the `latest`
+/// one its own window rendered: the first it had, held for the drag. A
+/// live view renders a new image nearly every frame, and the preview would
+/// upload each one to its own atlas and hold it till the drag ends.
+pub(crate) fn preview_frame(
+    view: EntityId,
+    latest: Option<Arc<RenderImage>>,
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    if !cx.has_global::<Riding>() {
+        return latest;
+    }
+    let frames = &mut cx.global_mut::<Riding>().frames;
+    match frames.get(&view) {
+        Some(frame) => Some(frame.clone()),
+        None => {
+            let latest = latest?;
+            frames.insert(view, latest.clone());
+            Some(latest)
+        }
+    }
+}
+
 /// Whether a drag from `source` has its panes out, below the tab.
 pub(crate) fn expanded(source: AnyWindowHandle, cx: &App) -> bool {
     cx.try_global::<Riding>()
@@ -173,6 +199,7 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
         expanded: false,
         grab,
         preview: None,
+        frames: HashMap::default(),
     });
     // Deferred: opening a window mid-dispatch re-enters the platform layer.
     cx.defer(move |cx| {
@@ -330,37 +357,43 @@ impl Render for DragOutPreview {
         // Unfolds downward from under the tab, laid out at its full size
         // throughout and uncovered as the frame grows, so the panes never
         // reflow mid-animation.
-        let body = (t > 0.0).then(|| {
-            div()
-                .absolute()
-                .left(margin)
-                .top(margin + px(CONTROL_HEIGHT - BORDER))
-                .w(lerp(folded, frame.width))
-                .h(lerp(px(0.0), frame.height))
-                .overflow_hidden()
-                .rounded_b(px(FRAME_RADIUS))
-                .border_1()
-                .border_color(theme.border_primary)
-                .bg(theme.bg_secondary)
-                .shadow_lg()
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(INSET))
-                        .top(px(INSET))
-                        .w(self.body.width)
-                        .h(self.body.height)
-                        .flex()
-                        .opacity(t)
-                        // A lone pane goes without its header: the tab
-                        // above already names it.
-                        .child(render_replica(
-                            &self.replica,
-                            matches!(self.replica, Replica::Split { .. }),
-                            cx,
-                        )),
-                )
-        });
+        //
+        // Drawn even while folded away, invisibly: a new window starts with
+        // cold text and glyph caches, and filling them for every pane in the
+        // first frames of the unfold would stall it. Drawn here from the
+        // drag's start, where they will appear, they are warm by the time
+        // the drag leaves its window.
+        let body = div()
+            .absolute()
+            .left(margin)
+            .top(margin + px(CONTROL_HEIGHT - BORDER))
+            .w(lerp(folded, frame.width))
+            .h(lerp(px(0.0), frame.height))
+            .overflow_hidden()
+            .when(t > 0.0, |body| {
+                body.rounded_b(px(FRAME_RADIUS))
+                    .border_1()
+                    .border_color(theme.border_primary)
+                    .bg(theme.bg_secondary)
+                    .shadow_lg()
+            })
+            .child(
+                div()
+                    .absolute()
+                    .left(px(INSET))
+                    .top(px(INSET))
+                    .w(self.body.width)
+                    .h(self.body.height)
+                    .flex()
+                    .opacity(t)
+                    // A lone pane goes without its header: the tab
+                    // above already names it.
+                    .child(render_replica(
+                        &self.replica,
+                        matches!(self.replica, Replica::Split { .. }),
+                        cx,
+                    )),
+            );
         div()
             .when_some(
                 cx.try_global::<crate::theme::FontSettings>()
@@ -369,7 +402,7 @@ impl Render for DragOutPreview {
             )
             .size_full()
             .relative()
-            .children(body)
+            .child(body)
             .child(tab)
     }
 }
