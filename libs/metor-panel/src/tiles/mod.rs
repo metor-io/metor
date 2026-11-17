@@ -2218,7 +2218,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_lifted_tab_leaves_its_gap_while_the_pointer_is_off_the_bar(cx: &mut TestAppContext) {
+    fn a_lifted_tab_leaves_a_gap_that_holds_while_the_pointer_is_off_the_bar(
+        cx: &mut TestAppContext,
+    ) {
         let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
         let a = cx.debug_bounds("top-tab-0").unwrap();
         let b_before = cx.debug_bounds("top-tab-1").unwrap();
@@ -2230,6 +2232,20 @@ mod tests {
             b_before.origin,
             "b holds its place beside the gap"
         );
+
+        // Once the pointer has picked a slot on the bar, leaving the bar
+        // keeps the gap there.
+        let c = cx.debug_bounds("top-tab-2").unwrap();
+        let end = point(c.right() - px(4.0), c.center().y);
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.simulate_mouse_move(away, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let preview = group.read(cx).bar.preview.expect("the gap stays");
+            assert_eq!(preview.before, None, "at the end, where it was last");
+        });
+
         cx.simulate_mouse_up(away, MouseButton::Left, Default::default());
         cx.refresh().unwrap();
         cx.update(|_, cx| assert_eq!(titles(&group, cx), ["a", "b", "c"]));

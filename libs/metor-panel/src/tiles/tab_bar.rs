@@ -215,7 +215,7 @@ pub(crate) fn tab_list(
         .map(Some)
         .collect();
     // A lifted tab leaves its slot open until the pointer, over the bar,
-    // picks another; off the bar the gap waits where the tab came from.
+    // picks another; the gap stays put while the pointer is off the bar.
     let landing = preview.or_else(|| {
         let tab = lifted?;
         let ix = tabs.iter().position(|(id, ..)| *id == tab)?;
@@ -333,7 +333,11 @@ pub(crate) fn tab_list(
     let drop_group = group.clone();
     list.child(tail)
         .on_drag_move(move |event: &DragMoveEvent<DraggedTab>, _, cx| {
-            let next = event.bounds.contains(&event.event.position).then(|| {
+            // Off the bar the gap stays where the pointer last left it.
+            if !event.bounds.contains(&event.event.position) {
+                return;
+            }
+            let next = Some({
                 let dragged = event.drag(cx);
                 let extent = slot_extent(&dragged.group.read(cx).bar.sizes, dragged.tab, vertical);
                 let bar = &preview_group.read(cx).bar;
