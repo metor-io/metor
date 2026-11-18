@@ -406,7 +406,23 @@ impl Render for TimeSeriesPlot {
         let axis_count = self.line_plot.read(cx).axes.len();
         let chrome_left = ui_px(left_margin(axis_count));
 
-        let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
+        // Measures the whole view, header room included, for the line
+        // plot to draw across before the plot area is painted.
+        let frame_area = self.line_plot.read(cx).frame_area();
+        let measure = canvas(
+            move |bounds, _, _| frame_area.set(Some(bounds)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        let mut root = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .pt(self.header_inset)
+            .bg(theme.bg_secondary)
+            .child(measure);
 
         let mut inner = self
             .plot_surface(cx)

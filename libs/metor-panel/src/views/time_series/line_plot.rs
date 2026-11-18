@@ -23,7 +23,7 @@ use super::override_field::Override;
 use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
 use crate::data_binding::RAW_SAMPLE_BUDGET;
 use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
-use crate::views::plot_common::{gpu_frame, link_traces, reconcile_trackers};
+use crate::views::plot_common::{gpu_frame_over, link_traces, reconcile_trackers};
 use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::wait_for_component;
 
@@ -183,7 +183,14 @@ pub struct LinePlot {
     title_rebuilds: usize,
     #[facet(opaque)]
     gpu_state: PlotRenderState,
+    /// Where the host lets the data run on past the plot area, under its
+    /// axis chrome; measured by the host each frame before this paints.
+    #[facet(opaque)]
+    frame_area: FrameArea,
 }
+
+/// A host's measured bounds, shared with the plot it hosts.
+pub(crate) type FrameArea = std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>;
 
 impl LinePlot {
     /// Upper bound on Y axes. Each axis reserves `Y_LABEL_WIDTH` of left
@@ -227,6 +234,7 @@ impl LinePlot {
             #[cfg(test)]
             title_rebuilds: 0,
             gpu_state: PlotRenderState::default(),
+            frame_area: FrameArea::default(),
         }
     }
 
@@ -470,6 +478,10 @@ impl LinePlot {
     /// auto-fits the shared X range against every visible trace and each
     /// axis's Y range against just the traces assigned to it, then applies
     /// per-axis inspector overrides on top.
+    pub(crate) fn frame_area(&self) -> FrameArea {
+        self.frame_area.clone()
+    }
+
     pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotView> {
         if let Some(v) = &self.view_override {
             return Some(v.clone());
@@ -829,11 +841,12 @@ impl Render for LinePlot {
         self.update_lod_state(cx);
         let degraded = self.gpu_state.degraded();
         let gap_bands = self.gap_bands(cx);
-        let plot_canvas = gpu_frame(
+        let plot_canvas = gpu_frame_over(
             cx.entity().downgrade(),
             line_plot_gpu_state,
-            move |lp, bounds, scale_factor, cx| {
-                let view = lp.effective_view(cx)?;
+            Some(self.frame_area.clone()),
+            move |lp, bounds, area, scale_factor, cx| {
+                let view = lp.effective_view(cx)?.spanning(area, bounds);
                 let mut draws: Vec<LineDraw<'_>> = Vec::new();
                 for trace in &lp.traces {
                     let config = trace.read(cx);

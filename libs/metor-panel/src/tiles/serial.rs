@@ -107,6 +107,7 @@ impl ItemRegistry {
                 config: state.to_string(),
                 snapshot: spec.snapshot.clone(),
                 tab_title: tile.tab_title.clone(),
+                under_header: tile.under_header.clone(),
             }))
         });
     }
@@ -157,6 +158,7 @@ struct RegisteredPaneHandle {
     config: String,
     snapshot: Arc<dyn Fn(&AnyEntity, &str, &App) -> Option<String>>,
     tab_title: Arc<dyn Fn(&AnyEntity, &str, &App) -> SharedString>,
+    under_header: Option<Arc<dyn Fn(&AnyEntity, gpui::Pixels, &mut App)>>,
 }
 
 impl PaneItemHandle for RegisteredPaneHandle {
@@ -190,6 +192,14 @@ impl PaneItemHandle for RegisteredPaneHandle {
 
     fn entity_any(&self, _cx: &App) -> AnyEntity {
         self.inspect.clone()
+    }
+
+    fn lie_under_header(&self, inset: gpui::Pixels, cx: &mut App) -> bool {
+        let Some(under_header) = &self.under_header else {
+            return false;
+        };
+        under_header(&self.state, inset, cx);
+        true
     }
 }
 

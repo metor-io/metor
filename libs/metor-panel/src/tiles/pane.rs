@@ -193,7 +193,8 @@ impl Pane {
         cx.notify();
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `over` lays the header over the item, which runs on beneath it.
+    fn render_header(&self, over: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let title = self
             .item
@@ -233,7 +234,18 @@ impl Pane {
             .pr(px(3.0))
             // Part of the panel rather than a strip above it, as in Rex: the
             // views' own background, which the tab bar shares too.
-            .bg(theme.bg_secondary)
+            .map(|header| {
+                if over {
+                    header
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bg(theme.plot_chrome_bg())
+                } else {
+                    header.bg(theme.bg_secondary)
+                }
+            })
             .text_size(px(12.0))
             .text_color(theme.text_secondary)
             .on_click(cx.listener(|_, event: &ClickEvent, _, cx| {
@@ -342,12 +354,22 @@ impl Render for Pane {
         .size_full()
         .absolute();
 
+        let header = !self.hide_header;
+        let inset = if header { px(HEADER_HEIGHT) } else { px(0.0) };
+        let under = self
+            .item
+            .as_ref()
+            .is_some_and(|item| item.lie_under_header(inset, cx))
+            && header;
         let mut content = div()
             .id("pane-content")
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .w_full()
+            .map(|content| {
+                if under {
+                    content.absolute().inset_0()
+                } else {
+                    content.relative().flex_1().min_h_0().w_full()
+                }
+            })
             .overflow_hidden()
             .bg(theme.bg_secondary);
         content = match &self.item {
@@ -361,8 +383,11 @@ impl Render for Pane {
             .flex_col()
             .size_full()
             .child(bounds_tracker)
-            .when(!self.hide_header, |pane| pane.child(self.render_header(cx)))
+            .when(header && !under, |pane| {
+                pane.child(self.render_header(false, cx))
+            })
             .child(content)
+            .when(under, |pane| pane.child(self.render_header(true, cx)))
     }
 }
 
