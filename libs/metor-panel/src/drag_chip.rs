@@ -189,7 +189,7 @@ impl Render for DragChip {
 #[cfg(target_os = "macos")]
 mod native {
     use gpui::{Pixels, Point, Window};
-    use objc2_app_kit::{NSEvent, NSView, NSWindow};
+    use objc2_app_kit::{NSEvent, NSView, NSWindow, NSWindowStyleMask};
     use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
 
     fn ns_window(window: &Window) -> Option<objc2::rc::Retained<NSWindow>> {
@@ -220,8 +220,14 @@ mod native {
 
     /// Make `window` a pure overlay: clicks and the pointer pass through
     /// it, and it has no outline of its own (the chip draws its shadow).
+    /// Borderless, too: gpui opens every window titled, and AppKit keeps a
+    /// titled window below the menu bar, which would stop the chip short of
+    /// the top of the screen by its margin and more.
     pub fn overlay(window: &Window) {
         if let Some(ns_window) = ns_window(window) {
+            ns_window.setStyleMask(
+                NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+            );
             ns_window.setIgnoresMouseEvents(true);
             ns_window.setHasShadow(false);
         }
