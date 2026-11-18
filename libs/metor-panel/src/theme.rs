@@ -143,14 +143,18 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// How much of a sidebar's tint covers the native blurred backdrop
+    /// behind it, shared by the splash and the side tab bar.
+    const BACKDROP_TINT: f32 = 0.7;
+
     /// A theme tint over the native blurred backdrop in the splash sidebar.
     pub(crate) fn splash_sidebar_bg(&self) -> Hsla {
-        Self::dim(self.bg_elevated, 0.25)
+        Self::dim(self.bg_elevated, Self::BACKDROP_TINT)
     }
 
     /// The side tab bar's tint over the native blurred backdrop.
     pub(crate) fn tab_sidebar_bg(&self) -> Hsla {
-        Self::dim(self.bg_secondary, 0.55)
+        Self::dim(self.bg_secondary, Self::BACKDROP_TINT)
     }
 
     /// The logo's ember ramp, fading into the current splash surface.
