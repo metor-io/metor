@@ -749,8 +749,9 @@ impl Render for AppRoot {
             .flex_row()
             .size_full()
             // Linux client-side decorations render into a transparent surface,
-            // so the root must paint its own opaque background.
-            .bg(theme.bg_primary)
+            // so the root must paint its own opaque background. On macOS the
+            // content paints its own, leaving the side tabs translucent.
+            .when(!cfg!(target_os = "macos"), |root| root.bg(theme.bg_primary))
             .children(sidebar)
             .child(
                 div()
@@ -759,6 +760,7 @@ impl Render for AppRoot {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .bg(theme.bg_primary)
                     .child(titlebar)
                     .child(div().flex_1().min_h_0().child(self.tiles.clone())),
             );
@@ -1071,7 +1073,11 @@ impl AppRoot {
             .w(width)
             .flex_shrink_0()
             .pb(px(6.0))
-            .bg(theme.bg_secondary)
+            .bg(if cfg!(target_os = "macos") {
+                theme.tab_sidebar_bg()
+            } else {
+                theme.bg_secondary
+            })
             .border_r_1()
             .border_color(theme.border_primary)
             .child(

@@ -148,6 +148,11 @@ impl Theme {
         Self::dim(self.bg_elevated, 0.25)
     }
 
+    /// The side tab bar's tint over the native blurred backdrop.
+    pub(crate) fn tab_sidebar_bg(&self) -> Hsla {
+        Self::dim(self.bg_secondary, 0.55)
+    }
+
     /// The logo's ember ramp, fading into the current splash surface.
     pub(crate) fn logo_color(&self, level: f32) -> Hsla {
         let stops: [gpui::Rgba; 3] = [

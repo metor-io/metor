@@ -151,6 +151,13 @@ pub(crate) fn open_panel_window(
             // titlebar strip, taking the pointer from the tabs that live
             // there. The window root moves the window itself instead.
             app_owns_titlebar_drag: true,
+            // The side tabs show the desktop blurred through; everything
+            // else paints opaque over it.
+            window_background: if cfg!(target_os = "macos") {
+                gpui::WindowBackgroundAppearance::Transparent
+            } else {
+                gpui::WindowBackgroundAppearance::Opaque
+            },
             app_id: Some("metor-panel".into()),
             ..Default::default()
         },
@@ -164,6 +171,18 @@ pub(crate) fn open_panel_window(
                 true
             });
             let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
+                    tracing::warn!(%error, "could not install the tab sidebar's backdrop");
+                }
+                root.update(cx, |_, cx| {
+                    cx.observe_global_in::<crate::theme::ActiveTheme>(window, |_, window, cx| {
+                        crate::backdrop::retheme(window, &crate::theme::theme(cx))
+                    })
+                    .detach()
+                });
+            }
             cx.observe_release(&root, |_, cx| cx.refresh_windows())
                 .detach();
             let tiles = root.read(cx).tiles().clone();

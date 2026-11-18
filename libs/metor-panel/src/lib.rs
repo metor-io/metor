@@ -17,6 +17,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 pub mod alarms;
 pub mod app;
 pub(crate) mod atlas;
+#[cfg(target_os = "macos")]
+pub(crate) mod backdrop;
 pub mod backfill;
 pub(crate) mod background_tasks;
 pub(crate) mod commands;
