@@ -111,7 +111,7 @@ pub(crate) fn begin(title: SharedString, width: Option<Pixels>, window: &Window,
 }
 
 /// The drag ended: the chip goes.
-fn finish(cx: &mut App) {
+pub(crate) fn finish(cx: &mut App) {
     if !cx.has_global::<Riding>() {
         return;
     }

@@ -2641,9 +2641,13 @@ mod window_tests {
             Some(0),
             "the tab lands before the target's own, and shows"
         );
-        assert!(
-            cx.update(|_, cx| crate::workspace::panel_windows(cx).len()) == 2,
-            "no window tears out"
+        assert_eq!(
+            cx.update(|_, cx| (
+                crate::workspace::panel_windows(cx).len(),
+                cx.windows().len()
+            )),
+            (2, 2),
+            "no window tears out, and the chip is gone"
         );
     }
 

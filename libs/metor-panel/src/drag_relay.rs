@@ -68,17 +68,28 @@ fn follow(event: &MouseMoveEvent, window: &mut Window, cx: &mut App) {
         target: target.map(|(handle, _)| handle),
     });
     if let Some((target, local)) = target {
-        let _ = cx.update_window(target, |_, window, cx| {
-            window.dispatch_event(
-                PlatformInput::MouseMove(MouseMoveEvent {
-                    position: local,
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: event.modifiers,
-                }),
-                cx,
-            )
-        });
+        forward(
+            target,
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: local,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: event.modifiers,
+            }),
+            cx,
+        );
     }
+}
+
+/// Dispatch `input` in `target`, in the midst of this window's own
+/// dispatch. Propagation is app-wide in gpui: a handler over there that
+/// stops it would otherwise stop this window's listeners too, such as the
+/// chip's.
+fn forward(target: AnyWindowHandle, input: PlatformInput, cx: &mut App) {
+    let _ = cx.update_window(target, |_, window, cx| {
+        window.dispatch_event(input, cx);
+        window.refresh();
+    });
+    cx.propagate();
 }
 
 /// The drag was released in `window` at `position`: when that was over
@@ -100,21 +111,21 @@ pub(crate) fn release(position: Point<gpui::Pixels>, window: &mut Window, cx: &m
     let Some((target, local)) = target else {
         return false;
     };
-    let _ = cx.update_window(target, |_, window, cx| {
-        window.dispatch_event(
-            PlatformInput::MouseUp(MouseUpEvent {
-                button: MouseButton::Left,
-                position: local,
-                modifiers: Modifiers::default(),
-                click_count: 1,
-            }),
-            cx,
-        );
-        window.activate_window();
-    });
+    forward(
+        target,
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: local,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }),
+        cx,
+    );
+    let _ = cx.update_window(target, |_, window, _| window.activate_window());
     // The target ends gpui's drag as it handles the release; one it didn't
     // take ends here, so the source can't land it as well.
     cx.stop_active_drag(window);
+    crate::drag_chip::finish(cx);
     crate::app::close_if_emptied(this, cx);
     true
 }
@@ -136,17 +147,15 @@ fn end(keep: Option<AnyWindowHandle>, cx: &mut App) {
 /// The pointer left `target`: move it far off, so its hovers and drop
 /// previews clear.
 fn leave(target: AnyWindowHandle, cx: &mut App) {
-    let _ = cx.update_window(target, |_, window, cx| {
-        window.dispatch_event(
-            PlatformInput::MouseMove(MouseMoveEvent {
-                position: point(px(-100_000.0), px(-100_000.0)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            }),
-            cx,
-        );
-        window.refresh();
-    });
+    forward(
+        target,
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(-100_000.0), px(-100_000.0)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        }),
+        cx,
+    );
 }
 
 /// The frontmost panel window other than `source` at screen point
