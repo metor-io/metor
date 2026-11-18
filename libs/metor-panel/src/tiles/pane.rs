@@ -231,8 +231,9 @@ impl Pane {
             .flex_shrink_0()
             .pl(px(8.0))
             .pr(px(3.0))
-            // Part of the panel rather than a strip above it, as in Rex.
-            .bg(theme.bg_primary)
+            // Part of the panel rather than a strip above it, as in Rex: the
+            // views' own background, which the tab bar shares too.
+            .bg(theme.bg_secondary)
             .text_size(px(12.0))
             .text_color(theme.text_secondary)
             .on_click(cx.listener(|_, event: &ClickEvent, _, cx| {
@@ -348,7 +349,7 @@ impl Render for Pane {
             .min_h_0()
             .w_full()
             .overflow_hidden()
-            .bg(theme.bg_primary);
+            .bg(theme.bg_secondary);
         content = match &self.item {
             Some(item) => content.child(item.view()),
             None => content.child(self.render_starters(window, cx)),
