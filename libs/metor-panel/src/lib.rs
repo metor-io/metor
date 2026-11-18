@@ -17,12 +17,16 @@ use metor_proto::types::{ComponentId, Timestamp};
 pub mod alarms;
 pub mod app;
 pub(crate) mod atlas;
+#[cfg(target_os = "macos")]
+pub(crate) mod backdrop;
 pub mod backfill;
 pub(crate) mod background_tasks;
 pub(crate) mod commands;
 pub mod config;
 pub mod connections;
 pub mod data_binding;
+pub(crate) mod drag_chip;
+pub(crate) mod drag_relay;
 pub mod dynamic;
 pub mod eviction;
 pub mod gpu_context;

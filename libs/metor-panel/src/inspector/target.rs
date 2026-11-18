@@ -17,8 +17,8 @@ pub const INSPECTOR_PANE_KEY: &str = "inspector";
 /// The pane the user last clicked, other than an inspector.
 ///
 /// Held weakly: a closed pane simply stops resolving. The inspector pane
-/// observes this global and reads the pane's active item when it renders,
-/// so switching tabs inside the selected pane retargets it too.
+/// observes this global and reads the pane's item when it renders, so a
+/// pane whose item changes retargets it too.
 #[derive(Default)]
 pub struct InspectionSelection {
     pane: Option<WeakEntity<Pane>>,
@@ -31,7 +31,7 @@ impl Global for InspectionSelection {}
 pub fn select_pane(pane: &Entity<Pane>, cx: &mut App) {
     if pane
         .read(cx)
-        .active_item()
+        .item()
         .is_some_and(|item| item.serialization_key() == INSPECTOR_PANE_KEY)
     {
         return;

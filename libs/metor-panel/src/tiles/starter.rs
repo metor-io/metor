@@ -163,7 +163,7 @@ const PANE_STARTERS: [(&str, Icon, fn(&mut Pane, &mut Context<Pane>)); 3] = [
 ];
 
 impl Pane {
-    /// Add a registered view with its default config as a new tab.
+    /// Show a registered view with its default config.
     pub(super) fn add_registered(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(registry) = cx.try_global::<super::ItemRegistry>().cloned() else {
             return;
@@ -245,7 +245,7 @@ mod tests {
                 });
             }
             cx.set_global(registry);
-            Pane::new(Vec::new(), cx)
+            Pane::new(None, cx)
         });
         let asked = Rc::new(Cell::new(false));
         let _subscription = cx.update(|_, cx| {
@@ -260,9 +260,9 @@ mod tests {
         let titles = |cx: &mut gpui::VisualTestContext| -> Vec<SharedString> {
             cx.update(|_, cx| {
                 pane.read(cx)
-                    .items()
-                    .iter()
+                    .item()
                     .map(|item| item.tab_title(cx))
+                    .into_iter()
                     .collect()
             })
         };
@@ -299,7 +299,7 @@ mod tests {
 
         click_starter("pane-starter-0", cx);
         assert_eq!(titles(cx), ["component_outline"]);
-        // A pane with a tab shows that tab, not the starters.
+        // A pane with an item shows it, not the starters.
         assert!(cx.debug_bounds("pane-starter-2").is_none());
     }
 }

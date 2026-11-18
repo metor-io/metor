@@ -9,9 +9,6 @@ use gpui::{
 use super::SessionStorage;
 use crate::PanelApp;
 
-#[cfg(target_os = "macos")]
-mod macos;
-
 pub(crate) struct SessionStartup {
     app: Option<PanelApp>,
     selecting: bool,
@@ -73,7 +70,7 @@ pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
     };
     if let Err(error) = cx.open_window(options, |window, cx| {
         #[cfg(target_os = "macos")]
-        if let Err(error) = macos::install_sidebar_blur(window, &crate::theme::theme(cx)) {
+        if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
             tracing::warn!(%error, "could not install native splash blur");
             window.set_background_appearance(gpui::WindowBackgroundAppearance::Blurred);
         }

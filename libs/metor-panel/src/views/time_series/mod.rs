@@ -1101,6 +1101,9 @@ pub struct TimeSeriesPlot {
     pinned_event: Option<PinnedEvent>,
     /// Lazily-built tree for a pinned event whose detail is decoded JSON.
     event_json_tree: Option<Entity<JsonTree>>,
+    /// Room kept clear at the top for a pane header laid over the plot,
+    /// which the data runs on under.
+    header_inset: Pixels,
 }
 
 /// A pinned event popover: the flag it opened on (by timestamp, since the
@@ -1184,6 +1187,16 @@ impl TimeSeriesPlot {
             hovered_event_cluster: None,
             pinned_event: None,
             event_json_tree: None,
+            header_inset: px(0.0),
+        }
+    }
+
+    /// Lie under a pane header `inset` tall: the plot keeps clear of it,
+    /// and its data runs on beneath.
+    pub(crate) fn set_header_inset(&mut self, inset: Pixels, cx: &mut Context<Self>) {
+        if self.header_inset != inset {
+            self.header_inset = inset;
+            cx.notify();
         }
     }
 

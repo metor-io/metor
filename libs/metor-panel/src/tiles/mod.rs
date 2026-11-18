@@ -1,4 +1,3 @@
-mod dock_guide;
 pub(crate) mod drag;
 pub(crate) mod item;
 mod motion;
@@ -7,27 +6,32 @@ pub mod panels;
 pub(crate) mod serial;
 mod split_preview;
 pub(crate) mod starter;
-mod tab;
+pub(crate) mod tab_bar;
+
+use std::collections::HashMap;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Pixels,
-    Point, Render, Window, actions, div, prelude::*, px, relative,
+    AnyElement, App, Axis, Context, DragMoveEvent, Entity, EntityId, EventEmitter, IntoElement,
+    Pixels, Point, Render, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    relative,
 };
 
 use smallvec::SmallVec;
 
 use crate::theme::theme;
 use drag::ResizeDrag;
-use serial::{TileItem, TileNode, TilePane, TileSplit};
+use serial::{TileItem, TileNode, TilePane, TileSplit, TileTab};
 
 pub use drag::SplitDirection;
-pub(crate) use drag::take_active_tab_drag;
+pub(crate) use drag::take_active_drag;
 pub use item::{PaneItem, PaneItemHandle};
 pub use pane::{
     OpenImageAction, OpenOutlineAction, OpenPivotTableAction, Pane, PaneEvent, PlotComponentAction,
-    PreviewPlotAction, TabOrientation,
+    PreviewPlotAction,
 };
 pub use serial::{ItemRegistry, TileLayout};
+pub use tab_bar::TabId;
 
 /// Sequence of member indices locating a node in the split tree.
 ///
@@ -46,8 +50,8 @@ actions!(
 
 /// Events the tile group forwards to its owning view.
 pub enum TileGroupEvent {
-    /// User asked to inspect a pane item (typically via right-click on a tab).
-    /// The position marks where to anchor the inspector.
+    /// User asked to inspect a pane item (typically via right-click on a
+    /// pane header). The position marks where to anchor the inspector.
     Inspect {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
@@ -64,6 +68,10 @@ impl EventEmitter<TileGroupEvent> for TileGroup {}
 
 const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
+/// How long a dragged pane must hover a background tab before it opens, so
+/// the pane can then be dropped at a precise spot in that tab.
+const SPRING_LOAD: Duration = Duration::from_millis(450);
+
 /// Layout version this binary writes and accepts on read. Lives in
 /// `metor-proto-wkt` so targets shipping preset layouts share it; bump in
 /// lockstep with [`TileGroup::serialize`] when the document shape changes.
@@ -79,6 +87,8 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 ///   either fall back to their config defaults.
 /// - 5: drop all legacy-layout fallbacks; plot bounds live only on `axes` and
 ///   dashboard allocation counters are derived from item ids.
+/// - 6: tabs move to the top of the window: the document is a list of tabs,
+///   each a split tree, and a pane holds at most one item.
 pub(crate) const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
 
 /// Failure modes when loading a layout from JSON.
@@ -140,24 +150,20 @@ impl SplitAxis {
 }
 
 impl Member {
-    /// Insert `new_pane` next to `target` along `direction`.
+    /// Insert `new` (a pane, or a whole tab's tree) next to `target` along
+    /// `direction`.
     ///
-    /// If `target` already sits in a split along the matching axis, the new
-    /// pane is appended as a sibling; otherwise a new `SplitAxis` wraps both.
+    /// If `target` already sits in a split along the matching axis, `new`
+    /// is inserted as a sibling; otherwise a new `SplitAxis` wraps both.
     /// Returns `true` if `target` was found.
-    fn split(
-        &mut self,
-        target: &Entity<Pane>,
-        new_pane: &Entity<Pane>,
-        direction: SplitDirection,
-    ) -> bool {
+    fn split(&mut self, target: &Entity<Pane>, new: &Member, direction: SplitDirection) -> bool {
         match self {
             Member::Pane(pane) => {
                 if pane.entity_id() != target.entity_id() {
                     return false;
                 }
                 let old = Member::Pane(pane.clone());
-                let new = Member::Pane(new_pane.clone());
+                let new = new.clone();
                 let (first, second) = if direction.increasing() {
                     (old, new)
                 } else {
@@ -172,7 +178,7 @@ impl Member {
                         && pane.entity_id() == target.entity_id()
                         && axis.axis == direction.axis()
                     {
-                        let new = Member::Pane(new_pane.clone());
+                        let new = new.clone();
                         let insert_at = if direction.increasing() { i + 1 } else { i };
                         axis.members.insert(insert_at, new);
                         axis.flexes.insert(insert_at, 1.0);
@@ -180,7 +186,7 @@ impl Member {
                     }
                 }
                 for member in &mut axis.members {
-                    if member.split(target, new_pane, direction) {
+                    if member.split(target, new, direction) {
                         return true;
                     }
                 }
@@ -234,21 +240,13 @@ impl Member {
         match self {
             Member::Pane(pane) => {
                 let pane = pane.read(cx);
-                let items = pane
-                    .items()
-                    .iter()
-                    .map(|item| TileItem {
+                TileNode::Pane(TilePane {
+                    item: pane.item().map(|item| TileItem {
                         kind: item.serialization_key().to_string(),
                         state: item.serialize(cx),
-                    })
-                    .collect();
-                TileNode::Pane(TilePane {
-                    active_index: pane.active_index(),
-                    items,
-                    tab_orientation: pane.tab_orientation(),
-                    hide_tab_bar: pane.hide_tab_bar(),
+                    }),
+                    hide_header: pane.hide_header(),
                     locked_size: pane.locked_size().map(|s| (s.width, s.height)),
-                    tab_rail_width: pane.custom_rail_width(),
                 })
             }
             Member::Axis(axis) => TileNode::Split(TileSplit {
@@ -287,17 +285,19 @@ impl Member {
                     return div().relative().size_full().child(slot).into_any_element();
                 }
                 if gaps.contains_key(&pane.entity_id()) {
-                    let placeholder = pane.read(cx).items().is_empty();
-                    let color = if placeholder {
-                        crate::theme::Theme::dim(theme(cx).control_active, 0.11)
-                    } else {
-                        theme(cx).bg_secondary
-                    };
+                    let placeholder = pane.read(cx).is_empty();
+                    let landing = gaps.landing == Some(id);
+                    let theme = theme(cx);
                     return div()
                         .size_full()
-                        .bg(color)
+                        .when(!landing, |gap| gap.bg(theme.bg_secondary))
                         .when(placeholder, |gap| {
                             gap.debug_selector(|| "split-preview-gap".into())
+                        })
+                        .when(landing, |gap| {
+                            gap.bg(theme.drop_fill())
+                                .border_1()
+                                .border_color(crate::theme::Theme::dim(theme.drop_accent(), 0.6))
                         })
                         .into_any_element();
                 }
@@ -310,9 +310,7 @@ impl Member {
                     .relative()
                     .size_full()
                     .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
-                        tg.update(cx, |this, _cx| {
-                            this.focused_pane = Some(focus_pane.clone());
-                        });
+                        tg.update(cx, |this, _cx| this.focus_pane(&focus_pane));
                         crate::inspector::target::select_pane(&focus_pane, cx);
                     })
                     .child(slot)
@@ -515,95 +513,356 @@ fn render_resize_handle(
         })
 }
 
-/// Owns the split tree that fills the main viewport.
+/// One top-level tab: a split tree of panes with its own focus and zoom.
 ///
 /// Panes are flat-indexed for fast iteration; the tree is only consulted for
-/// layout and structural edits. Axis bounds are cached during paint so
-/// resize drags can convert pixel positions into flex weights without a
-/// second traversal.
-pub struct TileGroup {
+/// layout and structural edits.
+struct Tab {
+    id: TabId,
     root: Member,
     panes: Vec<Entity<Pane>>,
-    axis_bounds: std::collections::HashMap<SplitPath, gpui::Bounds<gpui::Pixels>>,
     /// The pane that last received a click, i.e. the "current" tile that
     /// keyboard-driven commands (the transient chord menu) act on. Falls back
-    /// to the first pane via [`TileGroup::active_pane`] when unset or stale.
+    /// to the first pane via [`Tab::active_pane`] when unset or stale.
     focused_pane: Option<Entity<Pane>>,
-    /// The pane filling the whole group in place of the tree, toggled from a
-    /// tab double-click. The tree is left untouched underneath and the pane
-    /// keeps its entity, so its items keep their state across the toggle.
-    /// Transient: never serialized, and cleared by any edit that changes
-    /// which panes exist so the user is never left staring past a new one.
+    /// The pane filling the whole tab in place of the tree, toggled from a
+    /// header double-click. The tree is left untouched underneath and the
+    /// pane keeps its entity, so its item keeps its state across the
+    /// toggle. Transient: never serialized, and cleared by any edit that
+    /// changes which panes exist so the user is never left staring past a
+    /// new one.
     zoomed: Option<Entity<Pane>>,
+}
+
+impl Tab {
+    fn new(id: TabId, root: Member, panes: Vec<Entity<Pane>>) -> Self {
+        Self {
+            id,
+            focused_pane: panes.first().cloned(),
+            root,
+            panes,
+            zoomed: None,
+        }
+    }
+
+    fn active_pane(&self) -> Option<Entity<Pane>> {
+        self.focused_pane
+            .as_ref()
+            .filter(|pane| self.panes.contains(pane))
+            .cloned()
+            .or_else(|| self.panes.first().cloned())
+    }
+
+    /// What the tab bar calls this tab: whatever its current pane shows, so
+    /// a tab reads as the view the user last worked in.
+    fn title(&self, cx: &App) -> SharedString {
+        let title = |pane: &Entity<Pane>| pane.read(cx).item().map(|item| item.tab_title(cx));
+        self.active_pane()
+            .and_then(|pane| title(&pane))
+            .or_else(|| self.panes.iter().find_map(title))
+            .unwrap_or_else(|| SharedString::new_static("New tab"))
+    }
+
+    fn can_close(&self, cx: &App) -> bool {
+        self.panes
+            .iter()
+            .all(|pane| pane.read(cx).item().is_none_or(|item| item.can_close(cx)))
+    }
+}
+
+/// Owns a window's top-level tabs and the split tree each one lays out.
+///
+/// Tabs exist only here, at the top of the window — a pane shows exactly one
+/// item — so there is one place to look for everything open, and a dragged
+/// pane either splits the pane it is dropped on or moves into the tab it is
+/// dropped on. The tab bar itself is drawn by the window chrome (see
+/// [`tab_bar`]); this view draws the active tab's tree. Axis bounds are
+/// cached during paint so resize drags can convert pixel positions into flex
+/// weights without a second traversal.
+pub struct TileGroup {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// One per pane this group holds. Dropping it is how a pane that moved
+    /// to another group stops reporting here.
+    subscriptions: HashMap<EntityId, Subscription>,
+    axis_bounds: HashMap<SplitPath, gpui::Bounds<Pixels>>,
     /// The zoomed pane growing over the layout, or shrinking back into it.
     zoom_motion: Option<motion::ZoomMotion>,
     /// Where each pane was last drawn, which is where a zoom grows from and
     /// shrinks back to.
-    pane_bounds: std::collections::HashMap<gpui::EntityId, gpui::Bounds<gpui::Pixels>>,
+    pane_bounds: HashMap<EntityId, gpui::Bounds<Pixels>>,
     split_preview: split_preview::SplitPreview,
+    /// The background tab a dragged pane is hovering, and the timer that
+    /// opens it.
+    spring: Option<(TabId, Task<()>)>,
+    bar: tab_bar::BarState,
 }
 
 impl TileGroup {
-    /// Build a tile group containing a single pane seeded with `items`.
+    /// Build a group with one tab per item, or a single empty tab when
+    /// `items` is empty.
     pub fn new(items: Vec<Box<dyn PaneItemHandle>>, cx: &mut Context<Self>) -> Self {
-        let pane = cx.new(|cx| Pane::new(items, cx));
-        cx.subscribe(&pane, Self::handle_pane_event).detach();
-        let panes = vec![pane.clone()];
-        Self {
-            root: Member::Pane(pane.clone()),
-            panes,
-            axis_bounds: Default::default(),
-            focused_pane: Some(pane),
-            zoomed: None,
-            zoom_motion: None,
-            pane_bounds: Default::default(),
-            split_preview: Default::default(),
+        let mut this = Self::empty();
+        if items.is_empty() {
+            let pane = cx.new(|cx| Pane::new(None, cx));
+            this.push_tab(pane, cx);
         }
+        for item in items {
+            let pane = cx.new(|cx| Pane::new(Some(item), cx));
+            this.push_tab(pane, cx);
+        }
+        this
     }
 
-    /// Adopt an already-constructed pane as the sole member of the tree.
+    /// Adopt an already-constructed pane as the sole member of one tab.
     ///
     /// Use when the caller needs to hold the pane entity before handing
     /// ownership of the layout to the tile group.
     pub fn from_pane(pane: Entity<Pane>, cx: &mut Context<Self>) -> Self {
-        cx.subscribe(&pane, Self::handle_pane_event).detach();
-        let panes = vec![pane.clone()];
+        let mut this = Self::empty();
+        this.push_tab(pane, cx);
+        this
+    }
+
+    fn empty() -> Self {
         Self {
-            root: Member::Pane(pane.clone()),
-            panes,
-            axis_bounds: Default::default(),
-            focused_pane: Some(pane),
-            zoomed: None,
+            tabs: Vec::new(),
+            active_tab: 0,
+            subscriptions: HashMap::new(),
+            axis_bounds: HashMap::new(),
             zoom_motion: None,
-            pane_bounds: Default::default(),
+            pane_bounds: HashMap::new(),
             split_preview: Default::default(),
+            spring: None,
+            bar: Default::default(),
         }
     }
 
+    /// Unique across every window's group, so a tab dragged between windows
+    /// is never mistaken for one of its new bar's own.
+    fn next_id(&mut self) -> TabId {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        TabId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Start reporting `pane`'s events here and mark this group its owner.
+    fn adopt(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
+        let group = cx.weak_entity();
+        pane.update(cx, |pane, _| pane.group = Some(group));
+        self.subscriptions.insert(
+            pane.entity_id(),
+            cx.subscribe(pane, Self::handle_pane_event),
+        );
+    }
+
+    fn release(&mut self, pane: &Entity<Pane>) {
+        self.subscriptions.remove(&pane.entity_id());
+        self.pane_bounds.remove(&pane.entity_id());
+    }
+
+    fn push_tab(&mut self, pane: Entity<Pane>, cx: &mut Context<Self>) -> usize {
+        self.adopt(&pane, cx);
+        let id = self.next_id();
+        self.tabs
+            .push(Tab::new(id, Member::Pane(pane.clone()), vec![pane]));
+        self.tabs.len() - 1
+    }
+
+    fn insert_tab(&mut self, mut tab: Tab, at: usize, cx: &mut Context<Self>) -> usize {
+        for pane in &tab.panes {
+            self.adopt(pane, cx);
+        }
+        tab.id = self.next_id();
+        tab.zoomed = None;
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        if at <= self.active_tab && self.tabs.len() > 1 {
+            self.active_tab += 1;
+        }
+        at
+    }
+
+    /// Take tab `ix` out of the group, keeping one empty tab behind when it
+    /// was the last.
+    fn remove_tab_at(&mut self, ix: usize, cx: &mut Context<Self>) -> Tab {
+        let tab = self.tabs.remove(ix);
+        for pane in &tab.panes {
+            self.release(pane);
+        }
+        if self.tabs.is_empty() {
+            let pane = cx.new(|cx| Pane::new(None, cx));
+            self.push_tab(pane, cx);
+        }
+        if ix < self.active_tab || self.active_tab >= self.tabs.len() {
+            self.active_tab = self.active_tab.saturating_sub(1);
+        }
+        self.forget_layout();
+        cx.notify();
+        tab
+    }
+
+    /// Drop what was measured for the tree on screen, for a switch to
+    /// another tab's tree.
+    fn forget_layout(&mut self) {
+        self.axis_bounds.clear();
+        self.zoom_motion = None;
+        self.split_preview.forget_regions();
+    }
+
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn tab_of(&self, pane: &Entity<Pane>) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.panes.contains(pane))
+    }
+
+    pub fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    pub fn active_tab(&self) -> TabId {
+        self.tab().id
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// The active tab's panes.
     pub fn panes(&self) -> &[Entity<Pane>] {
-        &self.panes
+        &self.tab().panes
+    }
+
+    /// Every pane in every tab, active tab first.
+    pub fn all_panes(&self) -> impl Iterator<Item = &Entity<Pane>> {
+        self.tab().panes.iter().chain(
+            self.tabs
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| *ix != self.active_tab)
+                .flat_map(|(_, tab)| tab.panes.iter()),
+        )
     }
 
     pub fn zoomed(&self) -> Option<&Entity<Pane>> {
-        self.zoomed.as_ref()
+        self.tab().zoomed.as_ref()
     }
 
-    /// Zoom `pane` over the layout, or restore the layout when it is the one
-    /// already zoomed. A lone pane already fills the group, so there is
-    /// nothing to zoom.
+    pub fn activate_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tab_index(id)
+            && ix != self.active_tab
+        {
+            self.active_tab = ix;
+            self.forget_layout();
+            cx.notify();
+        }
+    }
+
+    /// Open a tab holding one empty pane and switch to it.
+    pub fn new_tab(&mut self, cx: &mut Context<Self>) -> Entity<Pane> {
+        let pane = cx.new(|cx| Pane::new(None, cx));
+        self.active_tab = self.push_tab(pane.clone(), cx);
+        self.forget_layout();
+        cx.notify();
+        pane
+    }
+
+    /// Close tab `id` and every pane in it, unless one of its items refuses
+    /// to close.
+    pub fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tab_index(id)
+            && self.tabs[ix].can_close(cx)
+        {
+            self.remove_tab_at(ix, cx);
+        }
+    }
+
+    pub fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let len = self.tabs.len();
+        if len > 1 {
+            let ix = if forward {
+                (self.active_tab + 1) % len
+            } else {
+                (self.active_tab + len - 1) % len
+            };
+            self.activate_tab(self.tabs[ix].id, cx);
+        }
+    }
+
+    /// Move tab `id` so it sits before `before`, or last without one.
+    pub fn move_tab(&mut self, id: TabId, before: Option<TabId>, cx: &mut Context<Self>) {
+        if Some(id) == before {
+            return;
+        }
+        let Some(from) = self.tab_index(id) else {
+            return;
+        };
+        let active = self.tab().id;
+        let tab = self.tabs.remove(from);
+        let to = before
+            .and_then(|before| self.tab_index(before))
+            .unwrap_or(self.tabs.len());
+        self.tabs.insert(to, tab);
+        self.active_tab = self.tab_index(active).unwrap_or(0);
+        cx.notify();
+    }
+
+    /// Bring tab `id` of `source` (another window's group) into this one
+    /// before `before`, and show it.
+    pub fn adopt_tab(
+        &mut self,
+        source: &Entity<TileGroup>,
+        id: TabId,
+        before: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = source.update(cx, |source, cx| {
+            let ix = source.tab_index(id)?;
+            Some(source.remove_tab_at(ix, cx))
+        }) else {
+            return;
+        };
+        let at = before
+            .and_then(|before| self.tab_index(before))
+            .unwrap_or(self.tabs.len());
+        self.active_tab = self.insert_tab(tab, at, cx);
+        self.forget_layout();
+        cx.notify();
+    }
+
+    /// Lift tab `id` out into a group of its own, for a new window.
+    pub fn split_off_tab(&mut self, id: TabId, cx: &mut Context<Self>) -> Option<Entity<Self>> {
+        let ix = self.tab_index(id)?;
+        let tab = self.remove_tab_at(ix, cx);
+        Some(cx.new(|cx| {
+            let mut group = Self::empty();
+            group.insert_tab(tab, 0, cx);
+            group
+        }))
+    }
+
+    /// Zoom `pane` over its tab's layout, or restore the layout when it is
+    /// the one already zoomed. A lone pane already fills the tab, so there
+    /// is nothing to zoom.
     pub fn toggle_zoom(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
-        if self.zoomed.as_ref() == Some(pane) {
+        let Some(ix) = self.tab_of(pane) else {
+            return;
+        };
+        if self.tabs[ix].zoomed.as_ref() == Some(pane) {
             self.exit_zoom(cx);
-        } else if self.panes.len() > 1 && self.panes.contains(pane) {
+        } else if self.tabs[ix].panes.len() > 1 && ix == self.active_tab {
             self.animate_zoom(pane.clone(), true, cx);
-            self.zoomed = Some(pane.clone());
-            self.focused_pane = Some(pane.clone());
+            let tab = &mut self.tabs[ix];
+            tab.zoomed = Some(pane.clone());
+            tab.focused_pane = Some(pane.clone());
             cx.notify();
         }
     }
 
     pub fn exit_zoom(&mut self, cx: &mut Context<Self>) {
-        if let Some(pane) = self.zoomed.take() {
+        let ix = self.active_tab;
+        if let Some(pane) = self.tabs[ix].zoomed.take() {
             self.animate_zoom(pane, false, cx);
             cx.notify();
         }
@@ -623,14 +882,15 @@ impl TileGroup {
         });
     }
 
-    /// The pane moving between its slot and the whole group this frame,
-    /// and how much of the group it covers. Ends the motion once it has
-    /// arrived, when a drag starts, or when an edit has since changed the
-    /// zoom out from under it.
+    /// The pane moving between its slot and the whole tab this frame, and
+    /// how much of the tab it covers. Ends the motion once it has arrived,
+    /// when a drag starts, or when an edit has since changed the zoom out
+    /// from under it.
     fn zoom_frame(&mut self, cx: &App) -> Option<(Entity<Pane>, f32)> {
         let motion = self.zoom_motion.as_ref()?;
-        let current = motion.zooming() == (self.zoomed.as_ref() == Some(&motion.pane));
-        let frame = (current && self.panes.contains(&motion.pane) && !cx.has_active_drag())
+        let tab = self.tab();
+        let current = motion.zooming() == (tab.zoomed.as_ref() == Some(&motion.pane));
+        let frame = (current && tab.panes.contains(&motion.pane) && !cx.has_active_drag())
             .then(|| motion.coverage(std::time::Instant::now()))
             .flatten()
             .map(|coverage| (motion.pane.clone(), coverage));
@@ -640,47 +900,59 @@ impl TileGroup {
         frame
     }
 
-    /// The "current" pane keyboard commands target: the last-clicked pane if it
-    /// still exists, otherwise the first pane. `None` only when the tree somehow
-    /// holds no panes (which never happens — the layout keeps at least one).
+    /// The "current" pane keyboard commands target: the active tab's
+    /// last-clicked pane if it still exists, otherwise its first pane.
     pub fn active_pane(&self, _cx: &App) -> Option<Entity<Pane>> {
-        self.focused_pane
-            .as_ref()
-            .filter(|p| self.panes.iter().any(|q| q.entity_id() == p.entity_id()))
-            .cloned()
-            .or_else(|| self.panes.first().cloned())
+        self.tab().active_pane()
+    }
+
+    /// Record `pane` as current in its tab.
+    fn focus_pane(&mut self, pane: &Entity<Pane>) {
+        if let Some(ix) = self.tab_of(pane) {
+            self.tabs[ix].focused_pane = Some(pane.clone());
+        }
+    }
+
+    /// Show `pane`: switch to its tab, make it current, and lift any zoom
+    /// that hides it.
+    fn reveal(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_of(pane) else {
+            return;
+        };
+        let id = self.tabs[ix].id;
+        self.activate_tab(id, cx);
+        let tab = &mut self.tabs[ix];
+        if tab.zoomed.as_ref().is_some_and(|zoomed| zoomed != pane) {
+            tab.zoomed = None;
+        }
+        tab.focused_pane = Some(pane.clone());
+        cx.notify();
     }
 
     /// Reveal the panel of `kind` (a [`PaneItem::serialization_key`]): when one
-    /// is already open anywhere in the layout, activate its tab and make its
-    /// pane current; otherwise build a fresh item with `make` and add it as a
-    /// new tab in the active pane.
+    /// is already open in any tab, switch to it and make its pane current;
+    /// otherwise build a fresh item with `make` and open it from the active
+    /// pane.
     ///
     /// This is the entry point for "jump to X" affordances (the titlebar alarm
     /// summary, and any future status-bar shortcut) — unlike the palette's
-    /// explicit "New Panel" commands, revealing must not multiply tabs.
+    /// explicit "New Panel" commands, revealing must not multiply panels.
     pub fn focus_or_open(
         &mut self,
         kind: &str,
         make: impl FnOnce(&mut Context<Pane>) -> Option<Box<dyn PaneItemHandle>>,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.panes.iter().find_map(|pane| {
-            pane.read(cx)
-                .items()
-                .iter()
-                .position(|item| item.serialization_key() == kind)
-                .map(|ix| (pane.clone(), ix))
-        });
+        let existing = self
+            .all_panes()
+            .find(|pane| {
+                pane.read(cx)
+                    .item()
+                    .is_some_and(|item| item.serialization_key() == kind)
+            })
+            .cloned();
         match existing {
-            Some((pane, ix)) => {
-                pane.update(cx, |pane, cx| pane.activate_item(ix, cx));
-                if self.zoomed.as_ref().is_some_and(|zoomed| zoomed != &pane) {
-                    self.zoomed = None;
-                }
-                self.focused_pane = Some(pane);
-                cx.notify();
-            }
+            Some(pane) => self.reveal(&pane, cx),
             None => {
                 if let Some(pane) = self.active_pane(cx) {
                     pane.update(cx, |pane, cx| {
@@ -704,48 +976,192 @@ impl TileGroup {
         // A missing `target` makes the split a no-op; tracking `new_pane`
         // anyway would leave a pane that's counted but never rendered — and
         // swallow whatever item it was carrying.
-        if !self.root.split(target, &new_pane, direction) {
+        let Some(ix) = self.tab_of(target) else {
+            return;
+        };
+        if !self.tabs[ix]
+            .root
+            .split(target, &Member::Pane(new_pane.clone()), direction)
+        {
             return;
         }
-        cx.subscribe(&new_pane, Self::handle_pane_event).detach();
-        self.zoomed = None;
+        self.adopt(&new_pane, cx);
+        let tab = &mut self.tabs[ix];
+        tab.zoomed = None;
         // A freshly-split pane becomes the current one so a follow-up chord
         // (e.g. "new tile") lands in the pane the user just created.
-        self.focused_pane = Some(new_pane.clone());
-        self.panes.push(new_pane);
+        tab.focused_pane = Some(new_pane.clone());
+        tab.panes.push(new_pane);
         cx.notify();
     }
 
-    /// Drop a pane from the layout; usually triggered by a pane emitting
-    /// [`PaneEvent::Empty`].
-    pub fn remove_pane(&mut self, target: &Entity<Pane>, cx: &mut Context<Self>) {
-        self.root.remove(target);
-        self.root.collapse();
-        self.panes.retain(|p| p.entity_id() != target.entity_id());
-        self.pane_bounds.remove(&target.entity_id());
-        if self.zoomed.as_ref() == Some(target) || self.panes.len() < 2 {
-            self.zoomed = None;
+    /// Drop a pane from the layout. A tab left with no panes closes, unless
+    /// it was the last, which gets a fresh empty pane. Returns whether the
+    /// pane was here.
+    pub fn remove_pane(&mut self, target: &Entity<Pane>, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.tab_of(target) else {
+            return false;
+        };
+        self.release(target);
+        let tab = &mut self.tabs[ix];
+        tab.root.remove(target);
+        tab.root.collapse();
+        tab.panes.retain(|pane| pane != target);
+        if tab.zoomed.as_ref() == Some(target) || tab.panes.len() < 2 {
+            tab.zoomed = None;
+        }
+        if tab.panes.is_empty() {
+            if self.tabs.len() > 1 {
+                self.remove_tab_at(ix, cx);
+            } else {
+                let pane = cx.new(|cx| Pane::new(None, cx));
+                self.adopt(&pane, cx);
+                let id = self.tabs[ix].id;
+                self.tabs[ix] = Tab::new(id, Member::Pane(pane.clone()), vec![pane]);
+            }
         }
         cx.notify();
+        true
+    }
+
+    /// Take `pane` out of whichever group holds it — this one, or another
+    /// window's. Returns whether it was found.
+    fn detach(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) -> bool {
+        let owner = pane.read(cx).group.as_ref().and_then(|g| g.upgrade());
+        match owner {
+            Some(owner) if owner.entity_id() != cx.entity_id() => {
+                owner.update(cx, |owner, cx| owner.remove_pane(pane, cx))
+            }
+            _ => self.remove_pane(pane, cx),
+        }
+    }
+
+    /// Move `pane` beside `target`, splitting toward `direction`. The pane
+    /// keeps its entity, so its item keeps its state.
+    pub fn move_pane(
+        &mut self,
+        pane: Entity<Pane>,
+        target: &Entity<Pane>,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if &pane == target || self.tab_of(target).is_none() || !self.detach(&pane, cx) {
+            return;
+        }
+        self.split_pane(target, pane.clone(), direction, cx);
+        self.reveal(&pane, cx);
+    }
+
+    /// Move `pane` into tab `id`: in place of the tab's lone empty pane, or
+    /// beside the pane current there. The tab then shows.
+    pub fn move_pane_to_tab(&mut self, pane: Entity<Pane>, id: TabId, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_index(id) else {
+            return;
+        };
+        if self.tabs[ix].panes.contains(&pane) {
+            self.activate_tab(id, cx);
+            return;
+        }
+        if !self.detach(&pane, cx) {
+            return;
+        }
+        let Some(ix) = self.tab_index(id) else {
+            return;
+        };
+        let tab = &self.tabs[ix];
+        let lone_empty = match tab.panes.as_slice() {
+            [only] if only.read(cx).is_empty() => Some(only.clone()),
+            _ => None,
+        };
+        if let Some(empty) = lone_empty {
+            self.release(&empty);
+            self.adopt(&pane, cx);
+            self.tabs[ix] = Tab::new(id, Member::Pane(pane.clone()), vec![pane.clone()]);
+        } else if let Some(anchor) = tab.active_pane() {
+            let direction = SplitDirection::along_longer(anchor.read(cx).bounds().size);
+            self.split_pane(&anchor, pane.clone(), direction, cx);
+        }
+        self.reveal(&pane, cx);
+    }
+
+    /// Move `pane` into a tab of its own at the end of the bar.
+    pub fn move_pane_to_new_tab(&mut self, pane: Entity<Pane>, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tab_of(&pane)
+            && self.tabs[ix].panes.len() == 1
+        {
+            let id = self.tabs[ix].id;
+            self.move_tab(id, None, cx);
+            self.activate_tab(id, cx);
+            return;
+        }
+        if !self.detach(&pane, cx) {
+            return;
+        }
+        self.active_tab = self.push_tab(pane, cx);
+        self.forget_layout();
+        cx.notify();
+    }
+
+    /// Lift `pane` out into a group of its own, for a new window.
+    pub fn split_off_pane(
+        &mut self,
+        pane: Entity<Pane>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Self>> {
+        if !self.detach(&pane, cx) {
+            return None;
+        }
+        Some(cx.new(|cx| Self::from_pane(pane, cx)))
+    }
+
+    /// A dragged pane is over tab `id` (or over no tab): after a moment,
+    /// open the tab so the pane can be dropped into its layout.
+    pub(crate) fn spring_load(&mut self, id: Option<TabId>, cx: &mut Context<Self>) {
+        let id = id.filter(|id| *id != self.tab().id);
+        if self.spring.as_ref().map(|(tab, _)| *tab) == id {
+            return;
+        }
+        self.spring = id.map(|id| {
+            let task = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SPRING_LOAD).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.spring.as_ref().is_some_and(|(tab, _)| *tab == id)
+                        && cx.has_active_drag()
+                    {
+                        // Detached rather than dropped: this is that task.
+                        if let Some((_, task)) = this.spring.take() {
+                            task.detach();
+                        }
+                        this.activate_tab(id, cx);
+                    }
+                });
+            });
+            (id, task)
+        });
     }
 
     /// Whether any pane holds an item. A fresh group keeps one empty pane
     /// around, so "no items anywhere" is the real test for an untouched
     /// layout (used to decide if loading a saved one needs consent).
     pub fn has_items(&self, cx: &App) -> bool {
-        self.panes
-            .iter()
-            .any(|pane| !pane.read(cx).items().is_empty())
+        self.all_panes().any(|pane| !pane.read(cx).is_empty())
     }
 
-    /// Snapshot the full layout (tree shape, flexes, and each item's own
-    /// persisted state) for saving to disk.
+    /// Snapshot the full layout (tabs, tree shapes, flexes, and each item's
+    /// own persisted state) for saving to disk.
     pub fn serialize(&self, cx: &App) -> TileLayout {
         TileLayout {
             version: SUPPORTED_LAYOUT_VERSION,
             global_time_range: crate::temporal::legacy_range(cx),
             temporal: Some(crate::temporal::save_layout(cx)),
-            root: self.root.serialize(cx),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| TileTab {
+                    root: tab.root.serialize(cx),
+                })
+                .collect(),
+            active_tab: self.active_tab,
         }
     }
 
@@ -801,7 +1217,7 @@ impl TileGroup {
     }
 
     /// Rebuild a layout from a [`TileLayout`]. Items whose serialization
-    /// key is absent from `registry` are silently dropped.
+    /// key is absent from `registry` load as inert placeholders.
     pub fn deserialize(
         serialized: TileLayout,
         registry: &ItemRegistry,
@@ -823,22 +1239,21 @@ impl TileGroup {
         if let Some(time) = serialized.temporal {
             crate::temporal::restore_layout(&time, cx);
         }
-        let mut panes = Vec::new();
-        let root = Self::deserialize_member(&serialized.root, registry, &mut panes, cx);
-        let mut this = Self {
-            root,
-            panes: Vec::new(),
-            axis_bounds: Default::default(),
-            focused_pane: panes.first().cloned(),
-            zoomed: None,
-            zoom_motion: None,
-            pane_bounds: Default::default(),
-            split_preview: Default::default(),
-        };
-        for pane in &panes {
-            cx.subscribe(pane, Self::handle_pane_event).detach();
+        let mut this = Self::empty();
+        for tab in &serialized.tabs {
+            let mut panes = Vec::new();
+            let root = Self::deserialize_member(&tab.root, registry, &mut panes, cx);
+            for pane in &panes {
+                this.adopt(pane, cx);
+            }
+            let id = this.next_id();
+            this.tabs.push(Tab::new(id, root, panes));
         }
-        this.panes = panes;
+        if this.tabs.is_empty() {
+            let pane = cx.new(|cx| Pane::new(None, cx));
+            this.push_tab(pane, cx);
+        }
+        this.active_tab = serialized.active_tab.min(this.tabs.len() - 1);
         this
     }
 
@@ -851,17 +1266,12 @@ impl TileGroup {
         match serialized {
             TileNode::Pane(sp) => {
                 let pane = cx.new(|cx| {
-                    let items: Vec<Box<dyn PaneItemHandle>> = sp
-                        .items
-                        .iter()
-                        .filter_map(|si| registry.deserialize(&si.kind, &si.state, cx))
-                        .collect();
-                    let mut pane = Pane::new(items, cx);
-                    if sp.active_index < pane.items().len() {
-                        pane.activate_item(sp.active_index, cx);
-                    }
-                    pane.set_tab_orientation(sp.tab_orientation, cx);
-                    pane.set_hide_tab_bar(sp.hide_tab_bar, cx);
+                    let item = sp
+                        .item
+                        .as_ref()
+                        .and_then(|si| registry.deserialize(&si.kind, &si.state, cx));
+                    let mut pane = Pane::new(item, cx);
+                    pane.set_hide_header(sp.hide_header, cx);
                     pane.set_locked_size(
                         sp.locked_size.map(|(w, h)| gpui::Size {
                             width: w,
@@ -869,9 +1279,6 @@ impl TileGroup {
                         }),
                         cx,
                     );
-                    if let Some(width) = sp.tab_rail_width {
-                        pane.set_rail_width(px(width), cx);
-                    }
                     pane
                 });
                 panes.push(pane.clone());
@@ -894,33 +1301,100 @@ impl TileGroup {
 
     fn handle_dock_drop(
         &mut self,
+        dragged: &drag::DraggedPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.split_preview.drop_target(window.mouse_position());
+        self.split_preview.clear();
+        if let Some((pane, direction)) = target
+            && self.tab().panes.contains(&pane)
+        {
+            self.move_pane(dragged.pane.clone(), &pane, direction, cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_tab_dock_drop(
+        &mut self,
         dragged: &drag::DraggedTab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let target = self.split_preview.drop_target(window.mouse_position());
         self.split_preview.clear();
-        if let Some((pane, target)) = target
-            && self.panes.contains(&pane)
+        if let Some((pane, direction)) = target
+            && self.tab().panes.contains(&pane)
         {
-            let direction = match target {
-                dock_guide::DockTarget::Tab => None,
-                dock_guide::DockTarget::Split(direction) => Some(direction),
-            };
-            pane.update(cx, |pane, cx| pane.drop_in_content(dragged, direction, cx));
+            self.merge_tab(&dragged.group, dragged.tab, &pane, direction, cx);
         }
+        cx.notify();
+    }
+
+    /// The panes a drag can land on: the zoomed one alone while zoomed,
+    /// since hidden panes keep stale bounds from before the zoom.
+    fn droppable_panes(&self) -> Vec<Entity<Pane>> {
+        let tab = self.tab();
+        match &tab.zoomed {
+            Some(pane) => vec![pane.clone()],
+            None => tab.panes.clone(),
+        }
+    }
+
+    /// Fold tab `id` of `source` (this group or another window's) into the
+    /// layout beside `target`, splitting toward `direction`. The tab's own
+    /// split tree comes along whole, and the tab closes.
+    pub fn merge_tab(
+        &mut self,
+        source: &Entity<TileGroup>,
+        id: TabId,
+        target: &Entity<Pane>,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        let take = |group: &mut TileGroup, cx: &mut Context<TileGroup>| {
+            let ix = group.tab_index(id)?;
+            (!group.tabs[ix].panes.contains(target)).then(|| group.remove_tab_at(ix, cx))
+        };
+        let tab = if source.entity_id() == cx.entity_id() {
+            take(self, cx)
+        } else {
+            source.update(cx, take)
+        };
+        let Some(tab) = tab else {
+            return;
+        };
+        let Some(ix) = self.tab_of(target) else {
+            return;
+        };
+        if !self.tabs[ix].root.split(target, &tab.root, direction) {
+            return;
+        }
+        for pane in &tab.panes {
+            self.adopt(pane, cx);
+        }
+        let focus = tab.active_pane();
+        let into = &mut self.tabs[ix];
+        into.zoomed = None;
+        into.panes.extend(tab.panes);
+        into.focused_pane = focus;
+        let id = into.id;
+        self.activate_tab(id, cx);
         cx.notify();
     }
 
     fn handle_pane_event(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
         match event {
             PaneEvent::Split { direction, item } => {
-                let new_pane = cx.new(|cx| Pane::new(vec![item.clone_handle()], cx));
+                let item = item.as_ref().map(|item| item.clone_handle());
+                let new_pane = cx.new(|cx| Pane::new(item, cx));
                 self.split_pane(&pane, new_pane, *direction, cx);
             }
             PaneEvent::Empty => {
-                // Keep one empty pane around so the layout is never void.
-                if self.panes.len() > 1 {
+                // The last pane of the last tab stays, showing its starters,
+                // so the window is never void.
+                let lone = self.tabs.len() == 1 && self.tabs[0].panes.len() == 1;
+                if !lone {
                     self.remove_pane(&pane, cx);
                 }
             }
@@ -1001,7 +1475,8 @@ impl TileGroup {
     }
 
     fn find_axis_mut(&mut self, path: &[usize]) -> Option<&mut SplitAxis> {
-        let mut current = &mut self.root;
+        let ix = self.active_tab;
+        let mut current = &mut self.tabs[ix].root;
         for &ix in path {
             current = match current {
                 Member::Axis(axis) => axis.members.get_mut(ix)?,
@@ -1019,6 +1494,11 @@ impl Render for TileGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let tile_group = cx.entity().clone();
+        if !cx.has_active_drag()
+            && let Some((_, task)) = self.spring.take()
+        {
+            drop(task);
+        }
         // While zoomed the pane stands in for the whole tree, so a drag's
         // split preview opens its gap inside the zoomed area; the drop then
         // edits the real tree and un-zooms.
@@ -1030,24 +1510,41 @@ impl Render for TileGroup {
         // the pane drawn on top at its in-between size.
         let zoomed = match moving {
             Some(_) => None,
-            None => self.zoomed.clone().map(Member::Pane),
+            None => self.tab().zoomed.clone().map(Member::Pane),
         };
-        let committed = zoomed.as_ref().unwrap_or(&self.root);
-        let (layout, gaps) = self.split_preview.layout(committed, window, cx);
+        let committed = zoomed.unwrap_or_else(|| self.tab().root.clone());
+        let (layout, gaps) = self.split_preview.layout(&committed, window, cx);
         let tracker = tile_group.clone();
         let mut root = div()
             .relative()
             .size_full()
             .bg(theme.bg_secondary)
             .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<drag::DraggedPane>, _, cx| {
+                    let panes = this.droppable_panes();
+                    let source = Some(event.drag(cx).pane.clone());
+                    if this
+                        .split_preview
+                        .drag_move(&panes, source, event.event.position, cx)
+                    {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<drag::DraggedTab>, _, cx| {
-                    // Hidden panes keep stale bounds from before the zoom,
-                    // so only the zoomed one can take a drop.
-                    let panes = match &this.zoomed {
-                        Some(pane) => std::slice::from_ref(pane),
-                        None => &this.panes[..],
+                    // A tab can't split into itself.
+                    let dragged = event.drag(cx);
+                    let own = dragged.group == cx.entity() && dragged.tab == this.active_tab();
+                    let panes = if own {
+                        Vec::new()
+                    } else {
+                        this.droppable_panes()
                     };
-                    if this.split_preview.drag_move(panes, event, cx) {
+                    if this
+                        .split_preview
+                        .drag_move(&panes, None, event.event.position, cx)
+                    {
                         cx.notify();
                     }
                 }),
@@ -1062,7 +1559,7 @@ impl Render for TileGroup {
                 .absolute()
                 .size_full(),
             )
-            .child(layout.as_ref().unwrap_or(committed).render(
+            .child(layout.as_ref().unwrap_or(&committed).render(
                 SplitPath::new(),
                 &tile_group,
                 &gaps,
@@ -1088,12 +1585,12 @@ impl Render for TileGroup {
             );
         }
         for (pane, bounds) in self.split_preview.drop_regions() {
-            if !self.panes.contains(pane) {
+            if !self.tab().panes.contains(pane) {
                 continue;
             }
             let bounds = *bounds;
             let origin = bounds.origin - self.split_preview.bounds.origin;
-            // Original content bounds stay fixed while the visual tree reflows.
+            // Original pane bounds stay fixed while the visual tree reflows.
             // This also catches drops into the newly opened gap.
             root = root.child(
                 div()
@@ -1103,14 +1600,8 @@ impl Render for TileGroup {
                     .w(bounds.size.width)
                     .h(bounds.size.height)
                     .occlude()
-                    .on_drop(cx.listener(Self::handle_dock_drop)),
-            );
-        }
-        if let Some(guide) = &mut self.split_preview.guide {
-            root = root.child(
-                guide
-                    .render(self.split_preview.bounds.origin, window, cx)
-                    .on_drop(cx.listener(Self::handle_dock_drop)),
+                    .on_drop(cx.listener(Self::handle_dock_drop))
+                    .on_drop(cx.listener(Self::handle_tab_dock_drop)),
             );
         }
         root
@@ -1120,13 +1611,443 @@ impl Render for TileGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiles::pane::TabOrientation;
     use crate::views::dashboard::{
         DashboardPanelConfig, DashboardWidget, WidgetId, WidgetKind, WidgetLive, WidgetRect,
         WidgetRegistry, WidgetSpec, deserialize_dashboard,
     };
-    use gpui::{AnyView, IntoElement, Render, Window};
+    use gpui::{AnyView, IntoElement, MouseButton, Render, TestAppContext, Window, point};
     use std::sync::Arc;
+
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct TestItemConfig {
+        title: String,
+    }
+
+    struct TestItem {
+        title: SharedString,
+        closable: bool,
+    }
+
+    impl Render for TestItem {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl PaneItem for TestItem {
+        type Config = TestItemConfig;
+
+        fn tab_title(&self, _: &App) -> SharedString {
+            self.title.clone()
+        }
+
+        fn serialization_key() -> &'static str {
+            "test_item"
+        }
+
+        fn to_config(&self, _: &App) -> TestItemConfig {
+            TestItemConfig {
+                title: self.title.to_string(),
+            }
+        }
+
+        fn can_close(&self, _: &App) -> bool {
+            self.closable
+        }
+    }
+
+    fn item(title: &'static str, cx: &mut App) -> Box<dyn PaneItemHandle> {
+        Box::new(cx.new(|_| TestItem {
+            title: title.into(),
+            closable: true,
+        }))
+    }
+
+    fn fixed(title: &'static str, cx: &mut App) -> Box<dyn PaneItemHandle> {
+        Box::new(cx.new(|_| TestItem {
+            title: title.into(),
+            closable: false,
+        }))
+    }
+
+    fn pane(title: &'static str, cx: &mut App) -> Entity<Pane> {
+        cx.new(|cx| Pane::new(Some(item(title, cx)), cx))
+    }
+
+    fn registry() -> ItemRegistry {
+        let mut registry = ItemRegistry::default();
+        registry.register::<TestItem>(|state, cx| {
+            let config: TestItemConfig = serde_json::from_str(state).ok()?;
+            Some(cx.new(|_| TestItem {
+                title: config.title.into(),
+                closable: true,
+            }))
+        });
+        registry
+    }
+
+    fn titles(group: &Entity<TileGroup>, cx: &App) -> Vec<SharedString> {
+        let group = group.read(cx);
+        group.tabs.iter().map(|tab| tab.title(cx)).collect()
+    }
+
+    fn tab_with(kind: &str, state: &str) -> TileTab {
+        TileTab {
+            root: TileNode::Pane(TilePane {
+                item: Some(serial::TileItem {
+                    kind: kind.into(),
+                    state: state.into(),
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn empty_layout(version: u32) -> String {
+        serde_json::to_string(&TileLayout {
+            version,
+            global_time_range: String::new(),
+            temporal: None,
+            tabs: vec![TileTab {
+                root: TileNode::Pane(TilePane::default()),
+            }],
+            active_tab: 0,
+        })
+        .expect("serialize")
+    }
+
+    #[gpui::test]
+    fn each_item_opens_as_its_own_tab(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        cx.read(|cx| {
+            assert_eq!(titles(&group, cx), ["a", "b"]);
+            assert_eq!(group.read(cx).panes().len(), 1);
+            assert!(group.read(cx).has_items(cx));
+        });
+        let blank = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        cx.read(|cx| {
+            assert_eq!(titles(&blank, cx), ["New tab"]);
+            assert!(!blank.read(cx).has_items(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn a_tab_is_named_for_its_current_pane(cx: &mut TestAppContext) {
+        let group = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("plot", cx)], cx)));
+        cx.update(|cx| {
+            let first = group.read(cx).panes()[0].clone();
+            let outline = pane("outline", cx);
+            group.update(cx, |group, cx| {
+                group.split_pane(&first, outline, SplitDirection::Right, cx)
+            });
+            assert_eq!(titles(&group, cx), ["outline"], "the new pane is current");
+            group.update(cx, |group, _| group.focus_pane(&first));
+            assert_eq!(titles(&group, cx), ["plot"]);
+        });
+    }
+
+    #[gpui::test]
+    fn adding_to_a_full_pane_splits_beside_it(cx: &mut TestAppContext) {
+        let group = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        // Pane events reach the group as each update's effects flush.
+        let first = cx.read(|cx| group.read(cx).panes()[0].clone());
+        cx.update(|cx| first.update(cx, |pane, cx| pane.add_item(item("a", cx), cx)));
+        cx.read(|cx| {
+            assert_eq!(
+                group.read(cx).panes().len(),
+                1,
+                "an empty pane fills in place"
+            )
+        });
+        cx.update(|cx| first.update(cx, |pane, cx| pane.add_item(item("b", cx), cx)));
+        cx.read(|cx| {
+            let group = group.read(cx);
+            assert_eq!(group.panes().len(), 2, "a full pane splits");
+            assert_eq!(
+                group
+                    .active_pane(cx)
+                    .unwrap()
+                    .read(cx)
+                    .item()
+                    .unwrap()
+                    .tab_title(cx),
+                "b"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn closing_a_tabs_last_pane_closes_the_tab_but_never_the_last(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        let a = cx.read(|cx| group.read(cx).panes()[0].clone());
+        cx.update(|cx| a.update(cx, |pane, cx| pane.close(cx)));
+        let b = cx.read(|cx| {
+            assert_eq!(titles(&group, cx), ["b"]);
+            group.read(cx).panes()[0].clone()
+        });
+        cx.update(|cx| b.update(cx, |pane, cx| pane.close(cx)));
+        cx.read(|cx| {
+            assert_eq!(titles(&group, cx), ["New tab"]);
+            assert_eq!(
+                group.read(cx).panes()[0],
+                b,
+                "the last pane stays to show its starters"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_tab_holding_an_item_that_refuses_to_close_stays(cx: &mut TestAppContext) {
+        let group = cx
+            .update(|cx| cx.new(|cx| TileGroup::new(vec![fixed("pinned", cx), item("b", cx)], cx)));
+        cx.update(|cx| {
+            let id = group.read(cx).tabs[0].id;
+            group.update(cx, |group, cx| group.close_tab(id, cx));
+            assert_eq!(titles(&group, cx), ["pinned", "b"]);
+            let id = group.read(cx).tabs[1].id;
+            group.update(cx, |group, cx| group.close_tab(id, cx));
+            assert_eq!(titles(&group, cx), ["pinned"]);
+        });
+    }
+
+    #[gpui::test]
+    fn tabs_cycle_and_reorder_keeping_the_active_one(cx: &mut TestAppContext) {
+        let group = cx.update(|cx| {
+            cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx), item("c", cx)], cx))
+        });
+        cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                group.cycle_tab(false, cx);
+                assert_eq!(group.active_tab, 2, "backward from the first wraps");
+                let (a, c) = (group.tabs[0].id, group.tabs[2].id);
+                group.move_tab(a, None, cx);
+                group.move_tab(c, Some(group.tabs[0].id), cx);
+                assert_eq!(group.active_tab(), c);
+            });
+            assert_eq!(titles(&group, cx), ["c", "b", "a"]);
+        });
+    }
+
+    #[gpui::test]
+    fn moving_a_pane_keeps_its_entity_and_drops_an_emptied_tab(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        cx.update(|cx| {
+            let a = group.read(cx).tabs[0].panes[0].clone();
+            let b = group.read(cx).tabs[1].panes[0].clone();
+            group.update(cx, |group, cx| {
+                group.move_pane(b.clone(), &a, SplitDirection::Down, cx)
+            });
+            let group = group.read(cx);
+            assert_eq!(group.tabs.len(), 1, "b's emptied tab closed");
+            assert_eq!(group.panes(), [a, b.clone()]);
+            assert_eq!(group.active_pane(cx), Some(b));
+            let Member::Axis(axis) = &group.tab().root else {
+                panic!("expected a split");
+            };
+            assert_eq!(axis.axis, Axis::Vertical);
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_a_pane_on_a_tab_moves_it_there(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        cx.update(|cx| {
+            let a = group.read(cx).tabs[0].panes[0].clone();
+            let extra = pane("extra", cx);
+            group.update(cx, |group, cx| {
+                group.split_pane(&a, extra.clone(), SplitDirection::Right, cx);
+                let b_tab = group.tabs[1].id;
+                group.move_pane_to_tab(extra.clone(), b_tab, cx);
+                assert_eq!(group.active_tab(), b_tab, "the tab it landed in shows");
+                assert_eq!(group.tabs[0].panes, std::slice::from_ref(&a));
+                assert_eq!(group.tabs[1].panes.len(), 2);
+
+                let blank = group.new_tab(cx);
+                let blank_tab = group.active_tab();
+                group.move_pane_to_tab(extra.clone(), blank_tab, cx);
+                let ix = group.tab_index(blank_tab).unwrap();
+                assert_eq!(
+                    group.tabs[ix].panes,
+                    std::slice::from_ref(&extra),
+                    "the pane replaces a lone empty pane"
+                );
+                assert!(!group.subscriptions.contains_key(&blank.entity_id()));
+
+                group.move_pane_to_new_tab(a.clone(), cx);
+                assert_eq!(group.tabs.last().unwrap().panes, std::slice::from_ref(&a));
+            });
+            assert_eq!(titles(&group, cx), ["b", "extra", "a"]);
+        });
+    }
+
+    #[gpui::test]
+    fn panes_and_tabs_move_between_windows_and_report_only_to_their_new_group(
+        cx: &mut TestAppContext,
+    ) {
+        let (left, right) = cx.update(|cx| {
+            (
+                cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)),
+                cx.new(|cx| TileGroup::new(vec![item("c", cx)], cx)),
+            )
+        });
+        let (a, c) = cx.update(|cx| {
+            let a = left.read(cx).tabs[0].panes[0].clone();
+            let c = right.read(cx).panes()[0].clone();
+            right.update(cx, |right, cx| {
+                right.move_pane(a.clone(), &c, SplitDirection::Left, cx)
+            });
+            assert_eq!(titles(&left, cx), ["b"]);
+            assert_eq!(right.read(cx).panes(), [c.clone(), a.clone()]);
+            assert_eq!(a.read(cx).owner(), Some(right.clone()));
+
+            let b_tab = left.read(cx).tabs[0].id;
+            right.update(cx, |right, cx| right.adopt_tab(&left, b_tab, None, cx));
+            assert_eq!(titles(&right, cx), ["a", "b"]);
+            assert_eq!(right.read(cx).active_tab, 1, "the adopted tab shows");
+            assert_eq!(titles(&left, cx), ["New tab"]);
+            assert!(!left.read(cx).has_items(cx));
+            (a, c)
+        });
+        // Closing the moved pane is the new group's business only.
+        cx.update(|cx| a.update(cx, |pane, cx| pane.close(cx)));
+        cx.update(|cx| {
+            assert_eq!(right.read(cx).tabs[0].panes, std::slice::from_ref(&c));
+            assert_eq!(titles(&left, cx), ["New tab"]);
+
+            let torn = right
+                .update(cx, |right, cx| right.split_off_pane(c.clone(), cx))
+                .unwrap();
+            assert_eq!(torn.read(cx).panes(), std::slice::from_ref(&c));
+            assert_eq!(titles(&right, cx), ["b"]);
+            let b_tab = right.read(cx).active_tab();
+            let torn_tab = right
+                .update(cx, |right, cx| right.split_off_tab(b_tab, cx))
+                .unwrap();
+            assert_eq!(titles(&torn_tab, cx), ["b"]);
+            assert_eq!(titles(&right, cx), ["New tab"]);
+        });
+    }
+
+    #[gpui::test]
+    fn focus_or_open_reveals_a_panel_in_another_tab(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), fixed("b", cx)], cx)));
+        cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                group.focus_or_open("test_item", |_| None, cx);
+                assert_eq!(group.active_tab, 0, "the first match wins");
+                let b = group.tabs[1].id;
+                group.activate_tab(b, cx);
+                group.focus_or_open("missing", |cx| Some(item("new", cx)), cx);
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                group.read(cx).panes().len(),
+                2,
+                "a missing panel opens beside"
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn zoom_clears_when_the_layout_changes_under_it(cx: &mut TestAppContext) {
+        let group = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx)], cx)));
+        cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                let left = group.panes()[0].clone();
+                group.toggle_zoom(&left, cx);
+                assert!(group.zoomed().is_none(), "a lone pane has nothing to hide");
+                let right = pane("b", cx);
+                group.split_pane(&left, right.clone(), SplitDirection::Right, cx);
+                group.toggle_zoom(&right, cx);
+                assert_eq!(group.zoomed(), Some(&right));
+                group.remove_pane(&right, cx);
+                assert!(
+                    group.zoomed().is_none(),
+                    "removing the zoomed pane un-zooms"
+                );
+
+                let extra = pane("c", cx);
+                group.split_pane(&left, extra.clone(), SplitDirection::Down, cx);
+                group.toggle_zoom(&left, cx);
+                group.split_pane(&extra, pane("d", cx), SplitDirection::Right, cx);
+                assert!(group.zoomed().is_none(), "a split reveals its new pane");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn the_layout_round_trips_tabs_and_the_active_one(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        let json = cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                let a = group.tabs[0].panes[0].clone();
+                group.split_pane(
+                    &a,
+                    cx.new(|cx| Pane::new(None, cx)),
+                    SplitDirection::Right,
+                    cx,
+                );
+                let b = group.tabs[1].id;
+                group.activate_tab(b, cx);
+            });
+            group.read(cx).to_json(cx)
+        });
+        let restored =
+            cx.update(|cx| cx.new(|cx| TileGroup::from_json(&json, &registry(), cx).unwrap()));
+        cx.read(|cx| {
+            assert_eq!(titles(&restored, cx), ["a", "b"]);
+            let restored = restored.read(cx);
+            assert_eq!(restored.active_tab, 1);
+            assert_eq!(restored.tabs[0].panes.len(), 2);
+            assert!(restored.tabs[0].panes[1].read(cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn unknown_pane_round_trips_raw_kind_and_state(cx: &mut TestAppContext) {
+        let state = r#"{"plugin":"temporarily absent"}"#;
+        let json = serde_json::to_string(&TileLayout {
+            version: SUPPORTED_LAYOUT_VERSION,
+            global_time_range: String::new(),
+            temporal: None,
+            tabs: vec![tab_with("downstream.plugin", state)],
+            active_tab: 0,
+        })
+        .unwrap();
+        let tg = cx.update(|cx| {
+            cx.new(|cx| TileGroup::from_json(&json, &ItemRegistry::default(), cx).unwrap())
+        });
+        cx.read(|cx| {
+            let item = tg.read(cx).panes()[0].read(cx).item().unwrap();
+            assert_eq!(item.serialization_key(), "downstream.plugin");
+            assert_eq!(item.serialize(cx), state);
+        });
+    }
+
+    #[gpui::test]
+    fn from_json_rejects_other_versions(cx: &mut TestAppContext) {
+        for version in [SUPPORTED_LAYOUT_VERSION - 1, SUPPORTED_LAYOUT_VERSION + 1] {
+            let json = empty_layout(version);
+            let rejected = cx.update(|cx| {
+                cx.new(|cx| {
+                    let rejected = matches!(
+                        TileGroup::from_json(&json, &ItemRegistry::default(), cx),
+                        Err(LoadError::UnsupportedVersion(v)) if v == version
+                    );
+                    assert!(rejected, "version {version} must be rejected");
+                    TileGroup::new(Vec::new(), cx)
+                })
+            });
+            drop(rejected);
+        }
+    }
 
     struct RegisteredTestView {
         value: String,
@@ -1138,54 +2059,347 @@ mod tests {
         }
     }
 
-    fn empty_pane_layout(version: u32) -> String {
-        let layout = TileLayout {
-            version,
-            global_time_range: String::new(),
-            temporal: None,
-            root: TileNode::Pane(TilePane {
-                active_index: 0,
-                tab_orientation: TabOrientation::Horizontal,
-                hide_tab_bar: false,
-                locked_size: None,
-                tab_rail_width: None,
-                items: vec![],
-            }),
-        };
-        serde_json::to_string(&layout).expect("serialize")
+    /// A window drawing a group's tab bar above its layout, as the
+    /// titlebar does.
+    struct Host {
+        group: Entity<TileGroup>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(div().h(px(36.0)).flex().child(tab_bar::tab_list(
+                    &self.group,
+                    crate::config::TabPlacement::Top,
+                    cx,
+                )))
+                .child(div().flex_1().child(self.group.clone()))
+        }
+    }
+
+    fn host(
+        items: impl FnOnce(&mut App) -> Vec<Box<dyn PaneItemHandle>> + 'static,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TileGroup>, &mut gpui::VisualTestContext) {
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            let items = items(cx);
+            Host {
+                group: cx.new(|cx| TileGroup::new(items, cx)),
+            }
+        });
+        cx.refresh().unwrap();
+        let group = cx.update(|_, cx| host.read(cx).group.clone());
+        (group, cx)
+    }
+
+    fn drag(
+        cx: &mut gpui::VisualTestContext,
+        start: gpui::Point<Pixels>,
+        end: gpui::Point<Pixels>,
+    ) {
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            start + point(px(6.0), px(0.0)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+    }
+
+    fn header_of(pane: &Entity<Pane>, cx: &mut gpui::VisualTestContext) -> gpui::Point<Pixels> {
+        let bounds = cx.update(|_, cx| pane.read(cx).bounds());
+        bounds.origin + point(px(40.0), px(pane::HEADER_HEIGHT / 2.0))
     }
 
     #[gpui::test]
-    fn unknown_pane_round_trips_raw_kind_and_state(cx: &mut gpui::TestAppContext) {
-        let state = r#"{"plugin":"temporarily absent"}"#;
-        let layout = TileLayout {
-            version: SUPPORTED_LAYOUT_VERSION,
-            global_time_range: String::new(),
-            temporal: None,
-            root: TileNode::Pane(TilePane {
-                active_index: 0,
-                tab_orientation: TabOrientation::Horizontal,
-                hide_tab_bar: false,
-                locked_size: None,
-                tab_rail_width: None,
-                items: vec![serial::TileItem {
-                    kind: "downstream.plugin".into(),
-                    state: state.into(),
-                }],
-            }),
-        };
-        let json = serde_json::to_string(&layout).unwrap();
-        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
-        cx.update(|cx| {
-            tg.update(cx, |this, cx| {
-                *this = TileGroup::from_json(&json, &ItemRegistry::default(), cx).unwrap();
+    fn dragging_a_header_onto_a_pane_splits_toward_the_nearest_edge(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx)], cx);
+        let (a, b) = cx.update(|_, cx| {
+            let a = group.read(cx).panes()[0].clone();
+            let b = pane("b", cx);
+            group.update(cx, |group, cx| {
+                group.split_pane(&a, b.clone(), SplitDirection::Right, cx)
+            });
+            (a, b)
+        });
+        cx.refresh().unwrap();
+        let target = cx.update(|_, cx| a.read(cx).bounds());
+        let end = point(target.center().x, target.bottom() - px(10.0));
+        let start = header_of(&b, cx);
+        drag(cx, start, end);
+        cx.update(|_, cx| {
+            let preview = group.read(cx).split_preview.target.clone();
+            assert_eq!(preview, Some((a.clone(), SplitDirection::Down)));
+            assert_eq!(group.read(cx).panes().len(), 2, "preview leaves the tree");
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let group = group.read(cx);
+            assert_eq!(group.panes(), [a.clone(), b.clone()]);
+            let Member::Axis(axis) = &group.tab().root else {
+                panic!("expected a split");
+            };
+            assert_eq!(axis.axis, Axis::Vertical, "b now sits below a");
+            assert!(group.split_preview.target.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_a_header_onto_a_tab_moves_the_pane_into_it(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx)], cx);
+        let (a, b_tab) = cx.update(|_, cx| {
+            let group = group.read(cx);
+            (group.tabs[0].panes[0].clone(), group.tabs[1].id)
+        });
+        let other = cx.update(|_, cx| {
+            let other = pane("extra", cx);
+            group.update(cx, |group, cx| {
+                group.split_pane(&a, other.clone(), SplitDirection::Right, cx)
+            });
+            other
+        });
+        cx.refresh().unwrap();
+        let tab = cx.debug_bounds("top-tab-1").unwrap().center();
+        let start = header_of(&other, cx);
+        drag(cx, start, tab);
+        cx.simulate_mouse_up(tab, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let group = group.read(cx);
+            assert_eq!(group.active_tab(), b_tab);
+            assert!(group.panes().contains(&other));
+            assert_eq!(group.tabs[0].panes, std::slice::from_ref(&a));
+        });
+    }
+
+    #[gpui::test]
+    fn hovering_a_tab_with_a_pane_opens_it(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx)], cx);
+        let a = cx.update(|_, cx| group.read(cx).panes()[0].clone());
+        cx.update(|_, cx| {
+            group.update(cx, |group, cx| {
+                group.split_pane(&a, pane("extra", cx), SplitDirection::Right, cx)
             })
         });
-        cx.read(|cx| {
-            let item = &tg.read(cx).panes[0].read(cx).items()[0];
-            assert_eq!(item.serialization_key(), "downstream.plugin");
-            assert_eq!(item.serialize(cx), state);
+        cx.refresh().unwrap();
+        let tab = cx.debug_bounds("top-tab-1").unwrap().center();
+        let start = header_of(&a, cx);
+        drag(cx, start, tab);
+        cx.executor().advance_clock(SPRING_LOAD * 2);
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(group.read(cx).active_tab, 1));
+    }
+
+    #[gpui::test]
+    fn dragging_a_tab_reorders_the_bar(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let first = cx.debug_bounds("top-tab-0").unwrap().center();
+        // Once a lifts, b slides into its slot and c follows, so the seam
+        // between them shows just inside where b began.
+        let b = cx.debug_bounds("top-tab-1").unwrap();
+        let seam = point(b.left() + px(4.0), b.center().y);
+        drag(cx, first, seam);
+        cx.simulate_mouse_up(seam, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            assert_eq!(
+                titles(&group, cx),
+                ["b", "a", "c"],
+                "a lands in the gap between b and c as the bar shows them"
+            );
+            assert_eq!(group.read(cx).active_tab, 1, "the moved tab shows");
         });
+    }
+
+    #[gpui::test]
+    fn a_lifted_tab_leaves_a_gap_that_holds_while_the_pointer_is_off_the_bar(
+        cx: &mut TestAppContext,
+    ) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let a = cx.debug_bounds("top-tab-0").unwrap();
+        let b_before = cx.debug_bounds("top-tab-1").unwrap();
+        let away = point(a.center().x, a.bottom() + px(200.0));
+        drag(cx, a.center(), away);
+        cx.update(|_, cx| assert!(group.read(cx).bar.lifted.is_some()));
+        assert_eq!(
+            cx.debug_bounds("top-tab-1").unwrap().origin,
+            b_before.origin,
+            "b holds its place beside the gap"
+        );
+
+        // Once the pointer has picked a slot on the bar, leaving the bar
+        // keeps the gap there.
+        let c = cx.debug_bounds("top-tab-2").unwrap();
+        let end = point(c.right() - px(4.0), c.center().y);
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.simulate_mouse_move(away, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let preview = group.read(cx).bar.preview.expect("the gap stays");
+            assert_eq!(preview.before, None, "at the end, where it was last");
+        });
+
+        cx.simulate_mouse_up(away, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| assert_eq!(titles(&group, cx), ["a", "b", "c"]));
+    }
+
+    #[gpui::test]
+    fn a_dragged_tab_opens_a_gap_and_its_neighbours_slide(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let ids: Vec<TabId> = cx.update(|_, cx| group.read(cx).tabs.iter().map(|t| t.id).collect());
+        let b_before = cx.debug_bounds("top-tab-1").unwrap();
+        let first = cx.debug_bounds("top-tab-0").unwrap().center();
+        let last = cx.debug_bounds("top-tab-2").unwrap();
+        let end = point(last.right() - px(4.0), last.center().y);
+        drag(cx, first, end);
+        cx.update(|_, cx| {
+            let group = group.read(cx);
+            assert_eq!(group.bar.lifted, Some(ids[0]));
+            let preview = group.bar.preview.expect("the bar previews a landing gap");
+            assert_eq!(preview.before, None);
+            assert_eq!(
+                group.tabs[0].id, ids[0],
+                "the preview leaves the order alone"
+            );
+        });
+        let b_moving = cx.debug_bounds("top-tab-1").unwrap();
+        assert!(
+            b_moving.origin.x < b_before.origin.x && b_moving.origin.x > px(0.0),
+            "b slides left into the lifted tab's slot rather than jumping"
+        );
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            assert_eq!(titles(&group, cx), ["b", "c", "a"]);
+            assert!(group.read(cx).bar.preview.is_none());
+            assert!(group.read(cx).bar.lifted.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn a_crowded_bar_scrolls_the_active_tab_into_view(cx: &mut TestAppContext) {
+        let (group, cx) = host(
+            |cx| (0..30).map(|_| item("a long tab title", cx)).collect(),
+            cx,
+        );
+        let last = cx.update(|_, cx| group.read(cx).tabs.last().unwrap().id);
+        cx.update(|_, cx| group.update(cx, |group, cx| group.activate_tab(last, cx)));
+        cx.refresh().unwrap();
+        cx.refresh().unwrap();
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let shown = cx.debug_bounds("top-tab-29").unwrap();
+        assert!(
+            shown.right() <= viewport.width,
+            "the active tab is on screen"
+        );
+        let scroll = cx.update(|_, cx| group.read(cx).bar.scroll.offset());
+        assert!(scroll.x < px(0.0), "the bar scrolled sideways");
+    }
+
+    #[gpui::test]
+    fn a_tab_dropped_on_a_pane_folds_its_layout_in_beside_it(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx), item("c", cx)], cx);
+        let (a, b, c_tab) = cx.update(|_, cx| {
+            let b = group.read(cx).tabs[1].panes[0].clone();
+            let extra = pane("b2", cx);
+            group.update(cx, |group, cx| {
+                group.split_pane(&b, extra, SplitDirection::Down, cx)
+            });
+            let group = group.read(cx);
+            (
+                group.tabs[0].panes[0].clone(),
+                group.tabs[1].id,
+                group.tabs[2].id,
+            )
+        });
+        cx.refresh().unwrap();
+        let target = cx.update(|_, cx| a.read(cx).bounds());
+        let end = point(target.right() - px(10.0), target.center().y);
+        let tab = cx.debug_bounds("top-tab-1").unwrap().center();
+        drag(cx, tab, end);
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.update(|_, cx| {
+            let preview = group.read(cx).split_preview.target.clone();
+            assert_eq!(preview, Some((a.clone(), SplitDirection::Right)));
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let group = group.read(cx);
+            assert_eq!(group.tab_count(), 2, "the dropped tab closed");
+            assert!(group.tab_index(b).is_none());
+            assert!(group.tab_index(c_tab).is_some());
+            assert_eq!(group.panes().len(), 3, "both of its panes came along");
+            let Member::Axis(axis) = &group.tab().root else {
+                panic!("expected a split");
+            };
+            assert_eq!(axis.axis, Axis::Horizontal);
+            assert!(
+                matches!(axis.members[1], Member::Axis(_)),
+                "its own split stays whole"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_tab_cannot_fold_into_itself(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx)], cx);
+        let a = cx.update(|_, cx| group.read(cx).panes()[0].clone());
+        let target = cx.update(|_, cx| a.read(cx).bounds());
+        let tab = cx.debug_bounds("top-tab-0").unwrap().center();
+        let end = point(target.right() - px(10.0), target.center().y);
+        drag(cx, tab, end);
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.update(|_, cx| assert_eq!(group.read(cx).tab_count(), 2));
+    }
+
+    #[gpui::test]
+    fn the_new_tab_button_slides_with_the_tabs(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("b", cx)], cx);
+        let before = cx.debug_bounds("new-top-tab").unwrap();
+        let first = cx.update(|_, cx| group.read(cx).tabs[0].id);
+        cx.update(|_, cx| group.update(cx, |group, cx| group.close_tab(first, cx)));
+        cx.refresh().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        // A test window draws as an update's effects flush.
+        cx.update(|window, _| window.refresh());
+        let moving = cx.debug_bounds("new-top-tab").unwrap();
+        assert!(
+            moving.origin.x < before.origin.x && moving.origin.x > px(100.0),
+            "the button glides left rather than jumping"
+        );
+    }
+
+    #[gpui::test]
+    fn the_new_tab_button_and_middle_click_open_and_close_tabs(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx)], cx);
+        let plus = cx.debug_bounds("new-top-tab").unwrap().center();
+        cx.simulate_click(plus, Default::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| assert_eq!(titles(&group, cx), ["a", "New tab"]));
+        let tab = cx.debug_bounds("top-tab-0").unwrap().center();
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Middle,
+            position: tab,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: MouseButton::Middle,
+            position: tab,
+            modifiers: Default::default(),
+            click_count: 1,
+        });
+        cx.update(|_, cx| assert_eq!(titles(&group, cx), ["New tab"]));
     }
 
     #[gpui::test]
@@ -1259,17 +2473,8 @@ mod tests {
             version: SUPPORTED_LAYOUT_VERSION,
             global_time_range: String::new(),
             temporal: None,
-            root: TileNode::Pane(TilePane {
-                active_index: 0,
-                tab_orientation: TabOrientation::Horizontal,
-                hide_tab_bar: false,
-                locked_size: None,
-                tab_rail_width: None,
-                items: vec![serial::TileItem {
-                    kind: "registered_test".into(),
-                    state: config.clone(),
-                }],
-            }),
+            tabs: vec![tab_with("registered_test", &config)],
+            active_tab: 0,
         };
         let json = serde_json::to_string(&layout).unwrap();
         let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
@@ -1279,43 +2484,10 @@ mod tests {
             })
         });
         cx.read(|cx| {
-            let item = &tg.read(cx).panes[0].read(cx).items()[0];
+            let item = tg.read(cx).panes()[0].read(cx).item().unwrap();
             assert_eq!(item.serialization_key(), "registered_test");
             assert_eq!(item.serialize(cx), config);
             assert!(item.entity_any(cx).downcast::<RegisteredTestView>().is_ok());
         });
-    }
-
-    #[gpui::test]
-    fn from_json_rejects_older_version(cx: &mut gpui::TestAppContext) {
-        let version = SUPPORTED_LAYOUT_VERSION - 1;
-        let json = empty_pane_layout(version);
-        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
-        let rejected = cx.update(|cx| {
-            tg.update(cx, |_this, cx| {
-                let registry = ItemRegistry::default();
-                matches!(
-                    TileGroup::from_json(&json, &registry, cx),
-                    Err(LoadError::UnsupportedVersion(v)) if v == version
-                )
-            })
-        });
-        assert!(rejected, "an older layout version must be rejected");
-    }
-
-    #[gpui::test]
-    fn from_json_rejects_newer_version(cx: &mut gpui::TestAppContext) {
-        let json = empty_pane_layout(SUPPORTED_LAYOUT_VERSION + 1);
-        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
-        let rejected = cx.update(|cx| {
-            tg.update(cx, |_this, cx| {
-                let registry = ItemRegistry::default();
-                matches!(
-                    TileGroup::from_json(&json, &registry, cx),
-                    Err(LoadError::UnsupportedVersion(v)) if v == SUPPORTED_LAYOUT_VERSION + 1
-                )
-            })
-        });
-        assert!(rejected, "a version above the ceiling must be rejected");
     }
 }

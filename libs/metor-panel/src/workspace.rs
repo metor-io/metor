@@ -147,6 +147,17 @@ pub(crate) fn open_panel_window(
             // wraps itself in resize borders and a shadow via
             // `window_controls::client_side_decorations`.
             window_decorations: Some(gpui::WindowDecorations::Client),
+            // macOS would otherwise drag the window from anywhere in the
+            // titlebar strip, taking the pointer from the tabs that live
+            // there. The window root moves the window itself instead.
+            app_owns_titlebar_drag: true,
+            // The side tabs show the desktop blurred through; everything
+            // else paints opaque over it.
+            window_background: if cfg!(target_os = "macos") {
+                gpui::WindowBackgroundAppearance::Transparent
+            } else {
+                gpui::WindowBackgroundAppearance::Opaque
+            },
             app_id: Some("metor-panel".into()),
             ..Default::default()
         },
@@ -160,6 +171,18 @@ pub(crate) fn open_panel_window(
                 true
             });
             let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
+                    tracing::warn!(%error, "could not install the tab sidebar's backdrop");
+                }
+                root.update(cx, |_, cx| {
+                    cx.observe_global_in::<crate::theme::ActiveTheme>(window, |_, window, cx| {
+                        crate::backdrop::retheme(window, &crate::theme::theme(cx))
+                    })
+                    .detach()
+                });
+            }
             cx.observe_release(&root, |_, cx| cx.refresh_windows())
                 .detach();
             let tiles = root.read(cx).tiles().clone();
@@ -319,7 +342,7 @@ fn bounds_visible(bounds: &Bounds<Pixels>, displays: &[Bounds<Pixels>]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiles::serial::{TileNode, TilePane};
+    use crate::tiles::serial::{TileNode, TilePane, TileTab};
     use gpui::{point, px, size};
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
@@ -334,14 +357,10 @@ mod tests {
             version,
             global_time_range: String::new(),
             temporal: None,
-            root: TileNode::Pane(TilePane {
-                active_index: 0,
-                tab_orientation: Default::default(),
-                hide_tab_bar: false,
-                locked_size: None,
-                tab_rail_width: None,
-                items: Vec::new(),
-            }),
+            tabs: vec![TileTab {
+                root: TileNode::Pane(TilePane::default()),
+            }],
+            active_tab: 0,
         }
     }
 

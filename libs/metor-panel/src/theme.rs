@@ -7,6 +7,15 @@ use metor_proto_wkt::SequenceChannelState;
 use crate::config::{self, FontConfig, PanelConfig};
 use crate::views::gradient::Palette;
 
+/// Height of the app's one-line controls — inspector rows, titlebar
+/// controls, tabs, pane headers, filter bars — so chrome lines up wherever
+/// two of them meet.
+pub const CONTROL_HEIGHT: f32 = 28.0;
+
+/// Corner radius of a control's surface: hover and selection pills, tabs,
+/// titlebar segments.
+pub const CONTROL_RADIUS: f32 = 4.0;
+
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
 /// Theme tables are `static`, so the conversion has to happen without
@@ -134,9 +143,18 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// How much of a sidebar's tint covers the native blurred backdrop
+    /// behind it, shared by the splash and the side tab bar.
+    const BACKDROP_TINT: f32 = 0.7;
+
     /// A theme tint over the native blurred backdrop in the splash sidebar.
     pub(crate) fn splash_sidebar_bg(&self) -> Hsla {
-        Self::dim(self.bg_elevated, 0.25)
+        Self::dim(self.bg_elevated, Self::BACKDROP_TINT)
+    }
+
+    /// The side tab bar's tint over the native blurred backdrop.
+    pub(crate) fn tab_sidebar_bg(&self) -> Hsla {
+        Self::dim(self.bg_secondary, Self::BACKDROP_TINT)
     }
 
     /// The logo's ember ramp, fading into the current splash surface.
@@ -200,12 +218,13 @@ impl Theme {
         Self::dim(self.text_primary, 0.2)
     }
 
-    /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
-    /// background and the axis fills that mask GPU-frame edges straying into
-    /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
+    /// Semi-transparent `bg_secondary` for plot chrome strips — the legend,
+    /// the axis fills and a pane header laid over a plot — which dims the
+    /// data running on beneath. Derived so it tracks whatever `bg_secondary`
+    /// a theme picks.
     pub fn plot_chrome_bg(&self) -> Hsla {
         Hsla {
-            a: 0.5,
+            a: 0.7,
             ..self.bg_secondary
         }
     }
@@ -223,6 +242,21 @@ impl Theme {
         Hsla {
             a: 0.12,
             ..self.stale_text()
+        }
+    }
+
+    /// Where a dragged pane or tab will land: a fixed blue, the same on
+    /// every theme, so a drop reads as "goes here" rather than as any
+    /// palette's status hue.
+    pub fn drop_accent(&self) -> Hsla {
+        hex(0x3d8bfd, 1.0)
+    }
+
+    /// [`drop_accent`](Self::drop_accent) as a fill behind a drop zone.
+    pub fn drop_fill(&self) -> Hsla {
+        Hsla {
+            a: 0.18,
+            ..self.drop_accent()
         }
     }
 

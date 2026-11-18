@@ -18,7 +18,7 @@ use crate::inspector::rows::TextField;
 use crate::query::Query;
 use crate::theme::theme;
 
-const BAR_HEIGHT: f32 = 28.0;
+const BAR_HEIGHT: f32 = crate::theme::CONTROL_HEIGHT;
 
 /// What the bar just did with a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

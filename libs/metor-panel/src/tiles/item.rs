@@ -71,6 +71,13 @@ pub trait PaneItemHandle: 'static {
     fn inspect_host(&self) -> Option<Rc<dyn InspectHost>> {
         None
     }
+
+    /// Offer to lay the item under its pane's header, `inset` tall. True
+    /// when it takes the offer, having kept that room clear at its top for
+    /// the header, which then draws over it translucent.
+    fn lie_under_header(&self, _inset: gpui::Pixels, _cx: &mut App) -> bool {
+        false
+    }
 }
 
 impl<T: PaneItem> PaneItemHandle for Entity<T> {

@@ -38,6 +38,25 @@ impl PlotView {
         self.axes.len()
     }
 
+    /// The view `frame` shows when this one fills `area` within it: every
+    /// range runs on past the area's edges at the same scale.
+    pub fn spanning(mut self, area: Bounds<Pixels>, frame: Bounds<Pixels>) -> Self {
+        let width = f64::from(f32::from(area.size.width)).max(1.0);
+        let height = f64::from(f32::from(area.size.height)).max(1.0);
+        let gap = |a: Pixels, b: Pixels| f64::from(f32::from(a - b)).max(0.0);
+        let left = gap(area.left(), frame.left()) / width;
+        let right = gap(frame.right(), area.right()) / width;
+        let top = gap(area.top(), frame.top()) / height;
+        let bottom = gap(frame.bottom(), area.bottom()) / height;
+        let span = self.x.1 - self.x.0;
+        self.x = (self.x.0 - left * span, self.x.1 + right * span);
+        for (lo, hi) in &mut self.axes {
+            let span = *hi - *lo;
+            (*lo, *hi) = (*lo - bottom * span, *hi + top * span);
+        }
+        self
+    }
+
     /// Pan the X range by `frac` of its current width.
     pub fn offset_x(mut self, frac: f64) -> Self {
         let dx = frac * (self.x.1 - self.x.0);
@@ -336,7 +355,7 @@ pub fn pretty_round(num: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_auto_range, pad_degenerate_range, pretty_round};
+    use super::{Bounds, PlotView, pad_auto_range, pad_degenerate_range, point, pretty_round};
 
     #[test]
     fn auto_range_strictly_contains_the_data() {
@@ -411,5 +430,26 @@ mod tests {
         assert_eq!(pretty_round(0.0), 0.0);
         assert!(pretty_round(f64::INFINITY).is_infinite());
         assert!(pretty_round(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn a_view_spanning_a_wider_frame_keeps_its_scale() {
+        let view = PlotView {
+            x: (0.0, 100.0),
+            axes: smallvec::smallvec![(0.0, 10.0), (-1.0, 1.0)],
+        };
+        let area = Bounds::new(
+            point(gpui::px(50.0), gpui::px(30.0)),
+            gpui::size(gpui::px(200.0), gpui::px(100.0)),
+        );
+        // 50 left, 10 right, 30 above, 20 below the area.
+        let frame = Bounds::new(
+            point(gpui::px(0.0), gpui::px(0.0)),
+            gpui::size(gpui::px(260.0), gpui::px(150.0)),
+        );
+        let wide = view.spanning(area, frame);
+        assert_eq!(wide.x, (-25.0, 105.0));
+        assert_eq!(wide.axes[0], (-2.0, 13.0));
+        assert_eq!(wide.axes[1], (-1.4, 1.6));
     }
 }

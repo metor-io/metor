@@ -36,7 +36,8 @@ pub fn default_menu(
         }),
         ChordNode::submenu("t", "Tabs", {
             let tiles = tiles.clone();
-            move |_cx| tabs_menu(tiles.clone())
+            let on_open = on_open_inspector.clone();
+            move |_cx| tabs_menu(tiles.clone(), on_open.clone())
         }),
         ChordNode::submenu("l", "Layout", {
             let tiles = tiles.clone();
@@ -106,8 +107,33 @@ fn window_menu(
     ]
 }
 
-fn tabs_menu(tiles: Entity<TileGroup>) -> Vec<ChordNode> {
+fn tabs_menu(tiles: Entity<TileGroup>, on_open: OpenInspectorCallback) -> Vec<ChordNode> {
     vec![
+        ChordNode::command("t", "New tab", {
+            let tiles = tiles.clone();
+            move |_w, cx| {
+                tiles.update(cx, |tiles, cx| {
+                    tiles.new_tab(cx);
+                });
+            }
+        }),
+        ChordNode::command("c", "Close tab", {
+            let tiles = tiles.clone();
+            move |_w, cx| {
+                tiles.update(cx, |tiles, cx| {
+                    let id = tiles.active_tab();
+                    tiles.close_tab(id, cx);
+                });
+            }
+        }),
+        ChordNode::command("s", "Tab placement", move |window, cx| {
+            open_centered(
+                &on_open,
+                crate::inspector::palette::tab_placement_rows(),
+                window,
+                cx,
+            )
+        }),
         ChordNode::command("n", "Next tab", {
             let tiles = tiles.clone();
             move |_w, cx| cycle_active(&tiles, true, cx)
@@ -215,7 +241,7 @@ fn split_active(
 ) {
     let new_pane = tiles.update(cx, |tg, cx| {
         let target = tg.active_pane(cx)?;
-        let new_pane = cx.new(|cx| Pane::new(vec![], cx));
+        let new_pane = cx.new(|cx| Pane::new(None, cx));
         tg.split_pane(&target, new_pane.clone(), direction, cx);
         Some(new_pane)
     });
@@ -226,24 +252,11 @@ fn split_active(
 }
 
 fn close_active(tiles: &Entity<TileGroup>, cx: &mut App) {
-    tiles.update(cx, |tg, cx| {
-        // Keep at least one pane so the layout is never void.
-        if tg.panes().len() > 1
-            && let Some(target) = tg.active_pane(cx)
-        {
-            tg.remove_pane(&target, cx);
-        }
-    });
+    if let Some(pane) = tiles.read(cx).active_pane(cx) {
+        pane.update(cx, |pane, cx| pane.close(cx));
+    }
 }
 
 fn cycle_active(tiles: &Entity<TileGroup>, forward: bool, cx: &mut App) {
-    if let Some(pane) = tiles.read(cx).active_pane(cx) {
-        pane.update(cx, |pane, cx| {
-            if forward {
-                pane.cycle_forward(cx);
-            } else {
-                pane.cycle_backward(cx);
-            }
-        });
-    }
+    tiles.update(cx, |tiles, cx| tiles.cycle_tab(forward, cx));
 }

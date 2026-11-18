@@ -276,12 +276,41 @@ pub(crate) fn gpu_frame<T: 'static>(
     submit: impl FnOnce(&mut T, Bounds<Pixels>, f32, &mut Context<T>) -> Option<ReadbackHandle>
     + 'static,
 ) -> impl IntoElement {
+    gpu_frame_over(
+        entity,
+        gpu_state,
+        None,
+        move |plot, bounds, _, scale, cx| submit(plot, bounds, scale, cx),
+    )
+}
+
+/// [`gpu_frame`], drawn across `area` (once its host has measured it this
+/// frame) rather than the canvas alone, so the data runs on under the
+/// chrome around the plot. `submit` gets the frame's bounds, then the
+/// canvas's, where the view's ranges lie.
+pub(crate) fn gpu_frame_over<T: 'static>(
+    entity: WeakEntity<T>,
+    gpu_state: fn(&mut T) -> &mut PlotRenderState,
+    area: Option<std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>>,
+    submit: impl FnOnce(
+        &mut T,
+        Bounds<Pixels>,
+        Bounds<Pixels>,
+        f32,
+        &mut Context<T>,
+    ) -> Option<ReadbackHandle>
+    + 'static,
+) -> impl IntoElement {
     canvas(
-        move |bounds, window, cx| {
+        move |own, window, cx| {
+            let bounds = area
+                .and_then(|area| area.get())
+                .filter(|area| area.contains(&own.center()))
+                .unwrap_or(own);
             let scale_factor = window.scale_factor();
             let (frame, released) = entity
                 .update(cx, |plot, cx| {
-                    if let Some(handle) = submit(plot, bounds, scale_factor, cx) {
+                    if let Some(handle) = submit(plot, bounds, own, scale_factor, cx) {
                         handle.spawn_and_set(cx, gpu_state);
                     }
                     let state = gpu_state(plot);
