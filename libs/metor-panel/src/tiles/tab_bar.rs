@@ -18,13 +18,13 @@ use crate::config::TabPlacement;
 use crate::icons::Icon;
 use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
 
-/// Identity of a tab within its group, stable while tabs are added, closed
-/// and reordered around it.
+/// Identity of a tab, stable while tabs are added, closed and reordered
+/// around it, and unique across windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub(super) u64);
 
 /// The motion slot of the "new tab" button, which slides along behind the
-/// last tab. Groups number their tabs from 1, so this never names one.
+/// last tab. Tabs are numbered from 1, so this never names one.
 const NEW_TAB_SLOT: TabId = TabId(0);
 
 /// A tab along the titlebar sizes to its title up to this width, then
@@ -333,8 +333,16 @@ pub(crate) fn tab_list(
     let drop_group = group.clone();
     list.child(tail)
         .on_drag_move(move |event: &DragMoveEvent<DraggedTab>, _, cx| {
-            // Off the bar the gap stays where the pointer last left it.
+            // Off the bar the gap stays where the pointer last left it,
+            // for a tab of this bar; another window's tab takes its gap away.
             if !event.bounds.contains(&event.event.position) {
+                if event.drag(cx).group != preview_group {
+                    preview_group.update(cx, |group, cx| {
+                        if group.bar.preview.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                }
                 return;
             }
             let next = Some({

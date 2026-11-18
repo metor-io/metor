@@ -518,7 +518,10 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !cx.has_active_drag() || in_viewport(event.position, window) {
+        if crate::drag_relay::release(event.position, window, cx)
+            || !cx.has_active_drag()
+            || in_viewport(event.position, window)
+        {
             return;
         }
         let Some(drag) = crate::tiles::take_active_drag(cx) else {
@@ -560,20 +563,7 @@ impl AppRoot {
                 false,
                 cx,
             );
-            // Tearing out a window's only content reads as moving the
-            // window: close the emptied source unless the picker is holding
-            // it open.
-            if let Some(source) = drag.source_window.downcast::<AppRoot>() {
-                let _ = source.update(cx, |root, window, cx| {
-                    let picker_up = root
-                        .connection_picker
-                        .as_ref()
-                        .is_some_and(|p| !p.read(cx).dismissed);
-                    if !root.tiles.read(cx).has_items(cx) && !picker_up {
-                        window.remove_window();
-                    }
-                });
-            }
+            close_if_emptied(drag.source_window, cx);
         });
     }
 
@@ -729,14 +719,18 @@ impl Render for AppRoot {
             // drop handlers; clear the mirror so it can't go stale. Fires
             // exactly when `on_mouse_up_out` below doesn't (hover is the
             // gate for both, in opposite directions).
-            .capture_any_mouse_up(|_, _, cx| {
+            .capture_any_mouse_up(|event, window, cx| {
+                crate::drag_relay::release(event.position, window, cx);
                 crate::tiles::take_active_drag(cx);
             })
             .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(Self::handle_drag_out))
             .child(
                 gpui::canvas(
                     |_, _, _| (),
-                    |_, _, window, _| crate::drag_chip::listen(window),
+                    |_, _, window, _| {
+                        crate::drag_chip::listen(window);
+                        crate::drag_relay::listen(window);
+                    },
                 )
                 .absolute()
                 .size_0(),
@@ -2291,6 +2285,27 @@ fn torn_size(source: &DragSource, window: &Window, cx: &App) -> gpui::Size<Pixel
 }
 
 /// Whether `position` (window coordinates) lies within the window's content.
+/// Moving a window's only content out (torn into a window of its own, or
+/// dropped on another) reads as moving the window: close the emptied
+/// `source` unless the picker is holding it open. Deferred, so it can run
+/// mid-dispatch.
+pub(crate) fn close_if_emptied(source: gpui::AnyWindowHandle, cx: &mut App) {
+    let Some(source) = source.downcast::<AppRoot>() else {
+        return;
+    };
+    cx.defer(move |cx| {
+        let _ = source.update(cx, |root, window, cx| {
+            let picker_up = root
+                .connection_picker
+                .as_ref()
+                .is_some_and(|p| !p.read(cx).dismissed);
+            if !root.tiles.read(cx).has_items(cx) && !picker_up {
+                window.remove_window();
+            }
+        });
+    });
+}
+
 fn in_viewport(position: Point<Pixels>, window: &Window) -> bool {
     let viewport = window.viewport_size();
     position.x >= px(0.)
@@ -2405,6 +2420,19 @@ mod window_tests {
         gpui::WindowHandle<AppRoot>,
         tempfile::TempDir,
     ) {
+        open_at(tabs, None, cx)
+    }
+
+    /// [`open`], at `bounds` on screen.
+    fn open_at(
+        tabs: usize,
+        bounds: Option<Bounds<Pixels>>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<TileGroup>,
+        gpui::WindowHandle<AppRoot>,
+        tempfile::TempDir,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(directory.path().join("db")).unwrap());
         let (tiles, window) = cx.update(|cx| {
@@ -2428,7 +2456,7 @@ mod window_tests {
                 tiles
             });
             let window =
-                crate::workspace::open_panel_window(db, None, Some(tiles.clone()), false, cx)
+                crate::workspace::open_panel_window(db, bounds, Some(tiles.clone()), false, cx)
                     .unwrap();
             (tiles, window)
         });
@@ -2568,6 +2596,54 @@ mod window_tests {
             cx.update(|_, cx| tiles.read(cx).tab_index(id)),
             Some(target),
             "the tab lands at the far end"
+        );
+    }
+
+    #[gpui::test]
+    fn a_tab_dragged_onto_another_windows_bar_moves_there(cx: &mut TestAppContext) {
+        let size = gpui::size(px(800.0), px(500.0));
+        let (source, source_window, _a) =
+            open_at(2, Some(Bounds::new(point(px(0.0), px(0.0)), size)), cx);
+        let (target, target_window, _b) =
+            open_at(1, Some(Bounds::new(point(px(1000.0), px(0.0)), size)), cx);
+        let into = &mut VisualTestContext::from_window(target_window.into(), cx);
+        into.run_until_parked();
+        into.refresh().unwrap();
+        // Before the target's only tab, in the source window's coordinates.
+        let over = into.debug_bounds("top-tab-0").unwrap();
+        let end = point(px(1000.0) + over.left() + px(4.0), over.center().y);
+
+        let cx = &mut VisualTestContext::from_window(source_window.into(), cx);
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let start = cx.debug_bounds("top-tab-0").unwrap().center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            start + point(px(12.0), px(0.0)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+
+        assert_eq!(cx.update(|_, cx| source.read(cx).tab_count()), 1);
+        assert_eq!(cx.update(|_, cx| target.read(cx).tab_count()), 2);
+        assert_eq!(
+            cx.update(|_, cx| {
+                let target = target.read(cx);
+                target.tab_index(target.active_tab())
+            }),
+            Some(0),
+            "the tab lands before the target's own, and shows"
+        );
+        assert!(
+            cx.update(|_, cx| crate::workspace::panel_windows(cx).len()) == 2,
+            "no window tears out"
         );
     }
 

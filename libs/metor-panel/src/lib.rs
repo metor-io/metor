@@ -26,6 +26,7 @@ pub mod config;
 pub mod connections;
 pub mod data_binding;
 pub(crate) mod drag_chip;
+pub(crate) mod drag_relay;
 pub mod dynamic;
 pub mod eviction;
 pub mod gpu_context;

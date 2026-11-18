@@ -582,7 +582,6 @@ impl Tab {
 pub struct TileGroup {
     tabs: Vec<Tab>,
     active_tab: usize,
-    next_tab_id: u64,
     /// One per pane this group holds. Dropping it is how a pane that moved
     /// to another group stops reporting here.
     subscriptions: HashMap<EntityId, Subscription>,
@@ -629,7 +628,6 @@ impl TileGroup {
         Self {
             tabs: Vec::new(),
             active_tab: 0,
-            next_tab_id: 0,
             subscriptions: HashMap::new(),
             axis_bounds: HashMap::new(),
             zoom_motion: None,
@@ -640,9 +638,11 @@ impl TileGroup {
         }
     }
 
+    /// Unique across every window's group, so a tab dragged between windows
+    /// is never mistaken for one of its new bar's own.
     fn next_id(&mut self) -> TabId {
-        self.next_tab_id += 1;
-        TabId(self.next_tab_id)
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        TabId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Start reporting `pane`'s events here and mark this group its owner.
