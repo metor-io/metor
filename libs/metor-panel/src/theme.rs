@@ -218,12 +218,13 @@ impl Theme {
         Self::dim(self.text_primary, 0.2)
     }
 
-    /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
-    /// background and the axis fills that mask GPU-frame edges straying into
-    /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
+    /// Semi-transparent `bg_secondary` for plot chrome strips — the legend,
+    /// the axis fills and a pane header laid over a plot — which dims the
+    /// data running on beneath. Derived so it tracks whatever `bg_secondary`
+    /// a theme picks.
     pub fn plot_chrome_bg(&self) -> Hsla {
         Hsla {
-            a: 0.5,
+            a: 0.7,
             ..self.bg_secondary
         }
     }
