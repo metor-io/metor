@@ -5,7 +5,7 @@
 
 use core::time::Duration;
 
-use adcs_contracts::{AttitudeEstimate, ModeCmd, V3};
+use adcs_contracts::{AttitudeEstimate, ModeCmd, Vec3};
 use metor_fsw_3::{
     AlarmSpec, JsonSchema, Output, Sample, Seq, SeqError, SystemTable, alarm, redline, sequence,
 };
@@ -121,7 +121,7 @@ pub async fn commission(
 }
 
 /// Whether `|v| < bound`.
-fn below(v: &V3, bound: f64) -> bool {
+fn below(v: &Vec3, bound: f64) -> bool {
     norm(v) < bound
 }
 
@@ -129,7 +129,7 @@ fn below(v: &V3, bound: f64) -> bool {
 ///
 /// `V3::norm` goes through `faer`, whose wasm build carries SIMD the module
 /// runtime refuses, and whose native build may round differently.
-fn norm(v: &V3) -> f64 {
+fn norm(v: &Vec3) -> f64 {
     let [x, y, z] = v.into_buf();
     (x * x + y * y + z * z).sqrt()
 }

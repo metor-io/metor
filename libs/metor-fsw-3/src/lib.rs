@@ -47,6 +47,13 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
+//! A cyclic fn can take a frame by value. `gps: Gps` or `gps: Option<Gps>`
+//! declares the same port as `&mut Input<Gps>` and gets the newest record,
+//! read once per cycle before the fn runs, so a branch that returns early
+//! never leaves the producer's ring to fill. An `Option` is `None` until the
+//! first record, and a bare frame skips the fn until then. A sequence takes
+//! `&Sample<Gps>` instead, since its body would keep the first value.
+//!
 //! Params nest. An array `[P; N]` of `Input`s, `Sample`s, `Output`s, or
 //! [`SystemParams`] structs names element `i` `{name}.{i}`. A `SystemParams`
 //! struct groups params: each field names its ports under the field name, and

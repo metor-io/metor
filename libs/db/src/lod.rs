@@ -19,9 +19,7 @@
 //! would disagree with the origin's.
 
 use std::{
-    cell::RefCell,
     collections::HashSet,
-    rc::{Rc, Weak},
     sync::{Arc, atomic},
     time::{Duration, Instant},
 };
@@ -112,20 +110,21 @@ pub fn spawn(db: Arc<DB>) {
     std::mem::forget(start(db));
 }
 
-/// The engine's tasks: the watcher and every downsampling task it
-/// started. Dropping it stops them all, so nothing writes to the DB after.
-pub struct Lod(Rc<RefCell<Vec<stellarator::JoinHandleDropGuard<()>>>>);
+/// The engine's watcher task. Dropping it cancels the watcher, whose
+/// future owns the drop guards of every downsampling task it started, so
+/// those are canceled with it and nothing writes to the DB after.
+pub struct Lod(#[allow(dead_code)] stellarator::JoinHandleDropGuard<()>);
 
 /// [`spawn`], running until the returned [`Lod`] is dropped.
 pub fn start(db: Arc<DB>) -> Lod {
-    let tasks = Rc::new(RefCell::new(Vec::new()));
-    let engine = stellarator::spawn(run(db, Rc::downgrade(&tasks)));
-    tasks.borrow_mut().push(engine.drop_guard());
-    Lod(tasks)
+    Lod(stellarator::spawn(run(db)).drop_guard())
 }
 
-async fn run(db: Arc<DB>, tasks: Weak<RefCell<Vec<stellarator::JoinHandleDropGuard<()>>>>) {
+async fn run(db: Arc<DB>) {
     let mut tracked: HashSet<ComponentId> = HashSet::new();
+    // Dropped with this future when the engine is canceled, which cancels
+    // every source task.
+    let mut tasks: Vec<stellarator::JoinHandleDropGuard<()>> = Vec::new();
     loop {
         let new: Vec<Component> = db.with_state(|state| {
             state
@@ -134,15 +133,15 @@ async fn run(db: Arc<DB>, tasks: Weak<RefCell<Vec<stellarator::JoinHandleDropGua
                 .filter_map(|(id, _)| state.get_component(*id).cloned())
                 .collect()
         });
-        let Some(tasks) = tasks.upgrade() else {
-            return;
-        };
+        if !new.is_empty() {
+            // Sources that bailed out (ineligible, no levels) are done;
+            // don't keep their guards forever.
+            tasks.retain(|t| !t.is_finished());
+        }
         for src in new {
             tracked.insert(src.component_id);
-            let task = stellarator::spawn(downsample_source(db.clone(), src));
-            tasks.borrow_mut().push(task.drop_guard());
+            tasks.push(stellarator::spawn(downsample_source(db.clone(), src)).drop_guard());
         }
-        drop(tasks);
         // Raced against a periodic recheck: a registration between the scan
         // above and the wait registering would otherwise be lost (wake_all
         // doesn't store wakeups), orphaning the component until some

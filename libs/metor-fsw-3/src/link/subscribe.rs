@@ -140,8 +140,8 @@ impl<W: InputWake> Param<W> for SubscribeOutputs {
         _input: &'a mut (),
         output: &'a mut SubscribeOutputs,
         _cx: &mut Cycle<'a>,
-    ) -> &'a mut SubscribeOutputs {
-        output
+    ) -> Option<&'a mut SubscribeOutputs> {
+        Some(output)
     }
 }
 

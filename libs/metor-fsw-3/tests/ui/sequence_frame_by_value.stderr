@@ -1,0 +1,17 @@
+error[E0080]: evaluation panicked: a `#[sequence]` fn takes `&Sample<T>`, not a frame `T` or `Option<T>` by value: the body would hold its first value across every `.await`
+  --> tests/ui/sequence_frame_by_value.rs:14:32
+   |
+14 | async fn watch(seq: &Seq, imu: Option<Imu>) -> Result<(), SeqError> {
+   |                                ^^^^^^ evaluation of `<watch::__MetorSystem as metor_fsw_3::SequenceFn>::call::{closure#0}::{constant#1}` failed here
+
+note: erroneous constant encountered
+  --> tests/ui/sequence_frame_by_value.rs:14:32
+   |
+14 | async fn watch(seq: &Seq, imu: Option<Imu>) -> Result<(), SeqError> {
+   |                                ^^^^^^
+
+note: the above error was encountered while instantiating `fn <__MetorSystem as SequenceFn>::call::{closure#0}`
+ --> src/sequence/step.rs
+  |
+  |         seq.advance(body.as_mut(), cx)
+  |                     ^^^^^^^^^^^^^

@@ -14,7 +14,7 @@
 
 use adcs_contracts::novatel::{BestXyz, LINE_MAX, LineBuf};
 use adcs_contracts::{
-    BodyState, GPS_POS_SIGMA, GPS_VEL_SIGMA, GpsError, GpsFault, V3, eci_to_ecef_state, epoch_at,
+    BodyState, GPS_POS_SIGMA, GPS_VEL_SIGMA, GpsError, GpsFault, Vec3, eci_to_ecef_state, epoch_at,
     gps_epoch, gps_time,
 };
 use futures_lite::future;
@@ -258,9 +258,9 @@ impl ReceiverModel {
         log
     }
 
-    fn noise(&mut self, sigma: f64) -> V3 {
+    fn noise(&mut self, sigma: f64) -> Vec3 {
         let mut draw = || self.unit.sample(&mut self.rng) * sigma;
-        V3::from_buf([draw(), draw(), draw()])
+        Vec3::from_buf([draw(), draw(), draw()])
     }
 }
 
@@ -277,13 +277,13 @@ mod tests {
     /// A body on a straight line through a 400 km orbit radius, at `t`.
     fn body(t: f64) -> BodyState {
         let (pos, vel) = (
-            V3::from_buf([6.78e6, 0.0, 0.0]),
-            V3::from_buf([0.0, 7670.0, 0.0]),
+            Vec3::from_buf([6.78e6, 0.0, 0.0]),
+            Vec3::from_buf([0.0, 7670.0, 0.0]),
         );
         BodyState {
             timestamp: Timestamp((t * 1e6).round() as i64),
             q_b_eci: Quat::identity(),
-            omega_b: V3::zeros(),
+            omega_b: Vec3::zeros(),
             pos_eci: pos + vel * t,
             vel_eci: vel,
         }

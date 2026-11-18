@@ -2,13 +2,13 @@
 
 use nox::tensor;
 
-use crate::V3;
+use crate::Vec3;
 
 /// Spacecraft mass (kg).
 pub const MASS: f64 = 2825.2 / 1000.0;
 
 /// Returns the spacecraft's principal moments of inertia (kg·m²).
-pub fn inertia_diag() -> V3 {
+pub fn inertia_diag() -> Vec3 {
     tensor![15204079.70002e-9, 14621352.61765e-9, 6237758.3131e-9]
 }
 

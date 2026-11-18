@@ -490,9 +490,24 @@ fn call_parts(
     let wake = sig.shape.wake(fsw);
     let items = quote!((#(#idents,)*): <Self::Params as #fsw::Param<#wake>>::Item);
     // Spanned at each parameter type, so a type that is no `Param` errors there.
+    let sequence = matches!(sig.shape, Shape::Sequence);
     let asserts = sig.ports().map(|arg| {
         let key = key_type(&arg.ty);
-        quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key, #wake>(); }
+        let assert =
+            quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key, #wake>(); };
+        // A sequence body would hold a by-value param's first value across
+        // every `.await`, so a sequence refuses one, spanned at its type.
+        let cyclic_only = sequence.then(|| {
+            quote_spanned! { arg.ty.span() =>
+                const {
+                    ::core::assert!(
+                        !<#key as #fsw::Param<#wake>>::CYCLIC_ONLY,
+                        "a `#[sequence]` fn takes `&Sample<T>`, not a frame `T` or `Option<T>` by value: the body would hold its first value across every `.await`"
+                    )
+                };
+            }
+        });
+        quote!(#assert #cyclic_only)
     });
     let args = sig.args.iter().map(|arg| &arg.ident);
     let turbofish = generics.split_for_impl().1.as_turbofish().to_token_stream();

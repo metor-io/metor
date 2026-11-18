@@ -1,41 +1,45 @@
-error[E0277]: `Feeds<'static>` is not a parameter of a system whose inputs wake `NoWake`
+error[E0277]: `(Feeds<'static>,)` is not a parameter of a system whose inputs wake `NoWake`
   --> tests/ui/system_params_async_on_cyclic.rs:19:1
    |
 19 | #[system]
-   | ^^^^^^^^^ unsatisfied trait bound
+   | ^^^^^^^^^ the trait `Param<NoWake>` is not implemented for `(Feeds<'static>,)`
    |
-   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
-help: the trait `Param<NoWake>` is not implemented for `Feeds<'static>`
-      but trait `Param<Notifier>` is implemented for it
-  --> tests/ui/system_params_async_on_cyclic.rs:13:10
-   |
-13 | #[derive(SystemParams)]
-   |          ^^^^^^^^^^^^
-   = help: for that trait implementation, expected `Notifier`, found `NoWake`
-   = note: required for `(Feeds<'static>,)` to implement `Param<NoWake>`
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+   = help: the following other types implement trait `Param<W>`:
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+             (A, B, C, D, E, F, G, H)
+           and $N others
 note: required by a bound in `metor_fsw_3::FnSignature::Params`
   --> src/fn_system/mod.rs
    |
    |     type Params: Param<Self::Wake>;
    |                  ^^^^^^^^^^^^^^^^^ required by this bound in `FnSignature::Params`
-   = note: this error originates in the attribute macro `system` which comes from the expansion of the derive macro `SystemParams` (in Nightly builds, run with -Z macro-backtrace for more info)
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Feeds<'static>` is not a parameter of a system whose inputs wake `NoWake`
+error[E0277]: `(Feeds<'static>,)` is not a parameter of a system whose inputs wake `NoWake`
   --> tests/ui/system_params_async_on_cyclic.rs:19:1
    |
 19 | #[system]
-   | ^^^^^^^^^ unsatisfied trait bound
+   | ^^^^^^^^^ the trait `Param<NoWake>` is not implemented for `(Feeds<'static>,)`
    |
-   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
-help: the trait `Param<NoWake>` is not implemented for `Feeds<'static>`
-      but trait `Param<Notifier>` is implemented for it
-  --> tests/ui/system_params_async_on_cyclic.rs:13:10
-   |
-13 | #[derive(SystemParams)]
-   |          ^^^^^^^^^^^^
-   = help: for that trait implementation, expected `Notifier`, found `NoWake`
-   = note: required for `(Feeds<'static>,)` to implement `Param<NoWake>`
-   = note: this error originates in the attribute macro `system` which comes from the expansion of the derive macro `SystemParams` (in Nightly builds, run with -Z macro-backtrace for more info)
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+   = help: the following other types implement trait `Param<W>`:
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+             (A, B, C, D, E, F, G, H)
+           and $N others
+   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Feeds<'static>` is not a parameter of a system whose inputs wake `NoWake`
   --> tests/ui/system_params_async_on_cyclic.rs:20:18
@@ -43,7 +47,34 @@ error[E0277]: `Feeds<'static>` is not a parameter of a system whose inputs wake 
 20 | fn cyclic(feeds: Feeds<'_>) {
    |                  ^^^^^^^^^ unsatisfied trait bound
    |
-   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+help: the trait `metor_fsw_3::Frame` is not implemented for `Feeds<'static>`
+  --> tests/ui/system_params_async_on_cyclic.rs:15:1
+   |
+15 | struct Feeds<'a> {
+   | ^^^^^^^^^^^^^^^^
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+   = help: the following other types implement trait `metor_fsw_3::Frame`:
+             ChannelMessage
+             ChannelStatus
+             DbStatus
+             Imu
+             LinkStatus
+             ResourceStatus
+             SystemStatus
+   = note: required for `Feeds<'static>` to implement `Param<NoWake>`
+note: required by a bound in `metor_fsw_3::fn_system::assert_param`
+  --> src/fn_system/mod.rs
+   |
+   | pub fn assert_param<P: Param<W>, W: InputWake>() {}
+   |                        ^^^^^^^^ required by this bound in `assert_param`
+
+error[E0277]: `Feeds<'static>` is not a parameter of a system whose inputs wake `NoWake`
+  --> tests/ui/system_params_async_on_cyclic.rs:20:18
+   |
+20 | fn cyclic(feeds: Feeds<'_>) {
+   |                  ^^^^^^^^^ unsatisfied trait bound
+   |
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<NoWake>` is not implemented for `Feeds<'static>`
       but trait `Param<Notifier>` is implemented for it
   --> tests/ui/system_params_async_on_cyclic.rs:13:10
@@ -51,6 +82,7 @@ help: the trait `Param<NoWake>` is not implemented for `Feeds<'static>`
 13 | #[derive(SystemParams)]
    |          ^^^^^^^^^^^^
    = help: for that trait implementation, expected `Notifier`, found `NoWake`
+   = note: required for `Feeds<'static>` to implement `Param<NoWake>`
 note: required by a bound in `metor_fsw_3::fn_system::assert_param`
   --> src/fn_system/mod.rs
    |

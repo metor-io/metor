@@ -198,7 +198,7 @@ fn truth_record(frame: &Frame, truth: &Truth, mid: Timestamp) -> StarTruth {
     record
 }
 
-fn to_v3(v: V3) -> adcs_contracts::V3 {
+fn to_v3(v: V3) -> adcs_contracts::Vec3 {
     Vector::from_buf(v)
 }
 

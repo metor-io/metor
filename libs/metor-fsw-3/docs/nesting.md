@@ -99,9 +99,34 @@ pub trait Param<W: InputWake> {
 | `Input<T, W>`, `DynInputs<W>`, `Abort<W>`, `PublishInputs<W>` | `Param<W>` |
 | `Output<T>`, `DynOutputs`, `SubscribeOutputs`, `Timestamp`, `Log`, `Records` | `Param<W>` for every `W` |
 | `Sample<T>`, `Rng`, `Alarms`, `Cap<K>`, `Seq<'static>` | `Param<NoWake>` |
+| a frame `T`, `Option<T>` (`T: Frame + Copy`) | `Param<NoWake>`, cyclic fns only |
 
 A param on the wrong kind of system is a compile error rather than a
 definition error. An async fn writes its inputs `Input<T, Notifier>`.
+
+### Frames by value
+
+```rust
+#[system]
+fn ctrl(estimate: AttitudeEstimate, gps: Option<Gps>, cmd: &mut Output<TorqueCmd>) { .. }
+```
+
+A frame `T` or an `Option<T>` declares the same input port an `Input<T>`
+would. Like a `Sample<T>`, it holds the newest record, read once per cycle
+before the fn runs whatever the fn then does, so no early return can leave
+a producer's ring to fill. The fn gets the value itself: an `Option<T>` is
+`None` until the first record, and a bare `T` skips the fn, writing nothing
+and leaving its state alone, until the first record arrives. A sample never
+empties again, so a fn only ever skips before its inputs first arrive.
+
+`Param::get` returns `Option<Item>`; `None` skips a cyclic fn's cycle. A
+tuple, an array, or a `SystemParams` struct is `None` when any member is.
+Only these two params return `None`, and both set `Param::CYCLIC_ONLY`. A
+sequence body would hold the value it started with across every `.await`,
+so `#[sequence]` asserts at compile time, at the param's type, that it takes
+none; a sequence keeps `&Sample<T>`, whose cell the step refreshes before
+each poll. They implement `Param<NoWake>` alone, so an async fn cannot take
+one either.
 
 ### Port names
 
@@ -126,8 +151,9 @@ fn sun(fss: [&mut Input<Fss>; 8], est: &mut Output<SunVec>) { .. }
 Element `i` is named `{path}.{i}`. `#[system]` keys the argument by its
 element's key, so `[&mut Input<Fss>; 8]` is keyed `[Input<Fss>; 8]`.
 
-An element must implement `ArrayParam`: `Input`, `Sample`, `Output`, an array
-of those, or a `SystemParams` struct. Any other element type is a compile
+An element must implement `ArrayParam`: `Input`, `Sample`, a frame, an
+`Option` of a frame, `Output`, an array of those, or a `SystemParams` struct.
+An array of bare frames skips the fn until every element has a record. Any other element type is a compile
 error.
 
 ### `#[derive(SystemParams)]`

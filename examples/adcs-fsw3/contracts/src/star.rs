@@ -5,7 +5,7 @@ use metor_fsw_3::{FrameArray, Timestamp};
 use nox::{ArrayRepr, Matrix, Matrix3, Vector};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::{Quat, UnknownCode, V3};
+use crate::{Quat, UnknownCode, Vec3};
 
 /// Rows in a [`StarVectors`] frame.
 pub const MAX_STARS: usize = 32;
@@ -48,12 +48,12 @@ impl StarVectors {
     }
 
     /// The first `count.min(MAX_STARS)` rows as `(b_body, r_eci, σ)`.
-    pub fn obs(&self) -> impl Iterator<Item = (V3, V3, f64)> + '_ {
+    pub fn obs(&self) -> impl Iterator<Item = (Vec3, Vec3, f64)> + '_ {
         let n = (self.count as usize).min(MAX_STARS);
         let b = self.b_body.inner().buf;
         let r = self.r_eci.inner().buf;
         let sigma = self.sigma.inner().buf;
-        (0..n).map(move |i| (V3::from_buf(b[i]), V3::from_buf(r[i]), sigma[i]))
+        (0..n).map(move |i| (Vec3::from_buf(b[i]), Vec3::from_buf(r[i]), sigma[i]))
     }
 
     /// Appends a row, or returns false when the frame is full.

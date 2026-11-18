@@ -12,7 +12,7 @@
 use adcs_contracts::{
     BodyState, Disturbances, EARTH_RADIUS, Epoch, GPS_POS_SIGMA, GPS_VEL_SIGMA, Gps, GpsError,
     MASS, MU, MagneticModel, MtqCmd, PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX,
-    ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World, clamp_dipole, eci_to_geodetic, epoch_at,
+    ReactionWheel, Sensors, TorqueCmd, Vec3, Wheels, World, clamp_dipole, eci_to_geodetic, epoch_at,
     in_earth_shadow, inertia_diag, mag_field_eci, orbit_pos_vel, raan_for_ltan, sun_dir_eci,
     target_epoch,
 };
@@ -42,10 +42,10 @@ const CSS_NORMALS: [[f64; 3]; 6] = [
 ];
 
 /// Returns the noiseless sun sensor readings for a body-frame sun direction.
-pub fn css_readings(sun_b: &V3, illuminated: bool) -> [f64; 6] {
+pub fn css_readings(sun_b: &Vec3, illuminated: bool) -> [f64; 6] {
     let lit = if illuminated { 1.0 } else { 0.0 };
     CSS_NORMALS.map(|n| {
-        let cos: f64 = V3::from_buf(n).dot(sun_b).into_buf();
+        let cos: f64 = Vec3::from_buf(n).dot(sun_b).into_buf();
         cos.max(0.0) * lit
     })
 }
@@ -124,25 +124,25 @@ impl WheelDynamics for ReactionWheel {
 /// The disturbance torques at one state, with the drag force that also slows the orbit.
 pub struct DisturbanceTorques {
     /// Gravity-gradient torque (N·m).
-    pub gg_b: V3,
+    pub gg_b: Vec3,
     /// Drag torque (N·m).
-    pub aero_b: V3,
+    pub aero_b: Vec3,
     /// Residual dipole torque `m_res × B` (N·m).
-    pub mag_b: V3,
+    pub mag_b: Vec3,
     /// Solar radiation pressure torque (N·m).
-    pub srp_b: V3,
+    pub srp_b: Vec3,
     /// Drag force (N).
-    pub aero_force_eci: V3,
+    pub aero_force_eci: Vec3,
 }
 
 /// The true state the disturbance torques act on.
 pub struct TrueState {
     pub q_b_eci: Quat,
-    pub pos_eci: V3,
-    pub vel_eci: V3,
-    pub sun_eci: V3,
+    pub pos_eci: Vec3,
+    pub vel_eci: Vec3,
+    pub sun_eci: Vec3,
     /// True field (T), unnormalized.
-    pub mag_eci: V3,
+    pub mag_eci: Vec3,
     pub illuminated: bool,
 }
 
@@ -155,7 +155,7 @@ impl DisturbanceTorques {
     /// - Solar radiation pressure: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b`, zero in shadow.
     pub fn at(p: &PlantParams, s: &TrueState) -> Self {
         let q_eci_b = s.q_b_eci.inverse();
-        let cp_offset_b = V3::from_buf(p.cp_offset_b);
+        let cp_offset_b = Vec3::from_buf(p.cp_offset_b);
 
         let r_mag: f64 = s.pos_eci.norm().into_buf();
         let r_hat_b = q_eci_b * (s.pos_eci.normalize());
@@ -165,12 +165,12 @@ impl DisturbanceTorques {
         let aero_force_eci = s.vel_eci * (-0.5 * p.rho * p.cd * p.area_aero * v_mag);
         let aero_b = cp_offset_b.cross(&(q_eci_b * aero_force_eci));
 
-        let mag_b = V3::from_buf(p.m_res_b).cross(&(q_eci_b * s.mag_eci));
+        let mag_b = Vec3::from_buf(p.m_res_b).cross(&(q_eci_b * s.mag_eci));
 
         let srp_force_b = if s.illuminated {
             (q_eci_b * s.sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr)
         } else {
-            V3::zeros()
+            Vec3::zeros()
         };
         let srp_b = cp_offset_b.cross(&srp_force_b);
 
@@ -184,7 +184,7 @@ impl DisturbanceTorques {
     }
 
     /// Returns the sum of the torques.
-    pub fn total_b(&self) -> V3 {
+    pub fn total_b(&self) -> Vec3 {
         self.gg_b + self.aero_b + self.mag_b + self.srp_b
     }
 }
@@ -194,7 +194,7 @@ pub struct PlantState {
     body: Body,
     wheels: [ReactionWheel; 3],
     /// Gyro bias, a random walk.
-    bias: V3,
+    bias: Vec3,
     rng: StdRng,
     /// Simulated seconds since boot, advanced by each step.
     t_sim: f64,
@@ -225,9 +225,9 @@ struct Ports<'a> {
 /// The true state at the start of a cycle and what the sensors measured.
 struct Sample {
     truth: TrueState,
-    omega_b_true: V3,
+    omega_b_true: Vec3,
     /// True field in the body frame, which the magnetorquers act against.
-    mag_b_true: V3,
+    mag_b_true: Vec3,
     sensors: Sensors,
     gps: Gps,
 }
@@ -235,13 +235,13 @@ struct Sample {
 /// The torques and drag one cycle applies, held until the next.
 #[derive(Default)]
 struct Held {
-    disturbance_b: V3,
-    mtq_b: V3,
-    drag_eci: V3,
+    disturbance_b: Vec3,
+    mtq_b: Vec3,
+    drag_eci: Vec3,
 }
 
 /// Returns point-mass gravity on `body`, `-MU·m / |r|³ · r`.
-fn gravity(body: &Body) -> V3 {
+fn gravity(body: &Body) -> Vec3 {
     let r = body.pos.linear();
     let r_mag = r.norm().into_buf();
     r * (-MU * MASS / r_mag.powi(3))
@@ -255,7 +255,7 @@ fn gravity(body: &Body) -> V3 {
 /// Pass `h_w_b` at the step midpoint. Wheel momentum changes linearly across the
 /// step while the coupling holds it constant, and centering it cancels the
 /// first-order error that would otherwise leak total angular momentum.
-pub fn propagate(dt: f64, body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> Body {
+pub fn propagate(dt: f64, body: Body, tau_body_const: Vec3, h_w_b: Vec3, f_drag_eci: Vec3) -> Body {
     six_dof_rk4(dt, body, move |b| {
         let q = b.pos.angular();
         let omega_b = q.inverse() * b.vel.angular();
@@ -271,7 +271,7 @@ impl PlantState {
         let raan = raan_for_ltan(target_epoch(), p.ltan_hours);
         let (pos0, vel0) = orbit_pos_vel(radius, p.inclination, raan, p.init_orbit_phase);
 
-        let axis: V3 = tensor![1.0, 1.0, 1.0];
+        let axis: Vec3 = tensor![1.0, 1.0, 1.0];
         let q0 = Quaternion::from_axis_angle(axis, p.init_angle);
         let omega0_world = axis.normalize() * p.init_rate;
         let body = Body {
@@ -295,7 +295,7 @@ impl PlantState {
                 ReactionWheel::new(tensor![0.0, 1.0, 0.0], arm).with_momentum(p.init_wheel_h),
                 ReactionWheel::new(tensor![0.0, 0.0, 1.0], arm).with_momentum(p.init_wheel_h),
             ],
-            bias: V3::zeros(),
+            bias: Vec3::zeros(),
             rng: StdRng::seed_from_u64(p.seed),
             t_sim: 0.0,
             last: None,
@@ -311,14 +311,14 @@ impl PlantState {
 
     /// Sets the wheels to the torque command and returns the commanded dipole.
     /// A missing command counts as zero.
-    fn actuate(&mut self, torque_cmd: &mut Input<TorqueCmd>, mtq_cmd: &mut Input<MtqCmd>) -> V3 {
-        let torque_b: V3 = match torque_cmd.latest() {
+    fn actuate(&mut self, torque_cmd: &mut Input<TorqueCmd>, mtq_cmd: &mut Input<MtqCmd>) -> Vec3 {
+        let torque_b: Vec3 = match torque_cmd.latest() {
             Ok(Some(cmd)) => cmd.torque_b,
-            _ => V3::zeros(),
+            _ => Vec3::zeros(),
         };
-        let dipole_b: V3 = match mtq_cmd.latest() {
+        let dipole_b: Vec3 = match mtq_cmd.latest() {
             Ok(Some(cmd)) => cmd.dipole_b,
-            _ => V3::zeros(),
+            _ => Vec3::zeros(),
         };
         // Each wheel takes the command's component along its axis.
         for wheel in &mut self.wheels {
@@ -368,14 +368,14 @@ impl PlantState {
     }
 
     /// Returns the true body rate plus the bias and white noise.
-    fn gyro(&mut self, omega_b_true: V3) -> V3 {
+    fn gyro(&mut self, omega_b_true: Vec3) -> Vec3 {
         let sigma = self.params.meas_sigma;
         self.bias = self.bias + self.noise(sigma * 1e-2);
         omega_b_true + self.bias + self.noise(sigma)
     }
 
     /// Returns the sun sensor readings with each head's noise added.
-    fn css(&mut self, sun_b_true: V3, illuminated: bool) -> [f64; 6] {
+    fn css(&mut self, sun_b_true: Vec3, illuminated: bool) -> [f64; 6] {
         let sigma = self.params.meas_sigma;
         let mut css = css_readings(&sun_b_true, illuminated);
         for reading in &mut css {
@@ -390,8 +390,8 @@ impl PlantState {
         now: Timestamp,
         dt: f64,
         epoch: Epoch,
-        pos_eci: &V3,
-        vel_eci: &V3,
+        pos_eci: &Vec3,
+        vel_eci: &Vec3,
     ) -> Gps {
         let unit = self.noise(1.0);
         let pos = *pos_eci + self.gps_pos_err.step(dt, unit);
@@ -401,7 +401,7 @@ impl PlantState {
             timestamp: now,
             pos_eci: pos,
             vel_eci: vel,
-            lla: V3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
+            lla: Vec3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
         }
     }
 
@@ -417,7 +417,7 @@ impl PlantState {
     }
 
     /// Returns the magnetorquer torque at the start of the step.
-    fn mtq_torque(&self, s: &Sample, dipole_b: V3) -> V3 {
+    fn mtq_torque(&self, s: &Sample, dipole_b: Vec3) -> Vec3 {
         clamp_dipole(dipole_b, self.params.mtq_max_dipole).cross(&s.mag_b_true)
     }
 
@@ -427,7 +427,7 @@ impl PlantState {
         now: Timestamp,
         s: &Sample,
         d: &DisturbanceTorques,
-        mtq_torque_b: V3,
+        mtq_torque_b: Vec3,
         ports: Ports<'_>,
     ) {
         let Ports {
@@ -479,11 +479,11 @@ impl PlantState {
         let rw_torque_b = self
             .wheels
             .iter()
-            .fold(V3::zeros(), |acc, w| acc + w.torque);
+            .fold(Vec3::zeros(), |acc, w| acc + w.torque);
         let h_w_b = self
             .wheels
             .iter()
-            .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
+            .fold(Vec3::zeros(), |acc, w| acc + w.ang_momentum);
         let Held {
             disturbance_b,
             mtq_b,
@@ -495,7 +495,7 @@ impl PlantState {
         self.t_sim += dt;
     }
 
-    fn noise(&mut self, sigma: f64) -> V3 {
+    fn noise(&mut self, sigma: f64) -> Vec3 {
         let (x, y, z) = (self.noise1(sigma), self.noise1(sigma), self.noise1(sigma));
         tensor![x, y, z]
     }
@@ -555,10 +555,10 @@ mod tests {
     /// The step the tests integrate by, one cycle at 120 Hz.
     const STEP: f64 = 1.0 / 120.0;
 
-    fn orbit_body(incline: f64, omega0: V3) -> Body {
+    fn orbit_body(incline: f64, omega0: Vec3) -> Body {
         let radius = EARTH_RADIUS + ALTITUDE;
         let v_orbit = (MU / radius).sqrt();
-        let vel: V3 = tensor![0.0, incline.cos(), incline.sin()] * v_orbit;
+        let vel: Vec3 = tensor![0.0, incline.cos(), incline.sin()] * v_orbit;
         Body {
             pos: SpatialTransform::new(
                 Quaternion::from_axis_angle(tensor![1.0, 1.0, 1.0], 0.5),
@@ -582,12 +582,12 @@ mod tests {
             ReactionWheel::new(tensor![0.0, 1.0, 0.0], true),
             ReactionWheel::new(tensor![0.0, 0.0, 1.0], true),
         ];
-        let l_eci = |body: &Body, wheels: &[ReactionWheel; 3]| -> V3 {
+        let l_eci = |body: &Body, wheels: &[ReactionWheel; 3]| -> Vec3 {
             let q = body.pos.angular();
             let omega_b = q.inverse() * body.vel.angular();
             let h_w = wheels
                 .iter()
-                .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
+                .fold(Vec3::zeros(), |acc, w| acc + w.ang_momentum);
             q * (inertia_diag() * omega_b + h_w)
         };
         let l0 = l_eci(&body, &wheels);
@@ -599,12 +599,12 @@ mod tests {
                 w.torque_set_point = w.axis * u;
                 w.update(STEP);
             }
-            let rw_torque = wheels.iter().fold(V3::zeros(), |acc, w| acc + w.torque);
+            let rw_torque = wheels.iter().fold(Vec3::zeros(), |acc, w| acc + w.torque);
             let h_w = wheels
                 .iter()
-                .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
+                .fold(Vec3::zeros(), |acc, w| acc + w.ang_momentum);
             let h_w_mid = h_w + rw_torque * (STEP / 2.0);
-            body = propagate(STEP, body, rw_torque, h_w_mid, V3::zeros());
+            body = propagate(STEP, body, rw_torque, h_w_mid, Vec3::zeros());
         }
         let l = l_eci(&body, &wheels);
         let drift: f64 = (l - l0).norm().into_buf();
@@ -719,9 +719,9 @@ mod tests {
     fn disturbance_torques_sane_at_400km() {
         let p = params();
         let radius = EARTH_RADIUS + ALTITUDE;
-        let pos: V3 = tensor![radius, 0.0, 0.0];
+        let pos: Vec3 = tensor![radius, 0.0, 0.0];
         let v_orbit = (MU / radius).sqrt();
-        let vel: V3 = tensor![0.0, v_orbit, 0.0];
+        let vel: Vec3 = tensor![0.0, v_orbit, 0.0];
         // Off every principal axis and not parallel to the field.
         let q = Quat::from_axis_angle(tensor![1.0, 1.0, 1.0], 0.5);
         let epoch = adcs_contracts::target_epoch();
@@ -737,7 +737,7 @@ mod tests {
         };
         let d = DisturbanceTorques::at(&p, &lit);
 
-        let mag_of = |v: &V3| -> f64 { v.norm().into_buf() };
+        let mag_of = |v: &Vec3| -> f64 { v.norm().into_buf() };
         let gg = mag_of(&d.gg_b);
         assert!(
             (1e-10..1e-6).contains(&gg),
@@ -779,7 +779,7 @@ mod tests {
     /// reads its direction cosines, and eclipse darkens every head.
     #[test]
     fn css_heads_read_cosine_fov_and_eclipse() {
-        let sun_x: V3 = tensor![1.0, 0.0, 0.0];
+        let sun_x: Vec3 = tensor![1.0, 0.0, 0.0];
         let r = css_readings(&sun_x, true);
         assert!(
             (r[0] - 1.0).abs() < 1e-12,
@@ -793,7 +793,7 @@ mod tests {
             "perpendicular heads read zero"
         );
 
-        let sun: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize();
+        let sun: Vec3 = (tensor![1.0, 1.0, 1.0] as Vec3).normalize();
         let r = css_readings(&sun, true);
         let c = 1.0 / 3f64.sqrt();
         for (i, reading) in r.iter().enumerate().take(3) {
@@ -811,13 +811,13 @@ mod tests {
     /// this window, so the test checks only the perpendicular one.
     #[test]
     fn detumble_law_damps_tumble() {
-        let omega0: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize() * 0.1;
+        let omega0: Vec3 = (tensor![1.0, 1.0, 1.0] as Vec3).normalize() * 0.1;
         let mut body = orbit_body(0.9, omega0);
         let mut mag_model = MagneticModel::default();
         let k_detumble = 5e-4; // ten times the default
         let mtq_max = 10.0 * MTQ_MAX_DIPOLE;
         let mut t_sim = 0.0;
-        let omega_perp = |body: &Body, mag_b: &V3| -> f64 {
+        let omega_perp = |body: &Body, mag_b: &Vec3| -> f64 {
             let q = body.pos.angular();
             let omega_b = q.inverse() * body.vel.angular();
             let b_hat = mag_b.normalize();
@@ -827,7 +827,7 @@ mod tests {
         let mut perp0 = None;
         let mut perp = f64::MAX;
         // The field changes on the orbit timescale, so evaluate it every 100 steps.
-        let mut mag_eci = V3::zeros();
+        let mut mag_eci = Vec3::zeros();
         for k in 0..15_000 {
             let q = body.pos.angular();
             let pos = body.pos.linear();
@@ -838,7 +838,7 @@ mod tests {
             let omega_b = q.inverse() * body.vel.angular();
             let m = clamp_dipole(detumble_dipole(k_detumble, &omega_b, &mag_b), mtq_max);
             let tau_mtq_b = m.cross(&mag_b);
-            body = propagate(STEP, body, tau_mtq_b, V3::zeros(), V3::zeros());
+            body = propagate(STEP, body, tau_mtq_b, Vec3::zeros(), Vec3::zeros());
             t_sim += STEP;
             perp = omega_perp(&body, &mag_b);
             perp0.get_or_insert(perp);

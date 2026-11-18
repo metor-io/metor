@@ -4,7 +4,7 @@ use hifitime::Duration;
 use nox_frames::earth::{ecef_to_eci, eci_to_ecef, ned_to_ecef};
 use wmm::GeodeticCoords;
 
-use crate::{EARTH_RADIUS, Epoch, MagneticModel, V3};
+use crate::{EARTH_RADIUS, Epoch, MagneticModel, Vec3};
 
 /// WGS84 semi-major axis (m).
 const WGS84_A: f64 = 6378137.0;
@@ -12,7 +12,7 @@ const WGS84_A: f64 = 6378137.0;
 const WGS84_E2: f64 = 6.694379990141316e-3;
 
 /// Converts an ECEF position to WGS84 `(latitude_rad, longitude_rad, altitude_m)`.
-pub fn ecef_to_geodetic(ecef: &V3) -> (f64, f64, f64) {
+pub fn ecef_to_geodetic(ecef: &Vec3) -> (f64, f64, f64) {
     let [x, y, z] = ecef.into_buf();
     let lon = y.atan2(x);
     let p = (x * x + y * y).sqrt();
@@ -30,12 +30,12 @@ pub fn ecef_to_geodetic(ecef: &V3) -> (f64, f64, f64) {
 }
 
 /// Converts an ECI position at `epoch` to WGS84 `(latitude_rad, longitude_rad, altitude_m)`.
-pub fn eci_to_geodetic(epoch: Epoch, pos_eci: &V3) -> (f64, f64, f64) {
+pub fn eci_to_geodetic(epoch: Epoch, pos_eci: &Vec3) -> (f64, f64, f64) {
     ecef_to_geodetic(&eci_to_ecef(epoch).dot(pos_eci))
 }
 
 /// Returns the unnormalized WMM magnetic field in ECI (T) at `pos_eci` and `epoch`.
-pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V3 {
+pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &Vec3) -> Vec3 {
     let (lat, lon, alt) = eci_to_geodetic(epoch, pos_eci);
     let geodetic = GeodeticCoords::with_elliposid_height(
         lat.to_degrees(),
@@ -44,7 +44,7 @@ pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V
     );
     let (elements, _) = model.calculate_field(epoch, geodetic);
     // WMM reports the field in north-east-down axes.
-    let b_ned = V3::from_buf(elements.b_field());
+    let b_ned = Vec3::from_buf(elements.b_field());
     let b_ecef = ned_to_ecef(lat, lon).dot(&b_ned);
     ecef_to_eci(epoch).dot(&b_ecef)
 }
@@ -56,7 +56,7 @@ const WEEK: f64 = 604_800.0;
 
 /// Converts an ECI position and velocity at `epoch` to ECEF. The velocity is
 /// relative to the rotating Earth.
-pub fn eci_to_ecef_state(epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> (V3, V3) {
+pub fn eci_to_ecef_state(epoch: Epoch, pos_eci: &Vec3, vel_eci: &Vec3) -> (Vec3, Vec3) {
     let r = eci_to_ecef(epoch);
     let carried = earth_rate().cross(pos_eci);
     (r.dot(pos_eci), r.dot(&(*vel_eci - carried)))
@@ -64,14 +64,14 @@ pub fn eci_to_ecef_state(epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> (V3, V3) {
 
 /// Converts an ECEF position and velocity at `epoch` to ECI, the inverse of
 /// [`eci_to_ecef_state`].
-pub fn ecef_to_eci_state(epoch: Epoch, pos_ecef: &V3, vel_ecef: &V3) -> (V3, V3) {
+pub fn ecef_to_eci_state(epoch: Epoch, pos_ecef: &Vec3, vel_ecef: &Vec3) -> (Vec3, Vec3) {
     let r = ecef_to_eci(epoch);
     let pos = r.dot(pos_ecef);
     (pos, r.dot(vel_ecef) + earth_rate().cross(&pos))
 }
 
-fn earth_rate() -> V3 {
-    V3::from_buf([0.0, 0.0, EARTH_RATE])
+fn earth_rate() -> Vec3 {
+    Vec3::from_buf([0.0, 0.0, EARTH_RATE])
 }
 
 /// Returns `epoch` as a GPS week and seconds into it, to the millisecond.
@@ -97,7 +97,7 @@ pub fn epoch_at(t_sim_s: f64) -> Epoch {
 }
 
 /// Returns the unit vector toward the sun in ECI at `epoch`.
-pub fn sun_dir_eci(epoch: Epoch) -> V3 {
+pub fn sun_dir_eci(epoch: Epoch) -> Vec3 {
     nox_frames::earth::sun_vec(epoch)
 }
 
@@ -113,7 +113,7 @@ pub fn raan_for_ltan(epoch: Epoch, ltan_hours: f64) -> f64 {
 ///
 /// At 400 km the cylinder moves eclipse entry by under a second against the
 /// true umbra cone, and the penumbra lasts about 8 s of a 35 minute eclipse.
-pub fn in_earth_shadow(pos_eci: &V3, sun_eci: &V3) -> bool {
+pub fn in_earth_shadow(pos_eci: &Vec3, sun_eci: &Vec3) -> bool {
     let s = sun_eci.normalize();
     let along: f64 = pos_eci.dot(&s).into_buf();
     if along >= 0.0 {
@@ -141,7 +141,7 @@ mod tests {
         for pos in [
             tensor![radius, 0.0, 0.0],
             tensor![0.0, radius, 0.0],
-            (tensor![1.0, 1.0, 1.0] as V3).normalize() * radius,
+            (tensor![1.0, 1.0, 1.0] as Vec3).normalize() * radius,
         ] {
             let b = mag_field_eci(&mut model, target_epoch(), &pos);
             let mag = b.norm().into_buf();
@@ -156,7 +156,7 @@ mod tests {
     /// shadow cylinder's edge classify correctly.
     #[test]
     fn earth_shadow_geometry() {
-        let sun: V3 = (tensor![0.2, -0.9, -0.4] as V3).normalize();
+        let sun: Vec3 = (tensor![0.2, -0.9, -0.4] as Vec3).normalize();
         let r = EARTH_RADIUS + ALTITUDE;
         assert!(!in_earth_shadow(&(sun * r), &sun), "sub-solar point is lit");
         assert!(
@@ -199,8 +199,8 @@ mod tests {
     fn state_round_trips_through_ecef() {
         let epoch = epoch_at(1234.5);
         let (pos, vel) = (
-            V3::from_buf([6.8e6, 1.0e5, -2.0e5]),
-            V3::from_buf([10.0, 7600.0, 5.0]),
+            Vec3::from_buf([6.8e6, 1.0e5, -2.0e5]),
+            Vec3::from_buf([10.0, 7600.0, 5.0]),
         );
         let (pos_e, vel_e) = eci_to_ecef_state(epoch, &pos, &vel);
         let (pos_i, vel_i) = ecef_to_eci_state(epoch, &pos_e, &vel_e);
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(gps_time(back), (week, seconds));
     }
 
-    fn norm(v: V3) -> f64 {
+    fn norm(v: Vec3) -> f64 {
         v.norm().into_buf()
     }
 }

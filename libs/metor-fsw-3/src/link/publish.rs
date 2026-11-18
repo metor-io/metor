@@ -115,8 +115,8 @@ impl<W: InputWake> Param<W> for PublishInputs<W> {
         input: &'a mut PublishInputs<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> &'a mut PublishInputs<W> {
-        input
+    ) -> Option<&'a mut PublishInputs<W>> {
+        Some(input)
     }
 }
 

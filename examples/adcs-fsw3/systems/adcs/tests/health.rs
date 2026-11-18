@@ -3,7 +3,7 @@
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adcs_contracts::{Gps, Magnetometer, SunSensors, V3, epoch_at, sun_dir_eci};
+use adcs_contracts::{Gps, Magnetometer, SunSensors, Vec3, epoch_at, sun_dir_eci};
 use metor_fsw_3::alarm::{ClearedMsg, RaisedMsg};
 use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig, InputConfig, SystemConfig};
 use metor_fsw_3::zerocopy::FromZeros;
@@ -45,13 +45,13 @@ fn feeder(
     if let Some(b) = script.mag.get() {
         let _ = mag.write(&Magnetometer {
             timestamp: now,
-            mag_b: V3::from_buf([b, 0.0, 0.0]),
+            mag_b: Vec3::from_buf([b, 0.0, 0.0]),
         });
     }
     if let Some(pos) = script.pos_eci.get() {
         let mut fix = Gps::new_zeroed();
         fix.timestamp = now;
-        fix.pos_eci = V3::from_buf(pos);
+        fix.pos_eci = Vec3::from_buf(pos);
         let _ = gps.write(&fix);
     }
 }

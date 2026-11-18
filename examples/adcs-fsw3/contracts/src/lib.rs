@@ -51,6 +51,6 @@ pub use hifitime::Epoch;
 pub use wmm::MagneticModel;
 
 /// A 3-vector of `f64`.
-pub type V3 = Vector<f64, 3, ArrayRepr>;
+pub type Vec3 = Vector<f64, 3, ArrayRepr>;
 /// A quaternion of `f64`.
 pub type Quat = Quaternion<f64, ArrayRepr>;

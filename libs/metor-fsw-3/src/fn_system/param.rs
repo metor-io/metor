@@ -305,7 +305,7 @@ impl<'a> Cycle<'a> {
 /// can take implements `Param<NoWake>` alone.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a parameter of a system whose inputs wake `{W}`",
-    note = "a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`"
+    note = "a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`"
 )]
 pub trait Param<W: InputWake> {
     /// The bound input, or `()` if the parameter has none.
@@ -321,6 +321,14 @@ pub trait Param<W: InputWake> {
     /// segment to its fields' paths.
     const FLATTEN: bool = false;
 
+    /// Whether only a cyclic fn may take this parameter.
+    ///
+    /// A value taken by value, such as a bare frame `T` or an `Option<T>`,
+    /// is read once per cycle. A sequence body would hold the value it
+    /// started with across every `.await`, so a sequence that takes one
+    /// fails to compile.
+    const CYCLIC_ONLY: bool = false;
+
     /// Declares the ports this parameter takes under the config in `cx`.
     ///
     /// Names them after `at` and appends them to `defs`.
@@ -332,12 +340,16 @@ pub trait Param<W: InputWake> {
     /// Binds this parameter's output, if it has one, from `writers`.
     fn bind_out(at: &ParamPath<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError>;
 
-    /// Returns the value passed to the system fn this cycle.
+    /// Returns the value passed to the system fn this cycle, or `None` if the
+    /// parameter has no value yet, which skips the cyclic fn this cycle.
+    ///
+    /// Only a [`CYCLIC_ONLY`](Self::CYCLIC_ONLY) parameter, or one that
+    /// holds one, returns `None`.
     fn get<'a>(
         input: &'a mut Self::In,
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a>;
+    ) -> Option<Self::Item<'a>>;
 
     /// Refreshes this parameter's [`Sample`]s for the cycle, before `get`.
     fn refresh(_input: &mut Self::In) {}
@@ -349,7 +361,10 @@ pub trait Param<W: InputWake> {
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
     ) -> (Self::Item<'a>, impl Refresh + use<'a, W, Self>) {
-        (Self::get(input, output, cx), ())
+        // PANIC Safety: only a `CYCLIC_ONLY` param returns `None`, and
+        // `#[sequence]` asserts at compile time that it takes none.
+        let item = Self::get(input, output, cx).expect("a sequence param always has a value");
+        (item, ())
     }
 }
 
@@ -402,8 +417,8 @@ impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Input<T, W> {
         input: &'a mut Self::In,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
-        input
+    ) -> Option<Self::Item<'a>> {
+        Some(input)
     }
 }
 
@@ -433,8 +448,8 @@ impl<T: Frame + Copy + 'static> Param<NoWake> for Sample<T> {
         input: &'a mut Self::In,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
-        &input.sample
+    ) -> Option<Self::Item<'a>> {
+        Some(&input.sample)
     }
 
     fn refresh(input: &mut Self::In) {
@@ -449,6 +464,77 @@ impl<T: Frame + Copy + 'static> Param<NoWake> for Sample<T> {
         let SampledInput { input, sample } = input;
         let sample = &*sample;
         (sample, SampleRefresh { input, sample })
+    }
+}
+
+/// A frame taken by value declares the same port an `Input` would.
+///
+/// The fn gets the newest record as of this cycle, read once per cycle
+/// before it runs. Until the first record arrives the fn is skipped, and
+/// the input is still read, so its producer never stalls. Only a cyclic fn
+/// takes one.
+impl<T: Frame + Copy + 'static> Param<NoWake> for T {
+    type In = SampledInput<T, NoWake>;
+    type Out = ();
+    type Item<'a> = T;
+
+    const CYCLIC_ONLY: bool = true;
+
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+        <Sample<T> as Param<NoWake>>::append_defs(at, cx, defs)
+    }
+
+    fn bind_in(views: &mut Views<NoWake>) -> Self::In {
+        SampledInput::new(bind_input(views))
+    }
+
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
+        Ok(())
+    }
+
+    fn get<'a>(input: &'a mut Self::In, _output: &'a mut (), _cx: &mut Cycle<'a>) -> Option<T> {
+        input.sample.get()
+    }
+
+    fn refresh(input: &mut Self::In) {
+        input.refresh();
+    }
+}
+
+/// An `Option` of a frame declares the same port an `Input` would.
+///
+/// The fn gets the newest record as of this cycle, or `None` until the
+/// first arrives, read once per cycle before it runs. Only a cyclic fn
+/// takes one.
+impl<T: Frame + Copy + 'static> Param<NoWake> for Option<T> {
+    type In = SampledInput<T, NoWake>;
+    type Out = ();
+    type Item<'a> = Option<T>;
+
+    const CYCLIC_ONLY: bool = true;
+
+    fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
+        <Sample<T> as Param<NoWake>>::append_defs(at, cx, defs)
+    }
+
+    fn bind_in(views: &mut Views<NoWake>) -> Self::In {
+        SampledInput::new(bind_input(views))
+    }
+
+    fn bind_out(_at: &ParamPath<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
+        Ok(())
+    }
+
+    fn get<'a>(
+        input: &'a mut Self::In,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> Option<Option<T>> {
+        Some(input.sample.get())
+    }
+
+    fn refresh(input: &mut Self::In) {
+        input.refresh();
     }
 }
 
@@ -470,8 +556,12 @@ impl Param<NoWake> for Rng {
         Ok(writers.instance.rng(&at.to_name()))
     }
 
-    fn get<'a>(_input: &'a mut (), output: &'a mut Rng, _cx: &mut Cycle<'a>) -> &'a mut Rng {
-        output
+    fn get<'a>(
+        _input: &'a mut (),
+        output: &'a mut Rng,
+        _cx: &mut Cycle<'a>,
+    ) -> Option<&'a mut Rng> {
+        Some(output)
     }
 }
 
@@ -500,9 +590,13 @@ impl Param<NoWake> for Alarms {
         AlarmPorts::bind(&writers.instance, raised, cleared, &writers.dropped).map(Alarms::new)
     }
 
-    fn get<'a>(_input: &'a mut (), output: &'a mut Alarms, cx: &mut Cycle<'a>) -> &'a mut Alarms {
+    fn get<'a>(
+        _input: &'a mut (),
+        output: &'a mut Alarms,
+        cx: &mut Cycle<'a>,
+    ) -> Option<&'a mut Alarms> {
         output.set_now(cx.now);
-        output
+        Some(output)
     }
 }
 
@@ -527,8 +621,8 @@ impl<W: InputWake> Param<W> for Records {
         _input: &'a mut (),
         output: &'a mut Arc<Records>,
         _cx: &mut Cycle<'a>,
-    ) -> &'a Records {
-        output
+    ) -> Option<&'a Records> {
+        Some(output)
     }
 }
 
@@ -558,8 +652,8 @@ impl<T: Record + 'static + ?Sized, W: InputWake> Param<W> for Output<T> {
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
-        output
+    ) -> Option<Self::Item<'a>> {
+        Some(output)
     }
 }
 
@@ -587,8 +681,8 @@ impl<W: InputWake> Param<W> for DynInputs<W> {
         input: &'a mut Self::In,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
-        input
+    ) -> Option<Self::Item<'a>> {
+        Some(input)
     }
 }
 
@@ -614,8 +708,8 @@ impl<W: InputWake> Param<W> for DynOutputs {
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
-        output
+    ) -> Option<Self::Item<'a>> {
+        Some(output)
     }
 }
 
@@ -634,8 +728,8 @@ impl<W: InputWake> Param<W> for Timestamp {
         Ok(())
     }
 
-    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> Timestamp {
-        cx.now
+    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> Option<Timestamp> {
+        Some(cx.now)
     }
 }
 
@@ -662,8 +756,8 @@ impl<W: InputWake> Param<W> for Abort<W> {
         input: &'a mut Self::In,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
-        input
+    ) -> Option<Self::Item<'a>> {
+        Some(input)
     }
 }
 
@@ -682,8 +776,8 @@ impl Param<NoWake> for Seq<'static> {
         Ok(())
     }
 
-    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> &'a Seq<'a> {
-        cx.seq()
+    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> Option<&'a Seq<'a>> {
+        Some(cx.seq())
     }
 }
 
@@ -702,8 +796,12 @@ impl<W: InputWake> Param<W> for Log {
         Ok(Log)
     }
 
-    fn get<'a>(_input: &'a mut (), output: &'a mut Log, _cx: &mut Cycle<'a>) -> &'a mut Log {
-        output
+    fn get<'a>(
+        _input: &'a mut (),
+        output: &'a mut Log,
+        _cx: &mut Cycle<'a>,
+    ) -> Option<&'a mut Log> {
+        Some(output)
     }
 }
 
@@ -717,6 +815,8 @@ macro_rules! impl_param_for_tuple {
             type In = ($($P::In,)*);
             type Out = ($($P::Out,)*);
             type Item<'a> = ($($P::Item<'a>,)*) where Self: 'a;
+
+            const CYCLIC_ONLY: bool = false $(|| $P::CYCLIC_ONLY)*;
 
             #[allow(unused_variables)]
             fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
@@ -735,8 +835,8 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn get<'a>(input: &'a mut Self::In, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a> {
-                ($( $P::get(&mut input.$i, &mut output.$i, cx), )*)
+            fn get<'a>(input: &'a mut Self::In, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Option<Self::Item<'a>> {
+                Some(($( $P::get(&mut input.$i, &mut output.$i, cx)?, )*))
             }
 
             #[allow(unused_variables)]

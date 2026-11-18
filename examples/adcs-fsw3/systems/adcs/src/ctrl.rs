@@ -6,10 +6,10 @@
 
 use adcs_contracts::{
     AttitudeEstimate, CtrlParams, Gps, Law, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_MOMENTUM_MAX,
-    RW_TORQUE_MAX, Sensors, TorqueCmd, V3, Wheels, clamp_dipole, desat_dipole, detumble_dipole,
+    RW_TORQUE_MAX, Sensors, TorqueCmd, Vec3, Wheels, clamp_dipole, desat_dipole, detumble_dipole,
     inertia_diag, target_for,
 };
-use metor_fsw_3::{AlarmCell, AlarmSpec, Alarms, Input, Output, Timestamp, system};
+use metor_fsw_3::{AlarmCell, AlarmSpec, Alarms, Output, Timestamp, system};
 use nox::{Quaternion, tensor};
 
 /// Stored wheel momentum the magnetorquers have not unloaded.
@@ -50,21 +50,19 @@ impl CtrlSystem {
 pub fn ctrl(
     #[state] state: &mut CtrlSystem,
     now: Timestamp,
-    estimate: &mut Input<AttitudeEstimate>,
-    gps: &mut Input<Gps>,
-    mode: &mut Input<ModeCmd>,
-    sensors: &mut Input<Sensors>,
-    wheels: &mut Input<Wheels>,
+    estimate: AttitudeEstimate,
+    gps: Option<Gps>,
+    mode: Option<ModeCmd>,
+    sensors: Option<Sensors>,
+    wheels: Option<Wheels>,
     torque_cmd: &mut Output<TorqueCmd>,
     mtq_cmd: &mut Output<MtqCmd>,
     alarms: &mut Alarms,
 ) {
-    let Ok(Some(e)) = estimate.latest() else {
-        return;
-    };
+    let e = estimate;
     let q_hat_b_eci = e.q_hat_b_eci;
 
-    if let Ok(Some(m)) = mode.latest()
+    if let Some(m) = mode
         && let Ok(law) = m.mode().map(|mode| mode.law())
         && state.law != Some(law)
     {
@@ -76,11 +74,11 @@ pub fn ctrl(
         state.law = Some(law);
     }
 
-    let mag_b = sensors.latest().ok().flatten().map(|s| s.mag_b);
-    let h_w_b = wheels.latest().ok().flatten().map(|w| {
+    let mag_b = sensors.map(|s| s.mag_b);
+    let h_w_b = wheels.map(|w| {
         w.wheels
             .iter()
-            .fold(V3::zeros(), |acc, wheel| acc + wheel.ang_momentum)
+            .fold(Vec3::zeros(), |acc, wheel| acc + wheel.ang_momentum)
     });
     let h = h_w_b.as_ref().map(magnitude);
     alarms.check_with(
@@ -97,11 +95,11 @@ pub fn ctrl(
                 detumble_dipole(state.k_detumble, &e.omega_b, b),
                 MTQ_MAX_DIPOLE,
             ),
-            None => V3::zeros(),
+            None => Vec3::zeros(),
         };
         let _ = torque_cmd.write(&TorqueCmd {
             timestamp: now,
-            torque_b: V3::zeros(),
+            torque_b: Vec3::zeros(),
         });
         let _ = mtq_cmd.write(&MtqCmd {
             timestamp: now,
@@ -111,7 +109,7 @@ pub fn ctrl(
     }
 
     // Identity until both a law and a GPS fix arrive.
-    let target = match (state.law, gps.latest().ok().flatten()) {
+    let target = match (state.law, gps) {
         (Some(law), Some(gps)) => target_for(law, &gps.pos_eci, &gps.vel_eci),
         _ => Quaternion::identity(),
     };
@@ -122,7 +120,7 @@ pub fn ctrl(
     let ang_vel = q_hat_b_eci * e.omega_b;
     let torque_eci = state.lqr.control(q_hat_b_eci, ang_vel, target);
     let torque_b = q_hat_b_eci.inverse() * torque_eci;
-    let torque_b = V3::from_buf(
+    let torque_b = Vec3::from_buf(
         torque_b
             .into_buf()
             .map(|t| t.clamp(-RW_TORQUE_MAX, RW_TORQUE_MAX)),
@@ -130,7 +128,7 @@ pub fn ctrl(
 
     let dipole_b = match (&mag_b, &h_w_b) {
         (Some(b), Some(h)) => clamp_dipole(desat_dipole(state.k_desat, h, b), MTQ_MAX_DIPOLE),
-        _ => V3::zeros(),
+        _ => Vec3::zeros(),
     };
 
     let _ = torque_cmd.write(&TorqueCmd {
@@ -144,7 +142,7 @@ pub fn ctrl(
 }
 
 /// `|v|`, summed in scalar order.
-pub(crate) fn magnitude(v: &V3) -> f64 {
+pub(crate) fn magnitude(v: &Vec3) -> f64 {
     let [x, y, z] = v.into_buf();
     (x * x + y * y + z * z).sqrt()
 }

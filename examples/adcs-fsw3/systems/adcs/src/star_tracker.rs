@@ -302,12 +302,12 @@ fn to_body(r: M3, p: M3) -> M3 {
 pub fn star_tracker(
     #[state] state: &mut StarTracker,
     image: &mut Input<StarImage>,
-    sensors: &mut Input<adcs_contracts::Sensors>,
+    sensors: Option<adcs_contracts::Sensors>,
     star_vectors: &mut Output<StarVectors>,
     star_solution: &mut Output<StarSolution>,
     star_centroids: &mut Output<StarCentroids>,
 ) {
-    if let Ok(Some(s)) = sensors.latest() {
+    if let Some(s) = sensors {
         state.set_gyro(s.timestamp, s.gyro_b.into_buf());
     }
     let latest = image.latest();

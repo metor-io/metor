@@ -10,7 +10,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use adcs_contracts::{AttitudeEstimate, BodyState, V3};
+use adcs_contracts::{AttitudeEstimate, BodyState, Vec3};
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
@@ -54,7 +54,7 @@ fn watch(
         [p[2][0], p[2][1], p[2][2]],
     ]);
     let nees = p_tt.try_inverse().map_or(f64::NAN, |inv| {
-        let e = V3::from_buf(e);
+        let e = Vec3::from_buf(e);
         e.dot(&inv.dot(&e)).into_buf()
     });
     state.0.borrow_mut().push((error.abs(), nees));

@@ -43,10 +43,9 @@ pub fn health(
     #[state] s: &mut Health,
     css: &mut Input<SunSensors>,
     mag: &mut Input<Magnetometer>,
-    gps: &mut Input<Gps>,
+    gps: Option<Gps>,
     alarms: &mut Alarms,
 ) {
-    let gps = gps.latest().ok().flatten().map(|g| *g);
     let css = css.drain().flatten().last().copied();
     let dark = css.and_then(|c| {
         let gps = gps.as_ref()?;

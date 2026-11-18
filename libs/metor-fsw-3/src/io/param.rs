@@ -31,7 +31,11 @@ impl<K: Interface> Param<NoWake> for Cap<K> {
         Ok(Cap::new(Handle::new(io.next_grant(), io.clone())))
     }
 
-    fn get<'a>(_input: &'a mut (), output: &'a mut Cap<K>, _cx: &mut Cycle<'a>) -> &'a Cap<K> {
-        output
+    fn get<'a>(
+        _input: &'a mut (),
+        output: &'a mut Cap<K>,
+        _cx: &mut Cycle<'a>,
+    ) -> Option<&'a Cap<K>> {
+        Some(output)
     }
 }

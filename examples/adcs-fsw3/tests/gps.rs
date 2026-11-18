@@ -5,7 +5,7 @@ use core::cell::{Cell, RefCell};
 use core::time::Duration;
 use std::rc::Rc;
 
-use adcs_contracts::{BodyState, Gps, GpsFault, Quat, V3};
+use adcs_contracts::{BodyState, Gps, GpsFault, Quat, Vec3};
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{Clock, Coordinator, CoordinatorConfig, SystemTable};
 use metor_fsw_3::{Input, Output, Timestamp, system};
@@ -18,13 +18,13 @@ const DT: i64 = 10_000;
 fn body(now: Timestamp) -> BodyState {
     let t = now.0 as f64 * 1e-6;
     let (pos, vel) = (
-        V3::from_buf([6.78e6, 0.0, 0.0]),
-        V3::from_buf([0.0, 7670.0, 0.0]),
+        Vec3::from_buf([6.78e6, 0.0, 0.0]),
+        Vec3::from_buf([0.0, 7670.0, 0.0]),
     );
     BodyState {
         timestamp: now,
         q_b_eci: Quat::identity(),
-        omega_b: V3::zeros(),
+        omega_b: Vec3::zeros(),
         pos_eci: pos + vel * t,
         vel_eci: vel,
     }

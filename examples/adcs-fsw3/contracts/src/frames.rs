@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::{Quat, V3};
+use crate::{Quat, Vec3};
 
 /// The plant's sensor measurements for one cycle.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
@@ -16,13 +16,13 @@ pub struct Sensors {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Measured body rate (rad/s).
-    pub gyro_b: V3,
+    pub gyro_b: Vec3,
     /// Coarse sun sensor readings, one head per face in the order
     /// `[+X, +Y, +Z, −X, −Y, −Z]`. A lit head reads the cosine of its sun angle,
     /// clamped at zero, and a dark head reads its noise floor.
     pub css: [f64; 6],
     /// Measured magnetic field (T).
-    pub mag_b: V3,
+    pub mag_b: Vec3,
 }
 
 /// The sun sensor heads alone, in [`Sensors::css`] order.
@@ -43,7 +43,7 @@ pub struct Magnetometer {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Measured magnetic field (T).
-    pub mag_b: V3,
+    pub mag_b: Vec3,
 }
 
 /// The ADCS housekeeping the beacon reports.
@@ -54,13 +54,13 @@ pub struct Housekeeping {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Estimated body rate (rad/s).
-    pub omega_b: V3,
+    pub omega_b: Vec3,
     /// Estimated gyro bias (rad/s).
-    pub b_hat_b: V3,
+    pub b_hat_b: Vec3,
     /// Commanded wheel torque (N·m).
-    pub torque_b: V3,
+    pub torque_b: Vec3,
     /// Commanded dipole (A·m²).
-    pub dipole_b: V3,
+    pub dipole_b: Vec3,
 }
 
 /// A GPS fix: the plant's, or the GPS driver's from the receiver's logs.
@@ -71,11 +71,11 @@ pub struct Gps {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Measured position (m).
-    pub pos_eci: V3,
+    pub pos_eci: Vec3,
     /// Measured velocity (m/s).
-    pub vel_eci: V3,
+    pub vel_eci: Vec3,
     /// Measured position as `[latitude_deg, longitude_deg, altitude_m]`.
-    pub lla: V3,
+    pub lla: Vec3,
 }
 
 /// A fault the GPS receiver model applies, as a scenario or the panel sends
@@ -100,9 +100,9 @@ pub struct AttitudeEstimate {
     /// Estimated attitude, body←ECI.
     pub q_hat_b_eci: Quat,
     /// Estimated body rate (rad/s).
-    pub omega_b: V3,
+    pub omega_b: Vec3,
     /// Estimated gyro bias (rad/s).
-    pub b_hat_b: V3,
+    pub b_hat_b: Vec3,
     /// Error covariance over attitude and gyro bias.
     pub p: Matrix6<f64, ArrayRepr>,
 }
@@ -138,11 +138,11 @@ pub struct BodyState {
     /// Attitude, body←ECI.
     pub q_b_eci: Quat,
     /// Body rate (rad/s).
-    pub omega_b: V3,
+    pub omega_b: Vec3,
     /// Position (m).
-    pub pos_eci: V3,
+    pub pos_eci: Vec3,
     /// Velocity (m/s).
-    pub vel_eci: V3,
+    pub vel_eci: Vec3,
 }
 
 /// A reaction wheel spinning about one body axis.
@@ -153,13 +153,13 @@ pub struct BodyState {
 #[repr(C)]
 pub struct ReactionWheel {
     /// Spin axis, a unit vector in the body frame.
-    pub axis: V3,
+    pub axis: Vec3,
     /// Stored momentum `s·axis` (N·m·s).
-    pub ang_momentum: V3,
+    pub ang_momentum: Vec3,
     /// Commanded body torque projected onto `axis` (N·m).
-    pub torque_set_point: V3,
+    pub torque_set_point: Vec3,
     /// Torque delivered to the body this step, `−ḣ·axis` (N·m).
-    pub torque: V3,
+    pub torque: Vec3,
     /// Signed spin rate about `axis` (rad/s).
     pub speed: f64,
     /// Bearing friction torque this step (N·m).
@@ -171,12 +171,12 @@ pub struct ReactionWheel {
 
 impl ReactionWheel {
     /// Returns a wheel at rest on `axis`.
-    pub fn new(axis: V3, arm: bool) -> Self {
+    pub fn new(axis: Vec3, arm: bool) -> Self {
         Self {
             axis,
-            ang_momentum: V3::zeros(),
-            torque_set_point: V3::zeros(),
-            torque: V3::zeros(),
+            ang_momentum: Vec3::zeros(),
+            torque_set_point: Vec3::zeros(),
+            torque: Vec3::zeros(),
             speed: 0.0,
             friction: 0.0,
             arm: arm as u8,
@@ -208,9 +208,9 @@ pub struct World {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Unit vector toward the sun.
-    pub sun_eci: V3,
+    pub sun_eci: Vec3,
     /// Magnetic field (T).
-    pub mag_eci: V3,
+    pub mag_eci: Vec3,
     /// `1` in sunlight and `0` in Earth shadow.
     pub illuminated: u8,
     _pad: [u8; 7],
@@ -218,7 +218,7 @@ pub struct World {
 
 impl World {
     /// Returns the environment for one cycle.
-    pub fn new(timestamp: Timestamp, sun_eci: V3, mag_eci: V3, illuminated: bool) -> Self {
+    pub fn new(timestamp: Timestamp, sun_eci: Vec3, mag_eci: Vec3, illuminated: bool) -> Self {
         Self {
             timestamp,
             sun_eci,
@@ -238,17 +238,17 @@ pub struct Disturbances {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Gravity-gradient torque (N·m).
-    pub gg_b: V3,
+    pub gg_b: Vec3,
     /// Aerodynamic drag torque (N·m).
-    pub aero_b: V3,
+    pub aero_b: Vec3,
     /// Residual magnetic dipole torque (N·m).
-    pub mag_b: V3,
+    pub mag_b: Vec3,
     /// Solar radiation pressure torque (N·m).
-    pub srp_b: V3,
+    pub srp_b: Vec3,
     /// Magnetorquer torque `m × B` (N·m), left out of `total_b`.
-    pub mtq_b: V3,
+    pub mtq_b: Vec3,
     /// Sum of the environmental torques (N·m).
-    pub total_b: V3,
+    pub total_b: Vec3,
 }
 
 /// The commanded magnetorquer dipole. The plant clamps each axis to its
@@ -260,7 +260,7 @@ pub struct MtqCmd {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Commanded dipole (A·m²).
-    pub dipole_b: V3,
+    pub dipole_b: Vec3,
 }
 
 /// An ADCS phase.
@@ -402,7 +402,7 @@ pub struct TorqueCmd {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Commanded torque (N·m).
-    pub torque_b: V3,
+    pub torque_b: Vec3,
 }
 
 #[cfg(test)]

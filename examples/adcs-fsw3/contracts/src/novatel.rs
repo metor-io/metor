@@ -196,8 +196,8 @@ impl crate::Gps {
     /// The fix a solved `log` reports at `now`, rotated to ECI at the log's
     /// GPS time.
     pub fn from_best_xyz(now: metor_fsw_3::Timestamp, log: &BestXyz) -> Self {
-        use crate::{V3, ecef_to_eci_state, ecef_to_geodetic, gps_epoch};
-        let (pos_ecef, vel_ecef) = (V3::from_buf(log.pos_ecef), V3::from_buf(log.vel_ecef));
+        use crate::{Vec3, ecef_to_eci_state, ecef_to_geodetic, gps_epoch};
+        let (pos_ecef, vel_ecef) = (Vec3::from_buf(log.pos_ecef), Vec3::from_buf(log.vel_ecef));
         let epoch = gps_epoch(log.week, log.seconds);
         let (pos_eci, vel_eci) = ecef_to_eci_state(epoch, &pos_ecef, &vel_ecef);
         let (lat, lon, alt) = ecef_to_geodetic(&pos_ecef);
@@ -205,7 +205,7 @@ impl crate::Gps {
             timestamp: now,
             pos_eci,
             vel_eci,
-            lla: V3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
+            lla: Vec3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
         }
     }
 }

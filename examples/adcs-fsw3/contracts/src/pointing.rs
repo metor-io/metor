@@ -1,7 +1,7 @@
 //! Pointing laws, which give the controller its target attitude, and the
 //! samples that score how well the spacecraft tracks it.
 
-use crate::{BodyState, Law, Quat, V3};
+use crate::{BodyState, Law, Quat, Vec3};
 
 /// The body axis both pointing laws aim.
 const POINTING_AXIS: [f64; 3] = [0.0, -1.0, 0.0];
@@ -13,9 +13,9 @@ const ANTIPARALLEL: f64 = 1e-9;
 ///
 /// A target opposite the axis has no unique shortest rotation, so it gets a
 /// half turn about body `X`.
-fn point_minus_y_at(dir_eci: V3) -> Quat {
+fn point_minus_y_at(dir_eci: Vec3) -> Quat {
     let r = dir_eci.normalize();
-    let body_axis: V3 = V3::from_buf(POINTING_AXIS);
+    let body_axis: Vec3 = Vec3::from_buf(POINTING_AXIS);
     let [x, y, z] = body_axis.cross(&r).into_buf();
     let w = 1.0 + body_axis.dot(&r).into_buf();
     if w.abs() < ANTIPARALLEL {
@@ -25,18 +25,18 @@ fn point_minus_y_at(dir_eci: V3) -> Quat {
 }
 
 /// Returns the attitude that aims body `-Y` at Earth's center.
-pub fn nadir_point(pos_eci: &V3) -> Quat {
+pub fn nadir_point(pos_eci: &Vec3) -> Quat {
     point_minus_y_at(pos_eci.normalize() * -1.0)
 }
 
 /// Returns the attitude that aims body `-Y` along the orbital velocity.
-pub fn hil_point(vel_eci: &V3) -> Quat {
+pub fn hil_point(vel_eci: &Vec3) -> Quat {
     point_minus_y_at(vel_eci.normalize())
 }
 
 /// Returns the target attitude for `law` at an orbit state, or identity when the
 /// law points nowhere or the target is not finite.
-pub fn target_for(law: Law, pos_eci: &V3, vel_eci: &V3) -> Quat {
+pub fn target_for(law: Law, pos_eci: &Vec3, vel_eci: &Vec3) -> Quat {
     let t = match law {
         Law::Nadir => nadir_point(pos_eci),
         Law::Hil => hil_point(vel_eci),
@@ -69,20 +69,20 @@ mod tests {
     /// along `vel`.
     #[test]
     fn pointing_laws_aim_the_body_axis() {
-        let axis: V3 = V3::from_buf(POINTING_AXIS);
+        let axis: Vec3 = Vec3::from_buf(POINTING_AXIS);
         let radius = EARTH_RADIUS + ALTITUDE;
         for (pos, vel) in [
             (
-                tensor![radius, 0.0, 0.0] as V3,
-                tensor![0.0, 7.6e3, 0.0] as V3,
+                tensor![radius, 0.0, 0.0] as Vec3,
+                tensor![0.0, 7.6e3, 0.0] as Vec3,
             ),
             (
-                tensor![0.0, radius, 0.0] as V3,
-                tensor![0.0, 0.0, 7.6e3] as V3,
+                tensor![0.0, radius, 0.0] as Vec3,
+                tensor![0.0, 0.0, 7.6e3] as Vec3,
             ),
             (
-                (tensor![1.0, 1.0, 1.0] as V3).normalize() * radius,
-                tensor![0.0, -7.6e3, 0.0] as V3,
+                (tensor![1.0, 1.0, 1.0] as Vec3).normalize() * radius,
+                tensor![0.0, -7.6e3, 0.0] as Vec3,
             ),
         ] {
             let aimed = nadir_point(&pos) * axis;
@@ -110,9 +110,9 @@ mod tests {
     /// A target opposite body `-Y` yields a unit half turn rather than NaN.
     #[test]
     fn antiparallel_target_is_a_finite_half_turn() {
-        let axis: V3 = V3::from_buf(POINTING_AXIS);
+        let axis: Vec3 = Vec3::from_buf(POINTING_AXIS);
         // Nadir from a position along `-Y` lies along `+Y`.
-        let q = nadir_point(&(tensor![0.0, -7.0e6, 0.0] as V3));
+        let q = nadir_point(&(tensor![0.0, -7.0e6, 0.0] as Vec3));
         assert!(
             q.0.into_buf().iter().all(|f| f.is_finite()),
             "a degenerate target must stay finite"
@@ -120,7 +120,7 @@ mod tests {
         let norm: f64 = q.0.norm().into_buf();
         assert!((norm - 1.0).abs() < 1e-12, "not a unit quaternion: {norm}");
         let aimed = q * axis;
-        let want: V3 = tensor![0.0, 1.0, 0.0];
+        let want: Vec3 = tensor![0.0, 1.0, 0.0];
         let err: f64 = (aimed - want).norm().into_buf();
         assert!(err < 1e-12, "half turn aims {:?}", aimed.into_buf());
     }

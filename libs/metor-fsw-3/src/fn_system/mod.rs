@@ -102,7 +102,10 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         stop: Stop,
     ) {
         let mut cx = Cycle::new(Timestamp::now());
-        let items = S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx);
+        // PANIC Safety: only a `CYCLIC_ONLY` param returns `None`, and those
+        // implement `Param<NoWake>` alone, so an async fn cannot take one.
+        let items = S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx)
+            .expect("an async system's params always have a value");
         let call = core::pin::pin!(S::call(state, items, stop));
         log::with_logs(&mut outputs.log, call).await;
     }
@@ -119,8 +122,10 @@ impl<S: SystemFn> System for FnSystem<S> {
 
     /// Runs one cycle, sending its log lines to the system's own `log` output.
     ///
-    /// Samples are refreshed before the fn runs. Failed writes are reported as a
-    /// fault afterward.
+    /// Samples are refreshed before the fn runs. If a param has no value yet,
+    /// such as a frame taken by value before its first record, the fn is
+    /// skipped this cycle; its inputs were still read. Failed writes are
+    /// reported as a fault afterward.
     fn execute(
         &self,
         now: Timestamp,
@@ -131,10 +136,9 @@ impl<S: SystemFn> System for FnSystem<S> {
         log::with_log_port(&mut outputs.log, now, || {
             S::Params::refresh(&mut inputs.ins);
             let mut cx = Cycle::new(now);
-            S::call(
-                state,
-                S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx),
-            );
+            if let Some(items) = S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx) {
+                S::call(state, items);
+            }
         });
         outputs.report_failed_writes(now);
     }

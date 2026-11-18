@@ -1,5 +1,3 @@
-//! The attitude filter.
-//!
 //! Nav runs a multiplicative extended Kalman filter on the gyro, the
 //! magnetometer, and the sun direction it reconstructs from the sun sensor
 //! heads. It evaluates its references, the sun direction and the WMM field, at
@@ -11,10 +9,11 @@
 
 use adcs_contracts::{
     AttitudeEstimate, CSS_THRESHOLD, Gps, MAX_STARS, MagneticModel, NavParams, NavStats, Quat,
-    Sensors, StarSolution, StarStatus, StarVectors, V3, epoch_at, mag_field_eci, sun_dir_eci,
+    Sensors, StarSolution, StarStatus, StarVectors, Vec3, epoch_at, mag_field_eci, sun_dir_eci,
 };
 use metor_adcs::mekf::{UpdateCounts, VectorObs};
-use metor_fsw_3::{Input, Output, Timestamp, system};
+use metor_fsw_3::{Output, Timestamp, system};
+use metor_star::geom::Quat;
 use nox::{Quaternion, tensor};
 
 /// The oldest star frame (s) nav fuses.
@@ -30,17 +29,17 @@ const LIVE_FOR: f64 = 1.0;
 /// Reconstructs the body-frame sun direction from the sun sensor readings, or
 /// returns `None` when every head is dark. Each opposed pair of heads gives one
 /// component.
-pub fn sun_from_css(css: &[f64; 6]) -> Option<V3> {
+pub fn sun_from_css(css: &[f64; 6]) -> Option<Vec3> {
     if css.iter().all(|r| *r < CSS_THRESHOLD) {
         return None;
     }
-    let v: V3 = tensor![css[0] - css[3], css[1] - css[4], css[2] - css[5]];
+    let v: Vec3 = tensor![css[0] - css[3], css[1] - css[4], css[2] - css[5]];
     Some(v.normalize())
 }
 
 /// `v` turned by `−ω·dt` (Rodrigues): a fixed inertial direction seen from a
 /// body turning at `omega` for `dt` seconds.
-pub fn rotate_back(v: V3, omega: V3, dt: f64) -> V3 {
+pub fn rotate_back(v: Vec3, omega: Vec3, dt: f64) -> Vec3 {
     let rate: f64 = omega.norm().into_buf();
     let angle = rate * dt;
     if angle == 0.0 {
@@ -53,7 +52,7 @@ pub fn rotate_back(v: V3, omega: V3, dt: f64) -> V3 {
 
 /// `q` carried `dt` seconds on at body rate `omega`: the attitude that sees
 /// [`rotate_back`]'s vectors.
-pub fn rotate_on(q: Quat, omega: V3, dt: f64) -> Quat {
+pub fn rotate_on(q: Quat, omega: Vec3, dt: f64) -> Quat {
     let angle: f64 = omega.norm().into_buf() * dt;
     if angle == 0.0 {
         return q;
@@ -66,7 +65,7 @@ pub fn rotate_on(q: Quat, omega: V3, dt: f64) -> Quat {
 /// over `dt`.
 pub fn star_obs(
     sv: &StarVectors,
-    omega: V3,
+    omega: Vec3,
     dt: f64,
     gyro_noise: f64,
 ) -> impl Iterator<Item = VectorObs> + '_ {
@@ -114,8 +113,8 @@ pub struct NavState {
 /// The filter for a step of `dt` seconds: the gyro's noise and bias walk,
 /// and the process noise they give over the step.
 fn mekf_for(gyro: Gyro, dt: f64) -> metor_adcs::mekf::State {
-    let noise: V3 = tensor![gyro.noise, gyro.noise, gyro.noise];
-    let walk: V3 = tensor![gyro.walk, gyro.walk, gyro.walk];
+    let noise: Vec3 = tensor![gyro.noise, gyro.noise, gyro.noise];
+    let walk: Vec3 = tensor![gyro.walk, gyro.walk, gyro.walk];
     metor_adcs::mekf::State::new(noise, walk, dt)
 }
 
@@ -182,8 +181,8 @@ impl NavState {
         }
         self.last_star = Some(sv.frame_id);
         let mut buf = [VectorObs {
-            body: V3::zeros(),
-            reference: V3::zeros(),
+            body: Vec3::zeros(),
+            reference: Vec3::zeros(),
             sigma: 0.0,
         }; MAX_STARS];
         let n = star_obs(sv, self.mekf.omega, age, self.gyro.noise)
@@ -274,26 +273,19 @@ impl NavState {
 pub fn nav(
     #[state] state: &mut NavState,
     now: Timestamp,
-    sensors: &mut Input<Sensors>,
-    gps: &mut Input<Gps>,
-    stars: &mut Input<StarVectors>,
-    star_solution: &mut Input<StarSolution>,
+    sensors: Sensors,
+    gps: Gps,
+    stars: Option<StarVectors>,
+    star_solution: Option<StarSolution>,
     attitude_estimate: &mut Output<AttitudeEstimate>,
     nav_stats: &mut Output<NavStats>,
 ) {
-    let Ok(Some(s)) = sensors.latest() else {
-        return; // no sensor sample yet
-    };
-    let s = *s;
-    let Ok(Some(g)) = gps.latest() else {
-        return; // no GPS fix yet
-    };
-    let Some((t_sim, dt)) = state.elapsed(s.timestamp) else {
+    let Some((t_sim, dt)) = state.elapsed(sensors.timestamp) else {
         return; // already filtered
     };
     state.seed(dt);
     let epoch = epoch_at(t_sim);
-    let gps_pos: V3 = g.pos_eci;
+    let gps_pos: Vec3 = gps.pos_eci;
     if !state.had_fix {
         state.had_fix = true;
         tracing::info!(t_sim, "first GPS fix; filter references live");
@@ -302,8 +294,8 @@ pub fn nav(
     let sun_eci = sun_dir_eci(epoch);
     let mag_eci = mag_field_eci(&mut state.mag_model, epoch, &gps_pos).normalize();
 
-    state.mekf.omega = s.gyro_b;
-    let sun_b = sun_from_css(&s.css);
+    state.mekf.omega = sensors.gyro_b;
+    let sun_b = sun_from_css(&sensors.css);
 
     match (state.sun_visible, sun_b.is_some()) {
         (Some(true), false) => {
@@ -321,21 +313,24 @@ pub fn nav(
             reference,
             sigma: state.sigma,
         };
-        let mag = obs(s.mag_b.normalize(), mag_eci);
+        let mag = obs(sensors.mag_b.normalize(), mag_eci);
         match sun_b {
             Some(sun_b) => state.fuse_sun_mag(&[obs(sun_b, sun_eci), mag], t_sim),
             None => state.fuse_sun_mag(&[mag], t_sim),
         }
     }
-    let star_frame = stars.latest().ok().flatten().map(|sv| *sv);
-    let solution = star_solution.latest().ok().flatten().map(|s| *s);
-    state.fuse_stars(star_frame.as_ref(), solution.as_ref(), s.timestamp, t_sim);
+    state.fuse_stars(
+        stars.as_ref(),
+        star_solution.as_ref(),
+        sensors.timestamp,
+        t_sim,
+    );
     state.mekf.reset_if_invalid();
 
     let _ = attitude_estimate.write(&AttitudeEstimate {
         timestamp: now,
         q_hat_b_eci: state.mekf.q_hat,
-        omega_b: s.gyro_b, // the measured rate, passed through
+        omega_b: sensors.gyro_b, // the measured rate, passed through
         b_hat_b: state.mekf.b_hat,
         p: state.mekf.p,
     });
@@ -378,7 +373,7 @@ mod tests {
                 0.14 * ((i as f64 + 0.5) / MAX_STARS as f64).sqrt(),
                 i as f64 * 2.4,
             );
-            let b: V3 = (tensor![r * az.cos(), r * az.sin(), 1.0] as V3).normalize();
+            let b: Vec3 = (tensor![r * az.cos(), r * az.sin(), 1.0] as Vec3).normalize();
             sv.push(b.into_buf(), (q * b).into_buf(), 34e-6, i as u32);
         }
         let mut solution = StarSolution::new(t, id, StarMode::Tracking, StarStatus::Valid);
@@ -396,9 +391,9 @@ mod tests {
     #[test]
     fn star_obs_turns_by_the_rate_over_the_age() {
         let sv = frame(0, 1, &[([1.0, 0.0, 0.0], [1.0, 0.0, 0.0])]);
-        let omega: V3 = tensor![0.0, 0.0, 0.2];
+        let omega: Vec3 = tensor![0.0, 0.0, 0.2];
         let o = star_obs(&sv, omega, 0.5, 0.01).next().expect("one row");
-        let expected: V3 = tensor![0.1f64.cos(), -0.1f64.sin(), 0.0];
+        let expected: Vec3 = tensor![0.1f64.cos(), -0.1f64.sin(), 0.0];
         let err: f64 = (o.body - expected).norm().into_buf();
         assert!(err < 1e-15, "{err}");
         let grown = (34e-6f64.powi(2) + 0.01f64.powi(2) * 0.5).sqrt();
@@ -472,7 +467,7 @@ mod tests {
     fn a_lost_filter_resets_to_the_solution() {
         let truth: Quat =
             nox::Quaternion::from_axis_angle(tensor![1.0, 1.0, 1.0], 170f64.to_radians());
-        let omega: V3 = tensor![0.05, -0.1, 0.08];
+        let omega: Vec3 = tensor![0.05, -0.1, 0.08];
         let mut nav = NavState::new(NavParams {
             sun_mag: false,
             ..params()
@@ -492,7 +487,7 @@ mod tests {
 
     /// Returns noiseless readings for a body-frame sun direction. Written out here
     /// so nav does not depend on the plant.
-    fn readings_for(sun_b: &V3) -> [f64; 6] {
+    fn readings_for(sun_b: &Vec3) -> [f64; 6] {
         let [x, y, z] = sun_b.into_buf();
         [
             x.max(0.0),
@@ -509,10 +504,10 @@ mod tests {
     #[test]
     fn css_reconstruction_recovers_sun_direction() {
         for sun in [
-            (tensor![0.3, -0.5, 0.8] as V3).normalize(),
-            (tensor![-1.0, 0.1, 0.0] as V3).normalize(),
-            (tensor![0.0, 0.0, -1.0] as V3).normalize(),
-            (tensor![1.0, 1.0, 1.0] as V3).normalize(),
+            (tensor![0.3, -0.5, 0.8] as Vec3).normalize(),
+            (tensor![-1.0, 0.1, 0.0] as Vec3).normalize(),
+            (tensor![0.0, 0.0, -1.0] as Vec3).normalize(),
+            (tensor![1.0, 1.0, 1.0] as Vec3).normalize(),
         ] {
             let s = sun_from_css(&readings_for(&sun)).expect("lit readings reconstruct");
             let err: f64 = (s - sun).norm().into_buf();
@@ -588,10 +583,10 @@ mod tests {
         /// when given, and a star frame when `stars` and one is due.
         fn step(&mut self, coarse: Option<Quat>, stars: bool) {
             let t = Timestamp(self.k * 8_333);
-            self.nav.mekf.omega = V3::zeros();
+            self.nav.mekf.omega = Vec3::zeros();
             self.nav.mekf.propagate();
             if let Some(bias) = coarse {
-                let refs: [V3; 2] = [tensor![0.3, 0.9, -0.2], tensor![-0.8, 0.1, 0.6]];
+                let refs: [Vec3; 2] = [tensor![0.3, 0.9, -0.2], tensor![-0.8, 0.1, 0.6]];
                 let obs = refs.map(|r| {
                     let r = r.normalize();
                     VectorObs {

@@ -4,7 +4,7 @@ error[E0277]: `Sample<Imu>` is not a parameter of a system whose inputs wake `No
 13 | #[derive(SystemParams)]
    |          ^^^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
    |
-   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
       but trait `Param<NoWake>` is implemented for it
   --> src/fn_system/param.rs
@@ -20,7 +20,7 @@ error[E0277]: `Sample<Imu>` is not a parameter of a system whose inputs wake `No
   |         input: &'a mut Self::In,
   |                ^^^^^^^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
   |
-  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
       but trait `Param<NoWake>` is implemented for it
  --> src/fn_system/param.rs
@@ -35,7 +35,7 @@ error[E0277]: `Sample<Imu>` is not a parameter of a system whose inputs wake `No
   |         output: &'a mut Self::Out,
   |                 ^^^^^^^^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
   |
-  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+  = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
       but trait `Param<NoWake>` is implemented for it
  --> src/fn_system/param.rs
@@ -50,7 +50,7 @@ error[E0277]: `Sample<Imu>` is not a parameter of a system whose inputs wake `No
 17 |     held: &'a Sample<Imu>,
    |               ^^^^^^^^^^^ the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
    |
-   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
+   = note: a cyclic fn or sequence takes `Param<NoWake>`; an async fn takes `Param<Notifier>`, so its inputs are `Input<T, Notifier>` and it takes no `Sample`, frame `T` or `Option<T>` by value, `Rng`, `Alarms`, or `Cap`, and its `SystemParams` structs are `#[system_params(async)]`
 help: the trait `Param<Notifier>` is not implemented for `Sample<Imu>`
       but trait `Param<NoWake>` is implemented for it
   --> src/fn_system/param.rs

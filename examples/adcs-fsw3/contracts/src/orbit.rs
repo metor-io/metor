@@ -2,7 +2,7 @@
 
 use nox::tensor;
 
-use crate::V3;
+use crate::Vec3;
 
 /// Earth's gravitational parameter `G·M` (m³·s⁻²).
 pub const MU: f64 = 6.6743e-11 * 5.972e24;
@@ -16,12 +16,12 @@ pub const SSO_INCLINATION: f64 = 97.03 * core::f64::consts::PI / 180.0;
 
 /// Returns the ECI position and velocity of a circular orbit at phase `theta`
 /// (rad) past its ascending node.
-pub fn orbit_pos_vel(radius: f64, inclination: f64, raan: f64, theta: f64) -> (V3, V3) {
+pub fn orbit_pos_vel(radius: f64, inclination: f64, raan: f64, theta: f64) -> (Vec3, Vec3) {
     let (sin_o, cos_o) = raan.sin_cos();
     let (sin_i, cos_i) = inclination.sin_cos();
     // The node line and the in-plane direction 90° ahead of it.
-    let node: V3 = tensor![cos_o, sin_o, 0.0];
-    let climb: V3 = tensor![-sin_o * cos_i, cos_o * cos_i, sin_i];
+    let node: Vec3 = tensor![cos_o, sin_o, 0.0];
+    let climb: Vec3 = tensor![-sin_o * cos_i, cos_o * cos_i, sin_i];
     let (sin_th, cos_th) = theta.sin_cos();
     let v_orbit = (MU / radius).sqrt();
     (

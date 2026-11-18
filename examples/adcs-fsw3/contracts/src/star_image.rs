@@ -5,7 +5,7 @@
 use metor_fsw_3::{FrameArray, FrameImage, Mono16, Timestamp};
 use zerocopy::{AllocError, FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
-use crate::{Quat, V3};
+use crate::{Quat, Vec3};
 
 /// The most truth centroids a [`StarTruth`] carries.
 pub const MAX_TRUTH: usize = 32;
@@ -63,7 +63,7 @@ pub struct StarTruth {
     /// product), with `q_b_st` the camera mount (body←`st`).
     pub q_cam_eci: Quat,
     /// Sensor-frame rate (rad/s).
-    pub omega_cam: V3,
+    pub omega_cam: Vec3,
     /// Stars drawn into the image.
     pub n_rendered: u32,
     /// Stars bright enough to detect.

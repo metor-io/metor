@@ -103,13 +103,14 @@ fn impl_body(
         .collect();
     let index: Vec<_> = (0..keys.len()).map(syn::Index::from).collect();
     let get =
-        parts.build(|key, i| quote!(<#key as #param>::get(&mut input.#i, &mut output.#i, cx)));
+        parts.build(|key, i| quote!(<#key as #param>::get(&mut input.#i, &mut output.#i, cx)?));
     let sampled = parts.build(|_, i| quote!(parts.#i.0));
     quote! {
         type In = (#(<#keys as #param>::In,)*);
         type Out = (#(<#keys as #param>::Out,)*);
         type Item<'__p> = #item;
         const FLATTEN: bool = true;
+        const CYCLIC_ONLY: bool = false #(|| <#keys as #param>::CYCLIC_ONLY)*;
 
         #[allow(unused_variables)]
         fn append_defs(
@@ -139,8 +140,8 @@ fn impl_body(
             input: &'__p mut Self::In,
             output: &'__p mut Self::Out,
             cx: &mut #fsw::Cycle<'__p>,
-        ) -> #item {
-            #get
+        ) -> ::core::option::Option<#item> {
+            ::core::option::Option::Some(#get)
         }
 
         #[allow(unused_variables)]
@@ -235,8 +236,9 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
 const ARGUMENT_ONLY: [&str; 3] = ["Seq", "Timestamp", "Abort"];
 
 /// Params a struct flattens into nothing: each would take its parent's path.
-const LEAVES: [&str; 13] = [
+const LEAVES: [&str; 14] = [
     "Input",
+    "Option",
     "Output",
     "Sample",
     "Rng",

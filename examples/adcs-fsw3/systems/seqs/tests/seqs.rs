@@ -3,7 +3,7 @@
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adcs_contracts::{AttitudeEstimate, Mode, ModeCmd, V3};
+use adcs_contracts::{AttitudeEstimate, Mode, ModeCmd, Vec3};
 use metor_fsw_3::alarm::{ClearedMsg, RaisedMsg};
 use metor_fsw_3::coordinator::{
     Coordinator, CoordinatorConfig, EndReason, InputConfig, SystemConfig,
@@ -41,7 +41,7 @@ fn estimator(
 ) {
     let mut e = AttitudeEstimate::new_zeroed();
     e.timestamp = now;
-    e.omega_b = V3::from_buf([script.rate.get(), 0.0, 0.0]);
+    e.omega_b = Vec3::from_buf([script.rate.get(), 0.0, 0.0]);
     let _ = estimate.write(&e);
 }
 

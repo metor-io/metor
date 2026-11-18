@@ -14,13 +14,15 @@ use super::path::ParamPath;
 /// Element `i` of `[P; N]` is named `{path}.{i}`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be an array element of a system parameter",
-    note = "arrays hold `Input`, `Sample`, `Output`, arrays of those, and `SystemParams` structs"
+    note = "arrays hold `Input`, `Sample`, frames, `Option`s of frames, `Output`, arrays of those, and `SystemParams` structs"
 )]
 pub trait ArrayParam {}
 
 impl<T: Record + ?Sized, W: InputWake> ArrayParam for Input<T, W> {}
 impl<T: Record + ?Sized> ArrayParam for Output<T> {}
 impl<T: Frame + Copy> ArrayParam for Sample<T> {}
+impl<T: Frame + Copy> ArrayParam for T {}
+impl<T: Frame + Copy> ArrayParam for Option<T> {}
 impl<P: ArrayParam, const N: usize> ArrayParam for [P; N] {}
 
 impl<W: InputWake, P: Param<W> + ArrayParam, const N: usize> Param<W> for [P; N] {
@@ -30,6 +32,8 @@ impl<W: InputWake, P: Param<W> + ArrayParam, const N: usize> Param<W> for [P; N]
         = [P::Item<'a>; N]
     where
         Self: 'a;
+
+    const CYCLIC_ONLY: bool = P::CYCLIC_ONLY;
 
     fn append_defs(at: &ParamPath<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
         (0..N).try_for_each(|i| P::append_defs(&at.index(i), cx, defs))
@@ -51,13 +55,18 @@ impl<W: InputWake, P: Param<W> + ArrayParam, const N: usize> Param<W> for [P; N]
         input: &'a mut Self::In,
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a> {
+    ) -> Option<Self::Item<'a>> {
         let mut pairs = input.iter_mut().zip(output.iter_mut());
-        core::array::from_fn(|_| {
+        let items: [Option<P::Item<'a>>; N] = core::array::from_fn(|_| {
             // PANIC Safety: both arrays hold `N` elements.
             let (input, output) = pairs.next().expect("one pair per element");
             P::get(input, output, cx)
-        })
+        });
+        if items.iter().any(Option::is_none) {
+            return None;
+        }
+        // PANIC Safety: every element was checked above.
+        Some(items.map(|item| item.expect("every element has a value")))
     }
 
     fn refresh(input: &mut Self::In) {
