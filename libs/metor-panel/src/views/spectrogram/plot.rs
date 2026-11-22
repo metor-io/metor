@@ -222,9 +222,14 @@ impl SpectrogramPlot {
         })
     }
 
-    /// Earliest sample timestamp across resolved sources — the anchor the
-    /// x-axis tick generator uses so labels don't crawl during a scroll.
-    pub fn data_start(&self) -> Option<f64> {
+    /// The instant relative x labels count from; see
+    /// [`crate::temporal::plot_origin`].
+    pub fn time_origin(&self, cx: &gpui::App) -> Option<f64> {
+        crate::temporal::plot_origin(cx, || self.data_start())
+    }
+
+    /// Earliest loaded sample across resolved sources.
+    fn data_start(&self) -> Option<f64> {
         let mut start = f64::INFINITY;
         let mut any = false;
         for tracking in self.tracking.values() {

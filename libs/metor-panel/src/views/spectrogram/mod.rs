@@ -261,7 +261,7 @@ impl Render for Spectrogram {
 /// prepaint so paint itself only draws.
 struct Chrome {
     view: PlotBounds,
-    data_start: f64,
+    origin: f64,
     time_format: TimeFormat,
     /// Bins per Hz mapping, when the operator supplied a sample rate.
     hz_per_bin: Option<f64>,
@@ -292,7 +292,7 @@ impl Chrome {
             .map(|rate| (rate / 2.0) / (len - 1) as f64);
         let scale = p.scale(cx);
         let intensity = p.intensity_range();
-        let data_start = p.data_start().unwrap_or(view.min_x);
+        let origin = p.time_origin(cx).unwrap_or(view.min_x);
 
         let readout = hover.and_then(|pos| {
             let frac_x = f32::from(pos.x - pa.origin.x) / f32::from(pa.size.width);
@@ -304,7 +304,7 @@ impl Chrome {
             };
             let text = format!(
                 "{} · {} · {}{}",
-                format_time_label(sample.ts, data_start as i64, p.x_time_format, view.width()),
+                format_time_label(sample.ts, origin as i64, p.x_time_format, view.width()),
                 axis,
                 crate::views::format::format_exact(sample.value as f64),
                 scale.unit(),
@@ -314,7 +314,7 @@ impl Chrome {
 
         Some(Self {
             view,
-            data_start,
+            origin,
             time_format: p.x_time_format,
             hz_per_bin,
             scale,
@@ -348,18 +348,13 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
 
     paint_axis_backdrop(outer, pa, window, cx);
 
-    let anchor = x_tick_anchor(chrome.time_format, chrome.data_start);
+    let anchor = x_tick_anchor(chrome.time_format, chrome.origin);
     for tick in x_ticks(&view, 6, anchor) {
         let x = view.to_screen(pa, tick as f64, view.min_y).x;
         if x < pa.origin.x || x > pa.origin.x + pa.size.width {
             continue;
         }
-        let label = format_time_label(
-            tick,
-            chrome.data_start as i64,
-            chrome.time_format,
-            view.width(),
-        );
+        let label = format_time_label(tick, chrome.origin as i64, chrome.time_format, view.width());
         crate::views::plot_common::paint_text_label(
             label,
             theme.text_secondary,
