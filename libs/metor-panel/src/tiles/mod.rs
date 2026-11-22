@@ -2332,31 +2332,34 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_docked_panes_hidden_header_shows_while_the_pointer_is_at_its_top(cx: &mut TestAppContext) {
+    fn a_headerless_docked_panes_own_menu_carries_its_pane_rows(cx: &mut TestAppContext) {
         let (group, cx) = host(|cx| vec![item("a", cx), item("timeline", cx)], cx);
-        let pinned = cx.update(|_, cx| {
+        let (pinned, tabbed) = cx.update(|_, cx| {
             group.update(cx, |group, cx| {
                 let pinned = group.tabs[1].panes[0].clone();
                 group.pin(pinned.clone(), Edge::Bottom, cx);
-                pinned.update(cx, |pane, cx| pane.set_hide_header(true, cx));
-                pinned
+                (pinned, group.tabs[0].panes[0].clone())
             })
         });
         cx.refresh().unwrap();
-        let header =
-            |cx: &mut gpui::VisualTestContext| cx.debug_bounds("pane-header-peek").is_some();
-        assert!(!header(cx));
-        let top = cx.update(|_, cx| pinned.read(cx).bounds());
-        cx.simulate_mouse_move(
-            point(top.center().x, top.top() + px(2.0)),
-            None,
-            Default::default(),
+        let labels = |pane: &Entity<Pane>, cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                let at = pane.read(cx).bounds().center();
+                dock::headerless_rows_at(&group, at, cx)
+                    .iter()
+                    .map(|row| row.label().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(labels(&pinned, cx).is_empty());
+        cx.update(|_, cx| pinned.update(cx, |pane, cx| pane.set_hide_header(true, cx)));
+        cx.refresh().unwrap();
+        assert!(
+            labels(&pinned, cx)
+                .iter()
+                .any(|label| label == "Hide Header")
         );
-        cx.refresh().unwrap();
-        assert!(header(cx));
-        cx.simulate_mouse_move(top.center(), None, Default::default());
-        cx.refresh().unwrap();
-        assert!(!header(cx));
+        assert!(labels(&tabbed, cx).is_empty());
     }
 
     fn drag(

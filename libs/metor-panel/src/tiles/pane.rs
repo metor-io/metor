@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, EventEmitter, IntoElement, MouseButton, Pixels, Point,
-    Render, SharedString, WeakEntity, Window, div, prelude::*, px,
+    Bounds, ClickEvent, Context, EventEmitter, IntoElement, MouseButton, Pixels, Point, Render,
+    SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
@@ -58,10 +58,6 @@ pub struct PreviewPlotAction {
     pub anchor: Point<Pixels>,
 }
 
-/// How far down from a docked pane's top edge the pointer brings back its
-/// hidden header.
-const PEEK_HEIGHT: f32 = 6.0;
-
 /// Height of a pane's header row.
 pub(super) const HEADER_HEIGHT: f32 = crate::theme::CONTROL_HEIGHT;
 
@@ -118,9 +114,6 @@ pub struct Pane {
     /// Pinned in one of the window's docks, where there is no tab to zoom
     /// over.
     docked: bool,
-    /// The pointer reached the top edge of a docked pane whose header is
-    /// hidden, so the header shows over it until the pointer leaves.
-    peeking: bool,
 }
 
 impl Pane {
@@ -132,7 +125,6 @@ impl Pane {
             locked_size: None,
             group: None,
             docked: false,
-            peeking: false,
         }
     }
 
@@ -153,7 +145,6 @@ impl Pane {
     pub(super) fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
         if self.docked != docked {
             self.docked = docked;
-            self.peeking = false;
             cx.notify();
         }
     }
@@ -370,47 +361,6 @@ impl Pane {
     }
 }
 
-impl Pane {
-    /// A docked pane's hidden header, kept within reach: a thin strip along
-    /// its top edge that shows the header over the item while the pointer
-    /// is on it, for dragging the pane or opening its menu.
-    fn render_peek(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.peeking {
-            div()
-                .id("pane-header-peek")
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(HEADER_HEIGHT))
-                .debug_selector(|| "pane-header-peek".into())
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    if !hovered {
-                        this.peeking = false;
-                        cx.notify();
-                    }
-                }))
-                .child(self.render_header(true, cx))
-                .into_any_element()
-        } else {
-            div()
-                .id("pane-header-peek")
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(PEEK_HEIGHT))
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    if *hovered {
-                        this.peeking = true;
-                        cx.notify();
-                    }
-                }))
-                .into_any_element()
-        }
-    }
-}
-
 impl Render for Pane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
@@ -458,9 +408,6 @@ impl Render for Pane {
             })
             .child(content)
             .when(under, |pane| pane.child(self.render_header(true, cx)))
-            .when(self.docked && !header, |pane| {
-                pane.child(self.render_peek(cx))
-            })
     }
 }
 

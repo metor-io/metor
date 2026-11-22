@@ -156,6 +156,14 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut rows = rows;
+        if let InspectorMode::Anchored(position) = mode {
+            rows.extend(crate::tiles::dock::headerless_rows_at(
+                &self.tiles,
+                position,
+                cx,
+            ));
+        }
         let parent_focus = self.focus_handle.clone();
         let inspector = cx.new(|cx| {
             let mut insp = Inspector::new(rows, mode, cx);

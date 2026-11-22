@@ -15,7 +15,7 @@ use gpui::{
 };
 
 use super::{Member, Pane, RESIZE_HANDLE_SIZE, TabId, TileGroup};
-use crate::inspector::rows::{CommandRow, InspectorRow};
+use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::theme::theme;
 
 /// The height a dock opens at when the pane pinned to it has no locked
@@ -255,8 +255,7 @@ impl TileGroup {
 }
 
 /// Right-click rows that pin `pane` to an edge, or once it is pinned move
-/// it, hide its header (which then shows only while the pointer is at the
-/// pane's top edge), or unpin it.
+/// it, hide its header, or unpin it.
 pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Some(group) = pane.read(cx).owner() else {
         return Vec::new();
@@ -280,12 +279,12 @@ pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorR
         )));
     }
     if docked.is_some() {
-        let hidden = pane.read(cx).hide_header();
-        let toggle = pane.clone();
-        rows.push(Box::new(CommandRow::new(
-            if hidden { "Show Header" } else { "Hide Header" },
-            Arc::new(move |_, cx| {
-                toggle.update(cx, |pane, cx| pane.set_hide_header(!hidden, cx));
+        let (read, write) = (pane.clone(), pane.clone());
+        rows.push(Box::new(BoolRow::dynamic(
+            "Hide Header",
+            Arc::new(move |cx| read.read(cx).hide_header()),
+            Arc::new(move |hide, _, cx| {
+                write.update(cx, |pane, cx| pane.set_hide_header(hide, cx));
             }),
         )));
         let pane = pane.clone();
@@ -297,6 +296,21 @@ pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorR
         )));
     }
     rows
+}
+
+/// The pane rows for a menu a view opens at `position` (in window
+/// coordinates) inside a docked pane whose header is hidden. With no header
+/// to right-click, the view's own menu is the way back to them.
+pub(crate) fn headerless_rows_at(
+    group: &Entity<TileGroup>,
+    position: gpui::Point<Pixels>,
+    cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    let pane = group.read(cx).docked_panes().find(|pane| {
+        let pane = pane.read(cx);
+        pane.hide_header() && pane.bounds().contains(&position)
+    });
+    pane.map(|pane| pane_rows(pane, cx)).unwrap_or_default()
 }
 
 /// Right-click rows for tab `id` of `group`: pin the whole tab to an edge.
