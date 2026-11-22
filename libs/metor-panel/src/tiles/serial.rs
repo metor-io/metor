@@ -8,7 +8,8 @@ use gpui::{
 use metor_db::DB;
 
 pub use metor_proto_wkt::{
-    SplitAxis, TILE_LAYOUT_VERSION, TileItem, TileLayout, TileNode, TilePane, TileSplit, TileTab,
+    SplitAxis, TILE_LAYOUT_VERSION, TileDock, TileItem, TileLayout, TileNode, TilePane, TileSplit,
+    TileTab,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -302,6 +303,8 @@ mod tests {
                 },
             ],
             active_tab: 1,
+            top_dock: None,
+            bottom_dock: None,
         }
     }
 

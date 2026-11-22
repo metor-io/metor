@@ -361,6 +361,8 @@ mod tests {
                 root: TileNode::Pane(TilePane::default()),
             }],
             active_tab: 0,
+            top_dock: None,
+            bottom_dock: None,
         }
     }
 

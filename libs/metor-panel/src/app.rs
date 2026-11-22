@@ -66,8 +66,13 @@ pub(crate) struct AppRoot {
     /// underlying surface keeps focus and the modifiers-changed listener
     /// can dismiss without disturbing the regular inspector slot.
     hover_preview: Option<HoverPreview>,
-    pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
+    pending_inspector_request: Option<(
+        Box<dyn crate::tiles::PaneItemHandle>,
+        Entity<crate::tiles::Pane>,
+        Point<Pixels>,
+    )>,
     pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
+    pending_tab_menu: Option<(crate::tiles::TabId, Point<Pixels>)>,
     /// An empty pane whose Time Series button opened the trace wizard.
     pending_time_series: Option<Entity<crate::tiles::Pane>>,
     pending_inspector_open: Option<InspectorRequest>,
@@ -132,6 +137,7 @@ impl AppRoot {
             hover_preview: None,
             pending_inspector_request: None,
             pending_pane_inspector_request: None,
+            pending_tab_menu: None,
             pending_time_series: None,
             pending_inspector_open: None,
             transient: None,
@@ -330,17 +336,6 @@ impl AppRoot {
         self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
     }
 
-    fn open_inspector(
-        &mut self,
-        item: &dyn crate::tiles::PaneItemHandle,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let entity = item.entity_any(cx);
-        self.open_entity_inspector(&entity, position, window, cx);
-    }
-
     fn open_entity_inspector(
         &mut self,
         entity: &gpui::AnyEntity,
@@ -369,6 +364,7 @@ impl AppRoot {
         let mut rows =
             crate::inspector::reflect::rows_for_any_entity(&pane.clone().into_any(), &self.db, cx)
                 .unwrap_or_default();
+        rows.extend(crate::tiles::dock::pane_rows(&pane, cx));
         let db = self.db.clone();
         let on_open_inspector = crate::inspector::open_inspector(cx);
         rows.push(Box::new(crate::inspector::rows::NavRow::new(
@@ -576,10 +572,17 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TileGroupEvent::Inspect { item, position } => {
-                let position = *position;
+            TileGroupEvent::Inspect {
+                item,
+                pane,
+                position,
+            } => {
                 let item = item.clone_handle();
-                self.pending_inspector_request = Some((item, position));
+                self.pending_inspector_request = Some((item, pane.clone(), *position));
+                cx.notify();
+            }
+            TileGroupEvent::InspectTab { tab, position } => {
+                self.pending_tab_menu = Some((*tab, *position));
                 cx.notify();
             }
             TileGroupEvent::InspectPane { pane, position } => {
@@ -613,8 +616,19 @@ impl Render for AppRoot {
             self.open_connection_picker(require_connection, window, cx);
         }
 
-        if let Some((item, position)) = self.pending_inspector_request.take() {
-            self.open_inspector(&*item, position, window, cx);
+        if let Some((item, pane, position)) = self.pending_inspector_request.take() {
+            let entity = item.entity_any(cx);
+            let mut rows = crate::inspector::reflect::rows_for_any_entity(&entity, &self.db, cx)
+                .unwrap_or_default();
+            rows.extend(crate::tiles::dock::pane_rows(&pane, cx));
+            if !rows.is_empty() {
+                self.open_inspector_with(rows, InspectorMode::Anchored(position), window, cx);
+            }
+        }
+
+        if let Some((tab, position)) = self.pending_tab_menu.take() {
+            let rows = crate::tiles::dock::tab_rows(&self.tiles, tab);
+            self.open_inspector_with(rows, InspectorMode::Anchored(position), window, cx);
         }
 
         if let Some((pane, position)) = self.pending_pane_inspector_request.take() {

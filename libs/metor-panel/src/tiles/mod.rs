@@ -1,3 +1,4 @@
+pub(crate) mod dock;
 pub(crate) mod drag;
 pub(crate) mod item;
 mod motion;
@@ -23,6 +24,7 @@ use crate::theme::theme;
 use drag::ResizeDrag;
 use serial::{TileItem, TileNode, TilePane, TileSplit, TileTab};
 
+pub use dock::Edge;
 pub use drag::SplitDirection;
 pub(crate) use drag::take_active_drag;
 pub use item::{PaneItem, PaneItemHandle};
@@ -39,6 +41,14 @@ pub use tab_bar::TabId;
 /// deeper and the path is cloned on every handle render.
 pub(crate) type SplitPath = SmallVec<[usize; 4]>;
 
+/// Which of a group's split trees a [`SplitPath`] runs through: the tab on
+/// screen's, or a dock's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Region {
+    Tab,
+    Dock(Edge),
+}
+
 actions!(
     metor_panel,
     [
@@ -54,6 +64,7 @@ pub enum TileGroupEvent {
     /// pane header). The position marks where to anchor the inspector.
     Inspect {
         item: Box<dyn PaneItemHandle>,
+        pane: Entity<Pane>,
         position: Point<Pixels>,
     },
     InspectPane {
@@ -62,6 +73,8 @@ pub enum TileGroupEvent {
     },
     /// An empty pane's Time Series button: open the trace wizard aimed at it.
     NewTimeSeries { pane: Entity<Pane> },
+    /// A top-level tab was right-clicked.
+    InspectTab { tab: TabId, position: Point<Pixels> },
 }
 
 impl EventEmitter<TileGroupEvent> for TileGroup {}
@@ -88,7 +101,8 @@ const SPRING_LOAD: Duration = Duration::from_millis(450);
 /// - 5: drop all legacy-layout fallbacks; plot bounds live only on `axes` and
 ///   dashboard allocation counters are derived from item ids.
 /// - 6: tabs move to the top of the window: the document is a list of tabs,
-///   each a split tree, and a pane holds at most one item.
+///   each a split tree, and a pane holds at most one item. Panes pinned
+///   along the top and bottom edges sit in optional docks beside the tabs.
 pub(crate) const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
 
 /// Failure modes when loading a layout from JSON.
@@ -261,6 +275,7 @@ impl Member {
     /// is left empty here.
     fn render(
         &self,
+        region: Region,
         path: SplitPath,
         tile_group: &Entity<TileGroup>,
         gaps: &split_preview::GapWeights,
@@ -349,8 +364,15 @@ impl Member {
                                 })
                                 .into_any_element()
                         } else {
-                            render_resize_handle(path.clone(), ix, axis.axis, tile_group, cx)
-                                .into_any_element()
+                            render_resize_handle(
+                                region,
+                                path.clone(),
+                                ix,
+                                axis.axis,
+                                tile_group,
+                                cx,
+                            )
+                            .into_any_element()
                         };
                         children.push(handle);
                     }
@@ -360,7 +382,8 @@ impl Member {
                     let mut child_path = path.clone();
                     child_path.push(ix);
 
-                    let child_element = member.render(child_path, tile_group, gaps, moving, cx);
+                    let child_element =
+                        member.render(region, child_path, tile_group, gaps, moving, cx);
                     let locked_px = gap_amount
                         .is_none()
                         .then(|| locked_along_axis(member, axis.axis, cx))
@@ -396,7 +419,7 @@ impl Member {
                     move |bounds, _window, cx| {
                         if committed_layout {
                             tg.update(cx, |this, _| {
-                                this.axis_bounds.insert(p, bounds);
+                                this.axis_bounds.insert((region, p), bounds);
                             });
                         }
                     },
@@ -450,6 +473,7 @@ fn render_static_resize_handle(axis: Axis, cx: &App) -> gpui::Div {
 }
 
 fn render_resize_handle(
+    region: Region,
     path: SplitPath,
     handle_ix: usize,
     axis: Axis,
@@ -464,6 +488,11 @@ fn render_resize_handle(
     for &segment in path.as_slice() {
         id_hash = id_hash.wrapping_mul(31).wrapping_add(segment as u64);
     }
+    id_hash = id_hash.wrapping_mul(31).wrapping_add(match region {
+        Region::Tab => 0,
+        Region::Dock(Edge::Top) => 1,
+        Region::Dock(Edge::Bottom) => 2,
+    });
     let mut handle = div().id(("resize-handle", id_hash as usize));
 
     handle = match axis {
@@ -485,15 +514,11 @@ fn render_resize_handle(
         .hover(move |s| s.bg(hover_color))
         .on_drag(
             ResizeDrag {
+                region,
                 path: path.clone(),
                 handle_ix,
             },
-            |drag, _, _, cx| {
-                cx.new(|_| ResizeDrag {
-                    path: drag.path.clone(),
-                    handle_ix: drag.handle_ix,
-                })
-            },
+            |drag, _, _, cx| cx.new(|_| drag.clone()),
         )
         .on_drag_move({
             let tg = tg.clone();
@@ -501,13 +526,13 @@ fn render_resize_handle(
                 // Every handle hears every resize drag; only the grabbed one
                 // answers.
                 let drag = event.drag(cx);
-                if drag.path != path || drag.handle_ix != handle_ix {
+                if drag.region != region || drag.path != path || drag.handle_ix != handle_ix {
                     return;
                 }
                 let position = event.event.position;
                 let path = path.clone();
                 tg.update(cx, |this, cx| {
-                    this.handle_resize(path, handle_ix, position, cx);
+                    this.handle_resize(region, path, handle_ix, position, cx);
                 });
             }
         })
@@ -582,10 +607,16 @@ impl Tab {
 pub struct TileGroup {
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// Panes pinned along the window's top and bottom, shown whichever tab
+    /// is.
+    top_dock: Option<dock::Dock>,
+    bottom_dock: Option<dock::Dock>,
+    /// Where the whole group, docks included, was last drawn.
+    bounds: gpui::Bounds<Pixels>,
     /// One per pane this group holds. Dropping it is how a pane that moved
     /// to another group stops reporting here.
     subscriptions: HashMap<EntityId, Subscription>,
-    axis_bounds: HashMap<SplitPath, gpui::Bounds<Pixels>>,
+    axis_bounds: HashMap<(Region, SplitPath), gpui::Bounds<Pixels>>,
     /// The zoomed pane growing over the layout, or shrinking back into it.
     zoom_motion: Option<motion::ZoomMotion>,
     /// Where each pane was last drawn, which is where a zoom grows from and
@@ -628,6 +659,9 @@ impl TileGroup {
         Self {
             tabs: Vec::new(),
             active_tab: 0,
+            top_dock: None,
+            bottom_dock: None,
+            bounds: Default::default(),
             subscriptions: HashMap::new(),
             axis_bounds: HashMap::new(),
             zoom_motion: None,
@@ -648,7 +682,10 @@ impl TileGroup {
     /// Start reporting `pane`'s events here and mark this group its owner.
     fn adopt(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
         let group = cx.weak_entity();
-        pane.update(cx, |pane, _| pane.group = Some(group));
+        pane.update(cx, |pane, cx| {
+            pane.group = Some(group);
+            pane.set_docked(false, cx);
+        });
         self.subscriptions.insert(
             pane.entity_id(),
             cx.subscribe(pane, Self::handle_pane_event),
@@ -704,7 +741,8 @@ impl TileGroup {
     /// Drop what was measured for the tree on screen, for a switch to
     /// another tab's tree.
     fn forget_layout(&mut self) {
-        self.axis_bounds.clear();
+        self.axis_bounds
+            .retain(|(region, _), _| *region != Region::Tab);
         self.zoom_motion = None;
         self.split_preview.forget_regions();
     }
@@ -734,15 +772,19 @@ impl TileGroup {
         &self.tab().panes
     }
 
-    /// Every pane in every tab, active tab first.
+    /// Every pane in every tab, active tab first, then the docked ones.
     pub fn all_panes(&self) -> impl Iterator<Item = &Entity<Pane>> {
-        self.tab().panes.iter().chain(
-            self.tabs
-                .iter()
-                .enumerate()
-                .filter(|(ix, _)| *ix != self.active_tab)
-                .flat_map(|(_, tab)| tab.panes.iter()),
-        )
+        self.tab()
+            .panes
+            .iter()
+            .chain(
+                self.tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(ix, _)| *ix != self.active_tab)
+                    .flat_map(|(_, tab)| tab.panes.iter()),
+            )
+            .chain(self.docked_panes())
     }
 
     pub fn zoomed(&self) -> Option<&Entity<Pane>> {
@@ -973,6 +1015,19 @@ impl TileGroup {
         direction: SplitDirection,
         cx: &mut Context<Self>,
     ) {
+        if let Some(edge) = self.docked(target) {
+            if let Some(dock) = self.dock_mut(edge)
+                && dock
+                    .root
+                    .split(target, &Member::Pane(new_pane.clone()), direction)
+            {
+                dock.panes.push(new_pane.clone());
+                self.adopt(&new_pane, cx);
+                new_pane.update(cx, |pane, cx| pane.set_docked(true, cx));
+                cx.notify();
+            }
+            return;
+        }
         // A missing `target` makes the split a no-op; tracking `new_pane`
         // anyway would leave a pane that's counted but never rendered — and
         // swallow whatever item it was carrying.
@@ -999,6 +1054,9 @@ impl TileGroup {
     /// it was the last, which gets a fresh empty pane. Returns whether the
     /// pane was here.
     pub fn remove_pane(&mut self, target: &Entity<Pane>, cx: &mut Context<Self>) -> bool {
+        if self.undock(target, cx) {
+            return true;
+        }
         let Some(ix) = self.tab_of(target) else {
             return false;
         };
@@ -1162,7 +1220,16 @@ impl TileGroup {
                 })
                 .collect(),
             active_tab: self.active_tab,
+            top_dock: self.serialize_dock(Edge::Top, cx),
+            bottom_dock: self.serialize_dock(Edge::Bottom, cx),
         }
+    }
+
+    fn serialize_dock(&self, edge: Edge, cx: &App) -> Option<serial::TileDock> {
+        self.dock(edge).map(|dock| serial::TileDock {
+            root: dock.root.serialize(cx),
+            height: dock.height.into(),
+        })
     }
 
     /// Convenience: snapshot to a JSON string ready to write to disk.
@@ -1254,6 +1321,17 @@ impl TileGroup {
             this.push_tab(pane, cx);
         }
         this.active_tab = serialized.active_tab.min(this.tabs.len() - 1);
+        for (edge, dock) in [
+            (Edge::Top, &serialized.top_dock),
+            (Edge::Bottom, &serialized.bottom_dock),
+        ] {
+            let Some(dock) = dock else {
+                continue;
+            };
+            let mut panes = Vec::new();
+            let root = Self::deserialize_member(&dock.root, registry, &mut panes, cx);
+            this.dock_in(edge, root, panes, px(dock.height), cx);
+        }
         this
     }
 
@@ -1393,7 +1471,9 @@ impl TileGroup {
             PaneEvent::Empty => {
                 // The last pane of the last tab stays, showing its starters,
                 // so the window is never void.
-                let lone = self.tabs.len() == 1 && self.tabs[0].panes.len() == 1;
+                let lone = self.docked(&pane).is_none()
+                    && self.tabs.len() == 1
+                    && self.tabs[0].panes.len() == 1;
                 if !lone {
                     self.remove_pane(&pane, cx);
                 }
@@ -1401,6 +1481,7 @@ impl TileGroup {
             PaneEvent::Inspect { item, position } => {
                 cx.emit(TileGroupEvent::Inspect {
                     item: item.clone_handle(),
+                    pane,
                     position: *position,
                 });
             }
@@ -1417,17 +1498,18 @@ impl TileGroup {
 
     fn handle_resize(
         &mut self,
+        region: Region,
         path: SplitPath,
         handle_ix: usize,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let bounds = match self.axis_bounds.get(&path) {
+        let bounds = match self.axis_bounds.get(&(region, path.clone())) {
             Some(b) => *b,
             None => return,
         };
 
-        if let Some(axis) = self.find_axis_mut(&path) {
+        if let Some(axis) = self.find_axis_mut(region, &path) {
             if handle_ix == 0 || handle_ix > axis.members.len() {
                 return;
             }
@@ -1474,9 +1556,12 @@ impl TileGroup {
         }
     }
 
-    fn find_axis_mut(&mut self, path: &[usize]) -> Option<&mut SplitAxis> {
+    fn find_axis_mut(&mut self, region: Region, path: &[usize]) -> Option<&mut SplitAxis> {
         let ix = self.active_tab;
-        let mut current = &mut self.tabs[ix].root;
+        let mut current = match region {
+            Region::Tab => &mut self.tabs[ix].root,
+            Region::Dock(edge) => &mut self.dock_mut(edge).as_mut()?.root,
+        };
         for &ix in path {
             current = match current {
                 Member::Axis(axis) => axis.members.get_mut(ix)?,
@@ -1517,7 +1602,9 @@ impl Render for TileGroup {
         let tracker = tile_group.clone();
         let mut root = div()
             .relative()
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .bg(theme.bg_secondary)
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<drag::DraggedPane>, _, cx| {
@@ -1560,6 +1647,7 @@ impl Render for TileGroup {
                 .size_full(),
             )
             .child(layout.as_ref().unwrap_or(&committed).render(
+                Region::Tab,
                 SplitPath::new(),
                 &tile_group,
                 &gaps,
@@ -1604,7 +1692,53 @@ impl Render for TileGroup {
                     .on_drop(cx.listener(Self::handle_tab_dock_drop)),
             );
         }
-        root
+        let dock = |edge: Edge, cx: &mut App| {
+            let dock = self.dock(edge)?;
+            let tree = dock.root.render(
+                Region::Dock(edge),
+                SplitPath::new(),
+                &tile_group,
+                &Default::default(),
+                None,
+                cx,
+            );
+            Some(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .h(dock.height)
+                    .overflow_hidden()
+                    .bg(theme.bg_secondary)
+                    .child(tree),
+            )
+        };
+        let top = dock(Edge::Top, cx);
+        let bottom = dock(Edge::Bottom, cx);
+        let measure = tile_group.clone();
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| measure.update(cx, |this, _| this.bounds = bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(top, |group, top| {
+                group
+                    .child(top)
+                    .child(dock::render_resize_handle(Edge::Top, &tile_group, cx))
+            })
+            .child(root)
+            .when_some(bottom, |group, bottom| {
+                group
+                    .child(dock::render_resize_handle(Edge::Bottom, &tile_group, cx))
+                    .child(bottom)
+            })
     }
 }
 
@@ -1712,6 +1846,8 @@ mod tests {
                 root: TileNode::Pane(TilePane::default()),
             }],
             active_tab: 0,
+            top_dock: None,
+            bottom_dock: None,
         })
         .expect("serialize")
     }
@@ -2011,6 +2147,103 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_pinned_pane_stays_on_screen_across_tabs_until_unpinned(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        let timeline = cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                let a = group.tabs[0].panes[0].clone();
+                let timeline = cx.new(|cx| Pane::new(Some(item("timeline", cx)), cx));
+                group.split_pane(&a, timeline.clone(), SplitDirection::Down, cx);
+                group.pin(timeline.clone(), Edge::Bottom, cx);
+                let b = group.tabs[1].id;
+                group.activate_tab(b, cx);
+                timeline
+            })
+        });
+        cx.read(|cx| {
+            let group = group.read(cx);
+            assert_eq!(group.docked(&timeline), Some(Edge::Bottom));
+            assert!(timeline.read(cx).is_docked());
+            assert_eq!(group.tabs[0].panes.len(), 1);
+            assert!(group.all_panes().any(|pane| pane == &timeline));
+        });
+        cx.update(|cx| group.update(cx, |group, cx| group.pin(timeline.clone(), Edge::Top, cx)));
+        cx.read(|cx| {
+            let group = group.read(cx);
+            assert_eq!(group.docked(&timeline), Some(Edge::Top));
+            assert!(group.bottom_dock.is_none());
+        });
+        cx.update(|cx| group.update(cx, |group, cx| group.unpin(timeline.clone(), cx)));
+        cx.read(|cx| {
+            let group = group.read(cx);
+            assert_eq!(group.docked(&timeline), None);
+            assert!(!timeline.read(cx).is_docked());
+            assert!(group.top_dock.is_none());
+            assert!(group.tabs[1].panes.contains(&timeline));
+        });
+    }
+
+    #[gpui::test]
+    fn a_pinned_tab_closes_and_docks_its_layout_which_round_trips(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        let json = cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                let b = group.tabs[1].panes[0].clone();
+                group.split_pane(
+                    &b,
+                    cx.new(|cx| Pane::new(Some(item("c", cx)), cx)),
+                    SplitDirection::Right,
+                    cx,
+                );
+                let b = group.tabs[1].id;
+                group.pin_tab(b, Edge::Top, cx);
+            });
+            group.read(cx).to_json(cx)
+        });
+        cx.read(|cx| {
+            assert_eq!(titles(&group, cx), ["a"]);
+            assert_eq!(group.read(cx).top_dock.as_ref().unwrap().panes.len(), 2);
+        });
+        let restored =
+            cx.update(|cx| cx.new(|cx| TileGroup::from_json(&json, &registry(), cx).unwrap()));
+        cx.read(|cx| {
+            let restored = restored.read(cx);
+            let dock = restored.top_dock.as_ref().unwrap();
+            let docked: Vec<_> = dock
+                .panes
+                .iter()
+                .map(|pane| pane.read(cx).item().unwrap().tab_title(cx))
+                .collect();
+            assert_eq!(docked, ["b", "c"]);
+            assert_eq!(dock.height, dock::DEFAULT_HEIGHT);
+            assert!(dock.panes.iter().all(|pane| pane.read(cx).is_docked()));
+            assert!(restored.bottom_dock.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn closing_a_docks_last_pane_closes_the_dock(cx: &mut TestAppContext) {
+        let group =
+            cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item("a", cx), item("b", cx)], cx)));
+        let pinned = cx.update(|cx| {
+            group.update(cx, |group, cx| {
+                let pinned = group.tabs[1].panes[0].clone();
+                group.pin(pinned.clone(), Edge::Bottom, cx);
+                pinned
+            })
+        });
+        cx.read(|cx| assert_eq!(titles(&group, cx), ["a"]));
+        cx.update(|cx| pinned.update(cx, |pane, cx| pane.close(cx)));
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert!(group.read(cx).bottom_dock.is_none());
+            assert_eq!(titles(&group, cx), ["a"]);
+        });
+    }
+
+    #[gpui::test]
     fn unknown_pane_round_trips_raw_kind_and_state(cx: &mut TestAppContext) {
         let state = r#"{"plugin":"temporarily absent"}"#;
         let json = serde_json::to_string(&TileLayout {
@@ -2019,6 +2252,8 @@ mod tests {
             temporal: None,
             tabs: vec![tab_with("downstream.plugin", state)],
             active_tab: 0,
+            top_dock: None,
+            bottom_dock: None,
         })
         .unwrap();
         let tg = cx.update(|cx| {
@@ -2475,6 +2710,8 @@ mod tests {
             temporal: None,
             tabs: vec![tab_with("registered_test", &config)],
             active_tab: 0,
+            top_dock: None,
+            bottom_dock: None,
         };
         let json = serde_json::to_string(&layout).unwrap();
         let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));

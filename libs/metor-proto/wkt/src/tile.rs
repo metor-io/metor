@@ -2,7 +2,8 @@
 //!
 //! The document mirrors the panel's window: a row of top-level
 //! [`TileTab`]s, each a recursive [`TileNode`] of splits and panes, where
-//! each pane holds at most one [`TileItem`]. Item state is an opaque JSON blob owned by the panel that
+//! each pane holds at most one [`TileItem`], and an optional [`TileDock`]
+//! along the top and bottom edges. Item state is an opaque JSON blob owned by the panel that
 //! produced it, so this schema stays independent of any concrete panel's
 //! config shape. The panel uses this tree as its on-disk layout document;
 //! preset messages carry the same document as a JSON string (the tree is
@@ -36,6 +37,20 @@ pub struct TileLayout {
     /// Index into [`tabs`](Self::tabs) of the tab on screen.
     #[serde(default)]
     pub active_tab: usize,
+    /// Panes pinned along the top of the window, shown whichever tab is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_dock: Option<TileDock>,
+    /// Panes pinned along the bottom of the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_dock: Option<TileDock>,
+}
+
+/// A strip of panes pinned to one edge of the window, outside the tabs.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TileDock {
+    pub root: TileNode,
+    /// The strip's height in logical pixels.
+    pub height: f32,
 }
 
 /// One top-level tab: a split tree of panes.

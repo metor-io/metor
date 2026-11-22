@@ -463,6 +463,7 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
     let click_group = group.clone();
     let middle_group = group.clone();
     let tab_group = group.clone();
+    let menu_group = group.clone();
     element
         .drag_over::<DraggedPane>(move |s, _, _, _| s.border_color(drop_accent).bg(drop_fill))
         // Keep the press from arming the titlebar's window move, which would
@@ -471,6 +472,13 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, _, cx| {
             click_group.update(cx, |group, cx| group.activate_tab(id, cx));
+        })
+        .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+            cx.stop_propagation();
+            let position = event.position;
+            menu_group.update(cx, |_, cx| {
+                cx.emit(super::TileGroupEvent::InspectTab { tab: id, position })
+            });
         })
         .on_aux_click(move |event: &ClickEvent, _, cx| {
             if event.is_middle_click() && can_close {

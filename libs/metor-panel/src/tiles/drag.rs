@@ -130,6 +130,7 @@ pub(crate) fn ghost_chip(title: gpui::SharedString, closable: bool, cx: &App) ->
 /// grabbed, between `members[handle_ix - 1]` and `members[handle_ix]`.
 #[derive(Clone)]
 pub struct ResizeDrag {
+    pub region: super::Region,
     pub path: SplitPath,
     pub handle_ix: usize,
 }

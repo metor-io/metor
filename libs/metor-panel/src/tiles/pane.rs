@@ -111,6 +111,9 @@ pub struct Pane {
     /// The group holding this pane, set when one adopts it. A pane dropped
     /// in another window is taken out of its old group through this.
     pub(super) group: Option<WeakEntity<super::TileGroup>>,
+    /// Pinned in one of the window's docks, where there is no tab to zoom
+    /// over.
+    docked: bool,
 }
 
 impl Pane {
@@ -121,6 +124,7 @@ impl Pane {
             hide_header: false,
             locked_size: None,
             group: None,
+            docked: false,
         }
     }
 
@@ -131,6 +135,18 @@ impl Pane {
     pub fn set_hide_header(&mut self, hide: bool, cx: &mut Context<Self>) {
         self.hide_header = hide;
         cx.notify();
+    }
+
+    /// Whether the pane is pinned in one of its window's docks.
+    pub fn is_docked(&self) -> bool {
+        self.docked
+    }
+
+    pub(super) fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
+        if self.docked != docked {
+            self.docked = docked;
+            cx.notify();
+        }
     }
 
     pub fn locked_size(&self) -> Option<gpui::Size<f32>> {
@@ -295,12 +311,16 @@ impl Pane {
                     },
                 )),
             )
-            .child(
-                button("pane-zoom", Icon::Maximize, "Zoom").on_click(cx.listener(|_, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.emit(PaneEvent::ToggleZoom);
-                })),
-            )
+            .when(!self.docked, |header| {
+                header.child(
+                    button("pane-zoom", Icon::Maximize, "Zoom").on_click(cx.listener(
+                        |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(PaneEvent::ToggleZoom);
+                        },
+                    )),
+                )
+            })
             .when(can_close, |header| {
                 header.child(
                     button("pane-close", Icon::Close, "Close").on_click(cx.listener(
