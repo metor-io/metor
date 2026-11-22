@@ -2331,6 +2331,34 @@ mod tests {
         (group, cx)
     }
 
+    #[gpui::test]
+    fn a_docked_panes_hidden_header_shows_while_the_pointer_is_at_its_top(cx: &mut TestAppContext) {
+        let (group, cx) = host(|cx| vec![item("a", cx), item("timeline", cx)], cx);
+        let pinned = cx.update(|_, cx| {
+            group.update(cx, |group, cx| {
+                let pinned = group.tabs[1].panes[0].clone();
+                group.pin(pinned.clone(), Edge::Bottom, cx);
+                pinned.update(cx, |pane, cx| pane.set_hide_header(true, cx));
+                pinned
+            })
+        });
+        cx.refresh().unwrap();
+        let header =
+            |cx: &mut gpui::VisualTestContext| cx.debug_bounds("pane-header-peek").is_some();
+        assert!(!header(cx));
+        let top = cx.update(|_, cx| pinned.read(cx).bounds());
+        cx.simulate_mouse_move(
+            point(top.center().x, top.top() + px(2.0)),
+            None,
+            Default::default(),
+        );
+        cx.refresh().unwrap();
+        assert!(header(cx));
+        cx.simulate_mouse_move(top.center(), None, Default::default());
+        cx.refresh().unwrap();
+        assert!(!header(cx));
+    }
+
     fn drag(
         cx: &mut gpui::VisualTestContext,
         start: gpui::Point<Pixels>,

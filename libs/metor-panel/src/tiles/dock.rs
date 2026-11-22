@@ -254,8 +254,9 @@ impl TileGroup {
     }
 }
 
-/// Right-click rows that pin `pane` to an edge, or move or unpin it once
-/// it is pinned.
+/// Right-click rows that pin `pane` to an edge, or once it is pinned move
+/// it, hide its header (which then shows only while the pointer is at the
+/// pane's top edge), or unpin it.
 pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Some(group) = pane.read(cx).owner() else {
         return Vec::new();
@@ -279,6 +280,14 @@ pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorR
         )));
     }
     if docked.is_some() {
+        let hidden = pane.read(cx).hide_header();
+        let toggle = pane.clone();
+        rows.push(Box::new(CommandRow::new(
+            if hidden { "Show Header" } else { "Hide Header" },
+            Arc::new(move |_, cx| {
+                toggle.update(cx, |pane, cx| pane.set_hide_header(!hidden, cx));
+            }),
+        )));
         let pane = pane.clone();
         rows.push(Box::new(CommandRow::new(
             "Unpin",
