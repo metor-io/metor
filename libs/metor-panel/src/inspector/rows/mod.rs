@@ -408,7 +408,7 @@ fn elide_front(
 
 /// Height of every inspector row, so editing, header and ordinary rows stack
 /// uniformly and hosts can size their containers from a row count.
-pub const ROW_HEIGHT: f32 = 28.0;
+pub const ROW_HEIGHT: f32 = crate::theme::CONTROL_HEIGHT;
 
 /// A row's leading label in the row font.
 pub fn row_label(label: impl Into<SharedString>, color: Hsla) -> gpui::Div {
@@ -518,7 +518,7 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
                 .bottom(px(2.0))
                 .left(px(4.0))
                 .right(px(4.0))
-                .rounded(px(4.0))
+                .rounded(px(crate::theme::CONTROL_RADIUS))
                 .bg(pill_bg)
                 .when(interactive, |pill| {
                     pill.group_hover("inspector-row", |s| s.bg(theme.selection_bg))

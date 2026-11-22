@@ -633,41 +633,9 @@ impl InspectorRegistry {
     }
 
     fn register_pane_builder(&mut self) {
-        use crate::tiles::{Pane, TabOrientation};
+        use crate::tiles::Pane;
         self.register_type_builder::<Pane>(Arc::new(|any_entity, _db, _cx| {
             let pane: Entity<Pane> = any_entity.downcast().expect("Pane type mismatch");
-
-            let orientation_read = pane.clone();
-            let orientation_write = pane.clone();
-            let orientation_row = BoolRow::dynamic(
-                "Vertical Tabs",
-                Arc::new(move |cx| {
-                    matches!(
-                        orientation_read.read(cx).tab_orientation(),
-                        TabOrientation::Vertical
-                    )
-                }),
-                Arc::new(move |checked, _w, cx| {
-                    orientation_write.update(cx, |p, cx| {
-                        let next = if checked {
-                            TabOrientation::Vertical
-                        } else {
-                            TabOrientation::Horizontal
-                        };
-                        p.set_tab_orientation(next, cx);
-                    });
-                }),
-            );
-
-            let hide_read = pane.clone();
-            let hide_write = pane.clone();
-            let hide_row = BoolRow::dynamic(
-                "Hide Tab Bar",
-                Arc::new(move |cx| hide_read.read(cx).hide_tab_bar()),
-                Arc::new(move |checked, _w, cx| {
-                    hide_write.update(cx, |p, cx| p.set_hide_tab_bar(checked, cx));
-                }),
-            );
 
             let lock_read = pane.clone();
             let lock_write = pane;
@@ -682,11 +650,7 @@ impl InspectorRegistry {
                 }),
             );
 
-            vec![
-                Box::new(orientation_row),
-                Box::new(hide_row),
-                Box::new(lock_row),
-            ]
+            vec![Box::new(lock_row)]
         }));
     }
 

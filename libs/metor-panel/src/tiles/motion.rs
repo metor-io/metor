@@ -1,4 +1,5 @@
-//! Tab positions animate after layout, so text layout and pointer hitboxes stay coherent.
+//! Tabs slide to new positions after layout, so text layout and pointer
+//! hitboxes stay coherent, and a zoomed pane grows over its tab's layout.
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -67,7 +68,8 @@ impl ZoomMotion {
     }
 }
 
-pub(super) type TabSizes = Rc<RefCell<HashMap<gpui::EntityId, Size<Pixels>>>>;
+/// Each tab's last measured size, keyed by tab.
+pub(super) type TabSizes = Rc<RefCell<HashMap<super::TabId, Size<Pixels>>>>;
 
 #[derive(Default)]
 pub(super) struct Rail {
@@ -134,7 +136,7 @@ struct TabPosition {
 /// both follow the displayed position. State belongs to the tab's stable ID.
 pub(super) struct MovingTab {
     id: ElementId,
-    item_id: gpui::EntityId,
+    tab: super::TabId,
     child: AnyElement,
     rail: Rc<Rail>,
     animate: bool,
@@ -143,15 +145,15 @@ pub(super) struct MovingTab {
 
 impl MovingTab {
     pub(super) fn new(
-        id: gpui::EntityId,
+        tab: super::TabId,
         child: impl IntoElement,
         rail: Rc<Rail>,
         animate: bool,
         vertical: bool,
     ) -> Self {
         Self {
-            id: ("tab-position", id).into(),
-            item_id: id,
+            id: ("tab-position", tab.0 as usize).into(),
+            tab,
             child: child.into_any_element(),
             rail,
             animate,
@@ -197,13 +199,10 @@ impl Element for MovingTab {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.rail
-            .sizes
-            .borrow_mut()
-            .insert(self.item_id, bounds.size);
+        self.rail.sizes.borrow_mut().insert(self.tab, bounds.size);
         let rail = self.rail.bounds.get();
         // Both origins include the same scroll offset. Subtracting them keeps
-        // scrolling and movement of the pane itself out of the animation.
+        // scrolling and movement of the bar itself out of the animation.
         let target = bounds.origin - rail.origin;
         let now = Instant::now();
         let viewport = window.viewport_size();
@@ -277,7 +276,7 @@ mod tests {
 
     struct TestRail {
         first: bool,
-        tab_id: gpui::EntityId,
+        tab_id: super::super::TabId,
         displayed: Rc<Cell<Bounds<Pixels>>>,
         clicks: Rc<Cell<usize>>,
     }
@@ -331,9 +330,9 @@ mod tests {
     fn moving_tab_hitbox_follows_its_displayed_bounds(cx: &mut gpui::TestAppContext) {
         let displayed = Rc::new(Cell::new(Bounds::default()));
         let clicks = Rc::new(Cell::new(0));
-        let (host, cx) = cx.add_window_view(|_, cx| TestRail {
+        let (host, cx) = cx.add_window_view(|_, _| TestRail {
             first: true,
-            tab_id: cx.entity_id(),
+            tab_id: super::super::TabId(1),
             displayed: displayed.clone(),
             clicks: clicks.clone(),
         });

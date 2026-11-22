@@ -39,6 +39,10 @@ use super::{DashboardWidget, WidgetKind};
 pub struct TileViewSpec {
     pub serialization_key: SharedString,
     pub tab_title: Arc<dyn Fn(&AnyEntity, &str, &App) -> SharedString>,
+    /// Lays the view under the pane's header, given the header's height,
+    /// for a view whose content runs on beneath it; `None` keeps the view
+    /// below the header.
+    pub under_header: Option<Arc<dyn Fn(&AnyEntity, gpui::Pixels, &mut App)>>,
 }
 
 /// Everything the dashboard needs to create and label one [`WidgetKind`].
@@ -147,7 +151,26 @@ impl WidgetSpec {
         self.tile = Some(TileViewSpec {
             serialization_key: serialization_key.into(),
             tab_title: Arc::new(move |_state, config, _cx| tab_title(config)),
+            under_header: None,
         });
+        self
+    }
+
+    /// Lay the tile under its pane's header: `inset` tells the view how
+    /// tall the header is, to keep its own chrome clear of it.
+    pub fn with_tile_under_header<T: 'static>(
+        mut self,
+        inset: impl Fn(&mut T, gpui::Pixels, &mut Context<T>) + 'static,
+    ) -> Self {
+        let tile = self
+            .tile
+            .as_mut()
+            .expect("with_tile must be called before with_tile_under_header");
+        tile.under_header = Some(Arc::new(move |state, height, cx| {
+            if let Ok(view) = state.clone().downcast::<T>() {
+                view.update(cx, |view, cx| inset(view, height, cx));
+            }
+        }));
         self
     }
 
@@ -220,7 +243,8 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &TimeSeriesPlot| plot.line_plot().clone().into_any())
             .with_tile("time_series_plot", |_| "Plot".into())
-            .with_live_tile_title(TimeSeriesPlot::title),
+            .with_live_tile_title(TimeSeriesPlot::title)
+            .with_tile_under_header(TimeSeriesPlot::set_header_inset),
         );
         self.register(
             WidgetKind::new("xy_plot"),

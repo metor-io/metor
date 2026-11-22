@@ -36,6 +36,16 @@ pub enum MotionPreference {
     Reduced,
 }
 
+/// Where a window's top-level tabs sit: in the titlebar beside its other
+/// controls, or down a sidebar spanning the window's full height.
+#[derive(facet::Facet, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum TabPlacement {
+    #[default]
+    Top,
+    Side,
+}
+
 /// Root of the on-disk panel config document.
 ///
 /// `Default` is hand-written rather than derived: the derived impl would seed
@@ -55,6 +65,11 @@ pub struct PanelConfig {
     /// `"cmd-k"`).
     #[facet(default = default_leader())]
     pub leader: String,
+    #[facet(default)]
+    pub tab_placement: TabPlacement,
+    /// Width of the tab sidebar the user dragged away from the default.
+    #[facet(default)]
+    pub tab_sidebar_width: Option<f32>,
 }
 
 impl Default for PanelConfig {
@@ -64,6 +79,8 @@ impl Default for PanelConfig {
             motion: MotionPreference::default(),
             recording_parent: None,
             leader: default_leader(),
+            tab_placement: TabPlacement::default(),
+            tab_sidebar_width: None,
         }
     }
 }
@@ -186,6 +203,20 @@ mod tests {
         let restored = round_trip(&config);
         assert_eq!(restored.motion, MotionPreference::Reduced);
         assert_eq!(restored.leader, "cmd-k");
+    }
+
+    #[test]
+    fn tab_placement_round_trips_and_defaults_to_top() {
+        let older: PanelConfig = facet_json::from_str("{}").unwrap();
+        assert_eq!(older.tab_placement, TabPlacement::Top);
+        let config = PanelConfig {
+            tab_placement: TabPlacement::Side,
+            tab_sidebar_width: Some(240.0),
+            ..Default::default()
+        };
+        let restored = round_trip(&config);
+        assert_eq!(restored.tab_placement, TabPlacement::Side);
+        assert_eq!(restored.tab_sidebar_width, Some(240.0));
     }
 
     #[test]

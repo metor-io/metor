@@ -1,8 +1,9 @@
 //! Serialized form of a metor-panel tile layout.
 //!
-//! The tree mirrors the panel's split-pane system: a layout is a recursive
-//! [`TileNode`] of splits and panes, where each pane holds tabbed
-//! [`TileItem`]s. Item state is an opaque JSON blob owned by the panel that
+//! The document mirrors the panel's window: a row of top-level
+//! [`TileTab`]s, each a recursive [`TileNode`] of splits and panes, where
+//! each pane holds at most one [`TileItem`], and an optional [`TileDock`]
+//! along the top and bottom edges. Item state is an opaque JSON blob owned by the panel that
 //! produced it, so this schema stays independent of any concrete panel's
 //! config shape. The panel uses this tree as its on-disk layout document;
 //! preset messages carry the same document as a JSON string (the tree is
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped only on a structural break in the document. Field-level changes
 /// rely on `#[serde(default)]` instead.
-pub const TILE_LAYOUT_VERSION: u32 = 5;
+pub const TILE_LAYOUT_VERSION: u32 = 6;
 
 /// A complete tile layout document.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -32,6 +33,29 @@ pub struct TileLayout {
     /// Versioned display-time intent. Older readers use global_time_range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal: Option<TemporalLayout>,
+    pub tabs: Vec<TileTab>,
+    /// Index into [`tabs`](Self::tabs) of the tab on screen.
+    #[serde(default)]
+    pub active_tab: usize,
+    /// Panes pinned along the top of the window, shown whichever tab is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_dock: Option<TileDock>,
+    /// Panes pinned along the bottom of the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_dock: Option<TileDock>,
+}
+
+/// A strip of panes pinned to one edge of the window, outside the tabs.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TileDock {
+    pub root: TileNode,
+    /// The strip's height in logical pixels.
+    pub height: f32,
+}
+
+/// One top-level tab: a split tree of panes.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TileTab {
     pub root: TileNode,
 }
 
@@ -82,30 +106,16 @@ pub enum SplitAxis {
     Vertical,
 }
 
-/// Pane: which tab was active plus the items themselves.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Pane: a leaf of the split tree, showing one item or, when empty, the
+/// panel's starter cards.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TilePane {
-    pub active_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<TileItem>,
     #[serde(default)]
-    pub tab_orientation: TabOrientation,
-    #[serde(default)]
-    pub hide_tab_bar: bool,
+    pub hide_header: bool,
     #[serde(default)]
     pub locked_size: Option<(f32, f32)>,
-    /// Width of a vertical tab rail the user dragged away from the default.
-    /// Absent keeps the panel's default, so documents that never resized a
-    /// rail stay unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tab_rail_width: Option<f32>,
-    pub items: Vec<TileItem>,
-}
-
-/// How a pane's tab bar is laid out.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TabOrientation {
-    #[default]
-    Horizontal,
-    Vertical,
 }
 
 /// One pane item, tagged with the serialization key used to pick a
