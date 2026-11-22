@@ -254,8 +254,8 @@ impl TileGroup {
     }
 }
 
-/// Right-click rows that pin `pane` to an edge, or once it is pinned move
-/// it, hide its header, or unpin it.
+/// The rows a pane's right-click menu ends with: pin it to an edge (or
+/// once pinned, move or unpin it), and show or hide its header.
 pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Some(group) = pane.read(cx).owner() else {
         return Vec::new();
@@ -278,15 +278,15 @@ pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorR
             }),
         )));
     }
+    let (read, write) = (pane.clone(), pane.clone());
+    rows.push(Box::new(BoolRow::dynamic(
+        "Show Header",
+        Arc::new(move |cx| !read.read(cx).hide_header()),
+        Arc::new(move |show, _, cx| {
+            write.update(cx, |pane, cx| pane.set_hide_header(!show, cx));
+        }),
+    )));
     if docked.is_some() {
-        let (read, write) = (pane.clone(), pane.clone());
-        rows.push(Box::new(BoolRow::dynamic(
-            "Hide Header",
-            Arc::new(move |cx| read.read(cx).hide_header()),
-            Arc::new(move |hide, _, cx| {
-                write.update(cx, |pane, cx| pane.set_hide_header(hide, cx));
-            }),
-        )));
         let pane = pane.clone();
         rows.push(Box::new(CommandRow::new(
             "Unpin",
@@ -299,14 +299,16 @@ pub(crate) fn pane_rows(pane: &Entity<Pane>, cx: &App) -> Vec<Box<dyn InspectorR
 }
 
 /// The pane rows for a menu a view opens at `position` (in window
-/// coordinates) inside a docked pane whose header is hidden. With no header
-/// to right-click, the view's own menu is the way back to them.
+/// coordinates) inside a pane on screen whose header is hidden. With no
+/// header to right-click, the view's own menu is the way back to them.
 pub(crate) fn headerless_rows_at(
     group: &Entity<TileGroup>,
     position: gpui::Point<Pixels>,
     cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let pane = group.read(cx).docked_panes().find(|pane| {
+    let group = group.read(cx);
+    let shown = group.droppable_panes();
+    let pane = shown.iter().chain(group.docked_panes()).find(|pane| {
         let pane = pane.read(cx);
         pane.hide_header() && pane.bounds().contains(&position)
     });

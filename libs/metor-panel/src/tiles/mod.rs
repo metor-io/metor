@@ -2332,7 +2332,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_headerless_docked_panes_own_menu_carries_its_pane_rows(cx: &mut TestAppContext) {
+    fn a_headerless_panes_own_menu_carries_its_pane_rows_docked_or_not(cx: &mut TestAppContext) {
         let (group, cx) = host(|cx| vec![item("a", cx), item("timeline", cx)], cx);
         let (pinned, tabbed) = cx.update(|_, cx| {
             group.update(cx, |group, cx| {
@@ -2357,9 +2357,16 @@ mod tests {
         assert!(
             labels(&pinned, cx)
                 .iter()
-                .any(|label| label == "Hide Header")
+                .any(|label| label == "Show Header")
         );
         assert!(labels(&tabbed, cx).is_empty());
+
+        // Unpinned, it stays headerless and its menu still reaches it.
+        cx.update(|_, cx| group.update(cx, |group, cx| group.unpin(pinned.clone(), cx)));
+        cx.refresh().unwrap();
+        let rows = labels(&pinned, cx);
+        assert!(rows.iter().any(|label| label == "Show Header"));
+        assert!(rows.iter().any(|label| label == "Pin to Bottom"));
     }
 
     fn drag(

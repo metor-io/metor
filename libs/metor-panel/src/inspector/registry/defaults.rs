@@ -637,16 +637,6 @@ impl InspectorRegistry {
         self.register_type_builder::<Pane>(Arc::new(|any_entity, _db, _cx| {
             let pane: Entity<Pane> = any_entity.downcast().expect("Pane type mismatch");
 
-            let hide_read = pane.clone();
-            let hide_write = pane.clone();
-            let hide_row = BoolRow::dynamic(
-                "Hide Header",
-                Arc::new(move |cx| hide_read.read(cx).hide_header()),
-                Arc::new(move |checked, _w, cx| {
-                    hide_write.update(cx, |p, cx| p.set_hide_header(checked, cx));
-                }),
-            );
-
             let lock_read = pane.clone();
             let lock_write = pane;
             let lock_row = BoolRow::dynamic(
@@ -660,7 +650,7 @@ impl InspectorRegistry {
                 }),
             );
 
-            vec![Box::new(hide_row), Box::new(lock_row)]
+            vec![Box::new(lock_row)]
         }));
     }
 
