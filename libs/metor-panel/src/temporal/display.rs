@@ -20,10 +20,7 @@ impl TimeDisplay {
 }
 
 pub(crate) fn origin(config: &TemporalConfig, context: &TimeContext) -> Option<Timestamp> {
-    config
-        .t0
-        .map(Timestamp)
-        .or_else(|| context.extent.as_ref().map(|r| r.start))
+    config.t0.resolve(config.range, context)
 }
 
 /// Compact signed offset shared by temporal controls and plot axes.
@@ -118,10 +115,13 @@ pub(crate) fn range(
     }
 }
 
+/// Expands T0 shorthand to an absolute instant. `for_range` input refuses
+/// it while T0 follows the range, since the range would chase itself.
 pub(crate) fn expand_input(
     query: &str,
     config: &TemporalConfig,
     context: &TimeContext,
+    for_range: bool,
 ) -> Result<String, String> {
     let instant = |text: &str| -> Result<String, String> {
         let lower = text.trim().to_ascii_lowercase();
@@ -132,6 +132,12 @@ pub(crate) fn expand_input(
         } else {
             return Ok(text.to_string());
         };
+        if for_range && config.t0.follows_range() {
+            return Err(format!(
+                "T0 is the {}; choose another T0 to place the range with it",
+                config.t0
+            ));
+        }
         let zero =
             origin(config, context).ok_or("T0 unavailable; choose a T0 timestamp or load data")?;
         let (negative, duration) = if suffix.is_empty() {

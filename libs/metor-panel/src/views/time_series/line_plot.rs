@@ -1029,7 +1029,7 @@ mod rebind_tests {
                 c.snapshot.context.extent = Some(Timestamp(10)..Timestamp(100));
             });
             assert_eq!(plot.read(cx).time_origin(cx), Some(10.0));
-            controller.update(cx, |c, _| c.config.t0 = Some(40));
+            controller.update(cx, |c, _| c.config.t0 = crate::temporal::T0::Fixed(40));
             assert_eq!(plot.read(cx).time_origin(cx), Some(40.0));
         });
     }
