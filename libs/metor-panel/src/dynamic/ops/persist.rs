@@ -4,8 +4,8 @@
 //!
 //! The persist node is a transparent passthrough — its output is the
 //! Component's own WAL, so subscribing to the persist node and subscribing
-//! to the underlying component yield the same stream. The Component's
-//! built-in persist task (spawned by `Component::create`) handles disk.
+//! to the underlying component yield the same stream. The db's persist
+//! thread drains the Component's WAL to disk.
 
 use std::hash::Hash;
 use std::sync::{Arc, atomic};
