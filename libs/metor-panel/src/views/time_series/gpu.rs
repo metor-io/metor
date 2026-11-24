@@ -2415,7 +2415,10 @@ mod tests {
 
         let target = RenderTarget::new(&gpu.ctx.device, w, h);
         assert!(gpu.submit(&target, view, 1.0, traces, None, &mut None, theme));
-        target.staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        target
+            .staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |_| {});
         let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
         let expected = read_mapped_bytes(&target.staging, w, h, target.padded_bytes_per_row)
             .expect("staging buffer mapped");
@@ -2734,8 +2737,31 @@ mod tests {
         let component = synth_component(dir.path(), 6, 200_000, start_us, step_us);
         for (w, h) in [(1500, 600), (3000, 1700)] {
             let target = RenderTarget::new(&gpu.ctx.device, w, h);
+            // Stands in for gpui's atlas upload of each read-back frame.
+            let upload_tex = gpu.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("atlas stand-in"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TARGET_FORMAT,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            #[cfg(target_os = "macos")]
+            let device = gpu.ctx.device.clone();
+            #[cfg(target_os = "macos")]
+            let (mut pool, surface_msaa) = (
+                super::super::surface::SurfacePool::new(&device, w, h).unwrap(),
+                msaa_view(&device, w, h),
+            );
             let span = 60_000_000_i64;
-            let (mut submit, mut readback, mut image) = (0.0, 0.0, 0.0);
+            let (mut submit, mut readback, mut image, mut upload, mut surface) =
+                (0.0, 0.0, 0.0, 0.0, 0.0);
             let frames = 60;
             for f in 0..frames {
                 let min_x = start_us + 100_000_000 + f * 100_000;
@@ -2775,19 +2801,65 @@ mod tests {
                 target.staging.unmap();
                 let t2 = std::time::Instant::now();
                 let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes).unwrap();
+                let t3 = std::time::Instant::now();
+                gpu.ctx.queue.write_texture(
+                    upload_tex.as_image_copy(),
+                    buffer.as_raw(),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    upload_tex.size(),
+                );
+                gpu.ctx.queue.submit(None);
+                let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+                let t4 = std::time::Instant::now();
                 let _img =
                     RenderImage::new(SmallVec::<[Frame; 1]>::from_elem(Frame::new(buffer), 1));
-                let t3 = std::time::Instant::now();
                 submit += (t1 - t0).as_secs_f64();
                 readback += (t2 - t1).as_secs_f64();
                 image += (t3 - t2).as_secs_f64();
+                upload += (t4 - t3).as_secs_f64();
+
+                // The same frame on the surface path: submit, wait, done.
+                #[cfg(target_os = "macos")]
+                {
+                    let t0 = std::time::Instant::now();
+                    let (resolve_view, frame) = pool.acquire(&device).unwrap();
+                    assert!(gpu.submit_into(
+                        Dest {
+                            width: w,
+                            height: h,
+                            msaa_view: &surface_msaa,
+                            resolve_view,
+                            readback: None,
+                        },
+                        view,
+                        2.0,
+                        std::slice::from_ref(&draw),
+                        None,
+                        &mut None,
+                        &crate::theme::DARK,
+                    ));
+                    let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+                    drop(frame);
+                    surface += t0.elapsed().as_secs_f64();
+                }
             }
             let ms = |s: f64| s * 1e3 / frames as f64;
             eprintln!(
-                "{w}x{h}: submit {:.2} ms, gpu+readback {:.2} ms, image {:.2} ms per frame",
+                "{w}x{h} readback: submit {:.2} + gpu+readback {:.2} + image {:.2} + atlas upload {:.2} = {:.2} ms per frame",
                 ms(submit),
                 ms(readback),
-                ms(image)
+                ms(image),
+                ms(upload),
+                ms(submit + readback + image + upload),
+            );
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "{w}x{h} surface: submit+gpu {:.2} ms per frame",
+                ms(surface)
             );
         }
     }
