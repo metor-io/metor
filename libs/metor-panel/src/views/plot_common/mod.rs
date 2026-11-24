@@ -20,10 +20,12 @@ use crate::views::time_series::{
 };
 
 pub(crate) mod chrome;
+mod legend;
 pub(crate) mod lod;
 mod numeric;
 mod pan_zoom;
 
+pub(crate) use legend::PlotLegend;
 pub use numeric::{NumericLinePlot, NumericPlot};
 pub(crate) use pan_zoom::PanZoom;
 

@@ -479,14 +479,7 @@ impl Render for TimeSeriesPlot {
         root = root.child(inner);
 
         if show_legend {
-            root = root.child(crate::views::plot_common::plot_legend(
-                &trace_entities,
-                self.line_plot.clone(),
-                chrome_left,
-                |trace| (trace.label.clone(), trace.color, trace.visible),
-                |trace| trace.visible = !trace.visible,
-                cx,
-            ));
+            root = root.child(PlotLegend::element(&self.legend, cx));
         }
 
         root
