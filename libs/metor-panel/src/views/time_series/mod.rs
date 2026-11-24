@@ -42,7 +42,9 @@ mod bounds;
 pub use bounds::*;
 
 mod gpu;
-pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState, ReadbackHandle};
+#[cfg(target_os = "macos")]
+mod surface;
+pub(crate) use gpu::{AxisSource, LineDraw, PlotFrame, PlotRenderState, ReadbackHandle};
 
 mod heatmap;
 pub use heatmap::{Colormap, IntensityScale};

@@ -109,6 +109,18 @@ bevy = { git = "https://github.com/bevyengine/bevy", rev = "5036d978a294a3fbb1c4
 cocoa = "0.26"
 objc = "0.2"
 objc2 = "0.6"
+# Plot frames render into IOSurfaces gpui composites in place.
+objc2-core-foundation = { version = "0.3", features = ["CFDictionary", "CFNumber"] }
+objc2-core-video = { version = "0.3", features = [
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVPixelBufferIOSurface",
+    "CVReturn",
+    "objc2-io-surface",
+] }
+objc2-io-surface = "0.3"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSAppearance",

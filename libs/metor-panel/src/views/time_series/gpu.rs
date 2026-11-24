@@ -44,7 +44,7 @@ use crate::theme::Theme;
 
 const VALUE_CAPACITY: u32 = 1 << 22;
 const VALUE_BUF_BYTES: u64 = VALUE_CAPACITY as u64 * 4;
-const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+pub(super) const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const SAMPLE_COUNT: u32 = 4;
 const MICROS_PER_SEC: f64 = 1.0e6;
 const UNIFORM_ALIGN: u64 = 256;
@@ -212,16 +212,7 @@ impl RenderTarget {
             height,
             depth_or_array_layers: 1,
         };
-        let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("plot msaa"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: SAMPLE_COUNT,
-            dimension: wgpu::TextureDimension::D2,
-            format: TARGET_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
+        let msaa_view = msaa_view(device, width, height);
         let resolve_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("plot resolve"),
             size: extent,
@@ -232,7 +223,6 @@ impl RenderTarget {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let unpadded = width * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -255,16 +245,138 @@ impl RenderTarget {
     }
 }
 
+/// The multisampled color attachment every plot target draws into.
+fn msaa_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("plot msaa"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// A target that resolves into a pool of IOSurfaces gpui composites
+/// directly ([`super::surface`]), so frames never leave the GPU.
+#[cfg(target_os = "macos")]
+struct SurfaceTarget {
+    width: u32,
+    height: u32,
+    msaa_view: wgpu::TextureView,
+    pool: super::surface::SurfacePool,
+}
+
+/// One caller's target: resolved into IOSurfaces where gpui can composite
+/// them, else read back to the CPU.
+enum Target {
+    Readback(RenderTarget),
+    #[cfg(target_os = "macos")]
+    Surface(SurfaceTarget),
+}
+
+impl Target {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        #[cfg(target_os = "macos")]
+        if surfaces_enabled()
+            && let Some(pool) = super::surface::SurfacePool::new(device, width, height)
+        {
+            return Target::Surface(SurfaceTarget {
+                width,
+                height,
+                msaa_view: msaa_view(device, width, height),
+                pool,
+            });
+        }
+        Target::Readback(RenderTarget::new(device, width, height))
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Target::Readback(t) => (t.width, t.height),
+            #[cfg(target_os = "macos")]
+            Target::Surface(t) => (t.width, t.height),
+        }
+    }
+}
+
+/// `METOR_PLOT_READBACK=1` forces the CPU readback path, to compare the two.
+#[cfg(target_os = "macos")]
+fn surfaces_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let readback = std::env::var_os("METOR_PLOT_READBACK").is_some_and(|v| v != "0");
+        tracing::info!(surfaces = !readback, "plot frame path");
+        !readback
+    })
+}
+
+/// A frame ready to paint.
+#[derive(Clone)]
+pub(crate) enum PlotFrame {
+    /// Pixels read back to the CPU, uploaded to gpui's sprite atlas.
+    Image(Arc<RenderImage>),
+    /// An IOSurface gpui samples in place.
+    #[cfg(target_os = "macos")]
+    Surface(super::surface::SurfaceFrame),
+}
+
+impl PlotFrame {
+    /// Paint at `rect`, clipped to the canvas `bounds`.
+    pub(crate) fn paint(
+        &self,
+        window: &mut gpui::Window,
+        bounds: Bounds<Pixels>,
+        rect: Bounds<Pixels>,
+    ) {
+        match self {
+            PlotFrame::Image(img) => {
+                let _ = window.paint_image(
+                    bounds,
+                    rect,
+                    gpui::Corners::default(),
+                    img.clone(),
+                    0,
+                    false,
+                );
+            }
+            #[cfg(target_os = "macos")]
+            PlotFrame::Surface(surface) => {
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    window.paint_surface(rect, surface.0.clone());
+                });
+            }
+        }
+    }
+}
+
+/// What an in-flight frame resolves to once its GPU work completes.
+enum Pending {
+    Readback {
+        staging: wgpu::Buffer,
+        padded_bytes_per_row: u32,
+    },
+    #[cfg(target_os = "macos")]
+    Surface(super::surface::SurfaceFrame),
+}
+
 /// Cookie representing an in-flight staging buffer readback.
 ///
 /// Drive it to completion via [`ReadbackHandle::spawn_and_set`] on the
 /// gpui side or [`ReadbackHandle::read_image`] directly on a worker.
 pub(crate) struct ReadbackHandle {
     ctx: Arc<GpuContext>,
-    staging: wgpu::Buffer,
+    pending: Pending,
     width: u32,
     height: u32,
-    padded_bytes_per_row: u32,
     in_flight: Arc<AtomicBool>,
     /// Whether this frame's uploads were clamped by buffer capacity.
     /// Travels with the frame so the degraded badge always describes the
@@ -276,22 +388,33 @@ pub(crate) struct ReadbackHandle {
 }
 
 impl ReadbackHandle {
-    /// Block until GPU work finishes, unmap the staging buffer, and wrap
-    /// the pixels into a `RenderImage`. Intended for background workers.
-    pub(crate) fn read_image(self) -> Option<Arc<RenderImage>> {
+    /// Block until GPU work finishes and hand back the frame: the surface
+    /// it drew into, or the staging buffer's pixels wrapped into a
+    /// `RenderImage`. Intended for background workers.
+    pub(crate) fn finish(self) -> Option<PlotFrame> {
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        let bytes = read_mapped_bytes(
-            &self.staging,
-            self.width,
-            self.height,
-            self.padded_bytes_per_row,
-        );
-        self.staging.unmap();
+        let frame = match self.pending {
+            Pending::Readback {
+                staging,
+                padded_bytes_per_row,
+            } => {
+                let bytes =
+                    read_mapped_bytes(&staging, self.width, self.height, padded_bytes_per_row);
+                staging.unmap();
+                bytes
+                    .and_then(|bytes| {
+                        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(self.width, self.height, bytes)
+                    })
+                    .map(|buffer| {
+                        let frames = SmallVec::from_elem(Frame::new(buffer), 1);
+                        PlotFrame::Image(Arc::new(RenderImage::new(frames)))
+                    })
+            }
+            #[cfg(target_os = "macos")]
+            Pending::Surface(surface) => Some(PlotFrame::Surface(surface)),
+        };
         self.in_flight.store(false, Ordering::Release);
-        let bytes = bytes?;
-        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(self.width, self.height, bytes)?;
-        let frames = SmallVec::from_elem(Frame::new(buffer), 1);
-        Some(Arc::new(RenderImage::new(frames)))
+        frame
     }
 
     /// Run the readback on the background executor and install the
@@ -311,7 +434,7 @@ impl ReadbackHandle {
             let view = self.view.clone();
             let image = cx
                 .background_executor()
-                .spawn(async move { self.read_image() })
+                .spawn(async move { self.finish() })
                 .await;
             let Some(img) = image else {
                 return;
@@ -556,10 +679,34 @@ impl PlotGpu {
     /// Returns `true` when real work was submitted (the caller starts a
     /// readback), `false` when there was nothing to draw — every trace
     /// decimated to nothing and no field.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &mut self,
         target: &RenderTarget,
+        view: PlotBounds,
+        scale: f32,
+        traces: &[LineDraw<'_>],
+        field: Option<&IntensityDraw<'_>>,
+        heatmap_state: &mut Option<HeatmapState>,
+        theme: &Theme,
+    ) -> bool {
+        let dest = Dest {
+            width: target.width,
+            height: target.height,
+            msaa_view: &target.msaa_view,
+            resolve_view: &target.resolve_view,
+            readback: Some(target),
+        };
+        self.submit_into(dest, view, scale, traces, field, heatmap_state, theme)
+    }
+
+    /// [`Self::submit`] into explicit attachments; the copy to the staging
+    /// buffer happens only when `dest.readback` names one.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_into(
+        &mut self,
+        target: Dest<'_>,
         view: PlotBounds,
         scale: f32,
         traces: &[LineDraw<'_>],
@@ -685,9 +832,9 @@ impl PlotGpu {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("plot pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.msaa_view,
+                    view: target.msaa_view,
                     depth_slice: None,
-                    resolve_target: Some(&target.resolve_view),
+                    resolve_target: Some(target.resolve_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
@@ -724,37 +871,50 @@ impl PlotGpu {
             }
         }
 
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.resolve_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &target.staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(target.padded_bytes_per_row),
-                    rows_per_image: Some(target.height),
+        if let Some(readback) = target.readback {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &readback.resolve_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-            },
-            wgpu::Extent3d {
-                width: target.width,
-                height: target.height,
-                depth_or_array_layers: 1,
-            },
-        );
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback.staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(readback.padded_bytes_per_row),
+                        rows_per_image: Some(readback.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: readback.width,
+                    height: readback.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.ctx.queue.submit(Some(encoder.finish()));
         true
     }
 }
 
+/// The attachments one frame draws into.
+struct Dest<'a> {
+    width: u32,
+    height: u32,
+    msaa_view: &'a wgpu::TextureView,
+    resolve_view: &'a wgpu::TextureView,
+    /// The readback target whose staging buffer receives a copy of the
+    /// resolved frame; `None` when the resolve view is itself what's shown.
+    readback: Option<&'a RenderTarget>,
+}
+
 /// Caller-local render state: target, blitted frame, and the in-flight
 /// flag that back-pressures submissions while a readback is outstanding.
 pub(crate) struct PlotRenderState {
-    target: Option<RenderTarget>,
-    current_frame: Option<Arc<RenderImage>>,
+    target: Option<Target>,
+    current_frame: Option<PlotFrame>,
     /// The view `current_frame` was drawn at.
     frame_view: Option<PlotView>,
     /// The view of the latest render request, drawn or not: where paint
@@ -865,40 +1025,66 @@ impl PlotRenderState {
             if self
                 .target
                 .as_ref()
-                .is_none_or(|t| t.width != width || t.height != height)
+                .is_none_or(|t| t.size() != (width, height))
             {
-                self.target = Some(RenderTarget::new(&gpu.ctx.device, width, height));
+                self.target = Some(Target::new(&gpu.ctx.device, width, height));
             }
-            let mut heatmap = self.heatmap.take();
-            let drew = match self.target.as_ref() {
-                Some(target) => gpu.submit(
-                    target,
-                    view,
-                    scale,
-                    traces,
-                    field,
-                    &mut heatmap,
-                    theme.as_ref(),
+            let device = gpu.ctx.device.clone();
+            let (dest, pending) = match self.target.as_mut()? {
+                Target::Readback(target) => (
+                    Dest {
+                        width,
+                        height,
+                        msaa_view: &target.msaa_view,
+                        resolve_view: &target.resolve_view,
+                        readback: Some(&*target),
+                    },
+                    Pending::Readback {
+                        staging: target.staging.clone(),
+                        padded_bytes_per_row: target.padded_bytes_per_row,
+                    },
                 ),
-                None => false,
+                #[cfg(target_os = "macos")]
+                Target::Surface(target) => {
+                    // Every buffer still on screen or queued in gpui: skip
+                    // this frame, as when a readback is in flight.
+                    let (resolve_view, surface) = target.pool.acquire(&device)?;
+                    (
+                        Dest {
+                            width,
+                            height,
+                            msaa_view: &target.msaa_view,
+                            resolve_view,
+                            readback: None,
+                        },
+                        Pending::Surface(surface),
+                    )
+                }
             };
+            let mut heatmap = self.heatmap.take();
+            let drew = gpu.submit_into(
+                dest,
+                view,
+                scale,
+                traces,
+                field,
+                &mut heatmap,
+                theme.as_ref(),
+            );
             self.heatmap = heatmap;
             if !drew {
                 self.clear_frame();
                 return None;
             }
-            let target = self.target.as_ref()?;
             self.in_flight.store(true, Ordering::Release);
-            target
-                .staging
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, |_| {});
+            if let Pending::Readback { staging, .. } = &pending {
+                staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            }
             Some(ReadbackHandle {
                 ctx: gpu.ctx.clone(),
-                staging: target.staging.clone(),
-                width: target.width,
-                height: target.height,
-                padded_bytes_per_row: target.padded_bytes_per_row,
+                pending,
+                width,
+                height,
                 in_flight: self.in_flight.clone(),
                 truncated: gpu.cache.truncated,
                 generation: self.generation,
@@ -908,8 +1094,10 @@ impl PlotRenderState {
     }
 
     /// Install a newly-read frame and park the previous one for release.
-    pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>, view: PlotView, truncated: bool) {
-        self.pending_release = self.current_frame.replace(image);
+    pub(crate) fn set_frame(&mut self, frame: PlotFrame, view: PlotView, truncated: bool) {
+        if let Some(PlotFrame::Image(old)) = self.current_frame.replace(frame) {
+            self.pending_release = Some(old);
+        }
         self.frame_view = Some(view);
         self.degraded = truncated;
     }
@@ -917,12 +1105,12 @@ impl PlotRenderState {
     pub(crate) fn clear_frame(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.frame_view = None;
-        if self.current_frame.is_some() {
-            self.pending_release = self.current_frame.take();
+        if let Some(PlotFrame::Image(old)) = self.current_frame.take() {
+            self.pending_release = Some(old);
         }
     }
 
-    pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
+    pub(crate) fn current_frame(&self) -> Option<PlotFrame> {
         self.current_frame.clone()
     }
 
@@ -2193,6 +2381,76 @@ mod tests {
         Component::from_time_series(ComponentId(1), f64_schema(), TimeSeries::open(dir).unwrap())
     }
 
+    /// A frame resolved into an IOSurface holds exactly the pixels the
+    /// readback path copies out, and the pool recycles a buffer only once
+    /// the frame holding it is gone. 300 px rows exercise both paths' row
+    /// padding.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn surface_frames_match_readback() {
+        let Some(mut gpu) = PlotGpu::try_new() else {
+            eprintln!("skipping: no GPU available");
+            return;
+        };
+        let (w, h) = (300, 100);
+        let dir = tempfile::tempdir().unwrap();
+        let component = synth_component(dir.path(), 1, 2_000, 0, 1_000);
+        let draw = LineDraw {
+            x: AxisSource::Timestamps,
+            y: AxisSource::Element {
+                component: &component,
+                element_index: 0,
+            },
+            y_min: -1.0,
+            y_max: 1.0,
+            style: PlotStyle::Line,
+            color: Hsla::white(),
+            stroke_width: 1.5,
+            x_clip: None,
+            time_clip: None,
+        };
+        let view = PlotBounds::new(0.0, -1.0, 2.0, 1.0);
+        let traces = std::slice::from_ref(&draw);
+        let theme = &crate::theme::DARK;
+
+        let target = RenderTarget::new(&gpu.ctx.device, w, h);
+        assert!(gpu.submit(&target, view, 1.0, traces, None, &mut None, theme));
+        target.staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let expected = read_mapped_bytes(&target.staging, w, h, target.padded_bytes_per_row)
+            .expect("staging buffer mapped");
+        target.staging.unmap();
+        assert!(expected.iter().any(|&b| b != 0), "readback drew nothing");
+
+        let device = gpu.ctx.device.clone();
+        let mut pool = super::super::surface::SurfacePool::new(&device, w, h).expect("pool");
+        let msaa = msaa_view(&device, w, h);
+        let (resolve_view, frame) = pool.acquire(&device).expect("free buffer");
+        let dest = Dest {
+            width: w,
+            height: h,
+            msaa_view: &msaa,
+            resolve_view,
+            readback: None,
+        };
+        assert!(gpu.submit_into(dest, view, 1.0, traces, None, &mut None, theme));
+        let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(
+            super::super::surface::read_pixels(&frame) == expected,
+            "surface pixels differ from readback"
+        );
+
+        // `frame` still holds the first buffer, so the next is a new one;
+        // once it is dropped the first is free again.
+        let (_, second) = pool.acquire(&device).expect("second buffer");
+        assert!(!std::ptr::eq(&*second.0, &*frame.0));
+        drop(second);
+        let first = &*frame.0 as *const _;
+        drop(frame);
+        let (_, again) = pool.acquire(&device).expect("recycled buffer");
+        assert!(std::ptr::eq(&*again.0, first));
+    }
+
     /// A field-only frame must render: the spectrogram submits no traces at
     /// all, empty cells must stay transparent so the plot background shows
     /// through, and the ramp must actually vary across the value range.
@@ -2453,8 +2711,8 @@ mod tests {
                 assert!(off.abs() <= 0.5, "frame {f} painted {off} px off the view");
                 assert_eq!(at.size, bounds.size);
             }
-            let img = handle.read_image().expect("readback");
-            state.set_frame(img, current.clone(), false);
+            let frame = handle.finish().expect("frame");
+            state.set_frame(frame, current.clone(), false);
             drawn = current;
         }
         assert_eq!(trailed, 10, "every drag frame paints the previous render");

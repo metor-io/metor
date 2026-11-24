@@ -7,17 +7,16 @@
 //! gestures and LoD selection are the same, so they live here.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point,
-    Rems, SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
+    Bounds, Context, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, Rems,
+    SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
     prelude::*, px,
 };
 
 use crate::theme::{Theme, ui_px, ui_scale};
 use crate::views::time_series::{
-    LABEL_FONT_SIZE, Override, PlotBounds, PlotRenderState, ReadbackHandle,
+    LABEL_FONT_SIZE, Override, PlotBounds, PlotFrame, PlotRenderState, ReadbackHandle,
 };
 
 pub(crate) mod chrome;
@@ -325,15 +324,9 @@ pub(crate) fn gpu_frame_over<T: 'static>(
             }
             (bounds, frame)
         },
-        |_,
-         (bounds, frame): (
-            Bounds<Pixels>,
-            Option<(Arc<gpui::RenderImage>, Bounds<Pixels>)>,
-        ),
-         window,
-         _cx| {
-            if let Some((img, rect)) = frame {
-                let _ = window.paint_image(bounds, rect, Corners::default(), img, 0, false);
+        |_, (bounds, frame): (Bounds<Pixels>, Option<(PlotFrame, Bounds<Pixels>)>), window, _cx| {
+            if let Some((frame, rect)) = frame {
+                frame.paint(window, bounds, rect);
             }
         },
     )

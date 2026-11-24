@@ -140,9 +140,33 @@ facet-path = { git = "https://github.com/metor-io/facet.git", branch = "sphw/fac
 facet-solver = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
 # The facet fork depends on crates.io `gpui = "*"`; point it at the same Zed
 # rev as the workspace dependency so both resolve to one gpui.
-gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca" }
+gpui = { path = "../zed/crates/gpui" }
 # Copied from Zed's root `[patch.crates-io]`: Zed's patches don't reach
 # dependents, and gpui's scheduler relies on the async-task fork's API.
 async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
 calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
 khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
+
+# SPIKE: local gpui fork (metor/bgra-surface) for zero-copy plot surfaces.
+# Every crate from the Zed git source is patched so they resolve to one gpui.
+[patch."https://github.com/zed-industries/zed"]
+collections = { path = "../zed/crates/collections" }
+derive_refineable = { path = "../zed/crates/refineable/derive_refineable" }
+gpui_apple = { path = "../zed/crates/gpui_apple" }
+gpui_ios = { path = "../zed/crates/gpui_ios" }
+gpui_linux = { path = "../zed/crates/gpui_linux" }
+gpui_macos = { path = "../zed/crates/gpui_macos" }
+gpui_macros = { path = "../zed/crates/gpui_macros" }
+gpui_platform = { path = "../zed/crates/gpui_platform" }
+gpui_shared_string = { path = "../zed/crates/gpui_shared_string" }
+gpui_util = { path = "../zed/crates/gpui_util" }
+gpui_web = { path = "../zed/crates/gpui_web" }
+gpui_wgpu = { path = "../zed/crates/gpui_wgpu" }
+gpui_windows = { path = "../zed/crates/gpui_windows" }
+gpui = { path = "../zed/crates/gpui" }
+http_client = { path = "../zed/crates/http_client" }
+refineable = { path = "../zed/crates/refineable" }
+scheduler = { path = "../zed/crates/scheduler" }
+sum_tree = { path = "../zed/crates/sum_tree" }
+ztracing_macro = { path = "../zed/crates/ztracing_macro" }
+ztracing = { path = "../zed/crates/ztracing" }
