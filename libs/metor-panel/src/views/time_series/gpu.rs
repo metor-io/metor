@@ -198,7 +198,6 @@ struct LineUniform {
 struct RenderTarget {
     width: u32,
     height: u32,
-    msaa_view: wgpu::TextureView,
     resolve_texture: wgpu::Texture,
     resolve_view: wgpu::TextureView,
     staging: wgpu::Buffer,
@@ -212,7 +211,6 @@ impl RenderTarget {
             height,
             depth_or_array_layers: 1,
         };
-        let msaa_view = msaa_view(device, width, height);
         let resolve_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("plot resolve"),
             size: extent,
@@ -236,7 +234,6 @@ impl RenderTarget {
         Self {
             width,
             height,
-            msaa_view,
             resolve_texture,
             resolve_view,
             staging,
@@ -269,7 +266,10 @@ impl Upload<'_> {
 /// upload (a few thousand f32 pairs), so most writes share chunks.
 const BELT_CHUNK: u64 = 1 << 20;
 
-/// The multisampled color attachment every plot target draws into.
+/// The multisampled color attachment every plot target draws into. It is
+/// only ever resolved, never read back, so it is transient: memoryless on
+/// Apple GPUs (the samples live in tile memory), which also keeps it out of
+/// the driver's residency work on every submit.
 fn msaa_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -283,7 +283,8 @@ fn msaa_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVie
             sample_count: SAMPLE_COUNT,
             dimension: wgpu::TextureDimension::D2,
             format: TARGET_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TRANSIENT_ATTACHMENT,
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
@@ -295,7 +296,6 @@ fn msaa_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVie
 struct SurfaceTarget {
     width: u32,
     height: u32,
-    msaa_view: wgpu::TextureView,
     pool: super::surface::SurfacePool,
 }
 
@@ -316,7 +316,6 @@ impl Target {
             return Target::Surface(SurfaceTarget {
                 width,
                 height,
-                msaa_view: msaa_view(device, width, height),
                 pool,
             });
         }
@@ -397,7 +396,6 @@ enum Pending {
 /// Drive it to completion via [`ReadbackHandle::spawn_and_set`] on the
 /// gpui side or [`ReadbackHandle::read_image`] directly on a worker.
 pub(crate) struct ReadbackHandle {
-    ctx: Arc<GpuContext>,
     pending: Pending,
     width: u32,
     height: u32,
@@ -415,8 +413,15 @@ impl ReadbackHandle {
     /// Block until GPU work finishes and hand back the frame: the surface
     /// it drew into, or the staging buffer's pixels wrapped into a
     /// `RenderImage`. Intended for background workers.
+    #[cfg(test)]
     pub(crate) fn finish(self) -> Option<PlotFrame> {
-        let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let ctx = GpuContext::get()?;
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        self.complete()
+    }
+
+    /// [`Self::finish`] once the device has already been polled to idle.
+    fn complete(self) -> Option<PlotFrame> {
         let frame = match self.pending {
             Pending::Readback {
                 staging,
@@ -456,41 +461,27 @@ impl ReadbackHandle {
         access: fn(&mut T) -> &mut PlotRenderState,
     ) {
         let entity = cx.weak_entity();
-        let start = move |cx: &mut gpui::App| {
-            let _ = entity.update(cx, |_, cx| self.wait_and_set(cx, access));
-        };
-        cx.update_global::<PlotGpu, _>(|gpu, _| gpu.pending_waits.push(Box::new(start)));
-    }
-
-    fn wait_and_set<T: 'static>(
-        self,
-        cx: &mut Context<T>,
-        access: fn(&mut T) -> &mut PlotRenderState,
-    ) {
-        cx.spawn(async move |this, cx| {
-            let truncated = self.truncated;
-            let generation = self.generation;
-            let view = self.view.clone();
-            let image = cx
-                .background_executor()
-                .spawn(async move { self.finish() })
-                .await;
-            let Some(img) = image else {
-                // Nothing to show for that render: let the next request redo it.
-                let _ = this.update(cx, |t, cx| {
-                    access(t).drawn = None;
-                    cx.notify();
-                });
-                return;
-            };
-            let _ = this.update(cx, |t, cx| {
-                if access(t).generation == generation {
-                    access(t).set_frame(img, view, truncated);
+        let (truncated, generation, view) = (self.truncated, self.generation, self.view.clone());
+        let install = move |frame: Option<PlotFrame>, cx: &mut gpui::App| {
+            let _ = entity.update(cx, |t, cx| {
+                let state = access(t);
+                match frame {
+                    Some(frame) if state.generation == generation => {
+                        state.set_frame(frame, view, truncated)
+                    }
+                    Some(_) => {}
+                    // Nothing to show for that render: let the next request redo it.
+                    None => state.drawn = None,
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        };
+        cx.update_global::<PlotGpu, _>(|gpu, _| {
+            gpu.pending_waits.push(PendingFrame {
+                handle: self,
+                install: Box::new(install),
+            })
+        });
     }
 }
 
@@ -526,8 +517,21 @@ pub(super) struct PlotGpu {
     pending_maps: Vec<wgpu::Buffer>,
     /// Completion waits to start once `frame` is submitted; one started
     /// earlier would wait on GPU work that hasn't been sent yet.
-    pending_waits: Vec<Box<dyn FnOnce(&mut gpui::App)>>,
+    pending_waits: Vec<PendingFrame>,
+    /// One MSAA attachment per target size, shared by every plot of that
+    /// size: plots draw one after another, so they never need two at once.
+    msaa: std::collections::HashMap<(u32, u32), wgpu::TextureView>,
 }
+
+/// A recorded plot frame waiting for its GPU work, and how to install it.
+struct PendingFrame {
+    handle: ReadbackHandle,
+    install: Box<dyn FnOnce(Option<PlotFrame>, &mut gpui::App)>,
+}
+
+/// Sizes the MSAA cache holds before it starts over (each is memoryless, so
+/// this only bounds the bookkeeping while a window is being resized).
+const MSAA_SIZES: usize = 32;
 
 impl Global for PlotGpu {}
 
@@ -729,6 +733,7 @@ impl PlotGpu {
             frame: None,
             pending_maps: Vec::new(),
             pending_waits: Vec::new(),
+            msaa: std::collections::HashMap::default(),
         })
     }
 
@@ -752,10 +757,11 @@ impl PlotGpu {
         heatmap_state: &mut Option<HeatmapState>,
         theme: &Theme,
     ) -> bool {
+        let msaa = msaa_view(&self.ctx.device, target.width, target.height);
         let dest = Dest {
             width: target.width,
             height: target.height,
-            msaa_view: &target.msaa_view,
+            msaa_view: &msaa,
             resolve_view: &target.resolve_view,
             readback: Some(target),
         };
@@ -786,16 +792,38 @@ impl PlotGpu {
         if gpu.frame.is_none() && gpu.pending_waits.is_empty() {
             return;
         }
-        let waits = cx.update_global::<PlotGpu, _>(|gpu, _| {
+        let (ctx, waits) = cx.update_global::<PlotGpu, _>(|gpu, _| {
             gpu.submit_frame();
             for staging in gpu.pending_maps.drain(..) {
                 staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             }
-            std::mem::take(&mut gpu.pending_waits)
+            (gpu.ctx.clone(), std::mem::take(&mut gpu.pending_waits))
         });
-        for wait in waits {
-            wait(cx);
+        if waits.is_empty() {
+            return;
         }
+        // One wait for the whole frame: a blocking task per plot had GCD
+        // spinning threads up and down for every frame.
+        let (handles, installs): (Vec<_>, Vec<_>) =
+            waits.into_iter().map(|w| (w.handle, w.install)).unzip();
+        cx.spawn(async move |cx| {
+            let frames = cx
+                .background_executor()
+                .spawn(async move {
+                    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+                    handles
+                        .into_iter()
+                        .map(ReadbackHandle::complete)
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            cx.update(|cx| {
+                for (install, frame) in installs.into_iter().zip(frames) {
+                    install(frame, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// [`Self::submit`] into explicit attachments; the copy to the staging
@@ -968,7 +996,9 @@ impl PlotGpu {
                     resolve_target: Some(target.resolve_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        // Only the resolve is kept; the samples stay in tile
+                        // memory (the attachment is transient).
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -1304,12 +1334,20 @@ impl PlotRenderState {
                 self.target = Some(Target::new(&gpu.ctx.device, width, height));
             }
             let device = gpu.ctx.device.clone();
+            if gpu.msaa.len() >= MSAA_SIZES && !gpu.msaa.contains_key(&(width, height)) {
+                gpu.msaa.clear();
+            }
+            let msaa = gpu
+                .msaa
+                .entry((width, height))
+                .or_insert_with(|| msaa_view(&device, width, height))
+                .clone();
             let (dest, pending) = match self.target.as_mut()? {
                 Target::Readback(target) => (
                     Dest {
                         width,
                         height,
-                        msaa_view: &target.msaa_view,
+                        msaa_view: &msaa,
                         resolve_view: &target.resolve_view,
                         readback: Some(&*target),
                     },
@@ -1330,7 +1368,7 @@ impl PlotRenderState {
                         Dest {
                             width,
                             height,
-                            msaa_view: &target.msaa_view,
+                            msaa_view: &msaa,
                             resolve_view,
                             readback: None,
                         },
@@ -1359,7 +1397,6 @@ impl PlotRenderState {
                 gpu.pending_maps.push(staging.clone());
             }
             Some(ReadbackHandle {
-                ctx: gpu.ctx.clone(),
                 pending,
                 width,
                 height,
@@ -2809,10 +2846,11 @@ mod tests {
             .map(|((w, h), _, _)| RenderTarget::new(&gpu.ctx.device, *w, *h))
             .collect();
         for (t, (_, view, draw)) in targets.iter().zip(&plots) {
+            let msaa = msaa_view(&gpu.ctx.device, t.width, t.height);
             let dest = Dest {
                 width: t.width,
                 height: t.height,
-                msaa_view: &t.msaa_view,
+                msaa_view: &msaa,
                 resolve_view: &t.resolve_view,
                 readback: Some(t),
             };

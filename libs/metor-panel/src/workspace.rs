@@ -132,66 +132,87 @@ pub(crate) fn open_panel_window(
     let bounds = bounds
         .filter(|b| bounds_visible(b, &display_bounds(cx)))
         .unwrap_or_else(|| Bounds::centered(None, size(px(1024.), px(600.)), cx));
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // `appears_transparent` hides the native titlebar on macOS
-            // (leaving the traffic lights) and on Windows (leaving nothing —
-            // the app draws its own controls).
-            titlebar: Some(TitlebarOptions {
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(12.0), px(8.0))),
+    // `METOR_FOREGROUND=1`: open maximized above other apps' windows and take
+    // focus, so a run started from a terminal (a benchmark, a profile) draws
+    // without anyone bringing it forward. macOS stops drawing covered windows.
+    let foreground = std::env::var_os("METOR_FOREGROUND").is_some_and(|v| v != "0");
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(if foreground {
+                    WindowBounds::Maximized(bounds)
+                } else {
+                    WindowBounds::Windowed(bounds)
+                }),
+                kind: if foreground {
+                    gpui::WindowKind::Floating
+                } else {
+                    gpui::WindowKind::Normal
+                },
+                // `appears_transparent` hides the native titlebar on macOS
+                // (leaving the traffic lights) and on Windows (leaving nothing —
+                // the app draws its own controls).
+                titlebar: Some(TitlebarOptions {
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.0), px(8.0))),
+                    ..Default::default()
+                }),
+                // Linux-only: request client-side decorations; the window root
+                // wraps itself in resize borders and a shadow via
+                // `window_controls::client_side_decorations`.
+                window_decorations: Some(gpui::WindowDecorations::Client),
+                // macOS would otherwise drag the window from anywhere in the
+                // titlebar strip, taking the pointer from the tabs that live
+                // there. The window root moves the window itself instead.
+                app_owns_titlebar_drag: true,
+                // The side tabs show the desktop blurred through; everything
+                // else paints opaque over it.
+                window_background: if cfg!(target_os = "macos") {
+                    gpui::WindowBackgroundAppearance::Transparent
+                } else {
+                    gpui::WindowBackgroundAppearance::Opaque
+                },
+                app_id: Some("metor-panel".into()),
                 ..Default::default()
-            }),
-            // Linux-only: request client-side decorations; the window root
-            // wraps itself in resize borders and a shadow via
-            // `window_controls::client_side_decorations`.
-            window_decorations: Some(gpui::WindowDecorations::Client),
-            // macOS would otherwise drag the window from anywhere in the
-            // titlebar strip, taking the pointer from the tabs that live
-            // there. The window root moves the window itself instead.
-            app_owns_titlebar_drag: true,
-            // The side tabs show the desktop blurred through; everything
-            // else paints opaque over it.
-            window_background: if cfg!(target_os = "macos") {
-                gpui::WindowBackgroundAppearance::Transparent
-            } else {
-                gpui::WindowBackgroundAppearance::Opaque
             },
-            app_id: Some("metor-panel".into()),
-            ..Default::default()
-        },
-        move |window, cx| {
-            // Snapshot the layout while the closing window still counts:
-            // this is the only hook that runs before gpui drops it, and it
-            // is what lets closing the last window behave like quitting.
-            window.on_window_should_close(cx, |window, cx| {
-                crate::connections::flush_layout_including(window, cx);
-                crate::session::save_workspace(window_layout(window, cx), cx);
-                true
-            });
-            let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
-            #[cfg(target_os = "macos")]
-            {
-                if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
-                    tracing::warn!(%error, "could not install the tab sidebar's backdrop");
-                }
-                root.update(cx, |_, cx| {
-                    cx.observe_global_in::<crate::theme::ActiveTheme>(window, |_, window, cx| {
-                        crate::backdrop::retheme(window, &crate::theme::theme(cx))
-                    })
-                    .detach()
+            move |window, cx| {
+                // Snapshot the layout while the closing window still counts:
+                // this is the only hook that runs before gpui drops it, and it
+                // is what lets closing the last window behave like quitting.
+                window.on_window_should_close(cx, |window, cx| {
+                    crate::connections::flush_layout_including(window, cx);
+                    crate::session::save_workspace(window_layout(window, cx), cx);
+                    true
                 });
-            }
-            cx.observe_release(&root, |_, cx| cx.refresh_windows())
-                .detach();
-            let tiles = root.read(cx).tiles().clone();
-            register_window_tiles(window.window_handle().window_id(), &tiles, cx);
-            root
-        },
-    )
-    .inspect_err(|err| tracing::error!(%err, "open panel window failed"))
-    .ok()
+                let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
+                        tracing::warn!(%error, "could not install the tab sidebar's backdrop");
+                    }
+                    root.update(cx, |_, cx| {
+                        cx.observe_global_in::<crate::theme::ActiveTheme>(
+                            window,
+                            |_, window, cx| {
+                                crate::backdrop::retheme(window, &crate::theme::theme(cx))
+                            },
+                        )
+                        .detach()
+                    });
+                }
+                cx.observe_release(&root, |_, cx| cx.refresh_windows())
+                    .detach();
+                let tiles = root.read(cx).tiles().clone();
+                register_window_tiles(window.window_handle().window_id(), &tiles, cx);
+                root
+            },
+        )
+        .inspect_err(|err| tracing::error!(%err, "open panel window failed"))
+        .ok();
+    if foreground && handle.is_some() {
+        cx.activate(true);
+    }
+    handle
 }
 
 /// Serialize every open panel window into a [`WorkspaceLayout`] JSON
