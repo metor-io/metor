@@ -324,7 +324,10 @@ pub(crate) fn gpu_frame_over<T: 'static>(
             }
             (bounds, frame)
         },
-        |_, (bounds, frame): (Bounds<Pixels>, Option<(PlotFrame, Bounds<Pixels>)>), window, _cx| {
+        |_, (bounds, frame): (Bounds<Pixels>, Option<(PlotFrame, Bounds<Pixels>)>), window, cx| {
+            // Paint runs after every prepaint in the window, so the first
+            // plot to paint sends the whole frame's plots in one submit.
+            PlotRenderState::flush(cx);
             if let Some((frame, rect)) = frame {
                 frame.paint(window, bounds, rect);
             }

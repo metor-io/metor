@@ -245,6 +245,30 @@ impl RenderTarget {
     }
 }
 
+/// Buffer writes recorded into the frame's command encoder through the
+/// staging belt, so they land in order with the render passes around them:
+/// every plot reuses the shared uniform and value buffers, and a copy
+/// recorded after one plot's pass can't overwrite what that pass reads.
+pub(super) struct Upload<'a> {
+    belt: &'a mut wgpu::util::StagingBelt,
+    encoder: &'a mut wgpu::CommandEncoder,
+}
+
+impl Upload<'_> {
+    fn write(&mut self, target: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        let Some(size) = wgpu::BufferSize::new(bytes.len() as u64) else {
+            return;
+        };
+        self.belt
+            .write_buffer(self.encoder, target, offset, size)
+            .copy_from_slice(bytes);
+    }
+}
+
+/// Size of each staging-belt chunk: above a typical frame's per-trace
+/// upload (a few thousand f32 pairs), so most writes share chunks.
+const BELT_CHUNK: u64 = 1 << 20;
+
 /// The multisampled color attachment every plot target draws into.
 fn msaa_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     device
@@ -423,7 +447,22 @@ impl ReadbackHandle {
     /// `access` lets this helper reach whichever field the caller stores
     /// its [`PlotRenderState`] in, replacing a block of task/update/notify
     /// boilerplate at every call site.
+    ///
+    /// The wait starts at the next [`PlotGpu::flush`], which submits the
+    /// frame this handle's work was recorded into.
     pub(crate) fn spawn_and_set<T: 'static>(
+        self,
+        cx: &mut Context<T>,
+        access: fn(&mut T) -> &mut PlotRenderState,
+    ) {
+        let entity = cx.weak_entity();
+        let start = move |cx: &mut gpui::App| {
+            let _ = entity.update(cx, |_, cx| self.wait_and_set(cx, access));
+        };
+        cx.update_global::<PlotGpu, _>(|gpu, _| gpu.pending_waits.push(Box::new(start)));
+    }
+
+    fn wait_and_set<T: 'static>(
         self,
         cx: &mut Context<T>,
         access: fn(&mut T) -> &mut PlotRenderState,
@@ -471,6 +510,18 @@ pub(super) struct PlotGpu {
     upload_x: Vec<f32>,
     upload_y: Vec<f32>,
     select_scratch: Vec<u32>,
+    /// Every upload goes through here into `frame`, never `queue.write_buffer`
+    /// (which allocates a fresh staging buffer per call).
+    belt: wgpu::util::StagingBelt,
+    /// One encoder collects every plot drawn this frame, so the whole frame
+    /// costs one command buffer, not one per plot; [`Self::flush`] submits it.
+    frame: Option<wgpu::CommandEncoder>,
+    /// Readback staging buffers to map once `frame` is submitted: mapping a
+    /// buffer an unsubmitted encoder still writes would fail validation.
+    pending_maps: Vec<wgpu::Buffer>,
+    /// Completion waits to start once `frame` is submitted; one started
+    /// earlier would wait on GPU work that hasn't been sent yet.
+    pending_waits: Vec<Box<dyn FnOnce(&mut gpui::App)>>,
 }
 
 impl Global for PlotGpu {}
@@ -651,6 +702,7 @@ impl PlotGpu {
             ],
         });
 
+        let belt = wgpu::util::StagingBelt::new(ctx.device.clone(), BELT_CHUNK);
         Some(Self {
             ctx,
             line_pipeline,
@@ -668,6 +720,10 @@ impl PlotGpu {
             upload_x: Vec::new(),
             upload_y: Vec::new(),
             select_scratch: Vec::new(),
+            belt,
+            frame: None,
+            pending_maps: Vec::new(),
+            pending_waits: Vec::new(),
         })
     }
 
@@ -698,7 +754,42 @@ impl PlotGpu {
             resolve_view: &target.resolve_view,
             readback: Some(target),
         };
-        self.submit_into(dest, view, scale, traces, field, heatmap_state, theme)
+        let drew = self.submit_into(dest, view, scale, traces, field, heatmap_state, theme);
+        self.submit_frame();
+        drew
+    }
+
+    /// Submit everything recorded into the frame encoder in one command
+    /// buffer. A no-op when nothing was drawn since the last submit.
+    fn submit_frame(&mut self) {
+        let Some(encoder) = self.frame.take() else {
+            return;
+        };
+        self.belt.finish();
+        self.ctx.queue.submit(Some(encoder.finish()));
+        self.belt.recall();
+    }
+
+    /// End the frame: submit every plot drawn since the last flush, map their
+    /// readback buffers, and start their completion waits. Called from paint,
+    /// which runs after every prepaint in the window has recorded its plot.
+    pub(crate) fn flush(cx: &mut gpui::App) {
+        let Some(gpu) = cx.try_global::<PlotGpu>() else {
+            return;
+        };
+        if gpu.frame.is_none() && gpu.pending_waits.is_empty() {
+            return;
+        }
+        let waits = cx.update_global::<PlotGpu, _>(|gpu, _| {
+            gpu.submit_frame();
+            for staging in gpu.pending_maps.drain(..) {
+                staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            }
+            std::mem::take(&mut gpu.pending_waits)
+        });
+        for wait in waits {
+            wait(cx);
+        }
     }
 
     /// [`Self::submit`] into explicit attachments; the copy to the staging
@@ -706,6 +797,40 @@ impl PlotGpu {
     #[allow(clippy::too_many_arguments)]
     fn submit_into(
         &mut self,
+        target: Dest<'_>,
+        view: PlotBounds,
+        scale: f32,
+        traces: &[LineDraw<'_>],
+        field: Option<&IntensityDraw<'_>>,
+        heatmap_state: &mut Option<HeatmapState>,
+        theme: &Theme,
+    ) -> bool {
+        let mut encoder = self.frame.take().unwrap_or_else(|| {
+            self.ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("plot frame"),
+                })
+        });
+        let drew = self.record(
+            &mut encoder,
+            target,
+            view,
+            scale,
+            traces,
+            field,
+            heatmap_state,
+            theme,
+        );
+        self.frame = Some(encoder);
+        drew
+    }
+
+    /// Record one plot's uploads and render pass into `encoder`.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
         target: Dest<'_>,
         view: PlotBounds,
         scale: f32,
@@ -725,7 +850,10 @@ impl PlotGpu {
             let y_epoch = trace.y_min;
             let y_scale = 1.0 / (trace.y_max - trace.y_min).max(1e-12);
             let plan = plan_trace(
-                &self.ctx,
+                &mut Upload {
+                    belt: &mut self.belt,
+                    encoder,
+                },
                 &mut self.cache,
                 &mut self.upload_x,
                 &mut self.upload_y,
@@ -777,9 +905,11 @@ impl PlotGpu {
             viewport: [target.width as f32, target.height as f32],
             _pad: [0.0; 2],
         };
-        self.ctx
-            .queue
-            .write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
+        let mut up = Upload {
+            belt: &mut self.belt,
+            encoder,
+        };
+        up.write(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
 
         // Pack every trace's uniform into one dynamic-offset buffer so
         // the whole frame goes in a single submit.
@@ -807,7 +937,7 @@ impl PlotGpu {
                 line_width: lw,
                 _pad: [0.0; 3],
             };
-            self.ctx.queue.write_buffer(
+            up.write(
                 &self.line_buf,
                 i as u64 * UNIFORM_ALIGN,
                 bytemuck::bytes_of(&uniform),
@@ -822,12 +952,6 @@ impl PlotGpu {
             self.heatmap.prepare(&self.ctx, heatmap_state, field, theme);
         }
 
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("plot encoder"),
-            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("plot pass"),
@@ -894,7 +1018,6 @@ impl PlotGpu {
                 },
             );
         }
-        self.ctx.queue.submit(Some(encoder.finish()));
         true
     }
 }
@@ -1078,7 +1201,7 @@ impl PlotRenderState {
             }
             self.in_flight.store(true, Ordering::Release);
             if let Pending::Readback { staging, .. } = &pending {
-                staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                gpu.pending_maps.push(staging.clone());
             }
             Some(ReadbackHandle {
                 ctx: gpu.ctx.clone(),
@@ -1108,6 +1231,11 @@ impl PlotRenderState {
         if let Some(PlotFrame::Image(old)) = self.current_frame.take() {
             self.pending_release = Some(old);
         }
+    }
+
+    /// Submit every plot recorded this frame; see [`PlotGpu::flush`].
+    pub(crate) fn flush(cx: &mut gpui::App) {
+        PlotGpu::flush(cx);
     }
 
     pub(crate) fn current_frame(&self) -> Option<PlotFrame> {
@@ -1310,7 +1438,7 @@ impl NodeView {
 /// and emit draw spans over the uploaded ranges.
 #[allow(clippy::too_many_arguments)]
 fn plan_trace(
-    ctx: &GpuContext,
+    up: &mut Upload<'_>,
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
@@ -1344,7 +1472,7 @@ fn plan_trace(
     {
         let len = (*x_len).min(*y_len);
         return plan_list_trace(
-            ctx,
+            up,
             cache,
             upload_x,
             upload_y,
@@ -1367,7 +1495,7 @@ fn plan_trace(
     } = &trace.y
     {
         return plan_min_max_trace(
-            ctx,
+            up,
             cache,
             upload_x,
             upload_y,
@@ -1487,7 +1615,7 @@ fn plan_trace(
         let lod_end = ext_end_idx.div_ceil(upload_stride).min(full_decimated);
 
         let Some((chunk_offset, count)) = upload_pair(
-            ctx,
+            up,
             cache,
             upload_x,
             upload_y,
@@ -1544,7 +1672,7 @@ struct NodePair {
 /// across.
 #[allow(clippy::too_many_arguments)]
 fn plan_min_max_trace(
-    ctx: &GpuContext,
+    up: &mut Upload<'_>,
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
@@ -1718,10 +1846,8 @@ fn plan_min_max_trace(
     }
 
     let byte_offset = cache.cursor as u64 * 4;
-    ctx.queue
-        .write_buffer(x_buf, byte_offset, bytemuck::cast_slice(upload_x));
-    ctx.queue
-        .write_buffer(y_buf, byte_offset, bytemuck::cast_slice(upload_y));
+    up.write(x_buf, byte_offset, bytemuck::cast_slice(upload_x));
+    up.write(y_buf, byte_offset, bytemuck::cast_slice(upload_y));
     let chunk_offset = cache.cursor;
     cache.cursor += total;
 
@@ -1754,7 +1880,7 @@ fn plan_min_max_trace(
 /// exact samples so the drawn line always runs through the plot edges.
 #[allow(clippy::too_many_arguments)]
 fn upload_pair(
-    ctx: &GpuContext,
+    up: &mut Upload<'_>,
     cache: &mut ValueCache,
     scratch_x: &mut Vec<f32>,
     scratch_y: &mut Vec<f32>,
@@ -1873,10 +1999,8 @@ fn upload_pair(
     };
 
     let byte_offset = cache.cursor as u64 * 4;
-    ctx.queue
-        .write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
-    ctx.queue
-        .write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
+    up.write(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
+    up.write(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
 
     let offset = cache.cursor;
     cache.cursor += count;
@@ -2191,7 +2315,7 @@ fn convert_element_strided(
 /// yet — the legend/auto-fit path will simply not see this trace.
 #[allow(clippy::too_many_arguments)]
 fn plan_list_trace(
-    ctx: &GpuContext,
+    up: &mut Upload<'_>,
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
@@ -2251,10 +2375,8 @@ fn plan_list_trace(
     );
 
     let byte_offset = cache.cursor as u64 * 4;
-    ctx.queue
-        .write_buffer(x_buf, byte_offset, bytemuck::cast_slice(upload_x));
-    ctx.queue
-        .write_buffer(y_buf, byte_offset, bytemuck::cast_slice(upload_y));
+    up.write(x_buf, byte_offset, bytemuck::cast_slice(upload_x));
+    up.write(y_buf, byte_offset, bytemuck::cast_slice(upload_y));
     let chunk_offset = cache.cursor;
     cache.cursor += count_u32;
 
@@ -2437,6 +2559,7 @@ mod tests {
             readback: None,
         };
         assert!(gpu.submit_into(dest, view, 1.0, traces, None, &mut None, theme));
+        gpu.submit_frame();
         let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
         assert!(
             super::super::surface::read_pixels(&frame) == expected,
@@ -2452,6 +2575,102 @@ mod tests {
         drop(frame);
         let (_, again) = pool.acquire(&device).expect("recycled buffer");
         assert!(std::ptr::eq(&*again.0, first));
+    }
+
+    /// Plots recorded into one frame share the uniform and value buffers;
+    /// the belt's copies are ordered with the passes, so each plot still
+    /// renders exactly what it would alone. Two plots with different data,
+    /// views, widths and colors, submitted once, each match a solo render.
+    #[test]
+    fn batched_plots_match_solo_renders() {
+        let Some(mut gpu) = PlotGpu::try_new() else {
+            eprintln!("skipping: no GPU available");
+            return;
+        };
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = synth_component(dir_a.path(), 1, 3_000, 0, 1_000);
+        let b = synth_component(dir_b.path(), 2, 1_500, 500_000, 700);
+        let line = |component, color, stroke_width| LineDraw {
+            x: AxisSource::Timestamps,
+            y: AxisSource::Element {
+                component,
+                element_index: 0,
+            },
+            y_min: -1.0,
+            y_max: 1.0,
+            style: PlotStyle::Line,
+            color,
+            stroke_width,
+            x_clip: None,
+            time_clip: None,
+        };
+        let plots = [
+            (
+                (300, 100),
+                PlotBounds::new(0.0, -1.0, 3_000_000.0, 1.0),
+                line(&a, Hsla::white(), 1.0),
+            ),
+            (
+                (200, 160),
+                PlotBounds::new(600_000.0, -1.0, 2_400_000.0, 1.0),
+                line(&b, Hsla::red(), 2.5),
+            ),
+        ];
+        let theme = &crate::theme::DARK;
+        let read = |gpu: &PlotGpu, t: &RenderTarget| {
+            t.staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+            let bytes = read_mapped_bytes(&t.staging, t.width, t.height, t.padded_bytes_per_row)
+                .expect("staging buffer mapped");
+            t.staging.unmap();
+            bytes
+        };
+
+        let solo: Vec<Vec<u8>> = plots
+            .iter()
+            .map(|((w, h), view, draw)| {
+                let t = RenderTarget::new(&gpu.ctx.device, *w, *h);
+                assert!(gpu.submit(
+                    &t,
+                    *view,
+                    1.0,
+                    std::slice::from_ref(draw),
+                    None,
+                    &mut None,
+                    theme
+                ));
+                read(&gpu, &t)
+            })
+            .collect();
+
+        let targets: Vec<RenderTarget> = plots
+            .iter()
+            .map(|((w, h), _, _)| RenderTarget::new(&gpu.ctx.device, *w, *h))
+            .collect();
+        for (t, (_, view, draw)) in targets.iter().zip(&plots) {
+            let dest = Dest {
+                width: t.width,
+                height: t.height,
+                msaa_view: &t.msaa_view,
+                resolve_view: &t.resolve_view,
+                readback: Some(t),
+            };
+            assert!(gpu.submit_into(
+                dest,
+                *view,
+                1.0,
+                std::slice::from_ref(draw),
+                None,
+                &mut None,
+                theme
+            ));
+        }
+        gpu.submit_frame();
+        for (i, t) in targets.iter().enumerate() {
+            assert!(solo[i].iter().any(|&b| b != 0), "plot {i} drew nothing");
+            assert!(read(&gpu, t) == solo[i], "plot {i} differs when batched");
+        }
     }
 
     /// A field-only frame must render: the spectrogram submits no traces at
@@ -2705,6 +2924,7 @@ mod tests {
                     )
                 })
                 .expect("frame submitted");
+            cx.update(PlotRenderState::flush);
             if f > 0 {
                 // This frame paints the last render, drawn at `drawn`.
                 let at = state.placement(bounds, 1.0);
@@ -2842,6 +3062,7 @@ mod tests {
                         &mut None,
                         &crate::theme::DARK,
                     ));
+                    gpu.submit_frame();
                     let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
                     drop(frame);
                     surface += t0.elapsed().as_secs_f64();
