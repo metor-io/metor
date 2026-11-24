@@ -198,10 +198,19 @@ impl DashboardPanel {
         }
 
         if let Some(view) = view {
-            container = if zoom == 1.0 {
-                container.child(view.clone())
+            // A live control redraws with its data; cached, the others on
+            // the canvas replay their last frame meanwhile.
+            let view = if super::widgets::widget_spec(&widget.kind, cx).cached {
+                view.clone()
+                    .cached(gpui::StyleRefinement::default().size_full())
+                    .into_any_element()
             } else {
-                container.child(super::zoom::Zoomed::new(zoom, view.clone()))
+                view.clone().into_any_element()
+            };
+            container = if zoom == 1.0 {
+                container.child(view)
+            } else {
+                container.child(super::zoom::Zoomed::new(zoom, view))
             };
         }
 

@@ -64,6 +64,8 @@ pub struct WidgetSpec {
     /// `None` keeps the last persisted blob verbatim.
     pub snapshot: Arc<dyn Fn(&AnyEntity, &str, &App) -> Option<String>>,
     pub tile: Option<TileViewSpec>,
+    /// Draw the widget cached on a dashboard (see [`WidgetSpec::cached`]).
+    pub cached: bool,
 }
 
 /// The three runtime handles a host needs for one registered view.
@@ -94,6 +96,7 @@ impl WidgetSpec {
             build: Arc::new(build),
             snapshot: Arc::new(snapshot),
             tile: None,
+            cached: false,
         }
     }
 
@@ -125,6 +128,15 @@ impl WidgetSpec {
     }
 
     /// Set the smallest usable content size for dashboard resizing.
+    /// Draw this widget cached on a dashboard: gpui replays its last frame
+    /// until it, an entity it read, or a global it read changes. Only for
+    /// widgets whose render reads nothing else that changes: a value read
+    /// straight from the db in render would go stale.
+    pub fn cached(mut self) -> Self {
+        self.cached = true;
+        self
+    }
+
     pub fn with_minimum_size(mut self, size: (f32, f32)) -> Self {
         self.minimum_size = size;
         self
@@ -366,6 +378,7 @@ impl WidgetRegistry {
                 Monitor::from_config,
                 |monitor, _| monitor.to_config(),
             )
+            .cached()
             .with_tile("monitor", |blob| {
                 parse_or_default::<MonitorConfig>(blob).component.into()
             }),
@@ -393,6 +406,7 @@ impl WidgetRegistry {
                 TrafficLight::from_config,
                 |light, _| light.to_config(),
             )
+            .cached()
             .with_tile("traffic_light", |blob| {
                 parse_or_default::<TrafficLightConfig>(blob)
                     .component
@@ -458,6 +472,7 @@ impl WidgetRegistry {
                 |cfg, db, cx| StateChip::from_config(&cfg, db, cx),
                 StateChip::to_config,
             )
+            .cached()
             .with_tile("state_chip", |blob| {
                 let cfg = parse_or_default::<StateChipConfig>(blob);
                 cfg.label.unwrap_or(cfg.component).into()

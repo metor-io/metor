@@ -97,8 +97,8 @@ wmm.path = "libs/wmm"
 # gpui `[patch.crates-io]` entry below, and recheck Zed's own
 # `[patch.crates-io]` block in lockstep.
 # `stacker` keeps the deep-layout stack growth that 0.2.1 always had on.
-gpui = { version = "0.2.2", git = "https://github.com/metor-io/zed", rev = "3a1bed0ee2aa4e67fc85b7be35a05f1e4682bf94", features = ["stacker"] }
-gpui_platform = { git = "https://github.com/metor-io/zed", rev = "3a1bed0ee2aa4e67fc85b7be35a05f1e4682bf94", features = ["font-kit", "wayland", "x11"] }
+gpui = { version = "0.2.2", git = "https://github.com/metor-io/zed", rev = "c9c5a54408cd74d268e5b75e034bf90844168340", features = ["stacker"] }
+gpui_platform = { git = "https://github.com/metor-io/zed", rev = "c9c5a54408cd74d268e5b75e034bf90844168340", features = ["font-kit", "wayland", "x11"] }
 
 [profile.release-with-debug]
 inherits = "release"
@@ -142,7 +142,7 @@ facet-path = { git = "https://github.com/metor-io/facet.git", branch = "sphw/fac
 facet-solver = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
 # The facet fork depends on crates.io `gpui = "*"`; point it at the same Zed
 # rev as the workspace dependency so both resolve to one gpui.
-gpui = { version = "0.2.2", git = "https://github.com/metor-io/zed", rev = "3a1bed0ee2aa4e67fc85b7be35a05f1e4682bf94" }
+gpui = { version = "0.2.2", git = "https://github.com/metor-io/zed", rev = "c9c5a54408cd74d268e5b75e034bf90844168340" }
 # Copied from Zed's root `[patch.crates-io]`: Zed's patches don't reach
 # dependents, and gpui's scheduler relies on the async-task fork's API.
 async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }

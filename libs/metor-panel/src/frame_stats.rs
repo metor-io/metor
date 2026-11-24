@@ -12,6 +12,8 @@ pub(crate) static DRAWS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PLOT_RENDERS: AtomicU64 = AtomicU64::new(0);
 /// Render requests skipped because nothing they draw from changed.
 pub(crate) static PLOT_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// Dashboard controls rendered (state chips, monitors, lights, value strips).
+pub(crate) static WIDGET_RENDERS: AtomicU64 = AtomicU64::new(0);
 /// Frames submitted to the GPU (one per flush with work).
 pub(crate) static SUBMITS: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +51,7 @@ pub(crate) fn start() {
                         plot_renders = format!("{:.1}", rate(&PLOT_RENDERS)),
                         plot_skips = format!("{:.1}", rate(&PLOT_SKIPS)),
                         submits = format!("{:.1}", rate(&SUBMITS)),
+                        widget_renders = format!("{:.1}", rate(&WIDGET_RENDERS)),
                         "frame stats (per second)"
                     );
                 }

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use gpui::{BorrowAppContext, Bounds, Context, Global, Hsla, Pixels, RenderImage, point, px, size};
+use gpui::{Bounds, Context, Global, Hsla, Pixels, RenderImage, point, px, size};
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, ComponentSchema};
@@ -476,7 +476,7 @@ impl ReadbackHandle {
                 cx.notify();
             });
         };
-        cx.update_global::<PlotGpu, _>(|gpu, _| {
+        PlotGpu::with(cx, |gpu| {
             gpu.pending_waits.push(PendingFrame {
                 handle: self,
                 install: Box::new(install),
@@ -533,9 +533,39 @@ struct PendingFrame {
 /// this only bounds the bookkeeping while a window is being resized).
 const MSAA_SIZES: usize = 32;
 
-impl Global for PlotGpu {}
+/// The shared renderer, built for the first plot drawn.
+///
+/// Set once, then changed only through the cell: a gpui global changed
+/// through `update_global` counts as changed for every cached view that read
+/// it, and the renderer changes with every plot drawn. Not a thread-local
+/// either: its wgpu resources must drop with the app, before wgpu's own
+/// thread-locals are torn down.
+#[derive(Default)]
+struct PlotGpuCell(std::cell::RefCell<Option<PlotGpu>>);
+
+impl Global for PlotGpuCell {}
 
 impl PlotGpu {
+    /// Run `f` on the renderer, if one was built.
+    fn with<R>(cx: &gpui::App, f: impl FnOnce(&mut PlotGpu) -> R) -> Option<R> {
+        let cell = cx.try_global::<PlotGpuCell>()?;
+        cell.0.borrow_mut().as_mut().map(f)
+    }
+
+    /// Run `f` on the renderer, building it first if need be. `None` when
+    /// there's no GPU to build it on.
+    fn with_or_init<R>(cx: &mut gpui::App, f: impl FnOnce(&mut PlotGpu) -> R) -> Option<R> {
+        if !cx.has_global::<PlotGpuCell>() {
+            cx.set_global(PlotGpuCell::default());
+        }
+        let cell = cx.global::<PlotGpuCell>();
+        let mut gpu = cell.0.borrow_mut();
+        if gpu.is_none() {
+            *gpu = PlotGpu::try_new();
+        }
+        gpu.as_mut().map(f)
+    }
+
     fn try_new() -> Option<Self> {
         let ctx = GpuContext::get()?;
         let device = &ctx.device;
@@ -786,19 +816,19 @@ impl PlotGpu {
     /// readback buffers, and start their completion waits. Called from paint,
     /// which runs after every prepaint in the window has recorded its plot.
     pub(crate) fn flush(cx: &mut gpui::App) {
-        let Some(gpu) = cx.try_global::<PlotGpu>() else {
-            return;
-        };
-        if gpu.frame.is_none() && gpu.pending_waits.is_empty() {
-            return;
-        }
-        let (ctx, waits) = cx.update_global::<PlotGpu, _>(|gpu, _| {
+        let work = PlotGpu::with(cx, |gpu| {
+            if gpu.frame.is_none() && gpu.pending_waits.is_empty() {
+                return None;
+            }
             gpu.submit_frame();
             for staging in gpu.pending_maps.drain(..) {
                 staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             }
-            (gpu.ctx.clone(), std::mem::take(&mut gpu.pending_waits))
+            Some((gpu.ctx.clone(), std::mem::take(&mut gpu.pending_waits)))
         });
+        let Some((ctx, waits)) = work.flatten() else {
+            return;
+        };
         if waits.is_empty() {
             return;
         }
@@ -1321,11 +1351,7 @@ impl PlotRenderState {
             return None;
         }
 
-        if !cx.has_global::<PlotGpu>() {
-            let gpu = PlotGpu::try_new()?;
-            cx.set_global(gpu);
-        }
-        cx.update_global::<PlotGpu, _>(|gpu, _| {
+        PlotGpu::with_or_init(cx, |gpu| {
             if self
                 .target
                 .as_ref()
@@ -1406,6 +1432,7 @@ impl PlotRenderState {
                 view: placement,
             })
         })
+        .flatten()
     }
 
     /// Install a newly-read frame and park the previous one for release.
