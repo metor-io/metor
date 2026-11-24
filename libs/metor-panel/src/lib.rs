@@ -29,6 +29,7 @@ pub(crate) mod drag_chip;
 pub(crate) mod drag_relay;
 pub mod dynamic;
 pub mod eviction;
+pub(crate) mod frame_stats;
 pub mod gpu_context;
 pub mod hydration;
 pub mod icons;

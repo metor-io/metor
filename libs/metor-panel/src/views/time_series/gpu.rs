@@ -476,6 +476,11 @@ impl ReadbackHandle {
                 .spawn(async move { self.finish() })
                 .await;
             let Some(img) = image else {
+                // Nothing to show for that render: let the next request redo it.
+                let _ = this.update(cx, |t, cx| {
+                    access(t).drawn = None;
+                    cx.notify();
+                });
                 return;
             };
             let _ = this.update(cx, |t, cx| {
@@ -765,6 +770,7 @@ impl PlotGpu {
         let Some(encoder) = self.frame.take() else {
             return;
         };
+        crate::frame_stats::bump(&crate::frame_stats::SUBMITS);
         self.belt.finish();
         self.ctx.queue.submit(Some(encoder.finish()));
         self.belt.recall();
@@ -812,6 +818,7 @@ impl PlotGpu {
                     label: Some("plot frame"),
                 })
         });
+        crate::frame_stats::bump(&crate::frame_stats::PLOT_RENDERS);
         let drew = self.record(
             &mut encoder,
             target,
@@ -1022,6 +1029,133 @@ impl PlotGpu {
     }
 }
 
+/// A fast word-wise hash (FxHash's mix) for frame fingerprints: a field
+/// grid can run to hundreds of thousands of floats, too many for SipHash
+/// every frame.
+#[derive(Default)]
+struct FrameHasher(u64);
+
+impl std::hash::Hasher for FrameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.write_u64(u64::from_le_bytes(*w));
+        }
+        for &b in rest {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl AxisSource<'_> {
+    /// Feed what this axis reads into a frame fingerprint: its kind, its
+    /// component and that component's data generation, and any sample it
+    /// was handed, so new data changes the fingerprint and nothing else does.
+    fn fingerprint(&self, h: &mut FrameHasher) {
+        use std::hash::Hasher;
+        let component = |h: &mut FrameHasher, c: &Component| {
+            h.write_u64(c.component_id.0);
+            h.write_u64(c.time_series.generation());
+        };
+        match self {
+            AxisSource::Timestamps => h.write_u64(0),
+            AxisSource::Element {
+                component: c,
+                element_index,
+            } => {
+                h.write_u64(1);
+                component(h, c);
+                h.write_u64(*element_index as u64);
+            }
+            AxisSource::LatestSampleIndex { len } => {
+                h.write_u64(2);
+                h.write_u64(*len as u64);
+            }
+            AxisSource::LatestSampleElements {
+                component: c,
+                sample,
+                len,
+            } => {
+                h.write_u64(3);
+                component(h, c);
+                h.write_u64(*len as u64);
+                h.write(sample);
+            }
+            AxisSource::MinMax {
+                component: c,
+                element_index,
+            } => {
+                h.write_u64(4);
+                component(h, c);
+                h.write_u64(*element_index as u64);
+            }
+        }
+    }
+}
+
+/// Everything a frame's pixels depend on, hashed: target size, view, theme,
+/// each trace's sources (with their data generations) and styling, and the
+/// field. Equal fingerprints draw identical frames, so the render is skipped.
+fn frame_fingerprint(
+    size: (u32, u32),
+    scale: f32,
+    view: PlotBounds,
+    traces: &[LineDraw<'_>],
+    field: Option<&IntensityDraw<'_>>,
+    theme: &Arc<Theme>,
+) -> u64 {
+    use std::hash::Hasher;
+    let mut h = FrameHasher::default();
+    h.write_u64(u64::from(size.0) << 32 | u64::from(size.1));
+    h.write_u64(u64::from(scale.to_bits()));
+    let (a, b, c, d) = view.bits();
+    for w in [a, b, c, d] {
+        h.write_u64(w);
+    }
+    h.write_u64(Arc::as_ptr(theme) as usize as u64);
+    let hsla = |h: &mut FrameHasher, c: Hsla| {
+        for f in [c.h, c.s, c.l, c.a] {
+            h.write_u64(u64::from(f.to_bits()));
+        }
+    };
+    for t in traces {
+        t.x.fingerprint(&mut h);
+        t.y.fingerprint(&mut h);
+        h.write_u64(t.y_min.to_bits());
+        h.write_u64(t.y_max.to_bits());
+        h.write_u64(t.style as u64);
+        hsla(&mut h, t.color);
+        h.write_u64(u64::from(t.stroke_width.to_bits()));
+        match t.x_clip {
+            Some((lo, hi)) => [1, lo.to_bits(), hi.to_bits()].map(|w| h.write_u64(w)),
+            None => [0; 3].map(|w| h.write_u64(w)),
+        };
+        match t.time_clip {
+            Some((lo, hi)) => [1, lo as u64, hi as u64].map(|w| h.write_u64(w)),
+            None => [0; 3].map(|w| h.write_u64(w)),
+        };
+    }
+    if let Some(f) = field {
+        h.write(bytemuck::cast_slice(f.grid));
+        h.write_u64(u64::from(f.cols) << 32 | u64::from(f.rows));
+        for v in [f.lo, f.hi, f.gain, f.row_view.0, f.row_view.1] {
+            h.write_u64(u64::from(v.to_bits()));
+        }
+        h.write_u64(f.scale as u64);
+        h.write_u64(f.colormap as u64);
+        hsla(&mut h, f.trace_color);
+    }
+    h.finish()
+}
+
 /// The attachments one frame draws into.
 struct Dest<'a> {
     width: u32,
@@ -1047,6 +1181,14 @@ pub(crate) struct PlotRenderState {
     in_flight: Arc<AtomicBool>,
     degraded: bool,
     generation: u64,
+    /// Fingerprint of the last frame submitted (or found empty): a render
+    /// request with the same one would redraw identical pixels, so it is
+    /// skipped. This is what keeps a frame landing — which notifies its
+    /// plot so the new image paints — from starting another render.
+    drawn: Option<u64>,
+    /// A render was wanted but couldn't start (every surface still on
+    /// screen); the canvas asks for another frame to try again.
+    retry: bool,
     /// Intensity-field texture and colormap, allocated on the first frame
     /// that draws one. Per caller, like `target`, since the field is sized to
     /// that caller's grid.
@@ -1068,6 +1210,8 @@ impl Default for PlotRenderState {
             in_flight: Arc::new(AtomicBool::new(false)),
             degraded: false,
             generation: 0,
+            drawn: None,
+            retry: false,
             heatmap: None,
             #[cfg(test)]
             painted: None,
@@ -1130,12 +1274,20 @@ impl PlotRenderState {
         if self.in_flight.load(Ordering::Acquire) {
             return None;
         }
+        self.retry = false;
         let scale = scale_factor.max(1.0);
         let width = ((f32::from(bounds.size.width) * scale).round() as u32).max(1);
         let height = ((f32::from(bounds.size.height) * scale).round() as u32).max(1);
         if traces.is_empty() && field.is_none() {
             self.degraded = false;
             self.clear_frame();
+            self.drawn = None;
+            return None;
+        }
+        let theme = crate::theme::theme(cx);
+        let fingerprint = frame_fingerprint((width, height), scale, view, traces, field, &theme);
+        if self.drawn == Some(fingerprint) {
+            crate::frame_stats::bump(&crate::frame_stats::PLOT_SKIPS);
             return None;
         }
 
@@ -1143,7 +1295,6 @@ impl PlotRenderState {
             let gpu = PlotGpu::try_new()?;
             cx.set_global(gpu);
         }
-        let theme = crate::theme::theme(cx);
         cx.update_global::<PlotGpu, _>(|gpu, _| {
             if self
                 .target
@@ -1169,9 +1320,12 @@ impl PlotRenderState {
                 ),
                 #[cfg(target_os = "macos")]
                 Target::Surface(target) => {
-                    // Every buffer still on screen or queued in gpui: skip
-                    // this frame, as when a readback is in flight.
-                    let (resolve_view, surface) = target.pool.acquire(&device)?;
+                    // Every buffer still on screen or queued in gpui: try
+                    // again next frame.
+                    let Some((resolve_view, surface)) = target.pool.acquire(&device) else {
+                        self.retry = true;
+                        return None;
+                    };
                     (
                         Dest {
                             width,
@@ -1195,6 +1349,7 @@ impl PlotRenderState {
                 theme.as_ref(),
             );
             self.heatmap = heatmap;
+            self.drawn = Some(fingerprint);
             if !drew {
                 self.clear_frame();
                 return None;
@@ -1231,6 +1386,11 @@ impl PlotRenderState {
         if let Some(PlotFrame::Image(old)) = self.current_frame.take() {
             self.pending_release = Some(old);
         }
+    }
+
+    /// A render couldn't start this frame and should be retried next one.
+    pub(crate) fn wants_retry(&self) -> bool {
+        self.retry
     }
 
     /// Submit every plot recorded this frame; see [`PlotGpu::flush`].

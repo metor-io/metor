@@ -613,6 +613,8 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::frame_stats::start();
+        crate::frame_stats::bump(&crate::frame_stats::DRAWS);
         if let Some(picker) = &self.connection_picker
             && picker.read(cx).dismissed
         {

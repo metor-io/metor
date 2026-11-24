@@ -43,6 +43,9 @@ pub struct TileViewSpec {
     /// for a view whose content runs on beneath it; `None` keeps the view
     /// below the header.
     pub under_header: Option<Arc<dyn Fn(&AnyEntity, gpui::Pixels, &mut App)>>,
+    /// Render the pane's view cached: gpui reuses its last layout and paint
+    /// until the view, or an entity it read while rendering, notifies.
+    pub cached: bool,
 }
 
 /// Everything the dashboard needs to create and label one [`WidgetKind`].
@@ -152,6 +155,7 @@ impl WidgetSpec {
             serialization_key: serialization_key.into(),
             tab_title: Arc::new(move |_state, config, _cx| tab_title(config)),
             under_header: None,
+            cached: false,
         });
         self
     }
@@ -171,6 +175,16 @@ impl WidgetSpec {
                 view.update(cx, |view, cx| inset(view, height, cx));
             }
         }));
+        self
+    }
+
+    /// Cache this view's pane (see [`TileViewSpec::cached`]). Only for views
+    /// whose render reads nothing that changes without a notify: a value
+    /// read straight from a global or the db in render would go stale.
+    pub fn cached_tile(mut self) -> Self {
+        if let Some(tile) = &mut self.tile {
+            tile.cached = true;
+        }
         self
     }
 
@@ -243,6 +257,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &TimeSeriesPlot| plot.line_plot().clone().into_any())
             .with_tile("time_series_plot", |_| "Plot".into())
+            .cached_tile()
             .with_live_tile_title(TimeSeriesPlot::title)
             .with_tile_under_header(TimeSeriesPlot::set_header_inset),
         );
@@ -256,6 +271,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &XyPlot| plot.line_plot().clone().into_any())
             .with_tile("xy_plot", |_| "XY Plot".into())
+            .cached_tile()
             .with_live_tile_title(XyPlot::title),
         );
         self.register(
@@ -268,6 +284,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &ListPlot| plot.line_plot().clone().into_any())
             .with_tile("list_plot", |_| "List Plot".into())
+            .cached_tile()
             .with_live_tile_title(ListPlot::title),
         );
         self.register(
@@ -280,6 +297,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &Spectrogram| plot.plot().clone().into_any())
             .with_tile("spectrogram", |_| "Spectrogram".into())
+            .cached_tile()
             .with_live_tile_title(Spectrogram::title),
         );
         self.register(

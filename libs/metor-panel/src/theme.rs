@@ -456,6 +456,9 @@ pub fn theme(cx: &App) -> Arc<Theme> {
 /// Swap the active theme. Triggers global observers so every view repaints.
 pub fn set_theme(cx: &mut App, theme: Arc<Theme>) {
     cx.set_global(ActiveTheme(theme));
+    // Views read the theme as a global, which no cached view tracks: redraw
+    // everything once, bypassing the caches.
+    cx.refresh_windows();
 }
 
 /// Every theme compiled into the binary, in the order the theme picker

@@ -84,6 +84,10 @@ pub struct TemporalController {
     playback: Option<Playback>,
     resume_live: bool,
     components: Vec<Component>,
+    /// Newest sample across `components` at the last tick.
+    data_head: Option<Timestamp>,
+    /// When readers were last notified; see the end of [`Self::tick`].
+    last_notify: Instant,
     last_bounds: Instant,
     bounds_busy: bool,
     _bounds: gpui::Task<()>,
@@ -99,6 +103,46 @@ impl Global for TemporalRevision {}
 
 #[derive(Default)]
 pub(crate) struct PlotSync(pub u64);
+
+/// Tick spacing when no display reports a refresh rate.
+const FALLBACK_FRAME: Duration = Duration::from_micros(16_667);
+/// Longest the controller sleeps with no new data: it still rescans history
+/// bounds and ages live freshness.
+const IDLE_TICK: Duration = Duration::from_millis(250);
+/// How long after the data head last moved the controller keeps looking
+/// every frame before it goes back to sleeping on commits.
+const STREAM_GRACE: Duration = Duration::from_secs(1);
+
+/// Resolves when any of `series` commits new data.
+async fn any_commit(series: Vec<metor_db::time_series::TimeSeries>) {
+    use std::future::Future;
+    use std::pin::Pin;
+    let mut waits: Vec<Pin<Box<dyn Future<Output = ()>>>> = series
+        .into_iter()
+        .map(|ts| Box::pin(async move { ts.wait().await }) as Pin<Box<dyn Future<Output = ()>>>)
+        .collect();
+    if waits.is_empty() {
+        return std::future::pending().await;
+    }
+    std::future::poll_fn(|cx| {
+        if waits.iter_mut().any(|w| w.as_mut().poll(cx).is_ready()) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// One frame of the fastest attached display, so time advances at the
+/// highest rate any window can show.
+fn frame_interval(cx: &App) -> Duration {
+    cx.displays()
+        .iter()
+        .filter_map(|d| d.refresh_interval())
+        .min()
+        .unwrap_or(FALLBACK_FRAME)
+}
 impl Global for PlotSync {}
 
 impl TemporalController {
@@ -108,15 +152,45 @@ impl TemporalController {
         }
         let controller = cx.new(|cx: &mut Context<Self>| {
             let tick = cx.spawn(async move |this, cx| {
+                let mut last_tick = Instant::now();
+                let mut last_head = None;
+                let mut last_activity = Instant::now();
                 loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(33))
-                        .await;
-                    if this
-                        .update(cx, |this, cx| this.tick(Instant::now(), cx))
-                        .is_err()
-                    {
+                    // Never tick faster than the fastest display can show.
+                    let frame = cx.update(|cx| frame_interval(cx));
+                    let since = last_tick.elapsed();
+                    if since < frame {
+                        cx.background_executor().timer(frame - since).await;
+                    }
+                    let Ok((continuous, series)) = this.update(cx, |this, _| {
+                        let series: Vec<_> = this
+                            .components
+                            .iter()
+                            .map(|c| c.time_series.clone())
+                            .collect();
+                        (this.advances_without_data(), series)
+                    }) else {
                         break;
+                    };
+                    // While data streams, look every frame: a committed sample
+                    // can land a moment after the db first hears of it. Once it
+                    // has been quiet a while, sleep until a series commits.
+                    if !continuous && last_activity.elapsed() >= STREAM_GRACE {
+                        futures_lite::future::race(any_commit(series), async {
+                            cx.background_executor().timer(IDLE_TICK).await;
+                        })
+                        .await;
+                    }
+                    last_tick = Instant::now();
+                    let Ok(head) = this.update(cx, |this, cx| {
+                        this.tick(Instant::now(), cx);
+                        this.data_head
+                    }) else {
+                        break;
+                    };
+                    if head != last_head {
+                        last_head = head;
+                        last_activity = Instant::now();
                     }
                 }
             });
@@ -140,6 +214,8 @@ impl TemporalController {
                 published: None,
                 resume_live: false,
                 components: vec![],
+                data_head: None,
+                last_notify: Instant::now(),
                 last_bounds: Instant::now() - Duration::from_secs(1),
                 bounds_busy: false,
                 _bounds: gpui::Task::ready(()),
@@ -149,6 +225,12 @@ impl TemporalController {
         cx.set_global(TemporalGlobal(controller.clone()));
         controller.update(cx, |this, cx| this.tick(Instant::now(), cx));
         controller
+    }
+
+    /// Playback and a wall-clock live view move every frame on their own;
+    /// everything else only moves when data arrives.
+    fn advances_without_data(&self) -> bool {
+        self.playback.is_some() || (self.config.wall_clock && self.snapshot.live)
     }
 
     fn tick(&mut self, now: Instant, cx: &mut Context<Self>) {
@@ -209,6 +291,7 @@ impl TemporalController {
             .iter()
             .filter_map(|c| c.time_series.latest().map(|s| s.timestamp()))
             .max();
+        self.data_head = data_head;
         // Historical discovery is throttled; the data-end anchor follows the
         // resident head on every tick, including when a scan returns older bounds.
         if let (Some(extent), Some(head)) = (&mut self.snapshot.context.extent, data_head) {
@@ -253,11 +336,18 @@ impl TemporalController {
             let revision = cx
                 .try_global::<TemporalRevision>()
                 .map_or(1, |r| r.0.wrapping_add(1));
+            // Views that show time observe this revision; a full window
+            // refresh would also re-lay-out every cached pane that doesn't.
             cx.set_global(TemporalRevision(revision));
-            cx.refresh_windows();
+            self.last_notify = now;
+            cx.notify();
+        } else if now.saturating_duration_since(self.last_notify) >= IDLE_TICK {
+            // Readers still age live freshness when the source clock has
+            // stopped. Every notify re-renders whatever read the controller,
+            // so an unchanged snapshot only does it this often.
+            self.last_notify = now;
+            cx.notify();
         }
-        // Readers still age live freshness when the source clock has stopped.
-        cx.notify();
     }
 
     pub fn apply(&mut self, action: TimeAction, cx: &mut Context<Self>) -> Result<(), String> {

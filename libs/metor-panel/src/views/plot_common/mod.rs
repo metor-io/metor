@@ -262,7 +262,9 @@ pub(crate) fn link_traces<T: 'static, P: 'static>(
 /// The canvas that shows a plot entity's GPU frame.
 ///
 /// Prepaint runs `submit` to start a render for the current bounds (it
-/// returns the readback when one was issued), releases the image the last
+/// returns the readback when one was issued; a request whose inputs match
+/// the last frame is skipped, so prepaint only renders when something
+/// changed), releases the image the last
 /// frame replaced back to the atlas, and paints the newest completed frame.
 /// That frame was drawn at an earlier view — readback is asynchronous — so
 /// it is placed under the current one ([`PlotRenderState::placement`]) and
@@ -307,7 +309,7 @@ pub(crate) fn gpu_frame_over<T: 'static>(
                 .filter(|area| area.contains(&own.center()))
                 .unwrap_or(own);
             let scale_factor = window.scale_factor();
-            let (frame, released) = entity
+            let (frame, released, retry) = entity
                 .update(cx, |plot, cx| {
                     if let Some(handle) = submit(plot, bounds, own, scale_factor, cx) {
                         handle.spawn_and_set(cx, gpu_state);
@@ -316,11 +318,17 @@ pub(crate) fn gpu_frame_over<T: 'static>(
                     let frame = state
                         .current_frame()
                         .map(|img| (img, state.placement(bounds, scale_factor)));
-                    (frame, state.take_pending_release())
+                    (frame, state.take_pending_release(), state.wants_retry())
                 })
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, false));
             if let Some(img) = released {
                 crate::atlas::release_image(window, cx, img);
+            }
+            if retry {
+                let entity = entity.clone();
+                window.on_next_frame(move |_, cx| {
+                    let _ = entity.update(cx, |_, cx| cx.notify());
+                });
             }
             (bounds, frame)
         },

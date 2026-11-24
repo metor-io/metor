@@ -65,6 +65,10 @@ pub struct TimeSeries {
     /// The head the peer's last complete listing reported, kept to be cut
     /// again when a mirror run starts. Changed under `structural`.
     peer_head: Arc<Mutex<Option<UnsealedHead>>>,
+    /// Bumped whenever the readable data changes (a write, nodes linked in
+    /// or out), so readers can tell cheaply whether anything they drew from
+    /// has moved. See [`TimeSeries::generation`].
+    generation: Arc<AtomicU64>,
 }
 
 /// One mirror connection's lifetime.
@@ -536,6 +540,7 @@ impl TimeSeries {
             roll_pending: Arc::new(AtomicBool::new(false)),
             run_start: Arc::new(AtomicI64::new(i64::MIN)),
             peer_head: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -572,6 +577,7 @@ impl TimeSeries {
             roll_pending: Arc::new(AtomicBool::new(false)),
             run_start: Arc::new(AtomicI64::new(i64::MIN)),
             peer_head: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1371,6 +1377,7 @@ impl TimeSeries {
             }
         };
         if self.list.replace(replaced, nodes, |a, b| key(a) > key(b)) {
+            self.bump_generation();
             Ok(())
         } else {
             Err(
@@ -2077,6 +2084,16 @@ impl TimeSeries {
         let _ = self.data_waker.wait().await;
     }
 
+    /// A counter that changes whenever the readable data does. Equal values
+    /// mean nothing was written, linked in or unlinked in between.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub fn waiter(&self) -> Arc<WaitQueue> {
         self.data_waker.clone()
     }
@@ -2145,6 +2162,7 @@ impl TimerSeriesWriter {
             self.time_series.lifecycle_waker.wake();
         }
         if pushed {
+            self.time_series.bump_generation();
             self.time_series.data_waker.wake_all();
         }
         result
