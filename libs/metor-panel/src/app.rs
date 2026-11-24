@@ -659,7 +659,11 @@ impl Render for AppRoot {
             self.open_inspector_with(request.rows, request.mode, window, cx);
         }
 
-        if let Some(request) = pending_edits_mut(cx).pending_request.take() {
+        // Look before taking: a mutable access counts as a change to the
+        // global, which redraws every cached view that reads it.
+        if pending_edits(cx).pending_request.is_some()
+            && let Some(request) = pending_edits_mut(cx).pending_request.take()
+        {
             let mode = request
                 .anchor
                 .map(InspectorMode::Anchored)

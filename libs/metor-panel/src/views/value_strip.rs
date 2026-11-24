@@ -343,28 +343,38 @@ impl ComponentValueStrip {
                 })
             },
             |this, update, cx| {
-                match update {
+                // Samples arrive whether or not the value moved; only a
+                // change redraws, so a strip whose component repeats itself
+                // stays cached.
+                let changed = match update {
                     StreamUpdate::Ready(metadata) => {
                         this.kind = metadata.kind;
                         this.component_name = metadata.component_name;
                         this.element_names = metadata.element_names;
                         this.formatter = metadata.formatter;
                         this.gradient = metadata.gradient;
+                        true
                     }
                     StreamUpdate::Value((cells, raw_values)) => {
+                        let changed =
+                            this.stale || this.cells != cells || this.raw_values != raw_values;
                         this.cells = cells;
                         this.raw_values = raw_values;
                         this.stale = false;
+                        changed
                     }
-                    StreamUpdate::Stale => this.stale = true,
+                    StreamUpdate::Stale => !std::mem::replace(&mut this.stale, true),
                     StreamUpdate::Unavailable => {
                         this.cells.clear();
                         this.raw_values.clear();
                         this.editing = None;
                         this.stale = false;
+                        true
                     }
+                };
+                if changed {
+                    cx.notify();
                 }
-                cx.notify();
             },
         );
 
@@ -627,6 +637,7 @@ fn parse_numeric(text: &str, prim_type: Option<PrimType>) -> Option<ElementValue
 
 impl Render for ComponentValueStrip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::frame_stats::bump(&crate::frame_stats::WIDGET_RENDERS);
         let theme = theme(cx);
 
         // Pending edits shadow WAL samples so typed changes stay visible

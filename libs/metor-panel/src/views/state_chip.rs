@@ -25,7 +25,7 @@ use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use super::binding::{self, CodeFeed};
-use super::monitor::{behavior_snapshot, edit_click};
+use super::monitor::{apply_click, behavior_with, edit_click};
 use super::switch::Switch;
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
 
@@ -128,6 +128,9 @@ pub struct StateChip {
     strip: Entity<ComponentValueStrip>,
     #[facet(opaque)]
     click: StripClick,
+    /// Kept, like `click`, so the behavior installed each render is the same.
+    #[facet(opaque)]
+    apply: StripClick,
     /// The toggle's own read of the bound value; only streams while the
     /// chip is drawn as a toggle.
     #[facet(opaque)]
@@ -147,7 +150,8 @@ impl StateChip {
         let name = binding::component_name(&db, component_id)
             .unwrap_or_else(|| SharedString::from(text.clone()));
         let click = edit_click(db.clone(), component_id, name);
-        let strip = new_strip(db.clone(), component_id, click.clone(), cx);
+        let apply = apply_click(db.clone(), component_id);
+        let strip = new_strip(db.clone(), component_id, click.clone(), apply.clone(), cx);
 
         Self {
             source,
@@ -173,6 +177,7 @@ impl StateChip {
             db,
             strip,
             click,
+            apply,
             feed: CodeFeed::default(),
         }
     }
@@ -222,7 +227,14 @@ impl StateChip {
             self.saved_component = name;
         }
         self.click = edit_click(self.db.clone(), component_id, self.saved_component.clone());
-        self.strip = new_strip(self.db.clone(), component_id, self.click.clone(), cx);
+        self.apply = apply_click(self.db.clone(), component_id);
+        self.strip = new_strip(
+            self.db.clone(),
+            component_id,
+            self.click.clone(),
+            self.apply.clone(),
+            cx,
+        );
         self.feed = CodeFeed::default();
     }
 
@@ -436,9 +448,10 @@ fn new_strip(
     db: Arc<DB>,
     component_id: ComponentId,
     click: StripClick,
+    apply: StripClick,
     cx: &mut Context<StateChip>,
 ) -> Entity<ComponentValueStrip> {
-    let behavior = behavior_snapshot(cx, db.clone(), component_id, click);
+    let behavior = behavior_with(cx, component_id, click, apply);
     cx.new(|cx| {
         ComponentValueStrip::new(db.clone(), component_id, StripStyle::boxes(), behavior, cx)
     })
@@ -446,6 +459,7 @@ fn new_strip(
 
 impl Render for StateChip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::frame_stats::bump(&crate::frame_stats::WIDGET_RENDERS);
         self.rebind(cx);
         self.refresh_feed(cx);
         let body = match self.style {
@@ -466,7 +480,7 @@ impl Render for StateChip {
 impl StateChip {
     fn render_chip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let style = self.style(cx);
-        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
+        let behavior = behavior_with(cx, self.source.id(), self.click.clone(), self.apply.clone());
         self.strip.update(cx, |strip, cx| {
             strip.set_style(style, cx);
             strip.set_behavior(behavior, cx);
