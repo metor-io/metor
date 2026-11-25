@@ -43,6 +43,9 @@ pub struct TileViewSpec {
     /// for a view whose content runs on beneath it; `None` keeps the view
     /// below the header.
     pub under_header: Option<Arc<dyn Fn(&AnyEntity, gpui::Pixels, &mut App)>>,
+    /// Render the pane's view cached: gpui reuses its last layout and paint
+    /// until the view, or an entity it read while rendering, notifies.
+    pub cached: bool,
 }
 
 /// Everything the dashboard needs to create and label one [`WidgetKind`].
@@ -61,6 +64,8 @@ pub struct WidgetSpec {
     /// `None` keeps the last persisted blob verbatim.
     pub snapshot: Arc<dyn Fn(&AnyEntity, &str, &App) -> Option<String>>,
     pub tile: Option<TileViewSpec>,
+    /// Draw the widget cached on a dashboard (see [`WidgetSpec::cached`]).
+    pub cached: bool,
 }
 
 /// The three runtime handles a host needs for one registered view.
@@ -91,6 +96,7 @@ impl WidgetSpec {
             build: Arc::new(build),
             snapshot: Arc::new(snapshot),
             tile: None,
+            cached: false,
         }
     }
 
@@ -122,6 +128,15 @@ impl WidgetSpec {
     }
 
     /// Set the smallest usable content size for dashboard resizing.
+    /// Draw this widget cached on a dashboard: gpui replays its last frame
+    /// until it, an entity it read, or a global it read changes. Only for
+    /// widgets whose render reads nothing else that changes: a value read
+    /// straight from the db in render would go stale.
+    pub fn cached(mut self) -> Self {
+        self.cached = true;
+        self
+    }
+
     pub fn with_minimum_size(mut self, size: (f32, f32)) -> Self {
         self.minimum_size = size;
         self
@@ -152,6 +167,7 @@ impl WidgetSpec {
             serialization_key: serialization_key.into(),
             tab_title: Arc::new(move |_state, config, _cx| tab_title(config)),
             under_header: None,
+            cached: false,
         });
         self
     }
@@ -171,6 +187,16 @@ impl WidgetSpec {
                 view.update(cx, |view, cx| inset(view, height, cx));
             }
         }));
+        self
+    }
+
+    /// Cache this view's pane (see [`TileViewSpec::cached`]). Only for views
+    /// whose render reads nothing that changes without a notify: a value
+    /// read straight from a global or the db in render would go stale.
+    pub fn cached_tile(mut self) -> Self {
+        if let Some(tile) = &mut self.tile {
+            tile.cached = true;
+        }
         self
     }
 
@@ -243,6 +269,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &TimeSeriesPlot| plot.line_plot().clone().into_any())
             .with_tile("time_series_plot", |_| "Plot".into())
+            .cached_tile()
             .with_live_tile_title(TimeSeriesPlot::title)
             .with_tile_under_header(TimeSeriesPlot::set_header_inset),
         );
@@ -256,6 +283,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &XyPlot| plot.line_plot().clone().into_any())
             .with_tile("xy_plot", |_| "XY Plot".into())
+            .cached_tile()
             .with_live_tile_title(XyPlot::title),
         );
         self.register(
@@ -268,6 +296,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &ListPlot| plot.line_plot().clone().into_any())
             .with_tile("list_plot", |_| "List Plot".into())
+            .cached_tile()
             .with_live_tile_title(ListPlot::title),
         );
         self.register(
@@ -280,6 +309,7 @@ impl WidgetRegistry {
             )
             .inspecting(|plot: &Spectrogram| plot.plot().clone().into_any())
             .with_tile("spectrogram", |_| "Spectrogram".into())
+            .cached_tile()
             .with_live_tile_title(Spectrogram::title),
         );
         self.register(
@@ -348,6 +378,7 @@ impl WidgetRegistry {
                 Monitor::from_config,
                 |monitor, _| monitor.to_config(),
             )
+            .cached()
             .with_tile("monitor", |blob| {
                 parse_or_default::<MonitorConfig>(blob).component.into()
             }),
@@ -375,6 +406,7 @@ impl WidgetRegistry {
                 TrafficLight::from_config,
                 |light, _| light.to_config(),
             )
+            .cached()
             .with_tile("traffic_light", |blob| {
                 parse_or_default::<TrafficLightConfig>(blob)
                     .component
@@ -440,6 +472,7 @@ impl WidgetRegistry {
                 |cfg, db, cx| StateChip::from_config(&cfg, db, cx),
                 StateChip::to_config,
             )
+            .cached()
             .with_tile("state_chip", |blob| {
                 let cfg = parse_or_default::<StateChipConfig>(blob);
                 cfg.label.unwrap_or(cfg.component).into()

@@ -3,38 +3,57 @@
 //! full-height rules (gridlines, zero lines, limits, cursors) clipped to the
 //! plot area.
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Window, point};
+use gpui::{Bounds, Corners, Hsla, PathBuilder, Pixels, Window, point};
 
-/// Fill the Y-label column left of `pa` and the X-label strip below it.
+/// Fill the Y-label column left of `pa` and the X-label strip below it,
+/// frosting the data that runs on beneath them.
+///
+/// `legend_height` is the legend laid out below `outer`, if any. Its blur is
+/// painted here with the gutters' (its own element paints only the tint), so
+/// all three blur one backdrop: a blur reaches 3σ past its edge, and one
+/// painted after a neighbour's tint would blur that tint in, leaving a
+/// darker band along the seam.
 ///
 /// The fills also mask sub-pixel bleed from the GPU frame into the chrome.
+/// No interior gridlines: over a filled image they read as artefacts of the
+/// data rather than as chrome.
 pub(crate) fn paint_axis_backdrop(
     outer: Bounds<Pixels>,
     pa: Bounds<Pixels>,
+    legend_height: Option<Pixels>,
     window: &mut Window,
     cx: &gpui::App,
 ) {
     let axis_bg = crate::theme::theme(cx).plot_chrome_bg();
-    window.paint_quad(gpui::fill(
-        Bounds {
-            origin: outer.origin,
-            size: gpui::Size {
-                width: pa.origin.x - outer.origin.x,
-                height: outer.size.height,
-            },
+    let y_column = Bounds {
+        origin: outer.origin,
+        size: gpui::Size {
+            width: pa.origin.x - outer.origin.x,
+            height: outer.size.height,
         },
-        axis_bg,
-    ));
-    window.paint_quad(gpui::fill(
-        Bounds {
-            origin: point(pa.origin.x, pa.origin.y + pa.size.height),
-            size: gpui::Size {
-                width: pa.size.width,
-                height: outer.origin.y + outer.size.height - pa.origin.y - pa.size.height,
-            },
+    };
+    let x_strip = Bounds {
+        origin: point(pa.origin.x, pa.origin.y + pa.size.height),
+        size: gpui::Size {
+            width: pa.size.width,
+            height: outer.origin.y + outer.size.height - pa.origin.y - pa.size.height,
         },
-        axis_bg,
-    ));
+    };
+    let legend = legend_height.map(|height| Bounds {
+        origin: point(outer.origin.x, outer.origin.y + outer.size.height),
+        size: gpui::Size {
+            width: outer.size.width,
+            height,
+        },
+    });
+    // Every blur before any tint, so no blur samples a neighbour's tint.
+    let blurred = [Some(y_column), Some(x_strip), legend];
+    for region in blurred.iter().flatten() {
+        window.paint_backdrop_blur(*region, Corners::default(), crate::theme::CHROME_BLUR);
+    }
+    for gutter in [y_column, x_strip] {
+        window.paint_quad(gpui::fill(gutter, axis_bg));
+    }
 }
 
 /// The L-shaped axis rule down the left edge of `pa` and along its bottom.

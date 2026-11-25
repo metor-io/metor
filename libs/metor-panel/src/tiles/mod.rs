@@ -1,5 +1,6 @@
 pub(crate) mod dock;
 pub(crate) mod drag;
+mod header;
 pub(crate) mod item;
 mod motion;
 pub(crate) mod pane;

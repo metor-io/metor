@@ -613,6 +613,8 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::frame_stats::start();
+        crate::frame_stats::bump(&crate::frame_stats::DRAWS);
         if let Some(picker) = &self.connection_picker
             && picker.read(cx).dismissed
         {
@@ -657,7 +659,11 @@ impl Render for AppRoot {
             self.open_inspector_with(request.rows, request.mode, window, cx);
         }
 
-        if let Some(request) = pending_edits_mut(cx).pending_request.take() {
+        // Look before taking: a mutable access counts as a change to the
+        // global, which redraws every cached view that reads it.
+        if pending_edits(cx).pending_request.is_some()
+            && let Some(request) = pending_edits_mut(cx).pending_request.take()
+        {
             let mode = request
                 .anchor
                 .map(InspectorMode::Anchored)

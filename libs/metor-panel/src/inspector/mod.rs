@@ -989,12 +989,18 @@ impl Inspector {
                         cx.notify();
                     }))
             })
-            .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
-            .when(!matches!(self.mode, InspectorMode::Inline), |frame| {
-                frame.shadow_sm()
+            // Floating — the palette and context menus — it frosts what it
+            // covers; placed inline in a host's tree, there's nothing under
+            // it worth showing.
+            .map(|frame| match self.mode {
+                InspectorMode::Inline => frame.bg(theme.bg_elevated),
+                InspectorMode::Anchored(_) | InspectorMode::Centered => frame
+                    .bg(theme.surface_bg())
+                    .backdrop_blur(crate::theme::SURFACE_BLUR)
+                    .shadow_sm(),
             })
             .child(bounds_tracker);
 
@@ -1046,7 +1052,8 @@ impl Inspector {
             .w_full()
             .h(px(height))
             .flex_shrink_0()
-            .bg(theme.bg_elevated)
+            .bg(theme.surface_bg())
+            .backdrop_blur(crate::theme::SURFACE_BLUR)
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(4.0))

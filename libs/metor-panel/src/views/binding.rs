@@ -268,8 +268,12 @@ pub(crate) fn stream_scalar<E: ScalarInstrument>(
         at.element,
         cx,
         |view: &mut E, value, cx| {
-            view.scalar().2.value = value;
-            cx.notify();
+            let slot = &mut view.scalar().2.value;
+            // A repeated sample changes nothing: no redraw.
+            if bits(*slot) != bits(value) {
+                *slot = value;
+                cx.notify();
+            }
         },
     );
     let resolver = spawn_meta_resolver(
@@ -498,6 +502,11 @@ where
     )
 }
 
+/// `value` compared by bit pattern, so a repeated NaN counts as unchanged.
+fn bits(value: Option<f64>) -> Option<u64> {
+    value.map(f64::to_bits)
+}
+
 /// Returns `true` if any element of the iterator is "on".
 ///
 /// `Bool` short-circuits to the element value; numeric elements are treated
@@ -567,6 +576,7 @@ fn spawn_code_feed<E: 'static>(
         },
         move |view, update, cx| {
             let feed = feed(view);
+            let before = (feed.is_bool, bits(feed.value), feed.stale);
             match update {
                 StreamUpdate::Ready(is_bool) => feed.is_bool = is_bool,
                 StreamUpdate::Value(value) => {
@@ -579,7 +589,10 @@ fn spawn_code_feed<E: 'static>(
                     feed.stale = false;
                 }
             }
-            cx.notify();
+            // A repeated sample changes nothing: no redraw.
+            if (feed.is_bool, bits(feed.value), feed.stale) != before {
+                cx.notify();
+            }
         },
     )
 }

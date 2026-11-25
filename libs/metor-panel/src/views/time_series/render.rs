@@ -188,7 +188,9 @@ impl TimeSeriesPlot {
         .into_any_element()
     }
 
-    fn render_overlay(&self, _cx: &mut Context<Self>) -> AnyElement {
+    /// `legend_height`: the legend below the plot, which the overlay
+    /// frosts along with the axis gutters.
+    fn render_overlay(&self, legend_height: Option<Pixels>) -> AnyElement {
         let overlay_lp = self.line_plot.clone();
         canvas(
             move |bounds, _window, cx| {
@@ -233,6 +235,7 @@ impl TimeSeriesPlot {
                         &limit_lines,
                         origin,
                         fmt,
+                        legend_height,
                         window,
                         cx,
                     );
@@ -402,6 +405,7 @@ impl Render for TimeSeriesPlot {
         self.sync_event_sources(cx);
         let trace_entities: Vec<Entity<Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
+        let legend_height = show_legend.then(|| self.legend.read(cx).height());
         // Drives the left chrome width: one Y_LABEL_WIDTH column per axis.
         let axis_count = self.line_plot.read(cx).axes.len();
         let chrome_left = ui_px(left_margin(axis_count));
@@ -436,7 +440,7 @@ impl Render for TimeSeriesPlot {
                     .bottom(ui_px(X_LABEL_HEIGHT + PADDING))
                     .child(self.line_plot.clone()),
             )
-            .child(self.render_overlay(cx))
+            .child(self.render_overlay(legend_height))
             .child(self.render_event_flags(cx))
             .child(self.render_cursors(cx))
             .child(self.render_hover(cx));
@@ -479,14 +483,7 @@ impl Render for TimeSeriesPlot {
         root = root.child(inner);
 
         if show_legend {
-            root = root.child(crate::views::plot_common::plot_legend(
-                &trace_entities,
-                self.line_plot.clone(),
-                chrome_left,
-                |trace| (trace.label.clone(), trace.color, trace.visible),
-                |trace| trace.visible = !trace.visible,
-                cx,
-            ));
+            root = root.child(PlotLegend::element(&self.legend, cx));
         }
 
         root

@@ -48,6 +48,8 @@ pub struct Monitor {
     #[facet(opaque)]
     click: StripClick,
     #[facet(opaque)]
+    apply: StripClick,
+    #[facet(opaque)]
     _resolver_task: gpui::Task<()>,
 }
 
@@ -123,11 +125,12 @@ impl Monitor {
         let unit_shared = SharedString::from(unit);
 
         let click = edit_click(db.clone(), component_id, name_shared.clone());
+        let apply = apply_click(db.clone(), component_id);
 
         let style = StripStyle::dashboard().with_unit(unit_shared.clone());
         let behavior = StripBehavior {
             on_element_click: Some(click.clone()),
-            on_apply_element: Some(apply_click(db.clone(), component_id)),
+            on_apply_element: Some(apply.clone()),
             on_element_right_click: None,
             highlighted: SmallVec::new(),
             locked: pending_edits(cx).locked,
@@ -166,6 +169,7 @@ impl Monitor {
             sparkline,
             strip,
             click,
+            apply,
             _resolver_task: resolver_task,
         }
     }
@@ -221,6 +225,24 @@ pub(crate) fn behavior_snapshot(
     component_id: ComponentId,
     on_element_click: StripClick,
 ) -> StripBehavior {
+    behavior_with(
+        cx,
+        component_id,
+        on_element_click,
+        apply_click(db, component_id),
+    )
+}
+
+/// [`behavior_snapshot`] with an apply handler the caller keeps. A view that
+/// installs its behavior every render must pass the same handlers each time:
+/// the strip tells behaviors apart by handler identity, so a fresh one reads
+/// as a change, redraws the strip, and through it the view, every frame.
+pub(crate) fn behavior_with(
+    cx: &gpui::App,
+    component_id: ComponentId,
+    on_element_click: StripClick,
+    on_apply_element: StripClick,
+) -> StripBehavior {
     let pending = pending_edits(cx);
     let highlighted = pending
         .get(component_id)
@@ -228,7 +250,7 @@ pub(crate) fn behavior_snapshot(
         .unwrap_or_default();
     StripBehavior {
         on_element_click: Some(on_element_click),
-        on_apply_element: Some(apply_click(db, component_id)),
+        on_apply_element: Some(on_apply_element),
         on_element_right_click: None,
         highlighted,
         locked: pending.locked,
@@ -245,6 +267,7 @@ pub(crate) fn apply_click(db: Arc<DB>, component_id: ComponentId) -> StripClick 
 
 impl Render for Monitor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::frame_stats::bump(&crate::frame_stats::WIDGET_RENDERS);
         self.source.resolve(&self.db, cx);
         if self.bound != self.source.id() {
             let unit = self.unit.clone();
@@ -261,7 +284,7 @@ impl Render for Monitor {
             .with_unit(self.unit.clone())
             .with_align(self.align)
             .with_value_size((self.value_size > 0.0).then_some(self.value_size));
-        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
+        let behavior = behavior_with(cx, self.source.id(), self.click.clone(), self.apply.clone());
         self.strip.update(cx, |strip, cx| {
             strip.set_style(style, cx);
             strip.set_behavior(behavior, cx);

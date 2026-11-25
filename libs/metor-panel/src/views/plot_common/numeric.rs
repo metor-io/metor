@@ -10,8 +10,8 @@ use gpui::{
 };
 use metor_db::DB;
 
-use super::PanZoom;
 use super::chrome::{paint_axes, paint_axis_backdrop, paint_hline, paint_vline};
+use super::{PanZoom, PlotLegend};
 use crate::theme::{ui_px, ui_scale};
 use crate::views::time_series::{
     PADDING, PlotBounds, X_LABEL_HEIGHT, Y_LABEL_WIDTH, plot_area, value_ticks,
@@ -43,17 +43,37 @@ pub trait NumericLinePlot: Render + Sized {
 /// this entity owns gesture state and chrome only.
 pub struct NumericPlot<P: NumericLinePlot> {
     line_plot: Entity<P>,
+    /// Cached apart from the plot, which re-renders whenever its data moves.
+    legend: Entity<PlotLegend<P::Trace, P>>,
     pan_zoom: PanZoom,
 }
 
 impl<P: NumericLinePlot> NumericPlot<P> {
     pub fn new(db: Arc<DB>, traces: Vec<P::Trace>, cx: &mut Context<Self>) -> Self {
         let line_plot = cx.new(|cx| P::with_traces(db, traces, cx));
-        cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
+        let legend =
+            cx.new(|_| PlotLegend::new(line_plot.clone(), P::legend_entry, P::toggle_visible));
+        Self::sync_legend(&line_plot, &legend, cx);
+        cx.observe(&line_plot, |this, line_plot, cx| {
+            Self::sync_legend(&line_plot, &this.legend, cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             line_plot,
+            legend,
             pan_zoom: PanZoom::default(),
         }
+    }
+
+    fn sync_legend(
+        line_plot: &Entity<P>,
+        legend: &Entity<PlotLegend<P::Trace, P>>,
+        cx: &mut gpui::App,
+    ) {
+        let traces = line_plot.read(cx).traces().to_vec();
+        let left = ui_px(Y_LABEL_WIDTH + PADDING);
+        legend.update(cx, |legend, cx| legend.set(&traces, left, cx));
     }
 
     pub fn line_plot(&self) -> &Entity<P> {
@@ -87,6 +107,7 @@ impl<P: NumericLinePlot> Render for NumericPlot<P> {
         let theme = crate::theme::theme(cx);
         let trace_entities: Vec<Entity<P::Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
+        let legend_height = show_legend.then(|| self.legend.read(cx).height());
 
         let underlay_lp = self.line_plot.clone();
         let overlay_lp = self.line_plot.clone();
@@ -176,7 +197,7 @@ impl<P: NumericLinePlot> Render for NumericPlot<P> {
                             },
                             move |_, (bounds, view), window, cx| {
                                 if let Some(view) = view {
-                                    paint_numeric_overlay(bounds, view, window, cx);
+                                    paint_numeric_overlay(bounds, view, legend_height, window, cx);
                                 }
                             },
                         )
@@ -186,14 +207,7 @@ impl<P: NumericLinePlot> Render for NumericPlot<P> {
             );
 
         if show_legend {
-            root = root.child(super::plot_legend(
-                &trace_entities,
-                self.line_plot.clone(),
-                ui_px(Y_LABEL_WIDTH + PADDING),
-                P::legend_entry,
-                P::toggle_visible,
-                cx,
-            ));
+            root = root.child(PlotLegend::element(&self.legend, cx));
         }
 
         root
@@ -242,6 +256,7 @@ fn paint_numeric_underlay(
 fn paint_numeric_overlay(
     outer_bounds: Bounds<Pixels>,
     view: PlotBounds,
+    legend_height: Option<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -249,7 +264,7 @@ fn paint_numeric_overlay(
     let pb = plot_area(outer_bounds, 1, s);
     let theme = crate::theme::theme(cx);
 
-    paint_axis_backdrop(outer_bounds, pb, window, cx);
+    paint_axis_backdrop(outer_bounds, pb, legend_height, window, cx);
 
     let y_ticks: Vec<(f64, Pixels)> = value_ticks(view.min_y, view.max_y, 5)
         .map(|tick| (tick, view.to_screen(pb, view.min_x, tick).y))

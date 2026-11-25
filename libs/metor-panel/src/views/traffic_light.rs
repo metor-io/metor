@@ -69,8 +69,11 @@ impl TrafficLight {
 
         let meta = component_meta(&db, component_id);
         let task = spawn_on_stream(db.clone(), component_id, cx, |this, on, _value, cx| {
-            this.latest_on = on;
-            cx.notify();
+            // A repeated sample changes nothing: no redraw.
+            if this.latest_on != on {
+                this.latest_on = on;
+                cx.notify();
+            }
         });
 
         let resolver_task = spawn_meta_resolver(db.clone(), component_id, cx, |light, meta, cx| {
@@ -141,6 +144,7 @@ impl Focusable for TrafficLight {
 
 impl Render for TrafficLight {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::frame_stats::bump(&crate::frame_stats::WIDGET_RENDERS);
         self.source.resolve(&self.db, cx);
         if self.bound != self.source.id() {
             let color = self.color;

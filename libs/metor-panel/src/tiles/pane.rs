@@ -1,13 +1,13 @@
 use gpui::{
-    Bounds, ClickEvent, Context, EventEmitter, IntoElement, MouseButton, Pixels, Point, Render,
+    AnyElement, Bounds, Context, Entity, EventEmitter, IntoElement, Pixels, Point, Render,
     SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
 
-use super::drag::{DraggedPane, SplitDirection};
+use super::drag::SplitDirection;
+use super::header::{HeaderState, PaneHeader};
 use super::item::PaneItemHandle;
-use crate::icons::Icon;
 use crate::theme::theme;
 
 /// Dispatched by views inside a pane to open a new plot beside that pane.
@@ -114,6 +114,8 @@ pub struct Pane {
     /// Pinned in one of the window's docks, where there is no tab to zoom
     /// over.
     docked: bool,
+    /// Cached apart from the view, which may redraw every frame.
+    header: Option<Entity<PaneHeader>>,
 }
 
 impl Pane {
@@ -125,6 +127,7 @@ impl Pane {
             locked_size: None,
             group: None,
             docked: false,
+            header: None,
         }
     }
 
@@ -210,154 +213,24 @@ impl Pane {
     }
 
     /// `over` lays the header over the item, which runs on beneath it.
-    fn render_header(&self, over: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme(cx);
-        let title = self
-            .item
-            .as_ref()
-            .map(|item| item.tab_title(cx))
-            .unwrap_or_else(|| SharedString::new_static("New panel"));
-        let can_close = self.item.as_ref().is_none_or(|item| item.can_close(cx));
-
-        let button = |id: &'static str, icon: Icon, tooltip: &'static str| {
-            let hover_bg = theme.bg_primary;
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(22.0))
-                .rounded(px(crate::theme::CONTROL_RADIUS))
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover_bg))
-                .child(icon.svg(12.0, theme.text_tertiary))
-                .tooltip(move |_, cx| crate::views::tooltip::TooltipText::build(tooltip.into(), cx))
-                // A press on a control must not start a header drag.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    fn render_header(&mut self, over: bool, cx: &mut Context<Self>) -> AnyElement {
+        let state = HeaderState {
+            title: self
+                .item
+                .as_ref()
+                .map(|item| item.tab_title(cx))
+                .unwrap_or_else(|| SharedString::new_static("New panel")),
+            can_close: self.item.as_ref().is_none_or(|item| item.can_close(cx)),
+            docked: self.docked,
+            has_item: self.item.is_some(),
+            over,
         };
-
-        let mut header = div()
-            .id("pane-header")
-            .debug_selector(|| "pane-header".into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(2.0))
-            .h(px(HEADER_HEIGHT))
-            .flex_shrink_0()
-            .pl(px(8.0))
-            .pr(px(3.0))
-            // Part of the panel rather than a strip above it, as in Rex: the
-            // views' own background, which the tab bar shares too.
-            .map(|header| {
-                if over {
-                    header
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bg(theme.plot_chrome_bg())
-                } else {
-                    header.bg(theme.bg_secondary)
-                }
-            })
-            .text_size(px(12.0))
-            .text_color(theme.text_secondary)
-            .on_click(cx.listener(|_, event: &ClickEvent, _, cx| {
-                if event.click_count() == 2 {
-                    cx.emit(PaneEvent::ToggleZoom);
-                }
-            }))
-            .on_aux_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                if event.is_middle_click() {
-                    this.close(cx);
-                }
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(
-                    |this, event: &gpui::MouseDownEvent, _, cx| match &this.item {
-                        Some(item) => cx.emit(PaneEvent::Inspect {
-                            item: item.clone_handle(),
-                            position: event.position,
-                        }),
-                        None => cx.emit(PaneEvent::InspectPane {
-                            position: event.position,
-                        }),
-                    },
-                ),
-            )
-            .child(div().flex_1().min_w_0().truncate().child(title.clone()))
-            .child(
-                button("pane-split-right", Icon::SplitRight, "Split right").on_click(cx.listener(
-                    |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(PaneEvent::Split {
-                            direction: SplitDirection::Right,
-                            item: None,
-                        });
-                    },
-                )),
-            )
-            .child(
-                button("pane-split-down", Icon::SplitDown, "Split down").on_click(cx.listener(
-                    |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(PaneEvent::Split {
-                            direction: SplitDirection::Down,
-                            item: None,
-                        });
-                    },
-                )),
-            )
-            .when(!self.docked, |header| {
-                header.child(
-                    button("pane-zoom", Icon::Maximize, "Zoom").on_click(cx.listener(
-                        |_, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.emit(PaneEvent::ToggleZoom);
-                        },
-                    )),
-                )
-            })
-            .when(can_close, |header| {
-                header.child(
-                    button("pane-close", Icon::Close, "Close").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.close(cx);
-                        },
-                    )),
-                )
-            });
-
-        if self.item.is_some() {
-            header = header.cursor_grab().on_drag(
-                DraggedPane { pane: cx.entity() },
-                move |dragged, grab, window, cx| {
-                    // Mirror the drag app-side so a mouse-up outside the
-                    // window (which gpui otherwise swallows) can tear the
-                    // pane out.
-                    super::drag::set_active_drag(
-                        super::drag::ActiveDrag {
-                            source: super::drag::DragSource::Pane(dragged.pane.clone()),
-                            source_window: window.window_handle(),
-                            grab,
-                            closable: can_close,
-                        },
-                        cx,
-                    );
-                    crate::drag_chip::begin(title.clone(), None, window, cx);
-                    cx.new(|_| super::drag::DragGhost {
-                        title: title.clone(),
-                        width: None,
-                        closable: can_close,
-                    })
-                },
-            );
-        }
-        header
+        let pane = cx.entity().downgrade();
+        let header = self
+            .header
+            .get_or_insert_with(|| cx.new(|_| PaneHeader::new(pane, state.clone())))
+            .clone();
+        PaneHeader::element(&header, state, cx)
     }
 }
 
@@ -415,6 +288,7 @@ impl Render for Pane {
 mod tests {
     use super::*;
     use crate::tiles::{PaneItem, TileGroup};
+    use gpui::MouseButton;
     use gpui::{App, Entity};
 
     #[derive(serde::Serialize, serde::Deserialize, Default)]

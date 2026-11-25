@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use gpui::{App, Global, Hsla, Rems, SharedString, Window, px, rems};
+use gpui::{App, Global, Hsla, Pixels, Rems, SharedString, Window, px, rems};
 use metor_proto_wkt::SequenceChannelState;
 
 use crate::config::{self, FontConfig, PanelConfig};
@@ -15,6 +15,14 @@ pub const CONTROL_HEIGHT: f32 = 28.0;
 /// Corner radius of a control's surface: hover and selection pills, tabs,
 /// titlebar segments.
 pub const CONTROL_RADIUS: f32 = 4.0;
+
+/// Backdrop blur (gaussian sigma) under floating surfaces — the palette and
+/// context menus — so they read as frosted glass over whatever they cover.
+pub const SURFACE_BLUR: Pixels = px(16.0);
+
+/// Backdrop blur under the chrome strips laid over a plot — a pane header
+/// and the legend — softer than a surface's so the data still shows shape.
+pub const CHROME_BLUR: Pixels = px(8.0);
 
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
@@ -216,6 +224,17 @@ impl Theme {
     /// `selection_bg`) in light themes and dark.
     pub fn scrub_fill(&self) -> Hsla {
         Self::dim(self.text_primary, 0.2)
+    }
+
+    /// `bg_elevated` for floating surfaces. On macOS, where gpui blurs what
+    /// lies behind, it lets the blurred backdrop through; elsewhere nothing
+    /// blurs it, and translucency would only make rows harder to read.
+    pub(crate) fn surface_bg(&self) -> Hsla {
+        if cfg!(target_os = "macos") {
+            Self::dim(self.bg_elevated, 0.75)
+        } else {
+            self.bg_elevated
+        }
     }
 
     /// Semi-transparent `bg_secondary` for plot chrome strips — the legend,
@@ -456,6 +475,9 @@ pub fn theme(cx: &App) -> Arc<Theme> {
 /// Swap the active theme. Triggers global observers so every view repaints.
 pub fn set_theme(cx: &mut App, theme: Arc<Theme>) {
     cx.set_global(ActiveTheme(theme));
+    // Views read the theme as a global, which no cached view tracks: redraw
+    // everything once, bypassing the caches.
+    cx.refresh_windows();
 }
 
 /// Every theme compiled into the binary, in the order the theme picker

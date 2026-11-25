@@ -7,24 +7,25 @@
 //! gestures and LoD selection are the same, so they live here.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point,
-    Rems, SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
+    Bounds, Context, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, Rems,
+    SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
     prelude::*, px,
 };
 
 use crate::theme::{Theme, ui_px, ui_scale};
 use crate::views::time_series::{
-    LABEL_FONT_SIZE, Override, PlotBounds, PlotRenderState, ReadbackHandle,
+    LABEL_FONT_SIZE, Override, PlotBounds, PlotFrame, PlotRenderState, ReadbackHandle,
 };
 
 pub(crate) mod chrome;
+mod legend;
 pub(crate) mod lod;
 mod numeric;
 mod pan_zoom;
 
+pub(crate) use legend::PlotLegend;
 pub use numeric::{NumericLinePlot, NumericPlot};
 pub(crate) use pan_zoom::PanZoom;
 
@@ -49,6 +50,9 @@ pub fn plot_legend<T: 'static, N: 'static>(
         .gap_y_0()
         .pl(left)
         .pb_1()
+        // Tint only: the plot frosts the legend's area along with its
+        // gutters (see `chrome::paint_axis_backdrop`), so the blurs meet
+        // without a seam.
         .bg(theme.plot_chrome_bg());
 
     for trace_entity in traces {
@@ -263,7 +267,9 @@ pub(crate) fn link_traces<T: 'static, P: 'static>(
 /// The canvas that shows a plot entity's GPU frame.
 ///
 /// Prepaint runs `submit` to start a render for the current bounds (it
-/// returns the readback when one was issued), releases the image the last
+/// returns the readback when one was issued; a request whose inputs match
+/// the last frame is skipped, so prepaint only renders when something
+/// changed), releases the image the last
 /// frame replaced back to the atlas, and paints the newest completed frame.
 /// That frame was drawn at an earlier view — readback is asynchronous — so
 /// it is placed under the current one ([`PlotRenderState::placement`]) and
@@ -308,7 +314,7 @@ pub(crate) fn gpu_frame_over<T: 'static>(
                 .filter(|area| area.contains(&own.center()))
                 .unwrap_or(own);
             let scale_factor = window.scale_factor();
-            let (frame, released) = entity
+            let (frame, released, retry) = entity
                 .update(cx, |plot, cx| {
                     if let Some(handle) = submit(plot, bounds, own, scale_factor, cx) {
                         handle.spawn_and_set(cx, gpu_state);
@@ -317,23 +323,26 @@ pub(crate) fn gpu_frame_over<T: 'static>(
                     let frame = state
                         .current_frame()
                         .map(|img| (img, state.placement(bounds, scale_factor)));
-                    (frame, state.take_pending_release())
+                    (frame, state.take_pending_release(), state.wants_retry())
                 })
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, false));
             if let Some(img) = released {
                 crate::atlas::release_image(window, cx, img);
             }
+            if retry {
+                let entity = entity.clone();
+                window.on_next_frame(move |_, cx| {
+                    let _ = entity.update(cx, |_, cx| cx.notify());
+                });
+            }
             (bounds, frame)
         },
-        |_,
-         (bounds, frame): (
-            Bounds<Pixels>,
-            Option<(Arc<gpui::RenderImage>, Bounds<Pixels>)>,
-        ),
-         window,
-         _cx| {
-            if let Some((img, rect)) = frame {
-                let _ = window.paint_image(bounds, rect, Corners::default(), img, 0, false);
+        |_, (bounds, frame): (Bounds<Pixels>, Option<(PlotFrame, Bounds<Pixels>)>), window, cx| {
+            // Paint runs after every prepaint in the window, so the first
+            // plot to paint sends the whole frame's plots in one submit.
+            PlotRenderState::flush(cx);
+            if let Some((frame, rect)) = frame {
+                frame.paint(window, bounds, rect);
             }
         },
     )

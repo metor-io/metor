@@ -16,6 +16,7 @@ use crate::inspect;
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
 use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
+use crate::views::plot_common::PlotLegend;
 use crate::views::plot_common::chrome::{paint_axis_backdrop, paint_hline, paint_vline};
 use crate::views::popover::readout_card;
 
@@ -42,7 +43,9 @@ mod bounds;
 pub use bounds::*;
 
 mod gpu;
-pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState, ReadbackHandle};
+#[cfg(target_os = "macos")]
+mod surface;
+pub(crate) use gpu::{AxisSource, LineDraw, PlotFrame, PlotRenderState, ReadbackHandle};
 
 mod heatmap;
 pub use heatmap::{Colormap, IntensityScale};
@@ -644,6 +647,7 @@ fn paint_overlay(
     limit_lines: &[(usize, f64, Hsla, SharedString)],
     origin: f64,
     fmt: TimeFormat,
+    legend_height: Option<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -652,7 +656,7 @@ fn paint_overlay(
     let pb = plot_area(outer_bounds, axis_count, s);
     let theme = crate::theme::theme(cx);
 
-    paint_axis_backdrop(outer_bounds, pb, window, cx);
+    paint_axis_backdrop(outer_bounds, pb, legend_height, window, cx);
 
     // Axes are neutral unless given an explicit color.
     let label_color = |i: usize| -> Hsla {
@@ -1059,6 +1063,15 @@ struct CursorDrag {
     start_view: PlotView,
 }
 
+/// A trace's legend chip: its label, colour and visibility.
+fn legend_entry(trace: &Trace) -> (SharedString, Hsla, bool) {
+    (trace.label.clone(), trace.color, trace.visible)
+}
+
+fn toggle_trace_visible(trace: &mut Trace) {
+    trace.visible = !trace.visible;
+}
+
 /// Interactive wrapper around a [`LinePlot`] that adds axes, legend, and
 /// pan/zoom input.
 ///
@@ -1067,6 +1080,8 @@ struct CursorDrag {
 /// `TimeSeriesPlot` only owns drag state and chrome.
 pub struct TimeSeriesPlot {
     line_plot: Entity<LinePlot>,
+    /// Cached apart from the plot, which re-renders whenever its data moves.
+    legend: Entity<PlotLegend<Trace, LinePlot>>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotView>,
     drag_zone: AxisZone,
@@ -1160,9 +1175,18 @@ impl TimeSeriesPlot {
             lp.bind_traces(traces, cx);
             lp
         });
-        // Legend and chrome live on this entity; listen to the inner
-        // LinePlot so trace toggles and inspector edits trigger a repaint.
-        cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
+        // Chrome lives on this entity; listen to the inner LinePlot so trace
+        // toggles and inspector edits trigger a repaint. The legend follows
+        // the trace list from here rather than from render: a notify sent
+        // while drawing only lands on the next frame.
+        let legend =
+            cx.new(|_| PlotLegend::new(line_plot.clone(), legend_entry, toggle_trace_visible));
+        Self::sync_legend(&line_plot, &legend, cx);
+        cx.observe(&line_plot, |this, line_plot, cx| {
+            Self::sync_legend(&line_plot, &this.legend, cx);
+            cx.notify();
+        })
+        .detach();
         // Repaint when alarms change so limit lines and out-of-bounds tinting
         // track the control system's broadcast.
         if let Some(store) = crate::alarms::try_global(cx) {
@@ -1170,6 +1194,7 @@ impl TimeSeriesPlot {
         }
         Self {
             line_plot,
+            legend,
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
@@ -1198,6 +1223,17 @@ impl TimeSeriesPlot {
             self.header_inset = inset;
             cx.notify();
         }
+    }
+
+    fn sync_legend(
+        line_plot: &Entity<LinePlot>,
+        legend: &Entity<PlotLegend<Trace, LinePlot>>,
+        cx: &mut gpui::App,
+    ) {
+        let lp = line_plot.read(cx);
+        let traces = lp.traces().to_vec();
+        let left = ui_px(left_margin(lp.axes.len()));
+        legend.update(cx, |legend, cx| legend.set(&traces, left, cx));
     }
 
     pub fn panel_position(&self) -> PanelPosition {

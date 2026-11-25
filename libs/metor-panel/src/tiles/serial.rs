@@ -98,7 +98,8 @@ impl ItemRegistry {
             let live = (spec.build)(state, &db, cx);
             let view = cx.new({
                 let child = live.view.clone();
-                move |_| RegisteredPane { child }
+                let cached = tile.cached;
+                move |_| RegisteredPane { child, cached }
             });
             Some(Box::new(RegisteredPaneHandle {
                 view,
@@ -142,11 +143,19 @@ impl ItemRegistry {
 
 struct RegisteredPane {
     child: AnyView,
+    cached: bool,
 }
 
 impl Render for RegisteredPane {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.child.clone()
+        if self.cached {
+            self.child
+                .clone()
+                .cached(gpui::StyleRefinement::default().size_full())
+                .into_any_element()
+        } else {
+            self.child.clone().into_any_element()
+        }
     }
 }
 
