@@ -50,7 +50,8 @@ pub fn plot_legend<T: 'static, N: 'static>(
         .gap_y_0()
         .pl(left)
         .pb_1()
-        .bg(theme.plot_chrome_bg());
+        .bg(theme.plot_chrome_bg())
+        .backdrop_blur(crate::theme::CHROME_BLUR);
 
     for trace_entity in traces {
         let trace = trace_entity.read(cx);

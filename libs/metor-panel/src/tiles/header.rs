@@ -140,11 +140,16 @@ impl Render for PaneHeader {
             .pl(px(8.0))
             .pr(px(3.0))
             // Part of the panel rather than a strip above it, as in Rex: the
-            // views' own background, which the tab bar shares too.
-            .bg(if over {
-                theme.plot_chrome_bg()
-            } else {
-                theme.bg_secondary
+            // views' own background, which the tab bar shares too. Laid over
+            // a plot, it frosts the data running beneath.
+            .map(|header| {
+                if over {
+                    header
+                        .bg(theme.plot_chrome_bg())
+                        .backdrop_blur(crate::theme::CHROME_BLUR)
+                } else {
+                    header.bg(theme.bg_secondary)
+                }
             })
             .text_size(px(12.0))
             .text_color(theme.text_secondary)
