@@ -3,9 +3,10 @@
 //! full-height rules (gridlines, zero lines, limits, cursors) clipped to the
 //! plot area.
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Window, point};
+use gpui::{Bounds, Corners, Hsla, PathBuilder, Pixels, Window, point};
 
-/// Fill the Y-label column left of `pa` and the X-label strip below it.
+/// Fill the Y-label column left of `pa` and the X-label strip below it,
+/// frosting the data that runs on beneath them.
 ///
 /// The fills also mask sub-pixel bleed from the GPU frame into the chrome.
 pub(crate) fn paint_axis_backdrop(
@@ -15,26 +16,24 @@ pub(crate) fn paint_axis_backdrop(
     cx: &gpui::App,
 ) {
     let axis_bg = crate::theme::theme(cx).plot_chrome_bg();
-    window.paint_quad(gpui::fill(
-        Bounds {
-            origin: outer.origin,
-            size: gpui::Size {
-                width: pa.origin.x - outer.origin.x,
-                height: outer.size.height,
-            },
+    let y_column = Bounds {
+        origin: outer.origin,
+        size: gpui::Size {
+            width: pa.origin.x - outer.origin.x,
+            height: outer.size.height,
         },
-        axis_bg,
-    ));
-    window.paint_quad(gpui::fill(
-        Bounds {
-            origin: point(pa.origin.x, pa.origin.y + pa.size.height),
-            size: gpui::Size {
-                width: pa.size.width,
-                height: outer.origin.y + outer.size.height - pa.origin.y - pa.size.height,
-            },
+    };
+    let x_strip = Bounds {
+        origin: point(pa.origin.x, pa.origin.y + pa.size.height),
+        size: gpui::Size {
+            width: pa.size.width,
+            height: outer.origin.y + outer.size.height - pa.origin.y - pa.size.height,
         },
-        axis_bg,
-    ));
+    };
+    for gutter in [y_column, x_strip] {
+        window.paint_backdrop_blur(gutter, Corners::default(), crate::theme::CHROME_BLUR);
+        window.paint_quad(gpui::fill(gutter, axis_bg));
+    }
 }
 
 /// The L-shaped axis rule down the left edge of `pa` and along its bottom.
