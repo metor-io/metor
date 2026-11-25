@@ -54,6 +54,11 @@ impl<T: 'static, N: 'static> PlotLegend<T, N> {
         }
     }
 
+    /// The height the legend is laid out at this frame.
+    pub(crate) fn height(&self) -> Pixels {
+        self.height
+    }
+
     /// The legend as a child element, at the height it last measured.
     pub(crate) fn element(this: &Entity<Self>, cx: &App) -> AnyElement {
         let height = this.read(cx).height;

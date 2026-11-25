@@ -50,8 +50,10 @@ pub fn plot_legend<T: 'static, N: 'static>(
         .gap_y_0()
         .pl(left)
         .pb_1()
-        .bg(theme.plot_chrome_bg())
-        .backdrop_blur(crate::theme::CHROME_BLUR);
+        // Tint only: the plot frosts the legend's area along with its
+        // gutters (see `chrome::paint_axis_backdrop`), so the blurs meet
+        // without a seam.
+        .bg(theme.plot_chrome_bg());
 
     for trace_entity in traces {
         let trace = trace_entity.read(cx);

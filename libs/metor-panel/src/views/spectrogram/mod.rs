@@ -346,7 +346,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
     let view = chrome.view;
     crate::temporal::paint_playhead(pa, (view.min_x, view.max_x), window, cx);
 
-    paint_axis_backdrop(outer, pa, window, cx);
+    paint_axis_backdrop(outer, pa, None, window, cx);
 
     let anchor = x_tick_anchor(chrome.time_format, chrome.origin);
     for tick in x_ticks(&view, 6, anchor) {

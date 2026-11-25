@@ -107,6 +107,7 @@ impl<P: NumericLinePlot> Render for NumericPlot<P> {
         let theme = crate::theme::theme(cx);
         let trace_entities: Vec<Entity<P::Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
+        let legend_height = show_legend.then(|| self.legend.read(cx).height());
 
         let underlay_lp = self.line_plot.clone();
         let overlay_lp = self.line_plot.clone();
@@ -196,7 +197,7 @@ impl<P: NumericLinePlot> Render for NumericPlot<P> {
                             },
                             move |_, (bounds, view), window, cx| {
                                 if let Some(view) = view {
-                                    paint_numeric_overlay(bounds, view, window, cx);
+                                    paint_numeric_overlay(bounds, view, legend_height, window, cx);
                                 }
                             },
                         )
@@ -255,6 +256,7 @@ fn paint_numeric_underlay(
 fn paint_numeric_overlay(
     outer_bounds: Bounds<Pixels>,
     view: PlotBounds,
+    legend_height: Option<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -262,7 +264,7 @@ fn paint_numeric_overlay(
     let pb = plot_area(outer_bounds, 1, s);
     let theme = crate::theme::theme(cx);
 
-    paint_axis_backdrop(outer_bounds, pb, window, cx);
+    paint_axis_backdrop(outer_bounds, pb, legend_height, window, cx);
 
     let y_ticks: Vec<(f64, Pixels)> = value_ticks(view.min_y, view.max_y, 5)
         .map(|tick| (tick, view.to_screen(pb, view.min_x, tick).y))

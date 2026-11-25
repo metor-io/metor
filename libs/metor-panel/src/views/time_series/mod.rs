@@ -647,6 +647,7 @@ fn paint_overlay(
     limit_lines: &[(usize, f64, Hsla, SharedString)],
     origin: f64,
     fmt: TimeFormat,
+    legend_height: Option<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -655,7 +656,7 @@ fn paint_overlay(
     let pb = plot_area(outer_bounds, axis_count, s);
     let theme = crate::theme::theme(cx);
 
-    paint_axis_backdrop(outer_bounds, pb, window, cx);
+    paint_axis_backdrop(outer_bounds, pb, legend_height, window, cx);
 
     // Axes are neutral unless given an explicit color.
     let label_color = |i: usize| -> Hsla {
