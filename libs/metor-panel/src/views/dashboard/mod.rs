@@ -27,7 +27,7 @@ use crate::tiles::PaneItem;
 mod chrome;
 mod interaction;
 mod widgets;
-mod zoom;
+use metor_gpui::viewport as zoom;
 
 use widgets::create_widget_view;
 pub use widgets::{ImageWidgetConfig, TileViewSpec, WidgetLive, WidgetRegistry, WidgetSpec};

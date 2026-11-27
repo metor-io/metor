@@ -211,7 +211,7 @@ impl DashboardPanel {
             container = if zoom == 1.0 {
                 container.child(view)
             } else {
-                container.child(super::zoom::Zoomed::new(zoom, view))
+                container.child(metor_gpui::viewport::Zoomed::new(zoom, view))
             };
         }
 

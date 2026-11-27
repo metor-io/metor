@@ -1,33 +1,34 @@
-//! Dashboard zoom: the canvas-to-screen mapping and the element that makes
-//! widget content follow it.
+//! A pan-and-zoom mapping between a canvas and the screen, and the element that makes content
+//! follow it.
 //!
-//! gpui has no subtree scale transform, so zoom is a layout change rather
-//! than a paint one. Widget rects stay in unscaled dashboard units on disk and
-//! are multiplied by the zoom when laid out; every pointer position goes back
-//! through [`Viewport::to_canvas`] before it touches a rect. What a widget
-//! draws inside its box follows through [`Zoomed`], which scales the rem and
-//! the inherited text size — so rem-based spacing and text that does not pin
-//! its own size shrink with the box, while explicit `px` sizes stay put.
+//! gpui has no subtree scale transform, so zoom is a layout change rather than a paint one.
+//! Content rects stay in unscaled canvas units and are multiplied by the zoom when laid out;
+//! every pointer position goes back through [`Viewport::to_canvas`] before it touches a rect.
+//! What content draws inside its box follows through [`Zoomed`], which scales the rem and the
+//! inherited text size, so rem-based spacing and text that does not pin its own size shrink
+//! with the box, while explicit `px` sizes stay put.
+
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, Pixels, Point, Size, TextStyleRefinement, Window, point, px,
 };
 
-pub(super) const MIN_ZOOM: f32 = 0.25;
-pub(super) const MAX_ZOOM: f32 = 2.0;
+/// The default zoom range, sized for dashboards.
+pub const MIN_ZOOM: f32 = 0.25;
+pub const MAX_ZOOM: f32 = 2.0;
 
 /// Ratio between neighbouring zoom levels for the Zoom In / Zoom Out commands.
-pub(super) const ZOOM_STEP: f32 = 1.25;
+pub const ZOOM_STEP: f32 = 1.25;
 
 /// How strongly one pixel of wheel travel zooms; a 20px mouse-wheel notch is
 /// about 10%.
 const WHEEL_ZOOM_RATE: f32 = 0.005;
 
-/// Breathing room kept past the content's far edges when fitting, matching
-/// the margin `auto_place` leaves at the near edges.
+/// Breathing room kept past the content's far edges when fitting.
 const FIT_MARGIN: f32 = 20.0;
 
-pub(super) fn clamp_zoom(zoom: f32) -> f32 {
+/// Clamps `zoom` to the default range, mapping non-finite values to 1.
+pub fn clamp_zoom(zoom: f32) -> f32 {
     if zoom.is_finite() {
         zoom.clamp(MIN_ZOOM, MAX_ZOOM)
     } else {
@@ -37,21 +38,24 @@ pub(super) fn clamp_zoom(zoom: f32) -> f32 {
 
 /// The zoom multiplier a wheel delta asks for. Positive `dy` zooms in, the
 /// same direction a plot zooms for the same gesture.
-pub(super) fn wheel_zoom_factor(dy: f32) -> f32 {
+pub fn wheel_zoom_factor(dy: f32) -> f32 {
     (dy * WHEEL_ZOOM_RATE).exp()
 }
 
-/// Which part of the dashboard is on screen, and how large.
+/// Which part of a canvas is on screen, and how large.
 ///
-/// Screen coordinates here are relative to the canvas container's origin;
-/// canvas coordinates are the dashboard units widget rects are stored in.
+/// Screen coordinates here are relative to the canvas container's origin; canvas coordinates
+/// are the units content rects are stored in.
 /// `scroll` is kept in screen pixels so a pan moves by what the wheel says
 /// whatever the zoom.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Viewport {
-    pub(super) zoom: f32,
+pub struct Viewport {
+    pub zoom: f32,
     /// Negative values bring content below and right of the origin into view.
-    pub(super) scroll: Point<f32>,
+    pub scroll: Point<f32>,
+    /// The zoom range [`zoom_around`](Self::zoom_around) and [`fitted`](Self::fitted) keep to.
+    pub min_zoom: f32,
+    pub max_zoom: f32,
 }
 
 impl Default for Viewport {
@@ -59,26 +63,45 @@ impl Default for Viewport {
         Self {
             zoom: 1.0,
             scroll: point(0.0, 0.0),
+            min_zoom: MIN_ZOOM,
+            max_zoom: MAX_ZOOM,
         }
     }
 }
 
 impl Viewport {
-    pub(super) fn at_zoom(zoom: f32) -> Self {
+    /// The default viewport with zoom kept to `min..=max`.
+    pub fn with_zoom_range(min: f32, max: f32) -> Self {
+        Self {
+            min_zoom: min,
+            max_zoom: max,
+            ..Self::default()
+        }
+    }
+
+    fn clamped(self, zoom: f32) -> f32 {
+        if zoom.is_finite() {
+            zoom.clamp(self.min_zoom, self.max_zoom)
+        } else {
+            1.0
+        }
+    }
+
+    pub fn at_zoom(zoom: f32) -> Self {
         Self {
             zoom: clamp_zoom(zoom),
             ..Self::default()
         }
     }
 
-    pub(super) fn to_canvas(self, screen: Point<f32>) -> Point<f32> {
+    pub fn to_canvas(self, screen: Point<f32>) -> Point<f32> {
         point(
             (screen.x - self.scroll.x) / self.zoom,
             (screen.y - self.scroll.y) / self.zoom,
         )
     }
 
-    pub(super) fn to_screen(self, canvas: Point<f32>) -> Point<f32> {
+    pub fn to_screen(self, canvas: Point<f32>) -> Point<f32> {
         point(
             canvas.x * self.zoom + self.scroll.x,
             canvas.y * self.zoom + self.scroll.y,
@@ -87,8 +110,8 @@ impl Viewport {
 
     /// Change the zoom while the canvas point under `anchor` (screen) stays
     /// under it, which is what makes zooming toward the cursor feel anchored.
-    pub(super) fn zoom_around(&mut self, zoom: f32, anchor: Point<f32>) {
-        let zoom = clamp_zoom(zoom);
+    pub fn zoom_around(&mut self, zoom: f32, anchor: Point<f32>) {
+        let zoom = self.clamped(zoom);
         let fixed = self.to_canvas(anchor);
         self.zoom = zoom;
         self.scroll = point(anchor.x - fixed.x * zoom, anchor.y - fixed.y * zoom);
@@ -97,7 +120,7 @@ impl Viewport {
     /// Keep the pan inside the scaled content. `extent` is the content's
     /// far corner in canvas units; without a known viewport only the origin
     /// side can be enforced.
-    pub(super) fn clamp(&mut self, extent: Point<f32>, view: Option<Size<f32>>) {
+    pub fn clamp(&mut self, extent: Point<f32>, view: Option<Size<f32>>) {
         let (min_x, min_y) = match view {
             Some(view) => (
                 -(extent.x * self.zoom - view.width).max(0.0),
@@ -109,10 +132,15 @@ impl Viewport {
         self.scroll.y = self.scroll.y.clamp(min_y, 0.0);
     }
 
-    /// The viewport that shows all content at once, never magnified: a
-    /// dashboard that already fits comes back at 1:1. Below the minimum zoom
-    /// it shows what fits from the top-left.
-    pub(super) fn fit(extent: Point<f32>, view: Size<f32>) -> Self {
+    /// The default viewport that shows all content at once. See [`fitted`](Self::fitted).
+    pub fn fit(extent: Point<f32>, view: Size<f32>) -> Self {
+        Self::default().fitted(extent, view)
+    }
+
+    /// This viewport's zoom range, showing all content at once and never magnified: content
+    /// that already fits comes back at 1:1. Below the minimum zoom it shows what fits from the
+    /// top-left.
+    pub fn fitted(self, extent: Point<f32>, view: Size<f32>) -> Self {
         let w = extent.x + FIT_MARGIN;
         let h = extent.y + FIT_MARGIN;
         let zoom = if extent.x <= 0.0 || extent.y <= 0.0 {
@@ -120,24 +148,27 @@ impl Viewport {
         } else {
             (view.width / w).min(view.height / h).min(1.0)
         };
-        Self::at_zoom(zoom)
+        Self {
+            zoom: self.clamped(zoom),
+            scroll: point(0.0, 0.0),
+            ..self
+        }
     }
 }
 
-/// Lays a widget's content out as if the window's rem and inherited text
-/// size were scaled by the dashboard zoom.
+/// Lays content out as if the window's rem and inherited text size were scaled by the zoom.
 ///
 /// Both overrides only reach lengths resolved against them: gpui's spacing
 /// helpers (`p_2`, `gap_1`, …), `rems(…)`, and text that inherits its size.
 /// Explicit `px(…)` sizes — most view text, and any glyphs a view shapes
 /// itself — keep their size and clip at the widget's edge instead.
-pub(super) struct Zoomed {
+pub struct Zoomed {
     zoom: f32,
     child: AnyElement,
 }
 
 impl Zoomed {
-    pub(super) fn new(zoom: f32, child: impl IntoElement) -> Self {
+    pub fn new(zoom: f32, child: impl IntoElement) -> Self {
         Self {
             zoom,
             child: child.into_any_element(),
@@ -232,6 +263,7 @@ mod tests {
         let v = Viewport {
             zoom: 0.5,
             scroll: point(-40.0, -10.0),
+            ..Viewport::default()
         };
         let c = point(300.0, 120.0);
         assert!(close(v.to_screen(c), point(110.0, 50.0)));
@@ -243,6 +275,7 @@ mod tests {
         let mut v = Viewport {
             zoom: 1.0,
             scroll: point(-100.0, -60.0),
+            ..Viewport::default()
         };
         let anchor = point(250.0, 180.0);
         let before = v.to_canvas(anchor);
@@ -273,6 +306,7 @@ mod tests {
         let mut v = Viewport {
             zoom: 0.5,
             scroll: point(-5000.0, -5000.0),
+            ..Viewport::default()
         };
         v.clamp(extent, Some(view));
         // 1000×500 on screen: only the width overflows.

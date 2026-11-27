@@ -2,11 +2,12 @@
 mod commands;
 mod config;
 mod interaction;
-pub mod model;
 mod paint;
 #[cfg(test)]
 mod tests;
 mod tooltip;
+
+use metor_gpui::timeline as model;
 
 pub use crate::plot_events::index::TimelineEvent;
 use crate::{

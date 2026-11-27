@@ -29,7 +29,7 @@ pub mod trace_picker;
 
 use metor_gpui::theme;
 use metor_gpui::{Fade, motion};
-use rows::text_field::TextAlign;
+use metor_gpui::{TextAlign, TextFieldHost};
 use rows::{InspectorRow, PreviewSpec, ROW_HEIGHT, RowAction, TextField, tag_pill};
 
 /// Horizontal padding inside a row, both sides together.
@@ -175,6 +175,22 @@ pub struct Inspector {
     /// click-outside dismissal — together those keep the underlying
     /// surface fully interactive while the preview is up.
     dismiss_on_outside_click: bool,
+}
+
+impl TextFieldHost for Inspector {
+    fn text_field(&mut self) -> Option<&mut TextField> {
+        match &mut self.editing {
+            Some(edit) => Some(&mut edit.field),
+            None => Some(&mut self.search),
+        }
+    }
+
+    fn text_field_changed(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_none() {
+            self.query_edited(cx);
+            self.selected_index = self.first_selectable_index();
+        }
+    }
 }
 
 struct EditState {
@@ -919,7 +935,14 @@ impl Inspector {
             });
         }
 
-        bar = bar.child(div().flex_1().min_w(px(60.0)).child(self.search.element()));
+        let search = if self.editing.is_none() {
+            self.search
+                .input_element(&self.focus_handle, cx.entity().downgrade())
+                .into_any_element()
+        } else {
+            self.search.element().into_any_element()
+        };
+        bar = bar.child(div().flex_1().min_w(px(60.0)).child(search));
         if self.accessory.is_some() {
             bar = bar.child(
                 div()
@@ -1189,7 +1212,12 @@ impl Inspector {
                                     rows[row_idx].render_editing(
                                         vis_ix,
                                         selected,
-                                        edit.field.element().into_any_element(),
+                                        edit.field
+                                            .input_element(
+                                                &this.focus_handle,
+                                                cx.entity().downgrade(),
+                                            )
+                                            .into_any_element(),
                                         window,
                                         cx,
                                     )

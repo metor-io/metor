@@ -228,6 +228,11 @@ impl Theme {
         }
     }
 
+    /// The dimming laid over a page behind a modal dialog.
+    pub fn scrim(&self) -> Hsla {
+        Self::dim(self.bg_primary, 0.6)
+    }
+
     /// Track behind a checked switch knob: `control_active` with less presence.
     pub fn control_active_track(&self) -> Hsla {
         Self::dim(self.control_active, 0.7)

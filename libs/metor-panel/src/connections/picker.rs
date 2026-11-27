@@ -18,10 +18,10 @@ use gpui::{
 
 use super::options::option_rows;
 use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore, PickerEntry, TargetId, persist};
-use crate::inspector::rows::text_field::TextField;
 use crate::inspector::{Inspector, InspectorMode};
 use crate::query::fuzzy_scores;
 use metor_gpui::Icon;
+use metor_gpui::{TextField, TextFieldHost};
 use metor_gpui::{Theme, theme};
 
 const DIALOG_WIDTH: f32 = 640.0;
@@ -1143,7 +1143,10 @@ impl ConnectionPicker {
                     .border_color(theme.border_primary)
                     .rounded(px(4.0))
                     .text_size(px(13.0))
-                    .child(self.search.element()),
+                    .child(
+                        self.search
+                            .input_element(&self.focus_handle, cx.entity().downgrade()),
+                    ),
             );
         if let Some(error) = error {
             body = body.child(
@@ -1244,6 +1247,18 @@ impl ConnectionPicker {
     }
 }
 
+impl TextFieldHost for ConnectionPicker {
+    fn text_field(&mut self) -> Option<&mut TextField> {
+        Some(&mut self.search)
+    }
+
+    fn text_field_changed(&mut self, cx: &mut Context<Self>) {
+        self.selected = 0;
+        let len = self.slots(cx).len();
+        self.clamp_selection(len);
+    }
+}
+
 impl Focusable for ConnectionPicker {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1278,7 +1293,10 @@ impl Render for ConnectionPicker {
                     .border_color(theme.border_primary)
                     .rounded(px(4.0))
                     .text_size(px(12.0))
-                    .child(self.search.element()),
+                    .child(
+                        self.search
+                            .input_element(&self.focus_handle, cx.entity().downgrade()),
+                    ),
             );
         }
         if self.dismissable(cx) {

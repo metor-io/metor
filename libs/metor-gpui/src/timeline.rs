@@ -1,6 +1,11 @@
+//! The time axis model shared by the panel timeline and the Gantt view.
+//!
+//! Times are integer microseconds since the epoch, so epoch precision never reaches screen
+//! coordinates.
+
 use serde::{Deserialize, Serialize};
 
-/// Integer time bounds keep epoch precision out of screen coordinates.
+/// A half-open time range in microseconds, never empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interval {
     pub start: i64,
@@ -8,6 +13,7 @@ pub struct Interval {
 }
 
 impl Interval {
+    /// The range from `start` to `end`, widened to at least one microsecond.
     pub fn new(start: i64, end: i64) -> Self {
         let start = start.min(i64::MAX - 1);
         Self {
@@ -16,15 +22,22 @@ impl Interval {
         }
     }
 
+    /// The length of the range in microseconds.
     pub fn span(self) -> f64 {
         (i128::from(self.end) - i128::from(self.start)) as f64
     }
+
+    /// Where `t` falls in the range, 0 at the start and 1 at the end.
     pub fn fraction(self, t: i64) -> f64 {
         (i128::from(t) - i128::from(self.start)) as f64 / self.span()
     }
+
+    /// The time at `fraction` of the way through the range; the inverse of [`fraction`](Self::fraction).
     pub fn at(self, fraction: f64) -> i64 {
         clamp(i128::from(self.start) + (self.span() * fraction).round() as i128)
     }
+
+    /// The range moved by `delta` microseconds, stopping at the ends of `i64`.
     pub fn shifted(self, delta: i128) -> Self {
         let delta = delta.clamp(
             i128::from(i64::MIN) - i128::from(self.start),
@@ -35,6 +48,8 @@ impl Interval {
             clamp(i128::from(self.end) + delta),
         )
     }
+
+    /// The range scaled by `factor` around the time at `fraction`, which stays in place.
     pub fn zoom(self, factor: f64, fraction: f64) -> Self {
         let anchor = self.at(fraction);
         let span = (self.span() * factor).clamp(
@@ -44,9 +59,13 @@ impl Interval {
         let start = clamp(i128::from(anchor) - (span * fraction).round() as i128);
         Self::new(start, clamp(i128::from(start) + span.round() as i128))
     }
+
+    /// The smallest range covering both.
     pub fn hull(self, other: Self) -> Self {
         Self::new(self.start.min(other.start), self.end.max(other.end))
     }
+
+    /// The range with 5% margin before it and 10% after, for fitting data to a view.
     pub fn padded(self) -> Self {
         let span = self.span().max(1_000_000.0);
         Self::new(
@@ -56,22 +75,28 @@ impl Interval {
     }
 }
 
-pub(super) fn clamp(value: i128) -> i64 {
+/// Saturates an `i128` time to `i64`.
+pub fn clamp(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-/// Navigation belongs to each widget, independently of the global selection.
+/// How a time axis follows its data.
+///
+/// Each view owns its navigation, independently of any global selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum Navigation {
+    /// Show all the data.
     #[default]
     Fit,
+    /// Hold a range the user chose.
     Manual(Interval),
-    Follow {
-        span: f64,
-    },
+    /// Show the latest `span` microseconds.
+    Follow { span: f64 },
 }
 
-pub(super) fn tick_step(span: f64, width: f32) -> i64 {
+/// The ruler tick spacing in microseconds for `span` microseconds across `width` pixels, about
+/// one tick per 115px.
+pub fn tick_step(span: f64, width: f32) -> i64 {
     let desired = span / (f64::from(width) / 115.0).max(1.0);
     const STEPS: &[i64] = &[
         1_000,
@@ -110,7 +135,9 @@ pub(super) fn tick_step(span: f64, width: f32) -> i64 {
         })
 }
 
-pub(super) fn edge_speed(fraction: f64, width: f32) -> f64 {
+/// How fast to auto-scroll while dragging at `fraction` across an axis `width` pixels wide, in
+/// spans per second: zero away from the edges, up to half a span at them.
+pub fn edge_speed(fraction: f64, width: f32) -> f64 {
     let edge = (24.0 / f64::from(width.max(1.0))).min(0.25);
     if fraction < edge {
         -((edge - fraction) / edge).clamp(0.0, 1.0).powi(2) * 0.5
@@ -121,7 +148,11 @@ pub(super) fn edge_speed(fraction: f64, width: f32) -> f64 {
     }
 }
 
-pub(super) fn ticks(view: Interval, step: i64, timezone: &str, origin: Option<i64>) -> Vec<i64> {
+/// Tick times in `view`, `step` apart.
+///
+/// Day steps without an `origin` fall on local midnights in `timezone`, so they follow DST.
+/// Otherwise ticks are multiples of `step` counted from `origin`, or from the epoch.
+pub fn ticks(view: Interval, step: i64, timezone: &str, origin: Option<i64>) -> Vec<i64> {
     let mut ticks = Vec::new();
     if step >= 86_400_000_000 && origin.is_none() {
         let zone = if timezone.eq_ignore_ascii_case("local") {

@@ -13,10 +13,10 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 
-use crate::inspector::rows::TextField;
 use crate::query::Query;
 use metor_gpui::Icon;
 use metor_gpui::theme;
+use metor_gpui::{TextField, TextFieldHost};
 
 const BAR_HEIGHT: f32 = metor_gpui::CONTROL_HEIGHT;
 
@@ -111,6 +111,17 @@ impl FilterBar {
     }
 }
 
+impl TextFieldHost for FilterBar {
+    fn text_field(&mut self) -> Option<&mut TextField> {
+        Some(&mut self.field)
+    }
+
+    fn text_field_changed(&mut self, cx: &mut Context<Self>) {
+        self.query = Query::parse(&self.field.text);
+        cx.emit(FilterBarEvent::Changed);
+    }
+}
+
 impl EventEmitter<FilterBarEvent> for FilterBar {}
 
 impl Focusable for FilterBar {
@@ -145,7 +156,12 @@ impl Render for FilterBar {
             .text_color(theme.text_tertiary)
             .cursor_text()
             .child(Icon::Search.svg(11.0, theme.text_tertiary))
-            .child(div().flex_1().min_w_0().child(self.field.element()))
+            .child(
+                div().flex_1().min_w_0().child(
+                    self.field
+                        .input_element(&self.focus_handle, cx.entity().downgrade()),
+                ),
+            )
             .children(
                 self.status
                     .clone()

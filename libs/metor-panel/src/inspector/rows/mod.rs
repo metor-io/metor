@@ -22,7 +22,6 @@ pub mod nav;
 pub mod scalar;
 pub mod slider;
 pub mod text;
-pub mod text_field;
 
 pub use bool::BoolRow;
 pub use color::ColorRow;
@@ -35,11 +34,11 @@ pub use metor_gpui::row::{
     LABEL_SIZE, ROW_HEIGHT, measure, passive, row_base, row_label, row_value, tag_pill,
     with_passive,
 };
+pub use metor_gpui::{TextAlign, TextField};
 pub use nav::NavRow;
 pub use scalar::ScalarRow;
 pub use slider::SliderRow;
 pub use text::TextRow;
-pub use text_field::TextField;
 
 /// Contract every row in the inspector satisfies.
 ///

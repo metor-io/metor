@@ -1,12 +1,17 @@
+//! A small text editor that is also the window's input handler.
+
+use std::cell::Cell;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use gpui::{
-    App, ClipboardItem, Hsla, IntoElement, KeyDownEvent, Pixels, Point, SharedString, Styled,
-    TextRun, canvas, fill, point, px, size,
+    App, Bounds, ClipboardItem, FocusHandle, Hsla, InputHandler, IntoElement, KeyDownEvent, Pixels,
+    Point, SharedString, Styled, TextRun, UTF16Selection, WeakEntity, Window, canvas, fill, point,
+    px, size,
 };
 
-use metor_gpui::{Theme, theme};
+use crate::{Theme, theme};
 
 fn cursor_width() -> Pixels {
     px(1.5)
@@ -16,8 +21,7 @@ fn scroll_margin() -> Pixels {
     px(4.0)
 }
 
-/// Visual styling bundled so themes can tweak a text field's appearance
-/// without touching its input logic.
+/// Colors and metrics a [`TextField`] paints with, taken from the theme.
 pub struct TextFieldStyle {
     pub font_size: Pixels,
     pub line_height: Pixels,
@@ -40,12 +44,7 @@ impl TextFieldStyle {
     }
 }
 
-/// Minimal single-line text editor used inside the inspector.
-///
-/// Implements cursor movement, selection, standard shortcuts (Cmd-A/C/X/V,
-/// emacs-style Ctrl-A/E/F/B/D/K on macOS) and clipboard access without
-/// depending on gpui's heavier text-input widget. Clients drive repaint
-/// after each [`handle_key_down`].
+/// Which edge a [`TextField`]'s text sits against while it fits.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum TextAlign {
     #[default]
@@ -53,19 +52,27 @@ pub enum TextAlign {
     Right,
 }
 
+/// A small text editor, single-line unless made [`multiline`](Self::multiline).
+///
+/// It handles cursor movement, selection, the standard shortcuts (Cmd-A/C/X/V, and Emacs-style
+/// Ctrl-A/E/F/B/D/K on macOS) and the clipboard. The host view feeds it keys through
+/// [`handle_key_down`](Self::handle_key_down) and repaints after each. Drawn with
+/// [`input_element`](Self::input_element), it is also the window's input handler, so input
+/// methods compose into it and, on the web, paste reaches it.
 pub struct TextField {
+    /// The contents.
     pub text: String,
+    /// The cursor, as a byte offset into `text`.
     pub cursor: usize,
+    /// The other end of the selection; equal to `cursor` when nothing is selected.
     pub mark: usize,
     placeholder: String,
     style: TextFieldStyle,
     align: TextAlign,
-    /// Newlines are text rather than a submit gesture, and the field paints
-    /// every line instead of scrolling one horizontally. What makes the
-    /// program pane an editor rather than a viewer.
+    /// Newlines are text rather than a submit gesture, and the field paints every line instead
+    /// of scrolling one horizontally.
     multiline: bool,
-    /// Ranges to underline, and in what colour — how a compiler diagnostic
-    /// points at the thing it is complaining about.
+    /// Byte ranges to underline and their colors, such as compiler diagnostics.
     pub marks: Vec<(std::ops::Range<usize>, Hsla)>,
     /// First visible line, kept following the cursor.
     scroll_line: usize,
@@ -78,9 +85,16 @@ pub struct TextField {
     /// paint placed it — the anchor a completion popup hangs from. Packed
     /// f32 bits so the paint closure can write it without a lock.
     caret_px: Arc<AtomicU64>,
+    /// Text an input method is composing, as a byte range of `text`. It is replaced when the
+    /// composition commits or changes.
+    marked: Option<Range<usize>>,
+    /// Whether the last paint registered this field as the window's input handler, through
+    /// [`input_element`](Self::input_element). Pasting then arrives as a paste event on the web.
+    platform_input: Cell<bool>,
 }
 
 impl TextField {
+    /// An empty field showing `placeholder`, styled from the current theme.
     pub fn new(placeholder: impl Into<String>, cx: &App) -> Self {
         Self {
             text: String::new(),
@@ -94,6 +108,8 @@ impl TextField {
             scroll_line: 0,
             rows: Arc::new(AtomicUsize::new(1)),
             caret_px: Arc::new(AtomicU64::new(0)),
+            marked: None,
+            platform_input: Cell::new(false),
         }
     }
 
@@ -114,6 +130,7 @@ impl TextField {
         self
     }
 
+    /// Replaces the text, keeping the cursor where it still fits.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.cursor.min(self.text.len());
@@ -168,20 +185,24 @@ impl TextField {
         self.move_cursor(at, extend_selection);
     }
 
+    /// Replaces the text shown while the field is empty.
     pub fn set_placeholder(&mut self, placeholder: impl Into<String>) {
         self.placeholder = placeholder.into();
     }
 
+    /// Sets which edge the text sits against.
     pub fn set_align(&mut self, align: TextAlign) {
         self.align = align;
     }
 
+    /// Removes all text.
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
         self.mark = 0;
     }
 
+    /// Whether any text is selected.
     pub fn has_selection(&self) -> bool {
         self.mark != self.cursor
     }
@@ -356,6 +377,11 @@ impl TextField {
                     return true;
                 }
                 "v" => {
+                    // On the web the clipboard can only be read from the browser's paste event,
+                    // which reaches the input handler, so the key is left to the browser.
+                    if cfg!(target_family = "wasm") && self.platform_input.get() {
+                        return false;
+                    }
                     self.paste(cx);
                     return true;
                 }
@@ -635,8 +661,32 @@ impl TextField {
         .size_full()
     }
 
+    /// The field as an element that takes keys only through its host's key handler.
     pub fn element(&self) -> impl IntoElement {
+        self.platform_input.set(false);
+        self.render_element(None)
+    }
+
+    /// The field as an element that is also the window's input handler while `focus` is
+    /// focused, so input methods can compose text into it and, on the web, paste reaches it.
+    ///
+    /// `view` is the host, which says through [`TextFieldHost`] which field input goes to. Only
+    /// that field should be drawn this way, since a window has one input handler.
+    pub fn input_element<V: TextFieldHost>(
+        &self,
+        focus: &FocusHandle,
+        view: WeakEntity<V>,
+    ) -> impl IntoElement {
+        self.platform_input.set(true);
+        let focus = focus.clone();
+        self.render_element(Some(Box::new(move |bounds, window, cx| {
+            window.handle_input(&focus, TextFieldInput { view, bounds }, cx);
+        })))
+    }
+
+    fn render_element(&self, register_input: Option<RegisterInput>) -> impl IntoElement {
         let text = self.text.clone();
+        let marked = self.marked.clone();
         let placeholder = self.placeholder.clone();
         let cursor = self.cursor;
         let mark = self.mark;
@@ -677,7 +727,10 @@ impl TextField {
 
                 (bounds, shaped, is_placeholder)
             },
-            move |_, (bounds, shaped, is_placeholder), window, _cx| {
+            move |_, (bounds, shaped, is_placeholder), window, cx| {
+                if let Some(register) = register_input {
+                    register(bounds, window, cx);
+                }
                 let y_offset = (bounds.size.height - line_height).max(px(0.0)) / 2.0;
                 let base_y = bounds.origin.y + y_offset;
 
@@ -731,8 +784,18 @@ impl TextField {
                         gpui::TextAlign::Left,
                         None,
                         window,
-                        _cx,
+                        cx,
                     );
+
+                    if let Some(marked) = marked.filter(|_| !is_placeholder) {
+                        let start = shaped.x_for_index(marked.start);
+                        let end = shaped.x_for_index(marked.end);
+                        let underline = gpui::Bounds::new(
+                            point(text_origin.x + start, base_y + line_height - px(2.0)),
+                            size(end - start, px(1.0)),
+                        );
+                        window.paint_quad(fill(underline, cursor_color));
+                    }
 
                     let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
                         - scroll_offset
@@ -747,5 +810,282 @@ impl TextField {
         )
         .w_full()
         .h(line_height)
+    }
+}
+
+/// Registers a field's input handler from its paint, with the field's bounds.
+type RegisterInput = Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App)>;
+
+/// The platform text-input protocol, which counts in UTF-16 code units.
+impl TextField {
+    fn offset_to_utf16(&self, offset: usize) -> usize {
+        self.text[..offset.min(self.text.len())]
+            .chars()
+            .map(char::len_utf16)
+            .sum()
+    }
+
+    fn offset_from_utf16(&self, utf16: usize) -> usize {
+        let mut units = 0;
+        for (offset, ch) in self.text.char_indices() {
+            if units >= utf16 {
+                return offset;
+            }
+            units += ch.len_utf16();
+        }
+        self.text.len()
+    }
+
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+    }
+
+    /// Text without newlines unless the field is multiline, as typing and pasting insert it.
+    fn accepted(&self, text: &str) -> String {
+        match self.multiline {
+            true => text.to_string(),
+            false => text.replace('\n', ""),
+        }
+    }
+
+    /// The selection, in UTF-16 units.
+    pub fn selected_text_range(&self) -> UTF16Selection {
+        UTF16Selection {
+            range: self.range_to_utf16(&self.selection_range()),
+            reversed: self.cursor < self.mark,
+        }
+    }
+
+    /// The text an input method is composing, in UTF-16 units.
+    pub fn marked_text_range(&self) -> Option<Range<usize>> {
+        self.marked.as_ref().map(|range| self.range_to_utf16(range))
+    }
+
+    /// The text in `range_utf16`, clamped to the field.
+    pub fn text_for_range(
+        &self,
+        range_utf16: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+    ) -> String {
+        let range = self.range_from_utf16(&range_utf16);
+        *adjusted = Some(self.range_to_utf16(&range));
+        self.text[range].to_string()
+    }
+
+    /// Replace `range_utf16`, or the composition, or else the selection, with `text`, and end
+    /// any composition.
+    pub fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
+        let range = range_utf16
+            .map(|range| self.range_from_utf16(&range))
+            .or(self.marked.take())
+            .unwrap_or_else(|| self.selection_range());
+        let text = self.accepted(text);
+        self.text.replace_range(range.clone(), &text);
+        self.cursor = range.start + text.len();
+        self.mark = self.cursor;
+        self.marked = None;
+    }
+
+    /// Like [`replace_text_in_range`](Self::replace_text_in_range), but the new text stays
+    /// marked as a composition, with `selected_utf16` (relative to it) selected.
+    pub fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        selected_utf16: Option<Range<usize>>,
+    ) {
+        let range = range_utf16
+            .map(|range| self.range_from_utf16(&range))
+            .or(self.marked.clone())
+            .unwrap_or_else(|| self.selection_range());
+        let text = self.accepted(text);
+        self.text.replace_range(range.clone(), &text);
+        self.marked = (!text.is_empty()).then(|| range.start..range.start + text.len());
+        let start_utf16 = self.offset_to_utf16(range.start);
+        match selected_utf16 {
+            Some(selected) => {
+                self.mark = self.offset_from_utf16(start_utf16 + selected.start);
+                self.cursor = self.offset_from_utf16(start_utf16 + selected.end);
+            }
+            None => {
+                self.cursor = range.start + text.len();
+                self.mark = self.cursor;
+            }
+        }
+    }
+
+    /// Commit the composition as ordinary text.
+    pub fn unmark_text(&mut self) {
+        self.marked = None;
+    }
+}
+
+/// Connects a [`TextField`] inside a host view to the window's text input, so input methods
+/// and, on the web, paste can edit it.
+struct TextFieldInput<V: TextFieldHost> {
+    view: WeakEntity<V>,
+    /// Where the field was painted, which input methods place their candidate window by.
+    bounds: Bounds<Pixels>,
+}
+
+/// A view that holds a [`TextField`] drawn with [`TextField::input_element`].
+pub trait TextFieldHost: Sized + 'static {
+    /// The field platform input edits now, if any.
+    fn text_field(&mut self) -> Option<&mut TextField>;
+
+    /// Called after platform input changed the field's text, as the host's own key handler
+    /// would after a keystroke.
+    fn text_field_changed(&mut self, _cx: &mut gpui::Context<Self>) {}
+}
+
+impl<V: TextFieldHost> TextFieldInput<V> {
+    /// Run `f` on the host's field. When `edits`, tell the host its text changed.
+    fn with_field<R>(
+        &self,
+        edits: bool,
+        cx: &mut App,
+        f: impl FnOnce(&mut TextField) -> R,
+    ) -> Option<R> {
+        self.view
+            .update(cx, |view, cx| {
+                let result = view.text_field().map(f);
+                if edits && result.is_some() {
+                    view.text_field_changed(cx);
+                    cx.notify();
+                }
+                result
+            })
+            .ok()
+            .flatten()
+    }
+}
+
+impl<V: TextFieldHost> InputHandler for TextFieldInput<V> {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.with_field(false, cx, |field| field.selected_text_range())
+    }
+
+    fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.with_field(false, cx, |field| field.marked_text_range())
+            .flatten()
+    }
+
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.with_field(false, cx, |field| {
+            field.text_for_range(range_utf16, adjusted_range)
+        })
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.with_field(true, cx, |field| {
+            field.replace_text_in_range(replacement_range, text)
+        });
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.with_field(true, cx, |field| {
+            field.replace_and_mark_text_in_range(range_utf16, new_text, new_selected_range)
+        });
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+        self.with_field(true, cx, TextField::unmark_text);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        // The caret's last painted position stands in for the range: input methods only use it
+        // to place their candidate window beside the text.
+        let caret = self.with_field(false, cx, |field| field.caret_position())?;
+        let line = self.bounds.size.height;
+        Some(Bounds::new(
+            point(caret.x, caret.y - line),
+            size(px(1.0), line),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn field(text: &str, cx: &App) -> TextField {
+        let mut field = TextField::new("", cx);
+        field.set_text(text);
+        field
+    }
+
+    #[gpui::test]
+    fn composition_replaces_itself_and_commits(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::install_themes(cx, Vec::new(), None);
+            let mut field = field("ab", cx);
+            field.cursor = 1;
+            field.mark = 1;
+            field.replace_and_mark_text_in_range(None, "k", Some(1..1));
+            assert_eq!(field.text, "akb");
+            assert_eq!(field.marked_text_range(), Some(1..2));
+            field.replace_and_mark_text_in_range(None, "かな", Some(2..2));
+            assert_eq!(field.text, "aかなb");
+            assert_eq!(field.marked_text_range(), Some(1..3));
+            field.replace_text_in_range(None, "仮名");
+            assert_eq!(field.text, "a仮名b");
+            assert_eq!(field.marked_text_range(), None);
+            assert_eq!(field.selected_text_range().range, 3..3);
+        });
+    }
+
+    #[gpui::test]
+    fn ranges_count_utf16_units(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::install_themes(cx, Vec::new(), None);
+            let mut field = field("a😀b", cx);
+            let mut adjusted = None;
+            assert_eq!(field.text_for_range(1..3, &mut adjusted), "😀");
+            assert_eq!(adjusted, Some(1..3));
+            field.replace_text_in_range(Some(3..4), "c\nd");
+            assert_eq!(field.text, "a😀cd", "a single-line field drops newlines");
+        });
     }
 }

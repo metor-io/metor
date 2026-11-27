@@ -17,7 +17,7 @@ use super::drag::{ActiveDrag, DragGhost, DragSource, DraggedPane, DraggedTab, se
 use super::motion::{MovingTab, Rail, TabSizes};
 use crate::config::TabPlacement;
 use metor_gpui::Icon;
-use metor_gpui::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
+use metor_gpui::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, side_tab, theme};
 
 /// Identity of a tab, stable while tabs are added, closed and reordered
 /// around it, and unique across windows.
@@ -33,7 +33,7 @@ const NEW_TAB_SLOT: TabId = TabId(0);
 pub(crate) const TAB_MAX_WIDTH: f32 = 220.0;
 const TAB_MIN_WIDTH: f32 = 80.0;
 /// Space between neighbouring tabs.
-const TAB_GAP: f32 = 2.0;
+const TAB_GAP: f32 = metor_gpui::SIDE_TABS_GAP;
 const SIDEBAR_WIDTH: f32 = 200.0;
 const MIN_SIDEBAR_WIDTH: f32 = 140.0;
 const MAX_SIDEBAR_WIDTH: f32 = 420.0;
@@ -258,6 +258,7 @@ pub(crate) fn tab_list(
                         vertical,
                     },
                     &theme,
+                    cx,
                 );
                 list = list.child(MovingTab::new(id, tab, rail.clone(), animate, vertical));
             }
@@ -390,7 +391,14 @@ struct TabView {
     vertical: bool,
 }
 
-fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl IntoElement {
+/// One tab: the shared [`metor_gpui::SideTab`] look, plus close, drag and drop and the context
+/// menu.
+fn render_tab(
+    group: &Entity<TileGroup>,
+    tab: TabView,
+    theme: &Theme,
+    cx: &App,
+) -> impl IntoElement {
     let TabView {
         id,
         ix,
@@ -400,46 +408,23 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
         vertical,
     } = tab;
     let hover_group: SharedString = format!("top-tab-{}", id.0).into();
-    let bg_primary = theme.bg_primary;
-    let text_primary = theme.text_primary;
     let border_primary = theme.border_primary;
     let drop_accent = theme.drop_accent();
     let drop_fill = theme.drop_fill();
 
-    let mut element = div()
-        .id(("top-tab", id.0 as usize))
+    let mut element = side_tab(("top-tab", id.0 as usize), title)
+        .active(active)
+        .into_div(cx)
         .debug_selector(move || format!("top-tab-{ix}"))
         .group(hover_group.clone())
         .occlude()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .h(px(CONTROL_HEIGHT))
-        .flex_shrink_0()
-        .pl(px(8.0))
-        .pr(px(4.0))
-        .rounded(px(CONTROL_RADIUS))
-        .border_1()
-        .cursor_pointer()
-        .text_size(px(12.0));
-    element = if vertical {
-        element.w_full()
-    } else {
-        element.min_w(px(TAB_MIN_WIDTH)).max_w(px(TAB_MAX_WIDTH))
-    };
-    element = if active {
-        element
-            .bg(bg_primary)
-            .border_color(border_primary)
-            .text_color(text_primary)
-            .shadow_xs()
-    } else {
-        element
-            .border_color(gpui::transparent_black())
-            .text_color(theme.text_secondary)
-            .hover(move |s| s.bg(bg_primary).text_color(text_primary))
-    };
+        .cursor_pointer();
+    if !vertical {
+        element = element
+            .w_auto()
+            .min_w(px(TAB_MIN_WIDTH))
+            .max_w(px(TAB_MAX_WIDTH));
+    }
 
     let close = close_icon(theme)
         .id(("top-tab-close", id.0 as usize))
@@ -536,7 +521,6 @@ fn render_tab(group: &Entity<TileGroup>, tab: TabView, theme: &Theme) -> impl In
         })
         // Tabs occlude the bar beneath them, so they take a tab drop too.
         .on_drop(move |dragged: &DraggedTab, _, cx| drop_tab(&tab_group, dragged, cx))
-        .child(div().flex_1().min_w_0().truncate().child(title))
         .when(can_close, |tab| tab.child(close))
 }
 
