@@ -39,8 +39,8 @@ use crate::views::component_browser::component_tree::{
 use crate::views::component_browser::strip_cell_count;
 use crate::views::gradient::{Gradient, Palette, Scale, Span};
 use crate::views::lazy_pool::VisibleEntityCache;
-use crate::views::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use crate::views::value_strip::{ComponentValueStrip, StripStyle};
+use metor_gpui::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use metor_gpui::{theme, ui_px};
 use smallvec::SmallVec;
 

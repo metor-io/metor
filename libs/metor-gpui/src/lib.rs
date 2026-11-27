@@ -9,17 +9,31 @@
 
 #![allow(clippy::type_complexity)]
 
+pub mod button;
+pub mod chord;
 mod fonts;
 mod icons;
 pub mod motion;
+pub mod popover;
+pub mod row;
+mod scrollbar;
+mod switch;
+pub mod table;
 mod theme;
+mod tooltip;
+mod tree;
 
 use gpui::App;
 
 pub use fonts::{BUNDLED_FAMILY, UiSettings, font_family, register_fonts};
 pub use icons::{Icon, IconAssets};
 pub use motion::{Fade, MotionPreference};
+pub use scrollbar::Scrollbar;
+pub use switch::{OnPick, Switch};
+pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use theme::*;
+pub use tooltip::TooltipText;
+pub use tree::JsonTree;
 
 /// Register the bundled font and install default theme and settings globals.
 ///

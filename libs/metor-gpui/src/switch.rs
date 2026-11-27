@@ -10,18 +10,18 @@ use gpui::{
     SpringAnimation, SpringConfig, Styled, Window, div, prelude::*, px, relative,
 };
 
-use metor_gpui::{Theme, ui_px};
+use crate::{Theme, ui_px};
 
 /// A critically damped spring that settles in about a fifth of a second:
 /// the knob slides without overshooting.
 const SLIDE: SpringConfig = SpringConfig::new(900.0, 60.0, 1.0);
 
 /// Called with the position a click on a labelled switch picked.
-pub(crate) type OnPick = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+pub type OnPick = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// How a switch looks; the caller owns its state, and styles its own
 /// element with [`Switch::apply`].
-pub(crate) struct Switch {
+pub struct Switch {
     /// The position the knob sits at: `0` off and `1` on for a plain
     /// switch. `None` lights no position, for a value no label names.
     chosen: Option<usize>,
@@ -43,12 +43,12 @@ impl Switch {
     /// height in the inspector's proportions: a knob five sevenths of it,
     /// inset by a seventh, on a track eleven sevenths wide. The knob slides
     /// between sides unless motion is turned down.
-    pub(crate) fn new(on: bool, height: f32, cx: &App) -> Self {
+    pub fn new(on: bool, height: f32, cx: &App) -> Self {
         Self {
             chosen: Some(usize::from(on)),
             height,
             scaled: false,
-            slides: metor_gpui::motion::enabled(cx),
+            slides: crate::motion::enabled(cx),
             labels: Vec::new(),
             track: None,
             knob: None,
@@ -59,12 +59,7 @@ impl Switch {
 
     /// A switch between named positions, the knob under the `chosen` one.
     /// See [`Switch::labels`] for how it is laid out.
-    pub(crate) fn choice(
-        labels: Vec<SharedString>,
-        chosen: Option<usize>,
-        height: f32,
-        cx: &App,
-    ) -> Self {
+    pub fn choice(labels: Vec<SharedString>, chosen: Option<usize>, height: f32, cx: &App) -> Self {
         Self {
             chosen,
             labels,
@@ -74,7 +69,7 @@ impl Switch {
 
     /// Size in UI units, which follow the panel's text size, rather than
     /// pixels.
-    pub(crate) fn scaled(mut self) -> Self {
+    pub fn scaled(mut self) -> Self {
         self.scaled = true;
         self
     }
@@ -84,38 +79,34 @@ impl Switch {
     /// between named things has no "on", so the track is the buttons'
     /// surface whatever is chosen, and the labels are sized like button
     /// text: 11px on a 24px switch, padded as wide as a button's.
-    pub(crate) fn labels(
-        mut self,
-        off: impl Into<SharedString>,
-        on: impl Into<SharedString>,
-    ) -> Self {
+    pub fn labels(mut self, off: impl Into<SharedString>, on: impl Into<SharedString>) -> Self {
         self.labels = vec![off.into(), on.into()];
         self
     }
 
     /// Paint the track `color` in place of its on and off colours, for
     /// states that outrank the value: an unsent edit, a dead producer.
-    pub(crate) fn track(mut self, color: Hsla) -> Self {
+    pub fn track(mut self, color: Hsla) -> Self {
         self.track = Some(color);
         self
     }
 
     /// Paint the knob `fill`, with the label over it in `text`, wherever it
     /// is: a stale value's colours, which outrank the positions' own.
-    pub(crate) fn knob(mut self, fill: Hsla, text: Hsla) -> Self {
+    pub fn knob(mut self, fill: Hsla, text: Hsla) -> Self {
         self.knob = Some((fill, text));
         self
     }
 
     /// Give each position a knob colour, so the knob says what is chosen
     /// as well as where. Sliding between positions blends their colours.
-    pub(crate) fn colors(mut self, colors: Vec<Option<Hsla>>) -> Self {
+    pub fn colors(mut self, colors: Vec<Option<Hsla>>) -> Self {
         self.colors = colors;
         self
     }
 
     /// Let a click on a labelled position pick it.
-    pub(crate) fn on_pick(mut self, pick: OnPick) -> Self {
+    pub fn on_pick(mut self, pick: OnPick) -> Self {
         self.on_pick = Some(pick);
         self
     }
@@ -130,7 +121,7 @@ impl Switch {
     /// Style `el` as this switch: its size, track and knob. The knob's
     /// slide is keyed under the nearest element id above it, so each switch
     /// needs one of its own.
-    pub(crate) fn apply<E: Styled + ParentElement>(self, el: E, theme: &Theme) -> E {
+    pub fn apply<E: Styled + ParentElement>(self, el: E, theme: &Theme) -> E {
         let h = self.height;
         // A labelled switch sits among buttons, so it takes their surface.
         let track = self
@@ -280,7 +271,7 @@ mod tests {
 
     impl Render for Rig {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let theme = metor_gpui::theme(cx);
+            let theme = crate::theme(cx);
             let switch = Switch::new(self.on, 14.0, cx);
             let switch = match self.labels {
                 true => switch.labels("Channels", "History"),
@@ -294,7 +285,7 @@ mod tests {
         labels: bool,
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<Rig>, &mut gpui::VisualTestContext) {
-        cx.update(|cx| metor_gpui::set_theme(cx, std::sync::Arc::new(metor_gpui::DARK.clone())));
+        cx.update(|cx| crate::set_theme(cx, std::sync::Arc::new(crate::DARK.clone())));
         cx.add_window_view(move |_, _| Rig { on: false, labels })
     }
 
@@ -349,7 +340,7 @@ mod tests {
 
     impl Render for Choice {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let theme = metor_gpui::theme(cx);
+            let theme = crate::theme(cx);
             let picked = self.picked.clone();
             let switch = Switch::choice(
                 vec!["SAFE".into(), "ARMED".into(), "FIRE".into()],
@@ -364,7 +355,7 @@ mod tests {
 
     #[gpui::test]
     fn any_number_of_positions_share_the_track_and_pick_on_click(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| metor_gpui::set_theme(cx, std::sync::Arc::new(metor_gpui::DARK.clone())));
+        cx.update(|cx| crate::set_theme(cx, std::sync::Arc::new(crate::DARK.clone())));
         let picked = std::rc::Rc::new(std::cell::Cell::new(None));
         let (choice, cx) = cx.add_window_view({
             let picked = picked.clone();
@@ -408,7 +399,7 @@ mod tests {
 
     #[gpui::test]
     fn the_knob_takes_each_positions_colour_and_blends_between(cx: &mut gpui::TestAppContext) {
-        let theme = metor_gpui::DARK.clone();
+        let theme = crate::DARK.clone();
         let red = gpui::Hsla::from(gpui::rgb(0xff0000));
         let green = gpui::Hsla::from(gpui::rgb(0x00ff00));
         cx.update(|cx| {

@@ -114,7 +114,7 @@ impl Render for PaneHeader {
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover_bg))
                 .child(icon.svg(12.0, theme.text_tertiary))
-                .tooltip(move |_, cx| crate::views::tooltip::TooltipText::build(tooltip.into(), cx))
+                .tooltip(move |_, cx| metor_gpui::TooltipText::build(tooltip.into(), cx))
                 // A press on a control must not start a header drag.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         };

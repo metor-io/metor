@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{self, CodeFeed};
 use super::monitor::{apply_click, behavior_with, edit_click};
-use super::switch::Switch;
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
+use metor_gpui::Switch;
 
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspect;

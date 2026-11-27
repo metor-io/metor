@@ -1,8 +1,8 @@
 use super::*;
 use crate::plot_events::flags::{ClusterPaint, paint_event_flags};
 use crate::views::plot_common::paint_text_label;
-use crate::views::table::{CELL_FONT_SIZE, CELL_PAD_X, HEADER_HEIGHT, ROW_HEIGHT};
 use gpui::{BorderStyle, TextAlign, fill, point, quad, size};
+use metor_gpui::table::{CELL_FONT_SIZE, CELL_PAD_X, HEADER_HEIGHT, ROW_HEIGHT};
 use metor_gpui::ui_scale;
 
 /// Painted geometry is also the hit target, including the entire truncated chip.

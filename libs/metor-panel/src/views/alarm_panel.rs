@@ -18,12 +18,12 @@ use crate::alarms::latch::TileState;
 use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::views::buttons::{self, icon_button, pressable};
 use crate::views::format::format_age;
-use crate::views::switch::Switch;
-use crate::views::table;
 use crate::views::value_strip::STRIP_BOX_HEIGHT;
 use metor_gpui::Icon;
+use metor_gpui::Switch;
+use metor_gpui::button::{self, icon_button, pressable};
+use metor_gpui::table;
 use metor_gpui::{theme, ui_px};
 
 /// Which set the alarm list shows.
@@ -197,7 +197,7 @@ impl Render for AlarmView {
             let shelved = state.shelves_sorted().len();
             if shelved > 0 {
                 header = header.child(
-                    buttons::header_button(format!("{shelved} shelved"), &theme)
+                    button::header_button(format!("{shelved} shelved"), &theme)
                         .id("alarm-shelved-count")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.mode = AlarmListMode::Shelved;
@@ -210,7 +210,7 @@ impl Render for AlarmView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                buttons::header_button("Ack all", &theme)
+                button::header_button("Ack all", &theme)
                     .id("alarm-ack-all")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = alarms::try_global(cx) {

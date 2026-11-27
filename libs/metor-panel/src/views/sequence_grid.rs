@@ -13,7 +13,7 @@ use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, ChannelReaders, ChannelStatusReader, state_label};
-use crate::views::TooltipText;
+use metor_gpui::TooltipText;
 use metor_gpui::theme;
 
 /// Compact grid of sequence channels.

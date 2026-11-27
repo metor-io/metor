@@ -79,7 +79,7 @@ pub(crate) struct AppRoot {
     pending_inspector_open: Option<InspectorRequest>,
     /// The transient chord menu, retained through its passive exit fade.
     /// Logical dismissal releases focus before the visual is removed.
-    transient: Option<Entity<crate::transient::Transient>>,
+    transient: Option<Entity<metor_gpui::chord::Transient>>,
     /// The connection picker, present only while open, mirroring `inspector`.
     connection_picker: Option<Entity<crate::connections::ConnectionPicker>>,
     /// Queued picker open; `true` means the picker must stay up until
@@ -227,7 +227,7 @@ impl AppRoot {
             crate::transient::menu::default_menu(self.db.clone(), self.tiles.clone(), on_open);
         let parent_focus = self.focus_handle.clone();
         let transient = cx.new(|cx| {
-            let mut t = crate::transient::Transient::new(leader, nodes, cx);
+            let mut t = metor_gpui::chord::Transient::new(leader, nodes, cx);
             t.set_parent_focus(parent_focus);
             t
         });
@@ -1270,7 +1270,7 @@ impl AppRoot {
                     let text = crate::temporal::view_time(cx)
                         .map(|t| crate::temporal::model::timestamp_text(t, &c.timezone))
                         .unwrap_or_else(|| "Unavailable".into());
-                    crate::views::tooltip::TooltipText::build(text.into(), cx)
+                    metor_gpui::TooltipText::build(text.into(), cx)
                 })
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     crate::temporal::picker::open(
@@ -1293,9 +1293,7 @@ impl AppRoot {
             right = right.child(
                 Self::titlebar_segment(theme, "time-go-live")
                     .child(metor_gpui::Icon::SkipForward.svg(14.0, theme.text_secondary))
-                    .tooltip(|_, cx| {
-                        crate::views::tooltip::TooltipText::build("Go live".into(), cx)
-                    })
+                    .tooltip(|_, cx| metor_gpui::TooltipText::build("Go live".into(), cx))
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                         let _ = crate::temporal::dispatch(crate::temporal::TimeAction::Live, cx);
                     }),
@@ -1341,7 +1339,7 @@ impl AppRoot {
                     .svg(14.0, theme.text_secondary),
                 )
                 .tooltip(move |_, cx| {
-                    crate::views::tooltip::TooltipText::build(
+                    metor_gpui::TooltipText::build(
                         if mode == "Paused" { "Play" } else { "Pause" }.into(),
                         cx,
                     )

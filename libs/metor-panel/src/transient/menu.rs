@@ -18,7 +18,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::tiles::panels::new_panel_rows;
 use crate::tiles::{Pane, SplitDirection, TileGroup};
 
-use super::node::ChordNode;
+use metor_gpui::chord::ChordNode;
 
 /// The root chord menu: the levels reachable by the first keystroke after the
 /// leader. Submenu children are built lazily so they reflect current state.

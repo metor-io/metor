@@ -37,13 +37,13 @@ use serde::{Deserialize, Serialize};
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, Channel, ChannelStatus, ChannelStatusReader, state_label};
-use crate::views::TooltipText;
-use crate::views::buttons::{icon_button, pressable};
 use crate::views::format::format_age;
 use crate::views::value_strip::{
     STRIP_BOX_HEIGHT, STRIP_BOX_VALUE_SIZE, apply_chevron, box_corners, box_fill, box_padding,
 };
 use metor_gpui::Icon;
+use metor_gpui::TooltipText;
+use metor_gpui::button::{icon_button, pressable};
 use metor_gpui::{Theme, font_family, theme, ui_px};
 
 /// Persisted shape of a [`SequenceControl`], shared by the tile and dashboard

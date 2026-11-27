@@ -14,8 +14,8 @@ use metor_proto_wkt::SequenceChannelState;
 use crate::sequences::{self, ChannelReaders, HistoryEntry, SequenceHistory, state_label};
 use crate::views::format::format_age;
 use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
-use crate::views::switch::Switch;
-use crate::views::{buttons, table};
+use metor_gpui::Switch;
+use metor_gpui::{button, table};
 use metor_gpui::{theme, ui_px};
 
 /// Size of one square control in the channel grid, in unscaled pixels.
@@ -151,7 +151,7 @@ impl Render for SequenceView {
         header = header
             .child(div().flex_grow_1())
             .child(
-                buttons::header_button("Reload", &theme)
+                button::header_button("Reload", &theme)
                     .id("seq-reload")
                     .on_click(cx.listener(|_this, _, _, cx| {
                         if let Some(store) = sequences::try_global(cx) {

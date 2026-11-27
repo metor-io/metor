@@ -1,6 +1,6 @@
 use gpui::{Axis, IntoElement, div, prelude::*, px};
 
-use metor_gpui::theme;
+use crate::theme;
 
 const TRACK_SIZE: f32 = 8.0;
 const THUMB_SIZE: f32 = 6.0;

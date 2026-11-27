@@ -15,7 +15,7 @@ use metor_proto_wkt::LogLevel;
 
 use crate::logs::{self, LogState};
 use crate::views::format::format_time;
-use crate::views::table::{self, Column, ColumnSort, Table, TableDelegate};
+use metor_gpui::table::{self, Column, ColumnSort, Table, TableDelegate};
 use metor_gpui::{Theme, theme};
 
 /// The viewer's level floor. `All` shows everything received (the FSW side

@@ -306,7 +306,7 @@ impl InspectorPane {
                         },
                     ))
                     .tooltip(move |_, cx| {
-                        crate::views::TooltipText::build(
+                        metor_gpui::TooltipText::build(
                             if pinned {
                                 "Pinned: click to follow the selection again".into()
                             } else {

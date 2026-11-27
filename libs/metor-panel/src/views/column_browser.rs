@@ -9,12 +9,12 @@ use gpui::{
 };
 use smallvec::SmallVec;
 
-use super::Scrollbar;
 use super::filter_bar::{FilterBar, FilterBarEvent};
 use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use metor_gpui::Icon;
+use metor_gpui::Scrollbar;
 use metor_gpui::theme;
 
 actions!(metor_panel, [ToggleFilterBar]);

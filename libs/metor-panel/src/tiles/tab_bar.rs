@@ -293,7 +293,7 @@ pub(crate) fn tab_list(
             .hover(move |s| s.bg(bg_primary))
             .child(Icon::Add.svg(12.0, theme.text_tertiary))
             .when(vertical, |row| row.child("New tab"))
-            .tooltip(|_, cx| crate::views::tooltip::TooltipText::build("New tab".into(), cx))
+            .tooltip(|_, cx| metor_gpui::TooltipText::build("New tab".into(), cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, _, cx| {
                 group.update(cx, |group, cx| {

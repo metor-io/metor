@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::inspector::rows::{
     BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow, SliderRow,
 };
-use crate::views::Scrollbar;
 use crate::views::add_menu::{AddMenu, Host};
+use metor_gpui::Scrollbar;
 use metor_gpui::theme;
 
 use crate::tiles::PaneItem;

@@ -1,8 +1,8 @@
 //! Shared event readout styling for plots and timeline previews.
 use super::PlotEvent;
-use crate::views::popover::readout_card;
 use crate::views::time_series::LABEL_FONT_SIZE;
 use gpui::{App, SharedString, div, prelude::*, px};
+use metor_gpui::popover::readout_card;
 use metor_gpui::ui_px;
 
 pub(crate) fn event_card<'a>(
@@ -11,7 +11,7 @@ pub(crate) fn event_card<'a>(
     cx: &App,
 ) -> gpui::Div {
     let theme = metor_gpui::theme(cx);
-    readout_card(cx)
+    readout_card(crate::views::time_series::LABEL_FONT_SIZE, cx)
         .child(div().child(header))
         .children(events.map(|event| event_summary_row(event, &theme)))
 }

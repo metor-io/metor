@@ -7872,6 +7872,7 @@ version = "0.14.2"
 dependencies = [
  "gpui",
  "gpui_platform",
+ "serde_json",
  "tracing",
  "wasm-bindgen",
  "web-time",

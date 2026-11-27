@@ -8,6 +8,7 @@ description = "gpui primitives shared by metor-panel and the metor-ci web GUI"
 [dependencies]
 gpui.workspace = true
 tracing = "0.1"
+serde_json = "1"
 web-time = "1"
 
 [dev-dependencies]

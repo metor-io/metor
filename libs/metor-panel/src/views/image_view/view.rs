@@ -21,8 +21,8 @@ use super::render::{self, Frames, Job, LutKey, RenderKey, Rendered, Scheduler};
 use super::resample::{MAX_STEP, MIN_STEP, Rect, RenderError, Scratch, Viewport};
 use super::source::{Frame, FrameSource, FrameState, RecordSource};
 use crate::data_binding::Binding;
-use crate::views::popover;
 use crate::views::time_series::cursor::{estimate_readout_size, readout_origin};
+use metor_gpui::popover;
 use metor_gpui::{theme, ui_px, ui_scale};
 
 /// Zoom per wheel notch.
@@ -609,7 +609,7 @@ impl ImageView {
         }
         Some(
             div().absolute().top(px(4.0)).left(px(4.0)).child(
-                popover::readout_card(cx).children(
+                popover::readout_card(crate::views::time_series::LABEL_FONT_SIZE, cx).children(
                     lines
                         .into_iter()
                         .map(|l| div().child(SharedString::from(l))),
@@ -768,7 +768,8 @@ fn readout_card(
         .collect();
     let box_size = estimate_readout_size(header.chars().count(), &lens).map(|l| l * scale);
     let origin = readout_origin(pointer, box_size, bounds, px(READOUT_OFFSET * scale));
-    let mut card = popover::readout_card(cx).child(div().child(SharedString::from(header)));
+    let mut card = popover::readout_card(crate::views::time_series::LABEL_FONT_SIZE, cx)
+        .child(div().child(SharedString::from(header)));
     for (swatch, label, value, value_color) in rows {
         let mut row = div().flex().flex_row().items_center().gap_1();
         if let Some(color) = swatch {

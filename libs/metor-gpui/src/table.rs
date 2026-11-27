@@ -1,16 +1,16 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, EntityId, IntoElement,
-    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, EntityId, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
-use super::Scrollbar;
+use crate::Scrollbar;
 
-use crate::inspector::rows::measure;
-use metor_gpui::Icon;
-use metor_gpui::{theme, ui_px, ui_scale};
+use crate::Icon;
+use crate::row::measure;
+use crate::{theme, ui_px, ui_scale};
 
 /// Text size and horizontal padding of a header label, and the room a
 /// sortable header keeps for its chevron and the gap before it.
@@ -20,20 +20,20 @@ const SORT_ICON_ROOM: f32 = 16.0;
 
 /// Height of the column header, shared with the chip headers of the log,
 /// sequence and alarm panels so a row of tabs lines up across panes.
-pub(crate) const HEADER_HEIGHT: f32 = 32.0;
+pub const HEADER_HEIGHT: f32 = 32.0;
 /// Height of the buttons and switches in those chip headers, so they line
 /// up. Tall enough that a switch's knob has room inside its track.
-pub(crate) const HEADER_CONTROL_HEIGHT: f32 = 24.0;
+pub const HEADER_CONTROL_HEIGHT: f32 = 24.0;
 
 /// Height of one body row in the panel's dense tables. The component outline
 /// sets the house style here; panes that only *look* like a table (the
 /// execution timeline's lanes) take the same number so rows line up when two
 /// of them sit side by side.
-pub(crate) const ROW_HEIGHT: f32 = 30.0;
+pub const ROW_HEIGHT: f32 = 30.0;
 /// Horizontal padding inside a table cell.
-pub(crate) const CELL_PAD_X: f32 = 12.0;
+pub const CELL_PAD_X: f32 = 12.0;
 /// Font size of table cell text.
-pub(crate) const CELL_FONT_SIZE: f32 = 12.0;
+pub const CELL_FONT_SIZE: f32 = 12.0;
 const RESIZE_HANDLE_WIDTH: f32 = 6.0;
 
 /// Sort state of a column in a [`Table`].
@@ -135,6 +135,11 @@ pub trait TableDelegate: Sized + 'static {
         window: &mut Window,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement;
+    /// A background tint for row `row_ix`, such as a state color for a failed row. `None`
+    /// leaves the row on the table background.
+    fn row_tint(&self, _row_ix: usize, _cx: &App) -> Option<Hsla> {
+        None
+    }
     fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &mut Context<Table<Self>>);
     /// A header was dropped so that its column now sits at `to`, counted
     /// in the column list with it removed from `from`.
@@ -209,7 +214,7 @@ impl Render for ColumnDrag {
 }
 
 /// The floating label every drag in a table shows under the cursor.
-pub(crate) fn drag_chip(label: SharedString, cx: &App) -> impl IntoElement {
+pub fn drag_chip(label: SharedString, cx: &App) -> impl IntoElement {
     let theme = theme(cx);
     div()
         .bg(theme.bg_primary)
@@ -226,7 +231,7 @@ pub(crate) fn drag_chip(label: SharedString, cx: &App) -> impl IntoElement {
 /// before it when the cursor is in the slot's left half, else after. The
 /// result is the item's index once removed from `from`, so a drop on its
 /// own slot resolves to `from`.
-pub(crate) fn drop_index(from: usize, over: usize, before: bool) -> usize {
+pub fn drop_index(from: usize, over: usize, before: bool) -> usize {
     let slot = if before { over } else { over + 1 };
     if from < slot { slot - 1 } else { slot }
 }
@@ -298,8 +303,8 @@ impl<D: TableDelegate> Table<D> {
         -handle.offset().y >= handle.max_offset().y - px(ROW_HEIGHT * 4.0)
     }
 
-    #[cfg(test)]
-    pub(super) fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
+    /// Scroll the rows to `offset`, as a wheel would.
+    pub fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
         self.scroll_handle.0.borrow().base_handle.set_offset(offset);
     }
 
@@ -617,6 +622,9 @@ impl<D: TableDelegate> Render for Table<D> {
                             .h(row_height)
                             .border_b_1()
                             .border_color(border_color);
+                        if let Some(tint) = this.delegate.row_tint(row_ix, cx) {
+                            row = row.bg(tint);
+                        }
 
                         // `col_ix` indexes both `col_flex` and `col_states`,
                         // so a plain index loop reads better than zipping

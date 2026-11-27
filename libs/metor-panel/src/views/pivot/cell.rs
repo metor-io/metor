@@ -18,8 +18,8 @@ use crate::views::component_browser::strip_menu;
 use crate::views::image_view::collapsed_label;
 use crate::views::lazy_pool::VisibleEntityCache;
 use crate::views::monitor::{behavior_snapshot, edit_click};
-use crate::views::table::drag_chip;
 use crate::views::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
+use metor_gpui::table::drag_chip;
 use metor_gpui::{theme, ui_px};
 
 /// Horizontal padding inside one cell.

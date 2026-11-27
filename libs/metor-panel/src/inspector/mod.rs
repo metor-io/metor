@@ -935,7 +935,7 @@ impl Inspector {
                         .svg(12.0, theme.text_secondary),
                     )
                     .tooltip(|_, cx| {
-                        crate::views::TooltipText::build(
+                        metor_gpui::TooltipText::build(
                             "Expand/collapse the panel below (Alt-E); focus it (Alt-T)".into(),
                             cx,
                         )

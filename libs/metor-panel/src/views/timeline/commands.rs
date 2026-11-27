@@ -382,7 +382,7 @@ fn event_rows(event: Arc<TimelineEvent>, cx: &App) -> Vec<Box<dyn InspectorRow>>
         rows.push(Box::new(CommandRow::action(
             "Inspect payload",
             Arc::new(move |_, cx| {
-                let tree = cx.new(|cx| crate::views::JsonTree::new(value.clone(), cx));
+                let tree = cx.new(|cx| metor_gpui::JsonTree::new(value.clone(), cx));
                 RowAction::CascadeView(PreviewSpec {
                     view: tree.into(),
                     size: gpui::size(px(480.0), px(300.0)),

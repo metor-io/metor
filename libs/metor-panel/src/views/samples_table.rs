@@ -27,14 +27,14 @@ use serde::{Deserialize, Serialize};
 
 use super::format::ValueFormatter;
 use super::image_view::{expands, list_expandable_components};
-use super::table::{
-    CELL_PAD_X, Column, ColumnSort, HEADER_HEIGHT, ROW_HEIGHT, Table, TableDelegate,
-};
 use super::value_strip::{StripStyle, render_static_cells, resolve_metadata, strip_row_width};
 use crate::data_binding::Binding;
 use crate::inspector::rows::{
     BoolRow, ComponentRowBuilder, ExpressionRow, InspectorRow, OnExpression, RowAction,
     TailRowBuilder, row_base, row_label,
+};
+use metor_gpui::table::{
+    CELL_PAD_X, Column, ColumnSort, HEADER_HEIGHT, ROW_HEIGHT, Table, TableDelegate,
 };
 use metor_gpui::{theme, ui_px};
 

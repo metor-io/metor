@@ -16,10 +16,10 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 use crate::inspect;
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
 use crate::temporal::display::elapsed;
-use crate::views::json_tree::JsonTree;
 use crate::views::plot_common::PlotLegend;
 use crate::views::plot_common::chrome::{paint_axis_backdrop, paint_hline, paint_vline};
-use crate::views::popover::readout_card;
+use metor_gpui::JsonTree;
+use metor_gpui::popover::readout_card;
 
 mod render;
 
@@ -1727,7 +1727,8 @@ impl TimeSeriesPlot {
             pa.origin.y - px(PADDING * self.chrome_scale),
         );
 
-        let mut boxed = readout_card(cx).child(div().child(SharedString::from(header)));
+        let mut boxed = readout_card(crate::views::time_series::LABEL_FONT_SIZE, cx)
+            .child(div().child(SharedString::from(header)));
         for (color, label, value) in rows {
             boxed = boxed.child(
                 div()
@@ -2023,7 +2024,7 @@ impl TimeSeriesPlot {
 
         let detail = self.event_detail_element(&cluster.events[selected].detail, &theme);
 
-        let panel = readout_card(cx)
+        let panel = readout_card(crate::views::time_series::LABEL_FONT_SIZE, cx)
             .gap_1()
             .w(ui_px(300.0))
             .border_color(theme.selection_bg)

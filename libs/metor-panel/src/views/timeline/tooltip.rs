@@ -59,7 +59,10 @@ struct TimelineTooltip {
 impl Render for TimelineTooltip {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let card = match &self.readout {
-            Readout::Time(label) => crate::views::popover::readout_card(cx).child(label.clone()),
+            Readout::Time(label) => {
+                metor_gpui::popover::readout_card(crate::views::time_series::LABEL_FONT_SIZE, cx)
+                    .child(label.clone())
+            }
             Readout::Events(events, count) => {
                 let first = &events[0].event;
                 let header: SharedString = if *count > 1 {

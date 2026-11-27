@@ -38,7 +38,6 @@ use super::pivot::{
     Arrangement, CellFit, FieldDrag, Grid, InstanceDrag, alike, children, common_suffix,
     field_cell, field_label, field_menu_rows, live_strip, signature,
 };
-use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::StripStyle;
 use super::value_strip::{ComponentValueStrip, strip_row_width};
@@ -49,6 +48,7 @@ use crate::query::Query;
 use crate::tiles::{OpenOutlineAction, OpenPivotTableAction};
 use crate::views::PivotTableConfig;
 use metor_gpui::Icon;
+use metor_gpui::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use metor_gpui::{theme, ui_px};
 use model::{Disclosure, FrameType, Layout, OutlineRow, RowKind, flatten, root_node, type_key};
 

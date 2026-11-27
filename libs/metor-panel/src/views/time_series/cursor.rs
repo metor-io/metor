@@ -13,7 +13,7 @@ use metor_proto::types::Timestamp;
 
 use super::measurements::{MeasurementKind, MeasurementKindList};
 use super::{LinePlot, TimeSeriesPlot};
-pub(crate) use crate::views::popover::{READOUT_PAD_X, READOUT_PAD_Y};
+pub(crate) use metor_gpui::popover::{READOUT_PAD_X, READOUT_PAD_Y};
 
 /// Bytes within a cursor line treated as a click hit. Wider than the painted
 /// stroke so a user landing within a few pixels still opens the inspector

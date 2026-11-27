@@ -1,17 +1,19 @@
-//! The panel's buttons: square icon buttons, which sequence controls and
-//! alarm rows act through, and the text buttons of the chip headers.
+//! Buttons: square icon buttons and the text buttons of chip headers.
 
 use gpui::{Div, ElementId, Hsla, SharedString, Stateful, div, prelude::*, px};
 
-use super::table::HEADER_CONTROL_HEIGHT;
-use super::tooltip::TooltipText;
-use super::value_strip::STRIP_BOX_HEIGHT;
-use metor_gpui::Icon;
-use metor_gpui::{Theme, ui_px};
+use crate::Icon;
+use crate::TooltipText;
+use crate::table::HEADER_CONTROL_HEIGHT;
+use crate::{Theme, ui_px};
+
+/// Icon buttons taller than this draw the larger icon. It is the height of the panel's value
+/// boxes, which icon buttons in a row of them share.
+const LARGE_ICON_HEIGHT: f32 = 25.5;
 
 /// A square button `height` tall showing `icon`, named by `tooltip` on
 /// hover. Inert until [`pressable`] makes it act on click.
-pub(crate) fn icon_button(
+pub fn icon_button(
     id: impl Into<ElementId>,
     icon: Icon,
     color: Hsla,
@@ -34,7 +36,7 @@ pub(crate) fn icon_button(
         .bg(bg)
         .tooltip(move |_window, cx| TooltipText::build(tooltip.clone(), cx))
         .child(icon.svg(
-            if height > STRIP_BOX_HEIGHT {
+            if height > LARGE_ICON_HEIGHT {
                 15.0
             } else {
                 13.0
@@ -46,13 +48,13 @@ pub(crate) fn icon_button(
 /// The pointer and hover tint of an [`icon_button`] that acts on click.
 /// Inert ones (a command the channel won't take now) keep neither, so they
 /// don't read as pressable.
-pub(crate) fn pressable(button: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+pub fn pressable(button: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
     let hover = theme.selection_bg;
     button.cursor_pointer().hover(move |s| s.bg(hover))
 }
 
 /// A text button in a chip header, the caller adding its id and click.
-pub(crate) fn header_button(label: impl Into<SharedString>, theme: &Theme) -> Div {
+pub fn header_button(label: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
         .h(px(HEADER_CONTROL_HEIGHT))
         .flex()

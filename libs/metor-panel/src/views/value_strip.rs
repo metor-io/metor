@@ -19,7 +19,7 @@ use super::format::ValueFormatter;
 #[cfg(test)]
 use super::format::format_element;
 use super::gradient::{Gradient, Scale};
-use super::switch::Switch;
+use metor_gpui::Switch;
 
 /// Scalar interpretation of every cell in a strip.
 ///

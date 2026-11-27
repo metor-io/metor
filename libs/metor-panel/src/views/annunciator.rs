@@ -22,8 +22,8 @@ use crate::inspector::plot_preview::shift_hover_listener;
 
 use super::binding::{ElementRef, active_severity, component_meta, spawn_on_stream};
 use super::format_number;
-use super::tooltip::TooltipText;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
+use metor_gpui::TooltipText;
 use metor_gpui::{Theme, theme, ui_px};
 
 /// Which side of a component's value is the alarm.
