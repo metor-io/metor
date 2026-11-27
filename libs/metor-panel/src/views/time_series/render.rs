@@ -265,7 +265,7 @@ impl TimeSeriesPlot {
                     };
                     let pa = plot_area(bounds, view.axis_count(), scale);
                     let clusters = this.build_event_clusters(&view, pa, cx);
-                    let theme = crate::theme::theme(cx);
+                    let theme = metor_gpui::theme(cx);
                     let paints: Vec<ClusterPaint> = clusters
                         .iter()
                         .map(|c| ClusterPaint {
@@ -399,7 +399,7 @@ impl TimeSeriesPlot {
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         // Resolve this frame's event sources (and refresh their repaint subs)
         // before building canvases, so the flag canvas can query them in paint.
         self.sync_event_sources(cx);

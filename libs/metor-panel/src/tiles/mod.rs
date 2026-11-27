@@ -1,3 +1,4 @@
+use crate::theme::PanelThemeExt;
 pub(crate) mod dock;
 pub(crate) mod drag;
 mod header;
@@ -21,8 +22,8 @@ use gpui::{
 
 use smallvec::SmallVec;
 
-use crate::theme::theme;
 use drag::ResizeDrag;
+use metor_gpui::theme;
 use serial::{TileItem, TileNode, TilePane, TileSplit, TileTab};
 
 pub use dock::Edge;
@@ -313,7 +314,7 @@ impl Member {
                         .when(landing, |gap| {
                             gap.bg(theme.drop_fill())
                                 .border_1()
-                                .border_color(crate::theme::Theme::dim(theme.drop_accent(), 0.6))
+                                .border_color(metor_gpui::Theme::dim(theme.drop_accent(), 0.6))
                         })
                         .into_any_element();
                 }
@@ -915,7 +916,7 @@ impl TileGroup {
     /// motion is turned down or the pane has not been drawn yet.
     fn animate_zoom(&mut self, pane: Entity<Pane>, zooming: bool, cx: &App) {
         let drawn = self.pane_bounds.contains_key(&pane.entity_id());
-        self.zoom_motion = (drawn && crate::motion::enabled(cx)).then(|| {
+        self.zoom_motion = (drawn && metor_gpui::motion::enabled(cx)).then(|| {
             motion::ZoomMotion::new(
                 pane,
                 zooming,
@@ -2321,7 +2322,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<TileGroup>, &mut gpui::VisualTestContext) {
         let (host, cx) = cx.add_window_view(|_, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             let items = items(cx);
             Host {
                 group: cx.new(|cx| TileGroup::new(items, cx)),

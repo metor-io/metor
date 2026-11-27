@@ -27,8 +27,8 @@ pub mod rows;
 pub mod target;
 pub mod trace_picker;
 
-use crate::motion::{self, Fade};
-use crate::theme::theme;
+use metor_gpui::theme;
+use metor_gpui::{Fade, motion};
 use rows::text_field::TextAlign;
 use rows::{InspectorRow, PreviewSpec, ROW_HEIGHT, RowAction, TextField, tag_pill};
 
@@ -928,9 +928,9 @@ impl Inspector {
                     .cursor_pointer()
                     .child(
                         if self.accessory_expanded {
-                            crate::icons::Icon::ChevronUp
+                            metor_gpui::Icon::ChevronUp
                         } else {
-                            crate::icons::Icon::ChevronDown
+                            metor_gpui::Icon::ChevronDown
                         }
                         .svg(12.0, theme.text_secondary),
                     )
@@ -999,7 +999,7 @@ impl Inspector {
                 InspectorMode::Inline => frame.bg(theme.bg_elevated),
                 InspectorMode::Anchored(_) | InspectorMode::Centered => frame
                     .bg(theme.surface_bg())
-                    .backdrop_blur(crate::theme::SURFACE_BLUR)
+                    .backdrop_blur(metor_gpui::SURFACE_BLUR)
                     .shadow_sm(),
             })
             .child(bounds_tracker);
@@ -1053,7 +1053,7 @@ impl Inspector {
             .h(px(height))
             .flex_shrink_0()
             .bg(theme.surface_bg())
-            .backdrop_blur(crate::theme::SURFACE_BLUR)
+            .backdrop_blur(metor_gpui::SURFACE_BLUR)
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(4.0))
@@ -1475,10 +1475,11 @@ mod temporal_tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
         cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
+            cx.set_global(crate::config::PanelConfig::default());
+            cx.set_global(metor_gpui::UiSettings {
+                font_family: "monospace".into(),
+                ..Default::default()
             });
             temporal::TemporalController::init(db, cx);
             temporal::dispatch(
@@ -1570,7 +1571,7 @@ mod temporal_tests {
         let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
         let cx = cx.add_empty_window();
         cx.update(|window, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             temporal::TemporalController::init(db, cx);
             for mode in [
                 InspectorMode::Centered,
@@ -1693,10 +1694,11 @@ mod scrubber_tests {
         build: impl FnOnce(&mut Window, &mut Context<V>) -> V + 'static,
     ) -> (Entity<V>, &mut VisualTestContext) {
         cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
+            cx.set_global(crate::config::PanelConfig::default());
+            cx.set_global(metor_gpui::UiSettings {
+                font_family: "monospace".into(),
+                ..Default::default()
             });
         });
         let (view, cx) = cx.add_window_view(build);

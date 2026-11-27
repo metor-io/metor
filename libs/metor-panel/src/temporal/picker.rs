@@ -821,7 +821,7 @@ impl InspectorRow for TimeCandidate {
                 }
                 .into(),
             ),
-            crate::theme::theme(cx).text_primary,
+            metor_gpui::theme(cx).text_primary,
             window,
             cx,
         )

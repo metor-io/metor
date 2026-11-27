@@ -417,7 +417,7 @@ fn a_payload_enum_is_edited_through_its_variants(cx: &mut gpui::TestAppContext) 
         .unwrap()
         .wal_reader();
     let catalog = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         ItemRegistry::init(cx);
         let catalog = CommandCatalog::install(
             db.clone(),
@@ -480,7 +480,7 @@ fn the_send_page_records_the_encoded_draft(cx: &mut gpui::TestAppContext) {
         .wal_reader();
     let link = Arc::new(Mutex::new(Vec::<ConnectionStatus>::new()));
     let catalog = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         ItemRegistry::init(cx);
         let probe = link.clone();
         let catalog = CommandCatalog::install(

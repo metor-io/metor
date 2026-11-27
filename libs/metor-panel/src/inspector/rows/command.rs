@@ -4,7 +4,7 @@ use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 use smallvec::SmallVec;
 
 use super::{InspectorRow, RowAction, render_label_row};
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// Leaf row that runs a callback when activated.
 ///

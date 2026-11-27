@@ -187,16 +187,13 @@ pub(crate) fn open_panel_window(
                 let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
                 #[cfg(target_os = "macos")]
                 {
-                    if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
+                    if let Err(error) = crate::backdrop::install(window, &metor_gpui::theme(cx)) {
                         tracing::warn!(%error, "could not install the tab sidebar's backdrop");
                     }
                     root.update(cx, |_, cx| {
-                        cx.observe_global_in::<crate::theme::ActiveTheme>(
-                            window,
-                            |_, window, cx| {
-                                crate::backdrop::retheme(window, &crate::theme::theme(cx))
-                            },
-                        )
+                        cx.observe_global_in::<metor_gpui::ActiveTheme>(window, |_, window, cx| {
+                            crate::backdrop::retheme(window, &metor_gpui::theme(cx))
+                        })
                         .detach()
                     });
                 }
@@ -461,13 +458,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(directory.path().join("db")).unwrap());
         cx.update(|cx| {
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
+            cx.set_global(crate::config::PanelConfig::default());
+            cx.set_global(metor_gpui::UiSettings {
+                font_family: "monospace".into(),
+                ..Default::default()
             });
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                crate::theme::DARK.clone(),
-            )));
+            cx.set_global(metor_gpui::ActiveTheme(Arc::new(metor_gpui::DARK.clone())));
             cx.set_global(crate::tiles::ItemRegistry::default());
             crate::inspector::edits::init(cx);
             crate::temporal::TemporalController::init(db.clone(), cx);

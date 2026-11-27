@@ -16,8 +16,8 @@ use gpui::{
 };
 
 use crate::inspector::rows::tag_pill;
-use crate::motion::{self, Fade};
-use crate::theme::theme;
+use metor_gpui::theme;
+use metor_gpui::{Fade, motion};
 use node::{ChordAction, ChordNode};
 
 /// One level of the navigation stack: the rows to show, plus the crumb label of

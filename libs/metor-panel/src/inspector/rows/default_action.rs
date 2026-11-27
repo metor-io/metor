@@ -3,7 +3,7 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, SharedString, Window};
 
 use super::{InspectorRow, RowAction, render_label_row};
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// Prompt row whose input is the inspector's search field itself.
 ///

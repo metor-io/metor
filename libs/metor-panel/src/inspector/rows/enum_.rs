@@ -3,8 +3,8 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 
 use super::{CommandRow, InspectorRow, RowAction, row_base, row_label, row_value};
-use crate::icons::Icon;
-use crate::theme::theme;
+use metor_gpui::Icon;
+use metor_gpui::theme;
 
 /// Inspector row for an enum field.
 ///

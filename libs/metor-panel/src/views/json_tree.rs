@@ -13,8 +13,8 @@ use std::sync::Arc;
 use gpui::{AnyElement, Context, IntoElement, SharedString, Window, div, prelude::*, px};
 use serde_json::Value;
 
-use crate::icons::Icon;
-use crate::theme::{Theme, theme};
+use metor_gpui::Icon;
+use metor_gpui::{Theme, theme};
 
 /// Indent per depth level, in pixels.
 const INDENT: f32 = 12.0;

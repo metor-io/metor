@@ -334,7 +334,7 @@ impl InspectorRegistry {
                 label: ctx.label.clone(),
                 read_color: Arc::new(move |cx| match get(&read, cx) {
                     Some(Override::Custom(c)) => c,
-                    _ => crate::theme::theme(cx).text_primary,
+                    _ => metor_gpui::theme(cx).text_primary,
                 }),
                 on_change: Arc::new(move |c, _w, cx| {
                     crate::inspector::reflect::set_field(&write, idx, Override::Custom(c), cx);
@@ -374,7 +374,7 @@ impl InspectorRegistry {
             Box::new(ColorRow {
                 label: ctx.label.clone(),
                 read_color: Arc::new(move |cx| {
-                    get(&read, cx).unwrap_or_else(|| crate::theme::theme(cx).text_primary)
+                    get(&read, cx).unwrap_or_else(|| metor_gpui::theme(cx).text_primary)
                 }),
                 on_change: Arc::new(move |c, _w, cx| {
                     crate::inspector::reflect::set_field::<Option<Hsla>>(&write, idx, Some(c), cx);
@@ -833,9 +833,9 @@ mod tests {
             })
             .unwrap();
         }
-        let palette = crate::theme::DARK.line_colors;
+        let palette = metor_gpui::DARK.line_colors;
         let plot = cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             cx.new(|cx| {
                 let mut lp = LinePlot::new(db.clone(), cx);
                 let mut edited = Trace::new(ComponentId::new("a"), 0, palette[3]);

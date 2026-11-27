@@ -5,8 +5,8 @@ use smallvec::SmallVec;
 
 use super::slider::SliderRow;
 use super::{InspectorRow, RowAction, row_base, row_label, row_value};
-use crate::icons::Icon;
-use crate::theme::{Theme, theme};
+use metor_gpui::Icon;
+use metor_gpui::{Theme, theme};
 
 /// Row for colour fields.
 ///

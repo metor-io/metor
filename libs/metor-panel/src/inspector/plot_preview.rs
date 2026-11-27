@@ -89,7 +89,7 @@ mod tests {
     fn collapsed_components_have_no_whole_preview(cx: &mut gpui::TestAppContext) {
         let (db, _temp) = image_db();
         cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             for name in COLLAPSED {
                 let id = ComponentId::new(name);
                 assert!(preview_traces(&db, id, &[], cx).is_empty(), "{name}");

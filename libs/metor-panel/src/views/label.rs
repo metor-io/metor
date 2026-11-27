@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::value_strip::StripAlign;
 use crate::inspect;
-use crate::theme::{Theme, theme, ui_px};
+use metor_gpui::{Theme, theme, ui_px};
 
 /// Persisted shape of a [`Label`], shared by the tile and dashboard
 /// surfaces and the Python config API.

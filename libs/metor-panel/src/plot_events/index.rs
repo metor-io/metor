@@ -238,7 +238,7 @@ mod tests {
                     id,
                     event: PlotEvent {
                         ts: Timestamp(id as i64),
-                        color: crate::theme::DARK.text_secondary,
+                        color: metor_gpui::DARK.text_secondary,
                         label: "event".into(),
                         short: "event".into(),
                         detail: EventDetail::Raw(0),
@@ -265,7 +265,7 @@ mod tests {
                     id,
                     event: PlotEvent {
                         ts: Timestamp(id as i64),
-                        color: crate::theme::DARK.text_secondary,
+                        color: metor_gpui::DARK.text_secondary,
                         label: "span".into(),
                         short: "span".into(),
                         detail: EventDetail::Raw(0),

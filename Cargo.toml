@@ -26,6 +26,7 @@ members = [
     "fsw/video-streamer",
     "fsw/gstreamer",
     "libs/metor-panel",
+    "libs/metor-gpui",
     "libs/metor-expr",
     "examples/adcs-fsw3",
     "examples/adcs-fsw3/contracts",
@@ -98,7 +99,9 @@ wmm.path = "libs/wmm"
 # `[patch.crates-io]` block in lockstep.
 # `stacker` keeps the deep-layout stack growth that 0.2.1 always had on.
 gpui = { version = "0.2.2", git = "https://github.com/metor-io/zed", rev = "a8c8a4b4a0086747a9d792792ccf607f53af90c7", features = ["stacker"] }
-gpui_platform = { git = "https://github.com/metor-io/zed", rev = "a8c8a4b4a0086747a9d792792ccf607f53af90c7", features = ["font-kit", "wayland", "x11"] }
+# No default features: that turns off gpui_web's threads, so wasm builds are single-threaded,
+# on stable, and need no cross-origin isolation. Native builds are unaffected.
+gpui_platform = { git = "https://github.com/metor-io/zed", rev = "a8c8a4b4a0086747a9d792792ccf607f53af90c7", default-features = false, features = ["font-kit", "wayland", "x11"] }
 
 [profile.release-with-debug]
 inherits = "release"

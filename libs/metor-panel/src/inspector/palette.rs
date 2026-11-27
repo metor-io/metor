@@ -531,7 +531,7 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
             label: "Motion".into(),
             summary: "Short fades and tab movement, or reduced motion".into(),
             build: Arc::new(|_| {
-                use crate::config::MotionPreference;
+                use metor_gpui::MotionPreference;
                 [
                     ("Standard motion", MotionPreference::Full),
                     ("Reduced motion", MotionPreference::Reduced),
@@ -541,7 +541,7 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
                     Box::new(CommandRow::new(
                         label,
                         Arc::new(move |_, cx| {
-                            crate::motion::set_preference(preference, cx);
+                            metor_gpui::motion::set_preference(preference, cx);
                         }),
                     )) as Box<dyn InspectorRow>
                 })
@@ -610,13 +610,13 @@ fn register_preset_provider(cx: &mut App) {
 /// Rows for the **Theme** submenu: one per registered theme, applied on select.
 /// Shared by the command palette and the transient chord menu.
 pub(crate) fn theme_rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
-    crate::theme::themes(cx)
+    metor_gpui::themes(cx)
         .into_iter()
         .map(|theme| {
             Box::new(CommandRow::new(
                 theme.name.clone(),
                 Arc::new(move |_window, cx| {
-                    crate::theme::set_theme(cx, theme.clone());
+                    metor_gpui::set_theme(cx, theme.clone());
                 }),
             )) as Box<dyn InspectorRow>
         })
@@ -759,7 +759,7 @@ mod live_tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
         let (tiles, first, second) = cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             ItemRegistry::init(cx);
             register_panel_provider(cx);
             let first = cx.new(|_| Item("Same".into()));
@@ -808,16 +808,16 @@ mod live_tests {
     #[gpui::test]
     fn consumer_theme_is_offered_after_the_builtins(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            let mission = crate::theme::Theme {
+            let mission = metor_gpui::Theme {
                 name: "Mission".into(),
-                ..crate::theme::DARK.clone()
+                ..metor_gpui::DARK.clone()
             };
-            crate::theme::install_themes(cx, vec![mission], None);
+            metor_gpui::install_themes(cx, vec![mission], None);
             let labels: Vec<String> = theme_rows(cx)
                 .iter()
                 .map(|row| row.label().to_owned())
                 .collect();
-            let builtins = crate::theme::builtin_themes();
+            let builtins = metor_gpui::builtin_themes();
             assert_eq!(labels.len(), builtins.len() + 1);
             assert_eq!(labels[0], "Dark");
             assert_eq!(labels.last().unwrap(), "Mission");

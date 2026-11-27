@@ -1,3 +1,4 @@
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::TestAppContext;
@@ -293,7 +294,7 @@ pub(crate) fn app(
     let temp = tempfile::tempdir().unwrap();
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         crate::temporal::TemporalController::init(db.clone(), cx);
         super::SequenceStore::init(db.clone(), cx);
     });
@@ -587,7 +588,7 @@ fn sequence_flags_mark_each_raised_message(cx: &mut TestAppContext) {
         );
         assert_eq!(
             events[1].color,
-            crate::theme::theme(cx).run_state_color(Some(SequenceChannelState::Failed))
+            metor_gpui::theme(cx).run_state_color(Some(SequenceChannelState::Failed))
         );
         let index = crate::plot_events::index::snapshot(source.as_ref(), cx);
         assert_eq!(index.events.len(), 2);

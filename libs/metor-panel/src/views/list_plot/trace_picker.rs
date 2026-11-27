@@ -21,7 +21,7 @@ use metor_proto::types::ComponentId;
 use crate::dynamic::expressions;
 use crate::inspector::rows::{CommandRow, ExpressionRow, HeaderRow, InspectorRow, RowAction};
 use crate::inspector::trace_picker::{ColorBasis, element_names_for_component};
-use crate::theme::theme;
+use metor_gpui::theme;
 
 use super::ListTrace;
 

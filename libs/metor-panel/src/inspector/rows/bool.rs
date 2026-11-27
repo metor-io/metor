@@ -4,8 +4,8 @@ use gpui::{AnyElement, App, MouseMoveEvent, SharedString, Window, prelude::*};
 
 use super::{InspectorRow, RowAction, row_base, row_label};
 use crate::inspector::drag_paint;
-use crate::theme::theme;
 use crate::views::switch::Switch;
+use metor_gpui::theme;
 
 /// Inspector row for a `bool` field, rendered as a [`Switch`].
 ///

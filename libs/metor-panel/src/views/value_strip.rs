@@ -1,3 +1,4 @@
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::{
@@ -8,9 +9,9 @@ use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue, PrimType};
 use smallvec::SmallVec;
 
-use crate::icons::Icon;
 use crate::inspector::rows::TextField;
-use crate::theme::{Theme, theme, ui_px};
+use metor_gpui::Icon;
+use metor_gpui::{Theme, theme, ui_px};
 
 use super::binding::{StreamUpdate, spawn_seeded_stream};
 pub use super::format::StripCell;
@@ -1392,7 +1393,7 @@ mod tests {
 
     #[test]
     fn an_unmatched_value_shows_the_unknown_label() {
-        let theme = &crate::theme::DARK;
+        let theme = &metor_gpui::DARK;
         let mut t = table();
         assert!(
             t.display(7.0, theme).is_none(),

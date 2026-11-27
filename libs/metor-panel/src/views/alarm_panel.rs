@@ -4,6 +4,7 @@
 //! [`AlarmStore`](crate::alarms::AlarmStore); this view only renders and publishes the
 //! operator's side.
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,15 +16,15 @@ use metor_proto_wkt::AlarmId;
 
 use crate::alarms::latch::TileState;
 use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
-use crate::icons::Icon;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::theme::{theme, ui_px};
 use crate::views::buttons::{self, icon_button, pressable};
 use crate::views::format::format_age;
 use crate::views::switch::Switch;
 use crate::views::table;
 use crate::views::value_strip::STRIP_BOX_HEIGHT;
+use metor_gpui::Icon;
+use metor_gpui::{theme, ui_px};
 
 /// Which set the alarm list shows.
 #[derive(
@@ -280,7 +281,7 @@ impl Render for AlarmView {
     }
 }
 
-fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
+fn empty_row(theme: &metor_gpui::Theme, msg: &'static str) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -296,7 +297,7 @@ const ROW_BUTTON: f32 = STRIP_BOX_HEIGHT;
 
 /// One alarm's row, spaced like a sequence channel's: the same padding and
 /// gaps, in UI units so it follows the panel's text size.
-fn list_row(theme: &crate::theme::Theme) -> gpui::Div {
+fn list_row(theme: &metor_gpui::Theme) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -311,7 +312,7 @@ fn list_row(theme: &crate::theme::Theme) -> gpui::Div {
 /// Rows for everything awaiting an operator. A latched row — the alarm cleared before
 /// anyone looked — keeps its place with a dimmed severity bar and a "cleared" badge, and
 /// its `Ack` retires the latch outright.
-fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyElement> {
+fn pending_rows(state: &AlarmState, theme: &metor_gpui::Theme) -> Vec<AnyElement> {
     state
         .pending_sorted()
         .into_iter()
@@ -459,7 +460,7 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
 }
 
 /// The shelf list: what is suppressed, for how long, by whom, and why.
-fn shelved_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyElement> {
+fn shelved_rows(state: &AlarmState, theme: &metor_gpui::Theme) -> Vec<AnyElement> {
     state
         .shelves_sorted()
         .into_iter()
@@ -526,7 +527,7 @@ fn shelved_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
         .collect()
 }
 
-fn history_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyElement> {
+fn history_rows(state: &AlarmState, theme: &metor_gpui::Theme) -> Vec<AnyElement> {
     state
         .history()
         .iter()

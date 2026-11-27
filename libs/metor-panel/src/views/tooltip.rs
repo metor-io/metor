@@ -6,7 +6,7 @@
 
 use gpui::{AnyView, App, Context, IntoElement, Render, SharedString, Window, div, prelude::*, px};
 
-use crate::theme::{font_family, theme};
+use metor_gpui::{font_family, theme};
 
 pub struct TooltipText {
     text: SharedString,

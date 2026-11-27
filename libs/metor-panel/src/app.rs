@@ -1,4 +1,5 @@
 #![allow(unexpected_cfgs)]
+use crate::theme::PanelThemeExt;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7,7 +8,6 @@ use crate::config::TabPlacement;
 use crate::connections::{
     AddressResolver, ConnectionOption, ConnectionTarget, OptionSpec, RegistryHandle, TargetId,
 };
-use crate::icons::Icon;
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
@@ -27,6 +27,7 @@ use gpui::{
     Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
+use metor_gpui::Icon;
 use stellarator::net::TcpListener;
 
 actions!(
@@ -172,7 +173,7 @@ impl AppRoot {
         });
         cx.subscribe(
             &inspector,
-            |this, inspector, _: &crate::motion::Closed, cx| {
+            |this, inspector, _: &metor_gpui::motion::Closed, cx| {
                 if this
                     .inspector
                     .as_ref()
@@ -218,8 +219,7 @@ impl AppRoot {
             return;
         };
         let leader: SharedString = cx
-            .global::<crate::theme::FontSettings>()
-            .config
+            .global::<crate::config::PanelConfig>()
             .leader
             .clone()
             .into();
@@ -233,7 +233,7 @@ impl AppRoot {
         });
         cx.subscribe(
             &transient,
-            |this, transient, _: &crate::motion::Closed, cx| {
+            |this, transient, _: &metor_gpui::motion::Closed, cx| {
                 if this
                     .transient
                     .as_ref()
@@ -536,7 +536,7 @@ impl AppRoot {
         let window_size = torn_size(&drag.source, window, cx);
         let titlebar_inset = point(
             px(0.0),
-            px((TITLEBAR_HEIGHT - crate::theme::CONTROL_HEIGHT) / 2.0),
+            px((TITLEBAR_HEIGHT - metor_gpui::CONTROL_HEIGHT) / 2.0),
         );
         let origin = window.bounds().origin + event.position - drag.grab - titlebar_inset;
         let db = self.db.clone();
@@ -678,8 +678,8 @@ impl Render for AppRoot {
             self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
         }
 
-        let theme = crate::theme::theme(cx);
-        let font_family = crate::theme::font_family(cx);
+        let theme = metor_gpui::theme(cx);
+        let font_family = metor_gpui::font_family(cx);
         let placement = crate::tiles::tab_bar::placement(cx);
         let titlebar = self.render_titlebar(&theme, placement, window, cx);
         let sidebar = (placement == crate::config::TabPlacement::Side)
@@ -848,7 +848,7 @@ impl AppRoot {
     /// panel. Colored by the highest active severity.
     fn render_alarm_summary(
         &self,
-        theme: &crate::theme::Theme,
+        theme: &metor_gpui::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut bar = div()
@@ -944,15 +944,12 @@ impl AppRoot {
     /// A flat, borderless titlebar control: quiet at rest, background on
     /// hover. The titlebar reads as one surface instead of a row of pills,
     /// and stays compact so the tabs beside it get the room.
-    fn titlebar_segment(
-        theme: &crate::theme::Theme,
-        id: &'static str,
-    ) -> gpui::Stateful<gpui::Div> {
+    fn titlebar_segment(theme: &metor_gpui::Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
-            .h(px(crate::theme::CONTROL_HEIGHT))
+            .h(px(metor_gpui::CONTROL_HEIGHT))
             .px(px(8.0))
-            .rounded(px(crate::theme::CONTROL_RADIUS))
+            .rounded(px(metor_gpui::CONTROL_RADIUS))
             .flex()
             .flex_shrink_0()
             .flex_row()
@@ -964,7 +961,7 @@ impl AppRoot {
             .hover(|s| s.bg(theme.bg_primary))
     }
 
-    fn titlebar_separator(theme: &crate::theme::Theme) -> gpui::Div {
+    fn titlebar_separator(theme: &metor_gpui::Theme) -> gpui::Div {
         div()
             .w(px(1.0))
             .h(px(12.0))
@@ -1040,7 +1037,7 @@ impl AppRoot {
     /// drags the window like the titlebar does.
     fn render_tab_sidebar(
         &self,
-        theme: &crate::theme::Theme,
+        theme: &metor_gpui::Theme,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -1125,7 +1122,7 @@ impl AppRoot {
     /// the connection dialog.
     fn render_connection_segment(
         &self,
-        theme: &crate::theme::Theme,
+        theme: &metor_gpui::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         use crate::connections::ConnectionStatus;
@@ -1161,7 +1158,7 @@ impl AppRoot {
         };
 
         Self::titlebar_segment(theme, "connection-segment")
-            .child(crate::icons::Icon::Dot.svg(7.0, dot))
+            .child(metor_gpui::Icon::Dot.svg(7.0, dot))
             .child(label)
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -1175,7 +1172,7 @@ impl AppRoot {
 
     fn render_titlebar(
         &self,
-        theme: &crate::theme::Theme,
+        theme: &metor_gpui::Theme,
         placement: crate::config::TabPlacement,
         window: &Window,
         cx: &mut Context<Self>,
@@ -1185,9 +1182,9 @@ impl AppRoot {
         let locked = pending.locked;
 
         let icon = if locked {
-            crate::icons::Icon::Lock
+            metor_gpui::Icon::Lock
         } else {
-            crate::icons::Icon::LockOpen
+            metor_gpui::Icon::LockOpen
         };
         let icon_color = if locked {
             theme.text_tertiary
@@ -1199,10 +1196,10 @@ impl AppRoot {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(crate::theme::CONTROL_HEIGHT))
-            .h(px(crate::theme::CONTROL_HEIGHT))
+            .w(px(metor_gpui::CONTROL_HEIGHT))
+            .h(px(metor_gpui::CONTROL_HEIGHT))
             .flex_shrink_0()
-            .rounded(px(crate::theme::CONTROL_RADIUS))
+            .rounded(px(metor_gpui::CONTROL_RADIUS))
             .child(icon.svg(13.0, icon_color))
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
@@ -1295,7 +1292,7 @@ impl AppRoot {
         if mode != "Live" {
             right = right.child(
                 Self::titlebar_segment(theme, "time-go-live")
-                    .child(crate::icons::Icon::SkipForward.svg(14.0, theme.text_secondary))
+                    .child(metor_gpui::Icon::SkipForward.svg(14.0, theme.text_secondary))
                     .tooltip(|_, cx| {
                         crate::views::tooltip::TooltipText::build("Go live".into(), cx)
                     })
@@ -1310,7 +1307,7 @@ impl AppRoot {
                     || config.range.to_string(),
                     |t| crate::temporal::display::range(config.range, &config, &t.context),
                 )))
-                .child(crate::icons::Icon::ChevronDown.svg(10.0, theme.text_secondary))
+                .child(metor_gpui::Icon::ChevronDown.svg(10.0, theme.text_secondary))
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     crate::temporal::picker::open(
                         Some(crate::temporal::picker::Target::Range),
@@ -1337,9 +1334,9 @@ impl AppRoot {
             Self::titlebar_segment(theme, "time-transport")
                 .child(
                     if mode == "Paused" {
-                        crate::icons::Icon::Play
+                        metor_gpui::Icon::Play
                     } else {
-                        crate::icons::Icon::Pause
+                        metor_gpui::Icon::Pause
                     }
                     .svg(14.0, theme.text_secondary),
                 )
@@ -1436,7 +1433,7 @@ pub struct PanelApp {
         crate::views::dashboard::WidgetKind,
         crate::views::dashboard::WidgetSpec,
     )>,
-    themes: Vec<crate::theme::Theme>,
+    themes: Vec<metor_gpui::Theme>,
     default_theme: Option<SharedString>,
     splash_logo: Option<crate::connections::logo::SplashLogoBuilder>,
     storage: metor_db::storage::StorageConfig,
@@ -1673,9 +1670,9 @@ impl PanelApp {
 
     /// Add a palette to the theme picker after the built-ins. A theme named
     /// like one already registered — built-in or consumer — replaces it in
-    /// place. See [`Theme`](crate::theme::Theme) for the intended way to
+    /// place. See [`Theme`](metor_gpui::Theme) for the intended way to
     /// build one.
-    pub fn theme(mut self, theme: crate::theme::Theme) -> Self {
+    pub fn theme(mut self, theme: metor_gpui::Theme) -> Self {
         self.themes.push(theme);
         self
     }
@@ -1812,7 +1809,7 @@ impl PanelApp {
     /// the dock, and a reopen (dock click) spawns a fresh window.
     pub fn run(mut self) {
         crate::session::sweep_stale();
-        let app = gpui_platform::application().with_assets(crate::icons::IconAssets);
+        let app = gpui_platform::application().with_assets(metor_gpui::IconAssets);
         app.on_reopen(|cx| {
             if crate::workspace::panel_windows(cx).is_empty()
                 && let Some((db, offline)) = cx
@@ -1901,11 +1898,7 @@ impl PanelApp {
         }
 
         cx.set_global(tasks.clone());
-        let leader = cx
-            .global::<crate::theme::FontSettings>()
-            .config
-            .leader
-            .clone();
+        let leader = cx.global::<crate::config::PanelConfig>().leader.clone();
         edits::init(cx);
         crate::temporal::TemporalController::init(db.clone(), cx)
             .update(cx, |c, cx| c.set_session_lookback(session_lookback, cx));
@@ -2105,15 +2098,13 @@ struct RunningDatabase(Arc<DB>, bool);
 impl gpui::Global for RunningDatabase {}
 
 fn initialize_appearance(
-    themes: Vec<crate::theme::Theme>,
+    themes: Vec<metor_gpui::Theme>,
     default_theme: Option<&str>,
     cx: &mut App,
 ) {
-    crate::theme::register_fonts(cx);
-    let config = crate::config::load();
-    let family = crate::theme::resolve_font_family(cx, &config);
-    cx.set_global(crate::theme::FontSettings { family, config });
-    crate::theme::install_themes(cx, themes, default_theme);
+    metor_gpui::register_fonts(cx);
+    crate::config::install(crate::config::load(), cx);
+    metor_gpui::install_themes(cx, themes, default_theme);
     set_dock_icon();
 }
 
@@ -2464,13 +2455,12 @@ mod window_tests {
         let directory = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(directory.path().join("db")).unwrap());
         let (tiles, window) = cx.update(|cx| {
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
+            cx.set_global(crate::config::PanelConfig::default());
+            cx.set_global(metor_gpui::UiSettings {
+                font_family: "monospace".into(),
+                ..Default::default()
             });
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                crate::theme::DARK.clone(),
-            )));
+            cx.set_global(metor_gpui::ActiveTheme(Arc::new(metor_gpui::DARK.clone())));
             cx.set_global(crate::tiles::ItemRegistry::default());
             crate::inspector::edits::init(cx);
             crate::temporal::TemporalController::init(db.clone(), cx);

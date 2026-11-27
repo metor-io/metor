@@ -14,6 +14,7 @@
 //! Everything here branches on `cfg!()` rather than `#[cfg]` so the whole
 //! module type-checks on every platform.
 
+use crate::theme::PanelThemeExt;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Bounds, BoxShadow, CursorStyle, Decorations, Div, Global, HitboxBehavior,
@@ -22,8 +23,8 @@ use gpui::{
     transparent_black,
 };
 
-use crate::icons::Icon;
-use crate::theme::Theme;
+use metor_gpui::Icon;
+use metor_gpui::Theme;
 
 const CAPTION_BUTTON_WIDTH: Pixels = px(44.);
 const CSD_ROUNDING: Pixels = px(10.);
@@ -151,7 +152,7 @@ pub(crate) fn client_side_decorations(
     window: &mut Window,
     cx: &mut App,
 ) -> Stateful<Div> {
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let decorations = window.window_decorations();
     let tiling = match decorations {
         Decorations::Server => Tiling::default(),

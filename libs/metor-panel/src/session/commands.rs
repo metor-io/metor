@@ -214,8 +214,8 @@ fn choose_save(save_as: bool, window: &mut Window, cx: &mut App) {
         .and_then(|s| s.path.parent())
         .map(Path::to_owned)
         .or_else(|| {
-            cx.try_global::<crate::theme::FontSettings>()
-                .and_then(|s| s.config.recording_parent.as_ref())
+            cx.try_global::<crate::config::PanelConfig>()
+                .and_then(|s| s.recording_parent.as_ref())
                 .map(PathBuf::from)
         })
         .or_else(dirs::home_dir)

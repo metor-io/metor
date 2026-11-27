@@ -36,7 +36,7 @@ use crate::inspector::rows::{
     BoolRow, ComponentRowBuilder, ExpressionRow, InspectorRow, OnExpression, RowAction,
     TailRowBuilder, row_base, row_label,
 };
-use crate::theme::{theme, ui_px};
+use metor_gpui::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(from = "StoredConfig")]
@@ -1237,7 +1237,7 @@ mod tests {
         let added: Arc<Mutex<Vec<String>>> = Arc::default();
         let window = cx.add_empty_window();
         window.update(|window, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             let mut rows = add_sources_rows(
                 db.clone(),
                 Arc::new({

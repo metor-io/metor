@@ -1,8 +1,8 @@
 use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 
 use super::{InspectorRow, RowAction, row_base};
-use crate::icons::Icon;
-use crate::theme::theme;
+use metor_gpui::Icon;
+use metor_gpui::theme;
 
 /// Drill-down row whose child page is rebuilt from scratch on every
 /// activation.

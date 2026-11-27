@@ -24,8 +24,8 @@ use gpui::{
 use super::cursor::MeasurementCursor;
 use super::measurements::{self, MeasurementKind};
 use super::{LinePlot, TimeSeriesPlot, Trace};
-use crate::icons::Icon;
-use crate::theme::{theme, ui_px};
+use metor_gpui::Icon;
+use metor_gpui::{theme, ui_px};
 
 /// Where the measurement readout sits inside its host plot.
 ///
@@ -128,7 +128,7 @@ fn render_mini_panel(
     cursor_id: u64,
     line_plot_entity: &Entity<LinePlot>,
     origin: Point<Pixels>,
-    theme: &crate::theme::Theme,
+    theme: &metor_gpui::Theme,
     cx: &mut Context<TimeSeriesPlot>,
 ) -> AnyElement {
     let (delta_t, row_elements) = {
@@ -189,7 +189,7 @@ fn render_consolidated(
 /// The chrome shared by every panel variant: bg, border, rounded corners,
 /// shadow, plus `.occlude()` so mouse events don't fall through to the
 /// cursor canvas behind the panel.
-fn panel_card(id: impl Into<ElementId>, theme: &crate::theme::Theme) -> Stateful<gpui::Div> {
+fn panel_card(id: impl Into<ElementId>, theme: &metor_gpui::Theme) -> Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -231,7 +231,7 @@ where
 fn mini_title_bar(
     cursor_id: u64,
     label: SharedString,
-    theme: &crate::theme::Theme,
+    theme: &metor_gpui::Theme,
     panel_origin: Point<Pixels>,
     cx: &mut Context<TimeSeriesPlot>,
 ) -> AnyElement {
@@ -338,7 +338,7 @@ fn icon_button(
 fn measurement_rows_for_cursor(
     cursor: &MeasurementCursor,
     line_plot: &LinePlot,
-    theme: &crate::theme::Theme,
+    theme: &metor_gpui::Theme,
     cx: &gpui::App,
 ) -> Vec<AnyElement> {
     let (start, end) = cursor.ordered();

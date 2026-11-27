@@ -670,7 +670,7 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
     );
 
     cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         crate::inspector::edits::init(cx);
         DynamicWorker::init(cx);
@@ -824,7 +824,7 @@ fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
     )));
 
     let saved = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
 
@@ -911,7 +911,7 @@ fn an_xy_axis_binds_an_expression_independently(cx: &mut gpui::TestAppContext) {
     )));
 
     let saved = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
 
@@ -1020,7 +1020,7 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
     let published = expression_target(&db, "rpm * 2.0", source);
 
     let (saved, plot) = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
 
@@ -1081,7 +1081,7 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
     let published = expression_target(&db, "rpm * 3.0", source);
 
     let (saved, plot) = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
 
@@ -1214,7 +1214,7 @@ fn a_trace_added_from_the_picker_keeps_its_expression_alive(cx: &mut gpui::TestA
     let text = format!("=({path} @ {path})");
 
     cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
 
@@ -1275,7 +1275,7 @@ fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::Te
     let published = expression_target(&db, "rpm * 2.0", source);
     // Held as a view would hold it: dropping the binding stops the expression.
     let (bound, plan) = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
         let bound = expressions::bind("=rpm * 2.0", &db, cx).expect("the expression compiles");
@@ -1358,7 +1358,7 @@ fn a_window_too_wide_to_replay_shows_its_gap_without_computing(cx: &mut gpui::Te
 
     let published = expression_target(&db, "rpm * 2.0", source);
     let (_bound, plan) = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
         Backfiller::init(db.clone(), cx);
@@ -1450,7 +1450,7 @@ fn an_inspector_rebind_retains_the_expression_before_the_next_render(
     let published = expression_target(&db, "rpm * 2.0", ComponentId::new("rpm"));
     let window = cx.add_empty_window();
     let meter = window.update(|window, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
         InspectorRegistry::init(db.clone(), cx);
@@ -1518,7 +1518,7 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
     let db = Arc::new(db);
     let window = cx.add_empty_window();
     window.update(|window, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         crate::inspector::edits::init(cx);
         expressions::Expressions::init(cx);
         crate::dynamic::worker::DynamicWorker::init(cx);
@@ -1629,7 +1629,7 @@ fn widget_snapshots_preserve_expression_syntax_and_unbound_inputs(cx: &mut gpui:
     let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
     let db = Arc::new(db);
     cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         crate::inspector::edits::init(cx);
         expressions::Expressions::init(cx);
         crate::dynamic::worker::DynamicWorker::init(cx);

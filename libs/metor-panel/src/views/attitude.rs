@@ -36,7 +36,7 @@ use smallvec::SmallVec;
 use super::binding::{
     ElementRef, LiveBinding, component_meta, spawn_elements_stream, spawn_meta_resolver,
 };
-use crate::theme::{Theme, theme, ui_px, ui_scale};
+use metor_gpui::{Theme, theme, ui_px, ui_scale};
 
 /// Pitch angle that moves the horizon by a full ball radius.
 const PITCH_FULL_SCALE: f32 = std::f32::consts::FRAC_PI_2;

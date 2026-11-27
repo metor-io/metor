@@ -79,7 +79,7 @@ pub struct Timeline {
     context_key: String,
     history: Vec<Navigation>,
     area: Option<Bounds<Pixels>>,
-    /// [`ui_scale`](crate::theme::ui_scale) `area` was laid out at. Paint
+    /// [`ui_scale`](metor_gpui::ui_scale) `area` was laid out at. Paint
     /// and hit-testing work in unzoomed design units and multiply by this,
     /// so a zoomed dashboard widget shrinks the whole drawing with its box.
     scale: f32,
@@ -138,7 +138,7 @@ impl Timeline {
         this._subscriptions
             .push(cx.observe_global::<temporal::TemporalRevision>(|_, cx| cx.notify()));
         this._subscriptions
-            .push(cx.observe_global::<crate::theme::ActiveTheme>(|_, cx| cx.notify()));
+            .push(cx.observe_global::<metor_gpui::ActiveTheme>(|_, cx| cx.notify()));
         this.sync_sources(cx);
         this
     }
@@ -383,7 +383,7 @@ impl Render for Timeline {
             move |bounds, window, cx| {
                 entity.update(cx, |this, cx| {
                     this.area = Some(bounds);
-                    this.scale = crate::theme::ui_scale(window);
+                    this.scale = metor_gpui::ui_scale(window);
                     this.show_readout(window, cx);
                 });
             },
@@ -425,9 +425,9 @@ impl Render for Timeline {
             .when(self.edit.is_none(), |surface| {
                 surface
                     .border_1()
-                    .border_color(crate::theme::theme(cx).border_primary)
+                    .border_color(metor_gpui::theme(cx).border_primary)
             })
-            .bg(crate::theme::theme(cx).bg_primary)
+            .bg(metor_gpui::theme(cx).bg_primary)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::pointer_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::pointer_down))
             .on_mouse_down(

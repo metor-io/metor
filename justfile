@@ -9,3 +9,7 @@ install:
 # Run the adcs-fsw3 star-tracker sim and open metor-panel on it.
 star-demo:
   examples/adcs-fsw3/run-star-demo.sh
+
+# Check that metor-gpui builds for the browser: single-threaded, on stable.
+check-gpui-wasm:
+  cargo check -p metor-gpui --target wasm32-unknown-unknown

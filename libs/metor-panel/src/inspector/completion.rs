@@ -13,7 +13,7 @@ use metor_db::DB;
 use metor_expr::complete::{CompletionItem, CompletionKind, Completions};
 
 use crate::dynamic::resolver::DbResolver;
-use crate::theme::theme;
+use metor_gpui::theme;
 
 thread_local! {
     /// Resolver snapshot cached against the DB's vtable generation, so a

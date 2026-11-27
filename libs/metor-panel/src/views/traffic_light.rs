@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{component_meta, spawn_meta_resolver, spawn_on_stream};
 use crate::data_binding::Binding;
-use crate::theme::{Theme, theme, ui_px};
+use metor_gpui::{Theme, theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]

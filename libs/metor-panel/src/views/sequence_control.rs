@@ -23,6 +23,7 @@
 //! past, the control shows the state then and takes no commands at all.
 //! Commands go out through the [`SequenceStore`](crate::sequences::SequenceStore).
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::{
@@ -33,17 +34,17 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 use serde::{Deserialize, Serialize};
 
-use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, Channel, ChannelStatus, ChannelStatusReader, state_label};
-use crate::theme::{Theme, font_family, theme, ui_px};
 use crate::views::TooltipText;
 use crate::views::buttons::{icon_button, pressable};
 use crate::views::format::format_age;
 use crate::views::value_strip::{
     STRIP_BOX_HEIGHT, STRIP_BOX_VALUE_SIZE, apply_chevron, box_corners, box_fill, box_padding,
 };
+use metor_gpui::Icon;
+use metor_gpui::{Theme, font_family, theme, ui_px};
 
 /// Persisted shape of a [`SequenceControl`], shared by the tile and dashboard
 /// surfaces.
@@ -841,9 +842,10 @@ mod tests {
             install_status(&db, "deploy", frames);
             let inspector = Rc::new(RefCell::new(Vec::new()));
             cx.update(|cx| {
-                cx.set_global(crate::theme::FontSettings {
-                    family: "monospace".into(),
-                    config: Default::default(),
+                cx.set_global(crate::config::PanelConfig::default());
+                cx.set_global(metor_gpui::UiSettings {
+                    font_family: "monospace".into(),
+                    ..Default::default()
                 });
                 crate::views::dashboard::WidgetRegistry::init(cx);
                 let inspector = inspector.clone();
@@ -991,7 +993,7 @@ mod tests {
             let shown = control.shown(cx).expect("declared");
             assert!(
                 control
-                    .clocks(&shown.status, &crate::theme::theme(cx), window, cx)
+                    .clocks(&shown.status, &metor_gpui::theme(cx), window, cx)
                     .is_some()
             );
         });

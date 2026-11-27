@@ -4,7 +4,7 @@ use std::{collections::HashMap, time::Duration};
 use gpui::{App, AppContext, Bounds, Entity, EntityId, Pixels, Point, Window};
 
 use super::{Member, Pane, SplitDirection, drag::nearest_edge};
-use crate::motion::Fade;
+use metor_gpui::motion::Fade;
 
 const DURATION: Duration = Duration::from_millis(120);
 

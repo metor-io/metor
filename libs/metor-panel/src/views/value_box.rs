@@ -10,9 +10,9 @@ use gpui::{
 
 use crate::inspector::ActivateSelectedRow;
 use crate::inspector::rows::LABEL_SIZE;
-use crate::theme::Theme;
 use crate::views::scrubber::Scrubber;
 use crate::views::value_strip::BOX_RADIUS;
+use metor_gpui::Theme;
 
 /// Height of a value box: it fits inside an inspector row's selection pill
 /// and matches the edit field's 20px line.

@@ -1,9 +1,9 @@
 use super::*;
 use crate::plot_events::flags::{ClusterPaint, paint_event_flags};
-use crate::theme::ui_scale;
 use crate::views::plot_common::paint_text_label;
 use crate::views::table::{CELL_FONT_SIZE, CELL_PAD_X, HEADER_HEIGHT, ROW_HEIGHT};
 use gpui::{BorderStyle, TextAlign, fill, point, quad, size};
+use metor_gpui::ui_scale;
 
 /// Painted geometry is also the hit target, including the entire truncated chip.
 pub(super) struct EventHit {
@@ -88,7 +88,7 @@ impl Timeline {
 
     pub(super) fn paint(&mut self, area: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         self.event_hits.clear();
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         // Everything below is laid out in design units and scaled once on
         // its way to the screen; `hair` keeps rules a pixel thick at any zoom.
         let s = ui_scale(window);

@@ -7,6 +7,7 @@
 //! an Elements section and shows the selected child's rows above its own.
 //! The rows are one ordinary inline [`Inspector`] page, so search, drilling
 //! in and inline editing all work as they do in the popup.
+use crate::theme::PanelThemeExt;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -18,14 +19,14 @@ use gpui::{
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use crate::icons::Icon;
 use crate::inspector::rows::{
     HeaderRow, InspectorRow, RowAction, TextRow, row_base, row_label, tag_pill,
 };
 use crate::inspector::target::{self, InspectChild, InspectHost};
 use crate::inspector::{Inspector, InspectorMode};
-use crate::theme::theme;
 use crate::tiles::{Pane, PaneItemHandle};
+use metor_gpui::Icon;
+use metor_gpui::theme;
 
 /// Nothing persists: the target is whatever is selected when the layout
 /// opens, and a pin names a live pane that a reload would not bring back.

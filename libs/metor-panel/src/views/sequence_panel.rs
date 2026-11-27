@@ -6,16 +6,17 @@
 //! [`ChannelStatusReader`](crate::sequences::ChannelStatusReader)s, and the History tab
 //! from [`SequenceHistory`]; this view only renders and publishes commands.
 
+use crate::theme::PanelThemeExt;
 use gpui::{AnyElement, Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::SequenceChannelState;
 
 use crate::sequences::{self, ChannelReaders, HistoryEntry, SequenceHistory, state_label};
-use crate::theme::{theme, ui_px};
 use crate::views::format::format_age;
 use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
 use crate::views::switch::Switch;
 use crate::views::{buttons, table};
+use metor_gpui::{theme, ui_px};
 
 /// Size of one square control in the channel grid, in unscaled pixels.
 const SQUARE_TILE: (f32, f32) = (260.0, 132.0);
@@ -291,7 +292,7 @@ impl SequenceView {
     }
 }
 
-fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
+fn empty_row(theme: &metor_gpui::Theme, msg: &'static str) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -304,7 +305,7 @@ fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
 
 /// One message a channel raised: the channel, the message in the color of the
 /// state it left the channel in, and how long ago.
-fn history_row(entry: &HistoryEntry, now: Timestamp, theme: &crate::theme::Theme) -> AnyElement {
+fn history_row(entry: &HistoryEntry, now: Timestamp, theme: &metor_gpui::Theme) -> AnyElement {
     div()
         .flex()
         .flex_row()

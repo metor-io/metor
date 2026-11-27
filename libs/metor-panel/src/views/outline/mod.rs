@@ -42,14 +42,14 @@ use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::StripStyle;
 use super::value_strip::{ComponentValueStrip, strip_row_width};
-use crate::icons::Icon;
 use crate::inspector::plot_preview::shift_hover_listener;
 use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
-use crate::theme::{theme, ui_px};
 use crate::tiles::{OpenOutlineAction, OpenPivotTableAction};
 use crate::views::PivotTableConfig;
+use metor_gpui::Icon;
+use metor_gpui::{theme, ui_px};
 use model::{Disclosure, FrameType, Layout, OutlineRow, RowKind, flatten, root_node, type_key};
 
 /// Indent per tree depth, in pixels.
@@ -1558,7 +1558,7 @@ mod tests {
 
     fn outline(db: &Arc<DB>, cx: &mut gpui::VisualTestContext) -> Entity<Table<OutlineDelegate>> {
         let table = cx.update(|_, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             crate::inspector::edits::init(cx);
             cx.new(|cx| Table::new(OutlineDelegate::new(db.clone(), cx)))
         });

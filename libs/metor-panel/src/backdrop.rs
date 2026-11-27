@@ -22,7 +22,7 @@ fn render_view(window: &Window) -> Result<&NSView, String> {
 
 /// The panel's theme can differ from the system appearance inherited by
 /// AppKit, which otherwise gives a dark panel a pale sidebar.
-fn match_theme(effect: &NSVisualEffectView, theme: &crate::theme::Theme) -> Result<(), String> {
+fn match_theme(effect: &NSVisualEffectView, theme: &metor_gpui::Theme) -> Result<(), String> {
     let name = unsafe {
         if theme.bg_elevated.l < 0.5 {
             NSAppearanceNameDarkAqua
@@ -38,7 +38,7 @@ fn match_theme(effect: &NSVisualEffectView, theme: &crate::theme::Theme) -> Resu
 
 /// Install once during window creation, on a window opened with a
 /// transparent background.
-pub(crate) fn install(window: &Window, theme: &crate::theme::Theme) -> Result<(), String> {
+pub(crate) fn install(window: &Window, theme: &metor_gpui::Theme) -> Result<(), String> {
     let main_thread = MainThreadMarker::new().ok_or("The backdrop requires the AppKit thread")?;
     let render_view = render_view(window)?;
     let container =
@@ -68,7 +68,7 @@ pub(crate) fn install(window: &Window, theme: &crate::theme::Theme) -> Result<()
 }
 
 /// Follow a theme switch, which can cross between light and dark.
-pub(crate) fn retheme(window: &Window, theme: &crate::theme::Theme) {
+pub(crate) fn retheme(window: &Window, theme: &metor_gpui::Theme) {
     let Some(container) = render_view(window)
         .ok()
         .and_then(|view| unsafe { view.superview() })

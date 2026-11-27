@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::inspector::rows::{
     BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow, SliderRow,
 };
-use crate::theme::theme;
 use crate::views::Scrollbar;
 use crate::views::add_menu::{AddMenu, Host};
+use metor_gpui::theme;
 
 use crate::tiles::PaneItem;
 
@@ -639,11 +639,11 @@ fn zoom_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
 }
 
 /// The widgets an empty dashboard offers, by their Add Widget entry.
-const STARTERS: [(&str, crate::icons::Icon, &str); 4] = [
-    ("Time Series", crate::icons::Icon::Plot, "Time Series Plot"),
-    ("Monitor", crate::icons::Icon::Monitor, "Monitor"),
-    ("Gauge", crate::icons::Icon::Gauge, "Gauge"),
-    ("Label", crate::icons::Icon::Label, "Label"),
+const STARTERS: [(&str, metor_gpui::Icon, &str); 4] = [
+    ("Time Series", metor_gpui::Icon::Plot, "Time Series Plot"),
+    ("Monitor", metor_gpui::Icon::Monitor, "Monitor"),
+    ("Gauge", metor_gpui::Icon::Gauge, "Gauge"),
+    ("Label", metor_gpui::Icon::Label, "Label"),
 ];
 
 impl DashboardPanel {
@@ -1030,7 +1030,7 @@ pub(crate) mod test_support {
     /// The theme and registries a dashboard reads, plus a `blank_test` kind
     /// whose widgets paint nothing and inspect as themselves.
     pub(crate) fn install(db: &Arc<DB>, cx: &mut App) {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         WidgetRegistry::init(cx);
         crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
         let spec = WidgetSpec::new(

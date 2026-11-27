@@ -14,13 +14,13 @@ use metor_proto::types::ComponentId;
 
 use super::model::{Grid, Instance};
 use crate::inspector::rows::{CommandRow, InspectorRow};
-use crate::theme::{theme, ui_px};
 use crate::views::component_browser::strip_menu;
 use crate::views::image_view::collapsed_label;
 use crate::views::lazy_pool::VisibleEntityCache;
 use crate::views::monitor::{behavior_snapshot, edit_click};
 use crate::views::table::drag_chip;
 use crate::views::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
+use metor_gpui::{theme, ui_px};
 
 /// Horizontal padding inside one cell.
 pub(crate) const CELL_PAD: f32 = 8.0;

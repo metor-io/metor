@@ -8,6 +8,7 @@
 //! Configuration edits invalidate reconciliation; sample and image updates
 //! only repaint. Trace and axis observations bridge edits to child entities.
 
+use crate::theme::PanelThemeExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -837,7 +838,7 @@ const ENVELOPE_ALPHA: f32 = 0.55;
 
 impl Render for LinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         self.update_lod_state(cx);
         let degraded = self.gpu_state.degraded();
         let gap_bands = self.gap_bands(cx);
@@ -1052,7 +1053,7 @@ mod rebind_tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
         let (a, b) = cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             crate::temporal::TemporalController::init(db.clone(), cx);
             let a = cx.new(|cx| LinePlot::new(db.clone(), cx));
             let b = cx.new(|cx| LinePlot::new(db, cx));
@@ -1119,13 +1120,13 @@ mod rebind_tests {
             .unwrap();
         }
         let plot = cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             cx.new(|cx| {
                 let mut lp = LinePlot::new(db.clone(), cx);
                 let trace = Trace::new(
                     ComponentId::new("adcs.rate"),
                     0,
-                    crate::theme::DARK.line_colors[0],
+                    metor_gpui::DARK.line_colors[0],
                 );
                 lp.bind_traces(vec![trace], cx);
                 lp

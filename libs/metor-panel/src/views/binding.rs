@@ -2,6 +2,7 @@
 //! resolve metadata for late-registering components. Alarm limits and colors
 //! come from the shared alarm store.
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -606,7 +607,7 @@ pub(crate) fn limit_marks(at: ElementRef, cx: &App) -> SmallVec<[(f64, Hsla); 4]
     let Some(store) = crate::alarms::try_global(cx) else {
         return SmallVec::new();
     };
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     store
         .read(cx)
         .state()
@@ -633,7 +634,7 @@ pub(crate) fn active_severity(at: ElementRef, cx: &App) -> Option<Severity> {
 /// Wash color for an instrument whose element currently has an active alarm.
 pub(crate) fn alarm_tint(at: ElementRef, cx: &App) -> Option<Hsla> {
     let severity = active_severity(at, cx)?;
-    Some(crate::theme::theme(cx).alarm_tint(crate::alarms::severity_index(severity)))
+    Some(metor_gpui::theme(cx).alarm_tint(crate::alarms::severity_index(severity)))
 }
 
 #[cfg(test)]

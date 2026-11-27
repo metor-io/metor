@@ -4,6 +4,7 @@
 //! own render, because where it sits — in the titlebar beside the other
 //! controls, or as a sidebar the full height of the window — is a global
 //! preference ([`TabPlacement`]) that changes the whole window's frame.
+use crate::theme::PanelThemeExt;
 use std::rc::Rc;
 
 use gpui::{
@@ -15,8 +16,8 @@ use super::TileGroup;
 use super::drag::{ActiveDrag, DragGhost, DragSource, DraggedPane, DraggedTab, set_active_drag};
 use super::motion::{MovingTab, Rail, TabSizes};
 use crate::config::TabPlacement;
-use crate::icons::Icon;
-use crate::theme::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
+use metor_gpui::Icon;
+use metor_gpui::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
 
 /// Identity of a tab, stable while tabs are added, closed and reordered
 /// around it, and unique across windows.
@@ -80,16 +81,16 @@ fn insertion_before(
 }
 
 pub(crate) fn placement(cx: &App) -> TabPlacement {
-    cx.try_global::<crate::theme::FontSettings>()
-        .map(|settings| settings.config.tab_placement)
+    cx.try_global::<crate::config::PanelConfig>()
+        .map(|settings| settings.tab_placement)
         .unwrap_or_default()
 }
 
 /// Move every window's tabs to `placement` and remember the choice.
 pub(crate) fn set_placement(placement: TabPlacement, cx: &mut App) {
-    let settings = cx.global_mut::<crate::theme::FontSettings>();
-    settings.config.tab_placement = placement;
-    if let Err(error) = crate::config::save(&settings.config) {
+    let settings = cx.global_mut::<crate::config::PanelConfig>();
+    settings.tab_placement = placement;
+    if let Err(error) = crate::config::save(&settings) {
         tracing::error!(%error, "save tab placement failed");
     }
     cx.refresh_windows();
@@ -97,8 +98,8 @@ pub(crate) fn set_placement(placement: TabPlacement, cx: &mut App) {
 
 pub(crate) fn sidebar_width(cx: &App) -> Pixels {
     px(cx
-        .try_global::<crate::theme::FontSettings>()
-        .and_then(|settings| settings.config.tab_sidebar_width)
+        .try_global::<crate::config::PanelConfig>()
+        .and_then(|settings| settings.tab_sidebar_width)
         .unwrap_or(SIDEBAR_WIDTH))
 }
 
@@ -106,16 +107,16 @@ pub(crate) fn sidebar_width(cx: &App) -> Pixels {
 /// drop that ends the drag saves it with [`save_sidebar_width`].
 pub(crate) fn set_sidebar_width(width: Pixels, cx: &mut App) {
     let width = f32::from(width).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-    let settings = cx.global_mut::<crate::theme::FontSettings>();
-    if settings.config.tab_sidebar_width != Some(width) {
-        settings.config.tab_sidebar_width = Some(width);
+    let settings = cx.global_mut::<crate::config::PanelConfig>();
+    if settings.tab_sidebar_width != Some(width) {
+        settings.tab_sidebar_width = Some(width);
         cx.refresh_windows();
     }
 }
 
 pub(crate) fn save_sidebar_width(cx: &App) {
-    if let Some(settings) = cx.try_global::<crate::theme::FontSettings>()
-        && let Err(error) = crate::config::save(&settings.config)
+    if let Some(settings) = cx.try_global::<crate::config::PanelConfig>()
+        && let Err(error) = crate::config::save(&settings)
     {
         tracing::error!(%error, "save tab sidebar width failed");
     }

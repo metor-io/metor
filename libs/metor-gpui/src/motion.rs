@@ -1,37 +1,45 @@
 //! Short opacity transitions whose lifetime follows their owning view.
-use std::time::{Duration, Instant};
+
+use std::time::Duration;
 
 use gpui::{App, Window};
+use web_time::Instant;
 
-use crate::config::MotionPreference;
+use crate::UiSettings;
 
-pub(crate) const PALETTE_ENTER: Duration = Duration::from_millis(120);
-pub(crate) const PALETTE_EXIT: Duration = Duration::from_millis(80);
-pub(crate) const MENU_ENTER: Duration = Duration::from_millis(70);
-pub(crate) const MENU_EXIT: Duration = Duration::from_millis(90);
-pub(crate) const TRANSIENT_ENTER: Duration = Duration::from_millis(100);
-/// An inspector page sliding in as it is entered or returned to.
-pub(crate) const PAGE_TURN: Duration = Duration::from_millis(140);
-
-/// Emitted when an overlay's visual can be released, after logical dismissal.
-pub(crate) struct Closed;
-
-pub(crate) fn enabled(cx: &App) -> bool {
-    cx.try_global::<crate::theme::FontSettings>()
-        .is_none_or(|settings| settings.config.motion != MotionPreference::Reduced)
+/// Whether decorative fades run or UI state is shown immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MotionPreference {
+    #[default]
+    Full,
+    Reduced,
 }
 
-pub(crate) fn set_preference(preference: MotionPreference, cx: &mut App) {
-    let settings = cx.global_mut::<crate::theme::FontSettings>();
-    settings.config.motion = preference;
-    if let Err(error) = crate::config::save(&settings.config) {
-        tracing::error!(%error, "save motion preference failed");
-    }
+pub const PALETTE_ENTER: Duration = Duration::from_millis(120);
+pub const PALETTE_EXIT: Duration = Duration::from_millis(80);
+pub const MENU_ENTER: Duration = Duration::from_millis(70);
+pub const MENU_EXIT: Duration = Duration::from_millis(90);
+pub const TRANSIENT_ENTER: Duration = Duration::from_millis(100);
+/// A page sliding in as it is entered or returned to.
+pub const PAGE_TURN: Duration = Duration::from_millis(140);
+
+/// Emitted when an overlay's visual can be released, after logical dismissal.
+pub struct Closed;
+
+/// Whether fades run under the current [`UiSettings`].
+pub fn enabled(cx: &App) -> bool {
+    cx.try_global::<UiSettings>()
+        .is_none_or(|settings| settings.motion != MotionPreference::Reduced)
+}
+
+/// Change the motion preference and redraw every window under it.
+pub fn set_preference(preference: MotionPreference, cx: &mut App) {
+    cx.default_global::<UiSettings>().motion = preference;
     cx.refresh_windows();
 }
 
 /// Retains opacity across renders and samples a new target from the current value.
-pub(crate) struct Fade {
+pub struct Fade {
     from: f32,
     target: f32,
     started: Option<Instant>,
@@ -39,7 +47,7 @@ pub(crate) struct Fade {
 }
 
 impl Fade {
-    pub(crate) fn settled(opacity: f32) -> Self {
+    pub fn settled(opacity: f32) -> Self {
         Self {
             from: opacity,
             target: opacity,
@@ -48,7 +56,7 @@ impl Fade {
         }
     }
 
-    pub(crate) fn entrance(duration: Duration) -> Self {
+    pub fn entrance(duration: Duration) -> Self {
         Self {
             from: 0.0,
             target: 1.0,
@@ -78,16 +86,16 @@ impl Fade {
         self.from + (self.target - self.from) * eased
     }
 
-    pub(crate) fn finish(&mut self) {
+    pub fn finish(&mut self) {
         self.from = self.target;
         self.duration = Duration::ZERO;
     }
 
-    pub(crate) fn exit(&mut self, duration: Duration) {
+    pub fn exit(&mut self, duration: Duration) {
         self.retarget(0.0, duration, Instant::now());
     }
 
-    pub(crate) fn enter(&mut self, duration: Duration) {
+    pub fn enter(&mut self, duration: Duration) {
         self.retarget(1.0, duration, Instant::now());
     }
 
@@ -102,7 +110,7 @@ impl Fade {
         };
     }
 
-    pub(crate) fn opacity(&mut self, window: &Window, cx: &App) -> f32 {
+    pub fn opacity(&mut self, window: &Window, cx: &App) -> f32 {
         let now = Instant::now();
         self.started.get_or_insert(now);
         if !enabled(cx) {

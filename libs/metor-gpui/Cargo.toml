@@ -1,0 +1,25 @@
+[package]
+name = "metor-gpui"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "gpui primitives shared by metor-panel and the metor-ci web GUI"
+
+[dependencies]
+gpui.workspace = true
+tracing = "0.1"
+web-time = "1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen = "0.2"
+
+[lints]
+workspace = true
+
+[[example]]
+name = "hello_web"
+path = "examples/hello_web/main.rs"

@@ -40,7 +40,7 @@ use super::bounds::PlotView;
 use super::heatmap::{HeatmapPipeline, HeatmapState, IntensityDraw};
 use super::{PlotBounds, PlotStyle};
 use crate::gpu_context::GpuContext;
-use crate::theme::Theme;
+use metor_gpui::Theme;
 
 const VALUE_CAPACITY: u32 = 1 << 22;
 const VALUE_BUF_BYTES: u64 = VALUE_CAPACITY as u64 * 4;
@@ -1344,7 +1344,7 @@ impl PlotRenderState {
             self.drawn = None;
             return None;
         }
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         let fingerprint = frame_fingerprint((width, height), scale, view, traces, field, &theme);
         if self.drawn == Some(fingerprint) {
             crate::frame_stats::bump(&crate::frame_stats::PLOT_SKIPS);
@@ -2757,7 +2757,7 @@ mod tests {
         };
         let view = PlotBounds::new(0.0, -1.0, 2.0, 1.0);
         let traces = std::slice::from_ref(&draw);
-        let theme = &crate::theme::DARK;
+        let theme = &metor_gpui::DARK;
 
         let target = RenderTarget::new(&gpu.ctx.device, w, h);
         assert!(gpu.submit(&target, view, 1.0, traces, None, &mut None, theme));
@@ -2841,7 +2841,7 @@ mod tests {
                 line(&b, Hsla::red(), 2.5),
             ),
         ];
-        let theme = &crate::theme::DARK;
+        let theme = &metor_gpui::DARK;
         let read = |gpu: &PlotGpu, t: &RenderTarget| {
             t.staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
@@ -2924,7 +2924,7 @@ mod tests {
             gain: 1.0,
             scale: IntensityScale::Linear,
             colormap: Colormap::Heat,
-            trace_color: crate::theme::DARK.line_colors[0],
+            trace_color: metor_gpui::DARK.line_colors[0],
             row_view: (0.0, 4.0),
         };
         let mut state = None;
@@ -2935,7 +2935,7 @@ mod tests {
             &[],
             Some(&draw),
             &mut state,
-            &crate::theme::DARK,
+            &metor_gpui::DARK,
         );
         assert!(drew, "a field-only frame submitted nothing");
 
@@ -3019,7 +3019,7 @@ mod tests {
                 std::slice::from_ref(&draw),
                 None,
                 &mut None,
-                &crate::theme::DARK,
+                &metor_gpui::DARK,
             );
             let span_secs = (max_x - min_x) as f64 * 1e-6;
             assert!(drew, "no spans drawn for window of {span_secs}s");
@@ -3110,7 +3110,7 @@ mod tests {
             return;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        cx.update(|cx| crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone())));
+        cx.update(|cx| metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone())));
         let dir = tempfile::tempdir().unwrap();
         let component = synth_component(dir.path(), 1, 2_000, 0, 1_000);
         let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(500.0), px(300.0)));
@@ -3233,7 +3233,7 @@ mod tests {
                     std::slice::from_ref(&draw),
                     None,
                     &mut None,
-                    &crate::theme::DARK,
+                    &metor_gpui::DARK,
                 ));
                 target
                     .staging
@@ -3285,7 +3285,7 @@ mod tests {
                         std::slice::from_ref(&draw),
                         None,
                         &mut None,
-                        &crate::theme::DARK,
+                        &metor_gpui::DARK,
                     ));
                     gpu.submit_frame();
                     let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());

@@ -7,15 +7,16 @@
 //! or a filter changes, and each cell reads its record back through
 //! [`LogState::by_seq`](crate::logs::LogState::by_seq) at paint time.
 
+use crate::theme::PanelThemeExt;
 use gpui::{
     AnyElement, Context, Entity, IntoElement, SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use metor_proto_wkt::LogLevel;
 
 use crate::logs::{self, LogState};
-use crate::theme::{Theme, theme};
 use crate::views::format::format_time;
 use crate::views::table::{self, Column, ColumnSort, Table, TableDelegate};
+use metor_gpui::{Theme, theme};
 
 /// The viewer's level floor. `All` shows everything received (the FSW side
 /// already filters what it forwards); the rest hide rows below the floor.

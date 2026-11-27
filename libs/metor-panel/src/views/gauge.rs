@@ -23,6 +23,7 @@
 //! to get subtly wrong across the 180° boundary, and at [`ARC_STEP_DEG`] the
 //! polyline is indistinguishable from a true arc.
 
+use crate::theme::PanelThemeExt;
 use std::f32::consts::FRAC_PI_2;
 use std::sync::Arc;
 
@@ -39,7 +40,7 @@ use super::binding::{
 use super::format_number;
 use super::meter::{fill_span, scale_position};
 use crate::inspect;
-use crate::theme::{Theme, theme, ui_px, ui_scale};
+use metor_gpui::{Theme, theme, ui_px, ui_scale};
 
 /// How the value is shown along the dial.
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]

@@ -16,7 +16,7 @@ use gpui::{
 
 use super::{Member, Pane, RESIZE_HANDLE_SIZE, TabId, TileGroup};
 use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// The height a dock opens at when the pane pinned to it has no locked
 /// size to keep.

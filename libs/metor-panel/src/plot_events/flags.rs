@@ -13,7 +13,7 @@ use gpui::{Bounds, Hsla, Pixels, SharedString, TextAlign, TextRun, Window, point
 use metor_proto::types::Timestamp;
 
 use crate::plot_events::PlotEvent;
-use crate::theme::Theme;
+use metor_gpui::Theme;
 
 /// Height of the flag gutter band inside the top of the plot area. Chips hang
 /// from here, and hit-testing for hover/pin is confined to it so the trace
@@ -45,7 +45,7 @@ pub(crate) const FLAG_HIT_PX: f32 = 8.0;
 /// dimmed shade a translucent tint would show over the plot, but occluding
 /// the traces beneath so the label stays readable.
 pub(crate) fn mix(bg: Hsla, fg: Hsla, t: f32) -> Hsla {
-    Theme::dim(crate::theme::lerp_color(bg, fg, t), 1.0)
+    Theme::dim(metor_gpui::lerp_color(bg, fg, t), 1.0)
 }
 
 /// Exact-equality check for two colors — [`Hsla`] has no `PartialEq`, and a
@@ -162,10 +162,10 @@ pub(crate) fn paint_event_flags(
     cx: &mut gpui::App,
 ) -> Vec<Bounds<Pixels>> {
     let mut hits = Vec::with_capacity(clusters.len());
-    let plot_bg = crate::theme::theme(cx).bg_primary;
+    let plot_bg = metor_gpui::theme(cx).bg_primary;
     // Chip metrics are designed unzoomed; inside a zoomed dashboard widget
     // they scale with its rem like the rest of the plot chrome.
-    let s = crate::theme::ui_scale(window);
+    let s = metor_gpui::ui_scale(window);
     let chip_font_size = px(CHIP_FONT_SIZE * s);
     let chip_h = px(CHIP_H * s);
     let chip_pad = px(CHIP_PAD_X * s);
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn cluster_color_is_shared_or_secondary() {
-        let theme = crate::theme::DARK.clone();
+        let theme = metor_gpui::DARK.clone();
         let red = Hsla {
             h: 0.0,
             s: 1.0,

@@ -19,6 +19,7 @@
 //! trail reads the component's LoD companions instead — bucket midpoints
 //! stand in for samples, which for a smooth track is exactly a decimation.
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::{
@@ -33,7 +34,7 @@ use smallvec::SmallVec;
 use super::binding::{component_meta, spawn_elements_stream};
 use super::time_series::Override;
 use super::time_series::time_range::TimeRangeBehavior;
-use crate::theme::{Theme, theme, ui_px, ui_scale};
+use metor_gpui::{Theme, theme, ui_px, ui_scale};
 
 pub mod mercator;
 pub mod tiles;

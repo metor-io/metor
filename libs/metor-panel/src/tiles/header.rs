@@ -10,6 +10,7 @@
 //! often. The pane, which renders every frame anyway, works out a
 //! [`HeaderState`] instead and hands over a changed one.
 
+use crate::theme::PanelThemeExt;
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, IntoElement, MouseButton, Render, SharedString,
     StyleRefinement, Styled, WeakEntity, Window, div, prelude::*, px,
@@ -17,8 +18,8 @@ use gpui::{
 
 use super::drag::{DraggedPane, SplitDirection};
 use super::pane::{HEADER_HEIGHT, Pane, PaneEvent};
-use crate::icons::Icon;
-use crate::theme::theme;
+use metor_gpui::Icon;
+use metor_gpui::theme;
 
 /// Everything the header shows, as of the pane's last render.
 #[derive(Clone, PartialEq)]
@@ -109,7 +110,7 @@ impl Render for PaneHeader {
                 .items_center()
                 .justify_center()
                 .size(px(22.0))
-                .rounded(px(crate::theme::CONTROL_RADIUS))
+                .rounded(px(metor_gpui::CONTROL_RADIUS))
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover_bg))
                 .child(icon.svg(12.0, theme.text_tertiary))

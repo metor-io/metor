@@ -8,9 +8,9 @@ use gpui::{
 
 use super::Scrollbar;
 
-use crate::icons::Icon;
 use crate::inspector::rows::measure;
-use crate::theme::{theme, ui_px, ui_scale};
+use metor_gpui::Icon;
+use metor_gpui::{theme, ui_px, ui_scale};
 
 /// Text size and horizontal padding of a header label, and the room a
 /// sortable header keeps for its chevron and the gap before it.

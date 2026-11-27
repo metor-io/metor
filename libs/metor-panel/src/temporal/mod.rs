@@ -669,7 +669,7 @@ pub(crate) fn paint_playhead(
             ),
             size: gpui::size(gpui::px(1.0), area.size.height),
         },
-        crate::theme::theme(cx).control_active,
+        metor_gpui::theme(cx).control_active,
     ));
 }
 

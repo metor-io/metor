@@ -1,3 +1,4 @@
+use crate::theme::PanelThemeExt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +24,7 @@ use super::binding::{ElementRef, active_severity, component_meta, spawn_on_strea
 use super::format_number;
 use super::tooltip::TooltipText;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
-use crate::theme::{Theme, theme, ui_px};
+use metor_gpui::{Theme, theme, ui_px};
 
 /// Which side of a component's value is the alarm.
 ///

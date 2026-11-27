@@ -30,7 +30,7 @@ fn exiting_menu_releases_pointer_input_and_does_not_steal_new_focus(cx: &mut gpu
     let changes = Rc::new(Cell::new(0));
     let clicks = Rc::new(Cell::new(0));
     let (host, cx) = cx.add_window_view(|window, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         let focus = cx.focus_handle();
         let inspector = cx.new(|cx| {
             let changes = changes.clone();
@@ -121,7 +121,7 @@ fn command_executes_once_even_when_confirmed_during_entry(cx: &mut gpui::TestApp
     let count = Rc::new(Cell::new(0));
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         let callback_count = count.clone();
         let inspector = cx.new(|cx| {
             Inspector::new(
@@ -149,7 +149,7 @@ fn entering_a_page_slides_it_in_from_the_right_and_leaving_from_the_left(
     cx: &mut gpui::TestAppContext,
 ) {
     let (inspector, cx) = cx.add_window_view(|_, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         let row = |label: &'static str| -> Box<dyn InspectorRow> {
             Box::new(rows::BoolRow::new(label, false, Arc::new(|_, _, _| {})))
         };

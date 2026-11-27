@@ -21,15 +21,15 @@ use super::time_series::Override;
 use super::value_strip::{
     ComponentValueStrip, StripBehavior, StripClick, StripStyle, strip_row_width,
 };
-use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
-use crate::theme::{Theme, theme};
 use crate::tiles::{OpenImageAction, PlotComponentAction};
 use component_tree::{
     Children, ComponentNode, build_tree, component_count, compress_subtree, resolve_path,
 };
+use metor_gpui::Icon;
+use metor_gpui::{Theme, theme};
 
 /// [`ColumnBrowser`] specialized for the DB component namespace.
 pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
@@ -884,7 +884,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
                       range: Range<usize>,
                       _window: &mut Window,
                       cx: &mut Context<ComponentBrowser>| {
-                    let theme = crate::theme::theme(cx);
+                    let theme = metor_gpui::theme(cx);
                     let delegate = this.delegate_mut();
                     let mut items = Vec::with_capacity(range.len());
                     for ix in range {
@@ -1318,7 +1318,7 @@ mod tests {
 
     fn browser(db: &Arc<DB>, cx: &mut gpui::TestAppContext) -> Entity<ComponentBrowser> {
         let browser = cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             crate::inspector::edits::init(cx);
             cx.new(|cx| new_component_browser(db.clone(), cx))
         });

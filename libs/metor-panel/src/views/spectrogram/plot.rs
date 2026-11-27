@@ -10,6 +10,7 @@
 //! window — the same place `plan_trace` walks samples for a line — so zooming
 //! re-buckets rather than resampling a picture.
 
+use crate::theme::PanelThemeExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -532,7 +533,7 @@ impl SpectrogramPlot {
 
 impl Render for SpectrogramPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         self.update_lod_state(cx);
         let gap_bands = self.gap_bands(cx);
         div()
@@ -592,7 +593,7 @@ impl SpectrogramPlot {
         }
 
         let (lo, hi) = self.intensity_range();
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         let draw = IntensityDraw {
             grid: &self.grid.values,
             cols: self.grid.cols as u32,

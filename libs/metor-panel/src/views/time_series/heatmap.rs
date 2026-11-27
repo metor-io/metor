@@ -13,11 +13,12 @@
 //! shader's fast-math reassociation makes NaN tests unreliable, while a
 //! sentinel far below any real value survives it.
 
+use crate::theme::PanelThemeExt;
 use bytemuck::{Pod, Zeroable};
 use gpui::Hsla;
 
 use crate::gpu_context::GpuContext;
-use crate::theme::Theme;
+use metor_gpui::Theme;
 
 /// Value written into a grid cell no sample covered. The tonemap pass drops
 /// these to fully transparent, so the plot background shows through.

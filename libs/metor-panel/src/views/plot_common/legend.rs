@@ -182,7 +182,7 @@ mod tests {
     #[gpui::test]
     fn legend_stays_cached_while_the_plot_redraws(cx: &mut TestAppContext) {
         let (tile, cx) = cx.add_window_view(|_, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             let data = cx.new(|_| Data(0));
             let legend = cx.new(|cx| {
                 let mut legend = PlotLegend::new(data.clone(), describe, |_| {});

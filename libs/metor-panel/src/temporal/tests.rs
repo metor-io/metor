@@ -782,7 +782,11 @@ fn t0_choices_zero_their_own_instant() {
             t0,
             ..Default::default()
         };
-        assert_eq!(display::origin(&config, &clock), Some(Timestamp(zero)), "{t0}");
+        assert_eq!(
+            display::origin(&config, &clock),
+            Some(Timestamp(zero)),
+            "{t0}"
+        );
         assert_eq!(T0::named(&t0.to_string()).unwrap_or(t0), t0);
     }
     let from_end = TemporalConfig {

@@ -11,9 +11,9 @@ use crate::inspector::rows::HeaderRow;
 use crate::inspector::rows::{
     BoolRow, CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction, row_base, row_label,
 };
-use crate::theme::theme;
 use crate::views::image_view::{expands, list_expandable_components};
 use crate::views::time_series::Trace;
+use metor_gpui::theme;
 
 thread_local! {
     /// Name-sorted component list cached against the DB's vtable generation.
@@ -823,7 +823,7 @@ mod tests {
         let (db, _temp) = db_with(&[("adcs.rate", &[]), ("adcs.omega_b", &[3])]);
         let cx = cx.add_empty_window();
         cx.update(|window, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             let (on_pick, slot) = picked();
             let mut rows = channel_picker_rows(db.clone(), "Pick", on_pick);
 
@@ -861,7 +861,7 @@ mod tests {
         let (db, _temp) = db_with(&[("adcs.omega_b", &[3])]);
         let cx = cx.add_empty_window();
         cx.update(|window, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             expressions::Expressions::init(cx);
             crate::dynamic::worker::DynamicWorker::init(cx);
             let (on_pick, slot) = picked();
@@ -905,7 +905,7 @@ mod tests {
         let (db, _temp) = crate::views::image_view::tests::image_db();
         let cx = cx.add_empty_window();
         cx.update(|_window, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             expressions::Expressions::init(cx);
             crate::dynamic::worker::DynamicWorker::init(cx);
             let (on_pick, _slot) = picked();

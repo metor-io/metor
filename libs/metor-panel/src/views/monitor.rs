@@ -12,7 +12,7 @@ use crate::data_binding::Binding;
 use crate::inspect;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::inspector::plot_preview::shift_hover_listener;
-use crate::theme::{theme, ui_px};
+use metor_gpui::{theme, ui_px};
 
 /// A component's current value, name, and an optional sparkline — the one
 /// value readout, on panes and dashboards alike.

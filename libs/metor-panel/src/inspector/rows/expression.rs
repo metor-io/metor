@@ -9,7 +9,7 @@ use metor_proto::types::ComponentId;
 use super::{InspectorRow, RowAction, row_base};
 use crate::dynamic::expressions::{self, SIGIL};
 use crate::inspector::completion;
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// What a picker does with a committed channel — a picked component and a
 /// computed expression arrive the same way.
@@ -488,7 +488,7 @@ mod tests {
         let (db, _temp) = db_with(&["cube_sat.plant.body.omega_b"]);
         let cx = cx.add_empty_window();
         cx.update(|window, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             let drill: ComponentRowBuilder = Arc::new(|_id, item, _cx| {
                 Some(Box::new(NavRow::new(
                     SharedString::from(item.label.clone()),

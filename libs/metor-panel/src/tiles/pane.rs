@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use super::drag::SplitDirection;
 use super::header::{HeaderState, PaneHeader};
 use super::item::PaneItemHandle;
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// Dispatched by views inside a pane to open a new plot beside that pane.
 ///
@@ -59,7 +59,7 @@ pub struct PreviewPlotAction {
 }
 
 /// Height of a pane's header row.
-pub(super) const HEADER_HEIGHT: f32 = crate::theme::CONTROL_HEIGHT;
+pub(super) const HEADER_HEIGHT: f32 = metor_gpui::CONTROL_HEIGHT;
 
 /// Messages a pane sends to the [`TileGroup`](super::TileGroup) that owns it.
 ///
@@ -325,7 +325,7 @@ mod tests {
     fn group_with(closable: bool, cx: &mut gpui::TestAppContext) -> Entity<TileGroup> {
         cx.update(|cx| {
             cx.new(|cx| {
-                crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+                metor_gpui::set_theme(cx, std::sync::Arc::new(metor_gpui::DARK.clone()));
                 let item = Box::new(cx.new(|_| TestItem(closable))) as Box<dyn PaneItemHandle>;
                 TileGroup::new(vec![item], cx)
             })

@@ -7,7 +7,7 @@ use gpui::{
 use super::TileGroup;
 use super::pane::Pane;
 use super::tab_bar::TabId;
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// Payload carried by gpui while a pane is dragged by its header.
 ///
@@ -100,18 +100,18 @@ pub(crate) fn ghost_chip(title: gpui::SharedString, closable: bool, cx: &App) ->
     let theme = theme(cx);
     div()
         .when_some(
-            cx.try_global::<crate::theme::FontSettings>()
-                .map(|font| font.family.clone()),
+            cx.try_global::<metor_gpui::UiSettings>()
+                .map(|settings| settings.font_family.clone()),
             |ghost, family| ghost.font_family(family),
         )
         .flex()
         .items_center()
         .gap(px(4.0))
-        .h(px(crate::theme::CONTROL_HEIGHT))
+        .h(px(metor_gpui::CONTROL_HEIGHT))
         .max_w(px(super::tab_bar::TAB_MAX_WIDTH))
         .pl(px(8.0))
         .pr(px(if closable { 4.0 } else { 8.0 }))
-        .rounded(px(crate::theme::CONTROL_RADIUS))
+        .rounded(px(metor_gpui::CONTROL_RADIUS))
         .border_1()
         .border_color(theme.border_primary)
         .bg(theme.bg_elevated)

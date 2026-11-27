@@ -5877,7 +5877,6 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm_thread",
  "web-sys",
  "web-time",
 ]
@@ -7868,6 +7867,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-gpui"
+version = "0.14.2"
+dependencies = [
+ "gpui",
+ "gpui_platform",
+ "tracing",
+ "wasm-bindgen",
+ "web-time",
+]
+
+[[package]]
 name = "metor-panel"
 version = "0.14.2"
 dependencies = [
@@ -7894,6 +7904,7 @@ dependencies = [
  "mdns-sd",
  "metor-db",
  "metor-expr",
+ "metor-gpui",
  "metor-proto",
  "metor-proto-wkt",
  "nox",
@@ -10957,7 +10968,6 @@ dependencies = [
  "futures",
  "parking_lot",
  "rand 0.9.5",
- "wasm_thread",
  "web-time",
 ]
 
@@ -13079,17 +13089,6 @@ checksum = "ec1492381bfd5ea51c2a99a919b676662559925cb8d7490547ec2e14c1ad3eb1"
 dependencies = [
  "leb128fmt",
  "wasmparser 0.256.0",
-]
-
-[[package]]
-name = "wasm_thread"
-version = "0.3.3"
-source = "git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"
-dependencies = [
- "futures",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]

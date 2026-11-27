@@ -12,10 +12,10 @@ use metor_db::DB;
 
 use super::chrome::{paint_axes, paint_axis_backdrop, paint_hline, paint_vline};
 use super::{PanZoom, PlotLegend};
-use crate::theme::{ui_px, ui_scale};
 use crate::views::time_series::{
     PADDING, PlotBounds, X_LABEL_HEIGHT, Y_LABEL_WIDTH, plot_area, value_ticks,
 };
+use metor_gpui::{ui_px, ui_scale};
 
 /// What [`NumericPlot`] needs from the line-plot entity it wraps.
 ///
@@ -104,7 +104,7 @@ impl<P: NumericLinePlot> NumericPlot<P> {
 
 impl<P: NumericLinePlot> Render for NumericPlot<P> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         let trace_entities: Vec<Entity<P::Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
         let legend_height = show_legend.then(|| self.legend.read(cx).height());
@@ -225,7 +225,7 @@ fn paint_numeric_underlay(
     cx: &mut gpui::App,
 ) {
     let pb = plot_area(outer_bounds, 1, ui_scale(window));
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
 
     for tick in value_ticks(view.min_y, view.max_y, 5) {
         let y = view.to_screen(pb, view.min_x, tick).y;
@@ -262,7 +262,7 @@ fn paint_numeric_overlay(
 ) {
     let s = ui_scale(window);
     let pb = plot_area(outer_bounds, 1, s);
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
 
     paint_axis_backdrop(outer_bounds, pb, legend_height, window, cx);
 

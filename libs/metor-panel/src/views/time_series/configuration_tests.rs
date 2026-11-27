@@ -9,7 +9,7 @@ fn fixture(cx: &mut gpui::TestAppContext) -> (tempfile::TempDir, Arc<DB>, Entity
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     register(&db, "signal");
     let plot = cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         InspectorRegistry::init(db.clone(), cx);
         cx.new(|cx| {
             let mut plot = LinePlot::new(db.clone(), cx);
@@ -47,7 +47,7 @@ fn trace(name: &str, element: usize) -> Trace {
     Trace::new(
         ComponentId::new(name),
         element,
-        crate::theme::DARK.line_colors[0],
+        metor_gpui::DARK.line_colors[0],
     )
 }
 

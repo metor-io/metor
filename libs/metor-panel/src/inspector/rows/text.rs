@@ -5,8 +5,8 @@ use gpui::{AnyElement, App, Hsla, SharedString, Window, prelude::*, px};
 use super::{
     InspectorRow, RowAction, boxed_row, row_base, row_box, row_label, row_value, value_row,
 };
-use crate::theme::theme;
 use crate::views::value_box::ValueBox;
+use metor_gpui::theme;
 
 /// Inspector row for a string field.
 ///

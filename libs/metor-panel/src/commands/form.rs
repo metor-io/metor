@@ -25,7 +25,7 @@ use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::rows::{
     BoolRow, CommandRow, EnumRow, InspectorRow, NavRow, RowAction, ScalarRow, TextRow,
 };
-use crate::theme::theme;
+use metor_gpui::theme;
 
 type Rows = Vec<Box<dyn InspectorRow>>;
 

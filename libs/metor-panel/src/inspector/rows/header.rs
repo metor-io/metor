@@ -1,7 +1,7 @@
 use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 
 use super::{InspectorRow, ROW_HEIGHT, RowAction};
-use crate::theme::theme;
+use metor_gpui::theme;
 
 /// Non-interactive section label separating groups of rows.
 ///

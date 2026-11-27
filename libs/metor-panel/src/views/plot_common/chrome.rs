@@ -3,6 +3,7 @@
 //! full-height rules (gridlines, zero lines, limits, cursors) clipped to the
 //! plot area.
 
+use crate::theme::PanelThemeExt;
 use gpui::{Bounds, Corners, Hsla, PathBuilder, Pixels, Window, point};
 
 /// Fill the Y-label column left of `pa` and the X-label strip below it,
@@ -24,7 +25,7 @@ pub(crate) fn paint_axis_backdrop(
     window: &mut Window,
     cx: &gpui::App,
 ) {
-    let axis_bg = crate::theme::theme(cx).plot_chrome_bg();
+    let axis_bg = metor_gpui::theme(cx).plot_chrome_bg();
     let y_column = Bounds {
         origin: outer.origin,
         size: gpui::Size {

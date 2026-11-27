@@ -2,6 +2,7 @@
 //! them, and presets for how levels follow the frame. They head the view's
 //! inspector page, which is also its right-click menu.
 
+use crate::theme::PanelThemeExt;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -16,8 +17,8 @@ use super::view::ImageView;
 use crate::inspector::rows::{
     AccessorySpec, CommandRow, InspectorRow, RowAction, boxed_row, row_box,
 };
-use crate::theme::{Theme, theme};
 use crate::views::value_box::ValueBox;
+use metor_gpui::{Theme, theme};
 
 /// Stretch presets: a label and the levels it sets.
 const PRESETS: [(&str, Levels); 3] = [

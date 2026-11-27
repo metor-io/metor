@@ -6,8 +6,8 @@ use gpui::{Div, ElementId, Hsla, SharedString, Stateful, div, prelude::*, px};
 use super::table::HEADER_CONTROL_HEIGHT;
 use super::tooltip::TooltipText;
 use super::value_strip::STRIP_BOX_HEIGHT;
-use crate::icons::Icon;
-use crate::theme::{Theme, ui_px};
+use metor_gpui::Icon;
+use metor_gpui::{Theme, ui_px};
 
 /// A square button `height` tall showing `icon`, named by `tooltip` on
 /// hover. Inert until [`pressable`] makes it act on click.

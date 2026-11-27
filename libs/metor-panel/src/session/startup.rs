@@ -70,7 +70,7 @@ pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
     };
     if let Err(error) = cx.open_window(options, |window, cx| {
         #[cfg(target_os = "macos")]
-        if let Err(error) = crate::backdrop::install(window, &crate::theme::theme(cx)) {
+        if let Err(error) = crate::backdrop::install(window, &metor_gpui::theme(cx)) {
             tracing::warn!(%error, "could not install native splash blur");
             window.set_background_appearance(gpui::WindowBackgroundAppearance::Blurred);
         }
@@ -169,13 +169,13 @@ impl SessionStartup {
                         .parent()
                         .and_then(|p| p.canonicalize().ok())
                         .and_then(|p| p.to_str().map(str::to_owned));
-                    if let Some(settings) = cx.try_global::<crate::theme::FontSettings>() {
-                        let mut config = settings.config.clone();
+                    if let Some(settings) = cx.try_global::<crate::config::PanelConfig>() {
+                        let mut config = settings.clone();
                         config.recording_parent = parent;
                         if let Err(error) = crate::config::save(&config) {
                             tracing::warn!(%error, "could not remember recording folder");
                         }
-                        cx.global_mut::<crate::theme::FontSettings>().config = config;
+                        cx.set_global(config);
                     }
                 }
                 self.app
@@ -284,8 +284,8 @@ impl SessionStartup {
         self.selecting = true;
         self.error = None;
         let parent = cx
-            .try_global::<crate::theme::FontSettings>()
-            .and_then(|s| s.config.recording_parent.as_ref())
+            .try_global::<crate::config::PanelConfig>()
+            .and_then(|s| s.recording_parent.as_ref())
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .or_else(dirs::home_dir)
@@ -531,12 +531,11 @@ mod tests {
         );
         let mut app = PanelApp::choose_session().connection(target.clone());
         cx.update(|cx| {
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                crate::theme::DARK.clone(),
-            )));
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
+            cx.set_global(metor_gpui::ActiveTheme(Arc::new(metor_gpui::DARK.clone())));
+            cx.set_global(crate::config::PanelConfig::default());
+            cx.set_global(metor_gpui::UiSettings {
+                font_family: "monospace".into(),
+                ..Default::default()
             });
             app.prepare_connections(false, cx);
         });

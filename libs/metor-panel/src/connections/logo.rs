@@ -1,4 +1,5 @@
 //! The Unicode logo from `examples/ascii_logo.py`, with a breathing gradient stop.
+use crate::theme::PanelThemeExt;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -61,7 +62,7 @@ impl AsciiLogo {
 
 impl Render for AsciiLogo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let seconds = if crate::motion::enabled(cx) {
+        let seconds = if metor_gpui::motion::enabled(cx) {
             window.request_animation_frame();
             self.started.elapsed().as_secs_f64()
         } else {
@@ -73,7 +74,7 @@ impl Render for AsciiLogo {
         let eased = t.powi(3) * (t * (6. * t - 15.) + 10.);
         let stop_opacity = 0.3 * eased;
         let cells = render(COLUMNS, ROWS, stop_opacity);
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
@@ -89,7 +90,7 @@ impl Render for AsciiLogo {
                         cell_width * COLUMNS as f32 / 2.,
                         line_height * ROWS as f32 / 2.,
                     );
-                let font = gpui::font(crate::theme::BUNDLED_FAMILY);
+                let font = gpui::font(metor_gpui::BUNDLED_FAMILY);
                 let mut glyphs = std::collections::HashMap::new();
                 for (index, value) in cells.iter().copied().enumerate() {
                     let (level, shade) = quantize(value);

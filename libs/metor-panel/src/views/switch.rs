@@ -10,7 +10,7 @@ use gpui::{
     SpringAnimation, SpringConfig, Styled, Window, div, prelude::*, px, relative,
 };
 
-use crate::theme::{Theme, ui_px};
+use metor_gpui::{Theme, ui_px};
 
 /// A critically damped spring that settles in about a fifth of a second:
 /// the knob slides without overshooting.
@@ -48,7 +48,7 @@ impl Switch {
             chosen: Some(usize::from(on)),
             height,
             scaled: false,
-            slides: crate::motion::enabled(cx),
+            slides: metor_gpui::motion::enabled(cx),
             labels: Vec::new(),
             track: None,
             knob: None,
@@ -280,7 +280,7 @@ mod tests {
 
     impl Render for Rig {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let theme = crate::theme::theme(cx);
+            let theme = metor_gpui::theme(cx);
             let switch = Switch::new(self.on, 14.0, cx);
             let switch = match self.labels {
                 true => switch.labels("Channels", "History"),
@@ -294,9 +294,7 @@ mod tests {
         labels: bool,
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<Rig>, &mut gpui::VisualTestContext) {
-        cx.update(|cx| {
-            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()))
-        });
+        cx.update(|cx| metor_gpui::set_theme(cx, std::sync::Arc::new(metor_gpui::DARK.clone())));
         cx.add_window_view(move |_, _| Rig { on: false, labels })
     }
 
@@ -351,7 +349,7 @@ mod tests {
 
     impl Render for Choice {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let theme = crate::theme::theme(cx);
+            let theme = metor_gpui::theme(cx);
             let picked = self.picked.clone();
             let switch = Switch::choice(
                 vec!["SAFE".into(), "ARMED".into(), "FIRE".into()],
@@ -366,9 +364,7 @@ mod tests {
 
     #[gpui::test]
     fn any_number_of_positions_share_the_track_and_pick_on_click(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()))
-        });
+        cx.update(|cx| metor_gpui::set_theme(cx, std::sync::Arc::new(metor_gpui::DARK.clone())));
         let picked = std::rc::Rc::new(std::cell::Cell::new(None));
         let (choice, cx) = cx.add_window_view({
             let picked = picked.clone();
@@ -412,7 +408,7 @@ mod tests {
 
     #[gpui::test]
     fn the_knob_takes_each_positions_colour_and_blends_between(cx: &mut gpui::TestAppContext) {
-        let theme = crate::theme::DARK.clone();
+        let theme = metor_gpui::DARK.clone();
         let red = gpui::Hsla::from(gpui::rgb(0xff0000));
         let green = gpui::Hsla::from(gpui::rgb(0x00ff00));
         cx.update(|cx| {

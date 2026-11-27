@@ -10,6 +10,7 @@
 //! the palette's "Connect…" command, the titlebar identity segment, or
 //! automatically on first open when nothing is connected.
 
+use crate::theme::PanelThemeExt;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render, SharedString,
     Window, deferred, div, prelude::*, px,
@@ -17,11 +18,11 @@ use gpui::{
 
 use super::options::option_rows;
 use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore, PickerEntry, TargetId, persist};
-use crate::icons::Icon;
 use crate::inspector::rows::text_field::TextField;
 use crate::inspector::{Inspector, InspectorMode};
 use crate::query::fuzzy_scores;
-use crate::theme::{Theme, theme};
+use metor_gpui::Icon;
+use metor_gpui::{Theme, theme};
 
 const DIALOG_WIDTH: f32 = 640.0;
 const STARTUP_SIDEBAR_WIDTH: f32 = 300.0;
@@ -913,16 +914,19 @@ impl ConnectionPicker {
             picker.set_parent_focus(parent_focus);
             picker
         });
-        cx.subscribe(&picker, |this, picker, _: &crate::motion::Closed, cx| {
-            if this
-                .storage_picker
-                .as_ref()
-                .is_some_and(|current| current == &picker)
-            {
-                this.storage_picker = None;
-                cx.notify();
-            }
-        })
+        cx.subscribe(
+            &picker,
+            |this, picker, _: &metor_gpui::motion::Closed, cx| {
+                if this
+                    .storage_picker
+                    .as_ref()
+                    .is_some_and(|current| current == &picker)
+                {
+                    this.storage_picker = None;
+                    cx.notify();
+                }
+            },
+        )
         .detach();
         picker.focus_handle(cx).focus(window, cx);
         self.storage_picker = Some(picker);
@@ -1286,7 +1290,7 @@ impl Render for ConnectionPicker {
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.bg_secondary))
-                    .child(crate::icons::Icon::Close.svg(12.0, theme.text_secondary))
+                    .child(metor_gpui::Icon::Close.svg(12.0, theme.text_secondary))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -1486,7 +1490,7 @@ impl Render for ConnectionPicker {
                     theme.bg_elevated
                 })
                 .text_color(theme.text_primary)
-                .font_family(crate::theme::font_family(cx))
+                .font_family(metor_gpui::font_family(cx))
                 .child(
                     div()
                         .absolute()

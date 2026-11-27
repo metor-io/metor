@@ -6,7 +6,7 @@ use gpui::{
     TextRun, canvas, fill, point, px, size,
 };
 
-use crate::theme::{Theme, theme};
+use metor_gpui::{Theme, theme};
 
 fn cursor_width() -> Pixels {
     px(1.5)

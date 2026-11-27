@@ -8,7 +8,7 @@ fn thin_range_drag_keeps_live_anchor_and_preview_does_not_commit(cx: &mut gpui::
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         temporal::TemporalController::init(db.clone(), cx);
         temporal::dispatch(TimeAction::Range(TimeRangeSpec { start: TimeExpr::fixed(Timestamp(0)), end: TimeExpr::LIVE }), cx).unwrap();
         let edits = Arc::new(RefCell::new(Vec::new()));
@@ -42,7 +42,7 @@ fn manual_zoom_is_local_and_double_click_does_not_seek(cx: &mut gpui::TestAppCon
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         temporal::TemporalController::init(db.clone(), cx);
         temporal::dispatch(TimeAction::Seek(TimeExpr::fixed(Timestamp(50_000_000))), cx).unwrap();
         temporal::dispatch(
@@ -130,7 +130,7 @@ fn wheel_zooms_time_control_pans_and_shift_scrolls_overflow(cx: &mut gpui::TestA
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     let cx = cx.add_empty_window();
     cx.update(|_, cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
         temporal::TemporalController::init(db.clone(), cx);
         let timeline = cx.new(|cx| Timeline::from_config(TimelineConfig::default(), db, cx));
         timeline.update(cx, |t, cx| {
@@ -216,10 +216,11 @@ fn event_chip_body_hits_the_rendered_burst_and_span(cx: &mut gpui::TestAppContex
     let temp = tempfile::tempdir().unwrap();
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-        cx.set_global(crate::theme::FontSettings {
-            family: "monospace".into(),
-            config: Default::default(),
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
+        cx.set_global(crate::config::PanelConfig::default());
+        cx.set_global(metor_gpui::UiSettings {
+            font_family: "monospace".into(),
+            ..Default::default()
         });
         temporal::TemporalController::init(db.clone(), cx);
     });
@@ -239,7 +240,7 @@ fn event_chip_body_hits_the_rendered_burst_and_span(cx: &mut gpui::TestAppContex
             priority,
             event: crate::plot_events::PlotEvent {
                 ts: Timestamp(time),
-                color: crate::theme::theme(cx).text_primary,
+                color: metor_gpui::theme(cx).text_primary,
                 label: "Navigation warning".into(),
                 short: "WARN navigation".into(),
                 detail: crate::plot_events::EventDetail::Raw(0),
@@ -321,10 +322,11 @@ fn right_click_opens_shared_commands_and_can_execute_them(cx: &mut gpui::TestApp
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     let requests = Rc::new(RefCell::new(Vec::<InspectorRequest>::new()));
     cx.update(|cx| {
-        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-        cx.set_global(crate::theme::FontSettings {
-            family: "monospace".into(),
-            config: Default::default(),
+        metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
+        cx.set_global(crate::config::PanelConfig::default());
+        cx.set_global(metor_gpui::UiSettings {
+            font_family: "monospace".into(),
+            ..Default::default()
         });
         temporal::TemporalController::init(db.clone(), cx);
         let requests = requests.clone();

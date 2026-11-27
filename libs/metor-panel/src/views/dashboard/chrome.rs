@@ -1,7 +1,7 @@
 //! Canvas chrome rendered atop dashboard widgets in edit mode.
 use gpui::{Bounds, Context, IntoElement, canvas, fill, point, prelude::*, px, size};
 
-use crate::theme::theme;
+use metor_gpui::theme;
 
 use super::{DashboardPanel, SNAP_GRID_PX};
 

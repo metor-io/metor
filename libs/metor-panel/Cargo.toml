@@ -10,6 +10,7 @@ tar-core = "0.1.0"
 sha2 = "0.10"
 gpui.workspace = true
 gpui_platform.workspace = true
+metor-gpui.path = "../metor-gpui"
 hifitime.version = "4.0"
 nucleo-matcher = "0.3"
 regex = "1"

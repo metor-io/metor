@@ -15,6 +15,7 @@
 //! between named states, so the control that makes the choice is the table
 //! that names them.
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::{
@@ -31,7 +32,7 @@ use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle
 
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspect;
-use crate::theme::{Theme, theme, ui_px};
+use metor_gpui::{Theme, theme, ui_px};
 
 /// How a chip draws its table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]

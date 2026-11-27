@@ -24,7 +24,7 @@ use metor_proto::types::ComponentId;
 
 use crate::inspect;
 #[allow(unused_imports)]
-use crate::theme::{ui_px, ui_scale};
+use metor_gpui::{ui_px, ui_scale};
 
 use super::plot_common::PanZoom;
 use super::plot_common::chrome::{paint_axes, paint_axis_backdrop};
@@ -139,7 +139,7 @@ impl Spectrogram {
 
 impl Render for Spectrogram {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
         let overlay_plot = self.plot.clone();
         let hover = self.hover;
 
@@ -342,7 +342,7 @@ fn format_frequency(hz: f64) -> String {
 fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx: &mut gpui::App) {
     let s = ui_scale(window);
     let pa = plot_area(outer, 1, s);
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let view = chrome.view;
     crate::temporal::paint_playhead(pa, (view.min_x, view.max_x), window, cx);
 
@@ -423,7 +423,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
 /// A vertical ramp inside the plot's right edge, labelled with the intensity
 /// range the colours currently map. Without it the picture has no units.
 fn paint_colorbar(pa: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx: &mut gpui::App) {
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let s = ui_scale(window);
     let width = px(COLORBAR_WIDTH * s);
     let left = pa.origin.x + pa.size.width - width - px(2.0 * s);

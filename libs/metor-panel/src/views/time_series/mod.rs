@@ -1,5 +1,6 @@
 use crate::plot_events::popover::event_summary_row;
-use crate::theme::{Theme, ui_px, ui_scale};
+use crate::theme::PanelThemeExt;
+use metor_gpui::{Theme, ui_px, ui_scale};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -561,7 +562,7 @@ fn alarm_plot_tint(lp: &LinePlot, cx: &gpui::App) -> Option<Hsla> {
             worst = Some(worst.map_or(idx, |w| w.max(idx)));
         }
     }
-    worst.map(|idx| crate::theme::theme(cx).alarm_tint(idx))
+    worst.map(|idx| metor_gpui::theme(cx).alarm_tint(idx))
 }
 
 /// Display limit lines `(axis_index, value, color, label)` declared for the plot's
@@ -575,7 +576,7 @@ fn alarm_limit_lines(lp: &LinePlot, cx: &gpui::App) -> Vec<(usize, f64, Hsla, Sh
     };
     let store = store.read(cx);
     let state = store.state();
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let mut lines = Vec::new();
     for trace in lp.traces() {
         let cfg = trace.read(cx);
@@ -601,7 +602,7 @@ fn paint_underlay(
     cx: &mut gpui::App,
 ) {
     let pb = plot_area(outer_bounds, view.axis_count(), ui_scale(window));
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
 
     // Out-of-bounds tint: a wash over the plot area when a visible trace has an
     // active alarm. Painted before the gridlines so they stay legible on top.
@@ -654,7 +655,7 @@ fn paint_overlay(
     let axis_count = view.axis_count();
     let s = ui_scale(window);
     let pb = plot_area(outer_bounds, axis_count, s);
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
 
     paint_axis_backdrop(outer_bounds, pb, legend_height, window, cx);
 
@@ -835,7 +836,7 @@ fn paint_cursors(
     // Lines use X only; markers carry normalized [0,1] Y, so a 0..1 Y view
     // maps them straight to screen.
     let view = view.x_bounds();
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let scale_factor = window.scale_factor();
 
     for cursor in cursors {
@@ -926,7 +927,7 @@ fn paint_hover_crosshair(
     if pointer_x < pb.origin.x || pointer_x > pb.origin.x + pb.size.width {
         return;
     }
-    let color = Theme::dim(crate::theme::theme(cx).text_secondary, 0.6);
+    let color = Theme::dim(metor_gpui::theme(cx).text_secondary, 0.6);
     paint_vline(pb, pointer_x, px(0.5), color, window);
 }
 
@@ -1137,7 +1138,7 @@ pub fn traces_for_component(
     indices: &[usize],
     cx: &gpui::App,
 ) -> Vec<Trace> {
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let elem_names = crate::inspector::trace_picker::element_names_for_component(db, component_id);
     let comp_name = db
         .with_state(|s| {
@@ -1691,7 +1692,7 @@ impl TimeSeriesPlot {
         let pa = self.last_plot_area?;
         let lp = self.line_plot.read(cx);
         let view = lp.effective_view(cx)?;
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
 
         let (x_data, samples) = self.hover_samples(cx)?;
         let header = format_time_label(
@@ -1940,7 +1941,7 @@ impl TimeSeriesPlot {
         let pin = self.pinned_event.as_ref()?;
         let pa = self.last_plot_area?;
         let view = self.line_plot.read(cx).effective_view(cx)?;
-        let theme = crate::theme::theme(cx);
+        let theme = metor_gpui::theme(cx);
 
         let cluster = self
             .event_clusters
@@ -2055,11 +2056,7 @@ impl TimeSeriesPlot {
 
     /// Typed detail block for the selected pinned event, reusing each store's
     /// own record fields (log-panel `key: value` styling).
-    fn event_detail_element(
-        &self,
-        detail: &EventDetail,
-        theme: &crate::theme::Theme,
-    ) -> AnyElement {
+    fn event_detail_element(&self, detail: &EventDetail, theme: &metor_gpui::Theme) -> AnyElement {
         let mut body = div().flex().flex_col().gap_y_0().pt_1();
         for (key, value) in crate::plot_events::details::fields(detail) {
             body = body.child(kv_row(&key, value, theme));
@@ -2081,7 +2078,7 @@ const EVENT_POPOVER_ROWS: usize = 8;
 fn kv_row(
     key: &str,
     value: impl Into<SharedString>,
-    theme: &crate::theme::Theme,
+    theme: &metor_gpui::Theme,
 ) -> impl IntoElement {
     div()
         .flex()

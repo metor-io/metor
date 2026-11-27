@@ -15,7 +15,7 @@ use gpui::{
     px, size,
 };
 
-use crate::theme::CONTROL_HEIGHT;
+use metor_gpui::CONTROL_HEIGHT;
 
 /// Room around the chip inside its window: for its shadow, and clear of the
 /// corners AppKit rounds off every window.

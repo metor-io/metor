@@ -12,6 +12,7 @@
 //! them against what it last resolved at render time, so an inspector edit
 //! re-resolves without a setter, as the annunciator's pattern does.
 
+use crate::theme::PanelThemeExt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,6 @@ use crate::inspect;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
-use crate::theme::{theme, ui_px};
 use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
 use crate::views::component_browser::component_tree::{
     ComponentNode, build_full_tree, natural_cmp,
@@ -41,6 +41,7 @@ use crate::views::gradient::{Gradient, Palette, Scale, Span};
 use crate::views::lazy_pool::VisibleEntityCache;
 use crate::views::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use crate::views::value_strip::{ComponentValueStrip, StripStyle};
+use metor_gpui::{theme, ui_px};
 use smallvec::SmallVec;
 
 /// Live strips kept alive; well above any visible cell count.
@@ -971,7 +972,7 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
     ) -> Entity<PivotTable> {
         let view = cx.update(|_, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
             crate::inspector::edits::init(cx);
             cx.new(|cx| PivotTable::from_config(cfg, db.clone(), cx))
         });

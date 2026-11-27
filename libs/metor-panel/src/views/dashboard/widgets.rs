@@ -14,7 +14,6 @@ use metor_db::DB;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{theme, ui_px};
 use crate::tiles::panels::{
     OutlinePanelConfig, alarm_config, alarm_view, browser_config, browser_view, log_config,
     log_view, outline_config, outline_view, sequence_config, sequence_view,
@@ -31,6 +30,7 @@ use crate::views::{
     Timeline, TrafficLight, TrafficLightConfig, XyPlot,
 };
 use crate::views::{Label, LabelConfig, StateImage, StateImageConfig};
+use metor_gpui::{theme, ui_px};
 
 use super::{DashboardWidget, WidgetKind};
 

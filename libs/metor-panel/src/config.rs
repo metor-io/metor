@@ -12,6 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+use gpui::{App, Global};
+use metor_gpui::{MotionPreference, UiSettings};
+
 /// How the UI font family is chosen.
 ///
 /// [`Auto`](FontConfig::Auto) prefers a system **Berkeley Mono** and falls back
@@ -27,13 +30,31 @@ pub enum FontConfig {
     Family(String),
 }
 
-/// Whether decorative fades run or UI state is shown immediately.
+/// The persisted form of [`MotionPreference`].
 #[derive(facet::Facet, Clone, Copy, Debug, PartialEq, Default)]
 #[repr(u8)]
-pub enum MotionPreference {
+pub enum MotionConfig {
     #[default]
     Full,
     Reduced,
+}
+
+impl From<MotionConfig> for MotionPreference {
+    fn from(motion: MotionConfig) -> Self {
+        match motion {
+            MotionConfig::Full => Self::Full,
+            MotionConfig::Reduced => Self::Reduced,
+        }
+    }
+}
+
+impl From<MotionPreference> for MotionConfig {
+    fn from(motion: MotionPreference) -> Self {
+        match motion {
+            MotionPreference::Full => Self::Full,
+            MotionPreference::Reduced => Self::Reduced,
+        }
+    }
 }
 
 /// Where a window's top-level tabs sit: in the titlebar beside its other
@@ -57,7 +78,7 @@ pub struct PanelConfig {
     #[facet(default)]
     pub font: FontConfig,
     #[facet(default)]
-    pub motion: MotionPreference,
+    pub motion: MotionConfig,
     /// Initial folder for recording dialogs, never a recording filename.
     #[facet(default)]
     pub recording_parent: Option<String>,
@@ -76,13 +97,45 @@ impl Default for PanelConfig {
     fn default() -> Self {
         Self {
             font: FontConfig::default(),
-            motion: MotionPreference::default(),
+            motion: MotionConfig::default(),
             recording_parent: None,
             leader: default_leader(),
             tab_placement: TabPlacement::default(),
             tab_sidebar_width: None,
         }
     }
+}
+
+/// The live config every panel view reads. Settings that metor-gpui elements read as well
+/// (font, motion) are mirrored into [`UiSettings`].
+impl Global for PanelConfig {}
+
+impl PanelConfig {
+    /// The [`UiSettings`] this config asks for.
+    pub(crate) fn ui_settings(&self, cx: &App) -> UiSettings {
+        UiSettings {
+            font_family: crate::theme::resolve_font_family(cx, &self.font),
+            motion: self.motion.into(),
+        }
+    }
+}
+
+/// Install `config` and its [`UiSettings`], and save the config whenever a metor-gpui control
+/// changes a setting it mirrors.
+pub(crate) fn install(config: PanelConfig, cx: &mut App) {
+    cx.set_global(config.ui_settings(cx));
+    cx.set_global(config);
+    cx.observe_global::<UiSettings>(|cx| {
+        let motion = MotionConfig::from(cx.global::<UiSettings>().motion);
+        let config = cx.global_mut::<PanelConfig>();
+        if config.motion != motion {
+            config.motion = motion;
+            if let Err(error) = save(config) {
+                tracing::error!(%error, "save motion preference failed");
+            }
+        }
+    })
+    .detach();
 }
 
 fn default_leader() -> String {
@@ -190,18 +243,18 @@ mod tests {
         let cfg: PanelConfig = facet_json::from_str("{}").expect("deserialize");
         assert_eq!(cfg.font, FontConfig::Auto);
         assert_eq!(cfg.leader, "space");
-        assert_eq!(cfg.motion, MotionPreference::Full);
+        assert_eq!(cfg.motion, MotionConfig::Full);
     }
 
     #[test]
     fn reduced_motion_round_trips_with_existing_preferences() {
         let config = PanelConfig {
-            motion: MotionPreference::Reduced,
+            motion: MotionConfig::Reduced,
             leader: "cmd-k".into(),
             ..Default::default()
         };
         let restored = round_trip(&config);
-        assert_eq!(restored.motion, MotionPreference::Reduced);
+        assert_eq!(restored.motion, MotionConfig::Reduced);
         assert_eq!(restored.leader, "cmd-k");
     }
 

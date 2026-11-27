@@ -206,7 +206,7 @@ impl Element for MovingTab {
         let target = bounds.origin - rail.origin;
         let now = Instant::now();
         let viewport = window.viewport_size();
-        let animate = self.animate && crate::motion::enabled(cx);
+        let animate = self.animate && metor_gpui::motion::enabled(cx);
         window.with_element_state(id.unwrap(), |state: Option<TabPosition>, window| {
             let mut state = state.unwrap_or_else(|| TabPosition {
                 position: Position::new(target, now),

@@ -2,6 +2,7 @@
 //! the value by how far the pointer travels (ten times slower with Shift),
 //! and a fill and a hover handle show where the value sits in its range.
 
+use crate::theme::PanelThemeExt;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -10,9 +11,9 @@ use gpui::{
     Window, canvas, div, fill, prelude::*, px, relative, size,
 };
 
-use crate::theme::Theme;
 use crate::views::value_box::{HEIGHT, HOVER_GROUP};
 use crate::views::value_strip::BOX_RADIUS;
+use metor_gpui::Theme;
 
 /// Called with each new value while the scrubber is dragged.
 pub(crate) type OnScrub = Arc<dyn Fn(f64, &mut Window, &mut App)>;

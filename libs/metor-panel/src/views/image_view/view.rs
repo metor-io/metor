@@ -1,5 +1,6 @@
 //! The image view: one image component at device resolution.
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::{
@@ -20,9 +21,9 @@ use super::render::{self, Frames, Job, LutKey, RenderKey, Rendered, Scheduler};
 use super::resample::{MAX_STEP, MIN_STEP, Rect, RenderError, Scratch, Viewport};
 use super::source::{Frame, FrameSource, FrameState, RecordSource};
 use crate::data_binding::Binding;
-use crate::theme::{theme, ui_px, ui_scale};
 use crate::views::popover;
 use crate::views::time_series::cursor::{estimate_readout_size, readout_origin};
+use metor_gpui::{theme, ui_px, ui_scale};
 
 /// Zoom per wheel notch.
 const ZOOM_PER_NOTCH: f64 = 1.25;
@@ -509,7 +510,7 @@ impl ImageView {
         )
     }
 
-    fn overlay_color(color: OverlayColor, theme: &crate::theme::Theme) -> gpui::Hsla {
+    fn overlay_color(color: OverlayColor, theme: &metor_gpui::Theme) -> gpui::Hsla {
         match color {
             OverlayColor::Detected => theme.image_overlay_detected(),
             OverlayColor::Truth => theme.image_overlay_truth(),
@@ -955,10 +956,11 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<Host>, Entity<ImageView>, &mut VisualTestContext) {
         cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-            cx.set_global(crate::theme::FontSettings {
-                family: "monospace".into(),
-                config: Default::default(),
+            metor_gpui::set_theme(cx, Arc::new(metor_gpui::DARK.clone()));
+            cx.set_global(crate::config::PanelConfig::default());
+            cx.set_global(metor_gpui::UiSettings {
+                font_family: "monospace".into(),
+                ..Default::default()
             });
         });
         let (host, vcx) = cx.add_window_view(|_, cx| Host {

@@ -17,7 +17,7 @@ use metor_db::DB;
 
 use crate::inspector::rows::{InspectorRow, RowAction};
 use crate::inspector::trace_picker::{Channel, ColorBasis, OnChannel, channel_picker_rows};
-use crate::theme::theme;
+use metor_gpui::theme;
 
 use super::XyTrace;
 

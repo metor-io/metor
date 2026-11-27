@@ -4,6 +4,7 @@
 //! the global [`SequenceStore`](crate::sequences::SequenceStore) and each one's state from
 //! its shared [`ChannelStatusReader`], at the selected time.
 
+use crate::theme::PanelThemeExt;
 use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*, px};
@@ -12,8 +13,8 @@ use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, ChannelReaders, ChannelStatusReader, state_label};
-use crate::theme::theme;
 use crate::views::TooltipText;
+use metor_gpui::theme;
 
 /// Compact grid of sequence channels.
 #[derive(facet::Facet)]

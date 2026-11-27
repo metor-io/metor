@@ -6,6 +6,7 @@
 //! overrides) — but their tracker bookkeeping, frame canvas, chrome painters,
 //! gestures and LoD selection are the same, so they live here.
 
+use crate::theme::PanelThemeExt;
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
@@ -14,10 +15,10 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::theme::{Theme, ui_px, ui_scale};
 use crate::views::time_series::{
     LABEL_FONT_SIZE, Override, PlotBounds, PlotFrame, PlotRenderState, ReadbackHandle,
 };
+use metor_gpui::{Theme, ui_px, ui_scale};
 
 pub(crate) mod chrome;
 mod legend;
@@ -41,7 +42,7 @@ pub fn plot_legend<T: 'static, N: 'static>(
     toggle_visible: fn(&mut T),
     cx: &gpui::App,
 ) -> impl IntoElement {
-    let theme = crate::theme::theme(cx);
+    let theme = metor_gpui::theme(cx);
     let mut row = div()
         .flex()
         .flex_row()

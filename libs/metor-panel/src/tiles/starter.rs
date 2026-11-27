@@ -9,8 +9,8 @@
 use gpui::{AnyElement, App, ClickEvent, Context, SharedString, Window, div, prelude::*, px};
 
 use super::pane::{Pane, PaneEvent};
-use crate::icons::Icon;
-use crate::theme::theme;
+use metor_gpui::Icon;
+use metor_gpui::theme;
 
 /// One card: a name, an icon, and what clicking it does.
 pub(crate) struct StarterCard {
@@ -237,7 +237,7 @@ mod tests {
     #[gpui::test]
     fn an_empty_pane_offers_the_common_views(cx: &mut gpui::TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_, cx| {
-            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+            metor_gpui::set_theme(cx, std::sync::Arc::new(metor_gpui::DARK.clone()));
             let mut registry = ItemRegistry::default();
             for key in ["component_outline", "dashboard"] {
                 registry.register_erased(key, move |_, cx| {

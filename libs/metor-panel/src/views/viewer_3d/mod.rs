@@ -46,8 +46,8 @@ use smallvec::SmallVec;
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::theme::{theme, ui_px};
 use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
+use metor_gpui::{theme, ui_px};
 
 pub use bridge::BevyBridge;
 pub use camera::OrbitCamera;

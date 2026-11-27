@@ -16,6 +16,7 @@
 //! no schema is known yet). The [`EventSourceRegistry`] global holds the built-ins
 //! and hands out (or creates) a source for a requested [`EventKindKey`].
 
+use crate::theme::PanelThemeExt;
 pub(crate) mod details;
 pub(crate) mod flags;
 pub mod index;
@@ -38,7 +39,7 @@ use crate::alarms::{self, AlarmEvent, AlarmEventKind, severity_index};
 use crate::logs;
 use crate::msg_ingest::{IngestSource, ingest_all};
 use crate::sequences::{HistoryEntry, SequenceHistory};
-use crate::theme::{Theme, theme};
+use metor_gpui::{Theme, theme};
 
 #[cfg(test)]
 mod tests;

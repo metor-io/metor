@@ -24,7 +24,7 @@ use super::value_strip::StateTable;
 
 use crate::data_binding::Binding;
 use crate::inspect;
-use crate::theme::{theme, ui_px};
+use metor_gpui::{theme, ui_px};
 
 /// Serialized form of one [`StateImageEntry`].
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

@@ -32,7 +32,7 @@ use super::binding::{
     self, ElementRef, LiveBinding, ScalarInstrument, component_meta, default_label, stream_scalar,
 };
 use super::format_number;
-use crate::theme::{theme, ui_px};
+use metor_gpui::{theme, ui_px};
 
 /// Which way the bar grows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
