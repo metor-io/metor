@@ -12,6 +12,7 @@ serde_json = "1"
 web-time = "1"
 serde = { version = "1", features = ["derive"] }
 jiff = "0.2"
+smallvec = "1"
 
 [dev-dependencies]
 gpui_platform.workspace = true
@@ -29,3 +30,11 @@ workspace = true
 [[example]]
 name = "hello_web"
 path = "examples/hello_web/main.rs"
+
+[[example]]
+name = "graph"
+path = "examples/graph.rs"
+
+[[example]]
+name = "web_gallery"
+path = "examples/web_gallery/main.rs"

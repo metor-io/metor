@@ -13,6 +13,8 @@ mod banner;
 pub mod button;
 pub mod chord;
 mod fonts;
+pub mod gantt;
+pub mod graph;
 mod icons;
 mod modal;
 pub mod motion;

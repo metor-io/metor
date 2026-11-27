@@ -1,5 +1,7 @@
 //! A centered dialog over a dimmed page, and the confirm dialog built on it.
 
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, ClickEvent, IntoElement, MouseButton, RenderOnce, SharedString, Window, div,
     prelude::*, px,
@@ -62,13 +64,18 @@ impl Modal {
         confirm: impl Into<SharedString>,
         tone: StateTone,
         on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + Clone + 'static,
+        on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
+        let on_cancel = Rc::new(on_cancel);
+        let on_dismiss = on_cancel.clone();
         Self::new(title)
             .child(message.into())
-            .action(DialogButton::new("modal-cancel", "Cancel", None).on_click(on_cancel.clone()))
+            .action(
+                DialogButton::new("modal-cancel", "Cancel", None)
+                    .on_click(move |event, window, cx| on_cancel(event, window, cx)),
+            )
             .action(DialogButton::new("modal-confirm", confirm, Some(tone)).on_click(on_confirm))
-            .on_dismiss(on_cancel)
+            .on_dismiss(move |event, window, cx| on_dismiss(event, window, cx))
     }
 }
 

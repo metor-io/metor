@@ -90,7 +90,7 @@ pub(crate) fn placement(cx: &App) -> TabPlacement {
 pub(crate) fn set_placement(placement: TabPlacement, cx: &mut App) {
     let settings = cx.global_mut::<crate::config::PanelConfig>();
     settings.tab_placement = placement;
-    if let Err(error) = crate::config::save(&settings) {
+    if let Err(error) = crate::config::save(settings) {
         tracing::error!(%error, "save tab placement failed");
     }
     cx.refresh_windows();
@@ -116,7 +116,7 @@ pub(crate) fn set_sidebar_width(width: Pixels, cx: &mut App) {
 
 pub(crate) fn save_sidebar_width(cx: &App) {
     if let Some(settings) = cx.try_global::<crate::config::PanelConfig>()
-        && let Err(error) = crate::config::save(&settings)
+        && let Err(error) = crate::config::save(settings)
     {
         tracing::error!(%error, "save tab sidebar width failed");
     }
