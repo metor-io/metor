@@ -1839,7 +1839,9 @@ impl TimeSeries {
                 }
             }
             if complete {
-                draft.settled.retain(|s| listed_at(s.seal_start, s.checksum));
+                draft
+                    .settled
+                    .retain(|s| listed_at(s.seal_start, s.checksum));
             }
             draft.derive(
                 &resident,

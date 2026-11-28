@@ -475,7 +475,11 @@ mod tests {
         assert!(select(&one, Some("gnc.navv")).is_err());
         let mut own = one.clone();
         own.targets[0].coordinator.systems[0].id = "fsw.nav".into();
-        assert_eq!(select(&own, Some("fsw.nav")).ok(), nav, "an id under the namespace");
+        assert_eq!(
+            select(&own, Some("fsw.nav")).ok(),
+            nav,
+            "an id under the namespace"
+        );
         assert!(
             select(&deployment(), Some("gnc.nav")).is_err(),
             "bare ids need one target"

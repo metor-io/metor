@@ -315,9 +315,12 @@ impl TextField {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
-        // cmd on macOS, ctrl elsewhere — `platform` off-macOS is the
-        // Win/Super key, which the OS mostly reserves for itself.
-        let primary = if cfg!(target_os = "macos") {
+        // cmd on macOS, ctrl elsewhere: `platform` off macOS is the Win/Super key, which the OS
+        // mostly reserves for itself. A wasm build can't tell which OS the browser runs on, so
+        // either key works there.
+        let primary = if cfg!(target_family = "wasm") {
+            mods.platform || mods.control
+        } else if cfg!(target_os = "macos") {
             mods.platform
         } else {
             mods.control

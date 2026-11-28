@@ -867,7 +867,10 @@ mod tests {
             .unwrap();
         let lod = start(db.clone());
         stellarator::sleep(Duration::from_millis(20)).await;
-        assert!(Arc::strong_count(&db) > 2, "the watcher and a source task run");
+        assert!(
+            Arc::strong_count(&db) > 2,
+            "the watcher and a source task run"
+        );
         drop(lod);
         stellarator::sleep(Duration::from_millis(20)).await;
         assert_eq!(Arc::strong_count(&db), 1);

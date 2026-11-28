@@ -542,7 +542,17 @@ impl ElementValue {
 }
 
 #[derive(
-    TryFromBytes, Unaligned, Immutable, KnownLayout, PartialEq, Eq, Hash, Debug, Clone, Copy, IntoBytes,
+    TryFromBytes,
+    Unaligned,
+    Immutable,
+    KnownLayout,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Clone,
+    Copy,
+    IntoBytes,
 )]
 #[repr(u8)]
 pub enum PacketTy {
@@ -620,7 +630,8 @@ pub trait Msg: Serialize {
 /// Note that this blanket id is the bare fold: unlike [`msg_id`] it does not apply the
 /// reserved-row remap, so a schema name whose fold lands on `[224, _]` keeps it.
 impl<T: Serialize + postcard_schema::Schema> Msg for T {
-    const ID: PacketId = short_id(const_fnv1a_hash::fnv1a_hash_str_16_xor(T::SCHEMA.name).to_le_bytes());
+    const ID: PacketId =
+        short_id(const_fnv1a_hash::fnv1a_hash_str_16_xor(T::SCHEMA.name).to_le_bytes());
 }
 
 /// Zero-extends a 16-bit id: a message's fold or a hand-allocated protocol id.
@@ -1204,7 +1215,10 @@ mod tests {
         assert_eq!(off_reserved(short_id([224, 7])), short_id([223, 7]));
         assert_eq!(off_reserved(short_id([223, 7])), short_id([223, 7]));
         assert_eq!(off_reserved(short_id([1, 0])), short_id([1, 0]));
-        assert_eq!(off_reserved([224, 7, 1, 2, 3, 4, 5, 6]), [223, 7, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            off_reserved([224, 7, 1, 2, 3, 4, 5, 6]),
+            [223, 7, 1, 2, 3, 4, 5, 6]
+        );
 
         let mut on_the_row = None;
         for i in 0..100_000u32 {
@@ -1243,7 +1257,25 @@ mod tests {
         pkt.extend_from_slice(&[0xab]);
         assert_eq!(
             pkt.inner,
-            [13, 0, 0, 0, PacketTy::Table as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0xab]
+            [
+                13,
+                0,
+                0,
+                0,
+                PacketTy::Table as u8,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                0,
+                0,
+                0xab
+            ]
         );
     }
 
@@ -1303,7 +1335,9 @@ mod tests {
     #[cfg(feature = "alloc")]
     fn short_or_unknown_frames_are_rejected() {
         let mut short = LenPacket::msg(WIDE, 0);
-        short.inner.truncate(size_of::<u32>() + PACKET_HEADER_LEN - 1);
+        short
+            .inner
+            .truncate(size_of::<u32>() + PACKET_HEADER_LEN - 1);
         assert!(parse(short).is_err());
 
         let mut unknown = LenPacket::msg(WIDE, 0);

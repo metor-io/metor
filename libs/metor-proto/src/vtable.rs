@@ -624,7 +624,10 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
 
     /// Resolves an op reference to a UTF-8 string held in the VTable's `data` buffer.
     fn realize_str<'a>(&'a self, op_ref: OpRef, table: Option<&'a [u8]>) -> Result<&'a str, Error> {
-        let bytes = self.realize(op_ref, table)?.as_slice().ok_or(Error::InvalidOp)?;
+        let bytes = self
+            .realize(op_ref, table)?
+            .as_slice()
+            .ok_or(Error::InvalidOp)?;
         core::str::from_utf8(bytes).map_err(|_| Error::InvalidOp)
     }
 
@@ -691,7 +694,19 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         loop {
             match realized_op {
                 RealizedOp::Component(RealizedComponent { component_id }) => {
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, timestamp_at, false, None, table, f);
+                    return self.emit_leaf(
+                        field,
+                        &ctx,
+                        component_id,
+                        frame,
+                        &schema,
+                        timestamp,
+                        timestamp_at,
+                        false,
+                        None,
+                        table,
+                        f,
+                    );
                 }
                 RealizedOp::PathComponent(leaf) => {
                     let mut leaf_path = ctx.path;
@@ -700,7 +715,19 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                     let mut template = ctx.template;
                     template.push(leaf.name);
                     let ctx = WalkCtx { template, ..ctx };
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, timestamp_at, true, Some(leaf.name), table, f);
+                    return self.emit_leaf(
+                        field,
+                        &ctx,
+                        component_id,
+                        frame,
+                        &schema,
+                        timestamp,
+                        timestamp_at,
+                        true,
+                        Some(leaf.name),
+                        table,
+                        f,
+                    );
                 }
                 RealizedOp::Schema(s) => {
                     let s = schema.insert(s);
@@ -723,7 +750,16 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                     realized_op = self.realize(e.arg, table)?;
                 }
                 RealizedOp::List(dynm) | RealizedOp::Map(dynm) => {
-                    return self.expand_dynamic(field, &ctx, frame, timestamp, timestamp_at, &dynm, table, f);
+                    return self.expand_dynamic(
+                        field,
+                        &ctx,
+                        frame,
+                        timestamp,
+                        timestamp_at,
+                        &dynm,
+                        table,
+                        f,
+                    );
                 }
                 _ => return Err(Error::InvalidOp.into()),
             }
@@ -750,7 +786,8 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         let schema = schema.as_ref().ok_or(Error::SchemaNotFound)?;
         // NOTE(sphw): bogan version of zerocopy::transmute_ref; see the original
         // realize_fields for the upstream zerocopy issue this works around.
-        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes()).map_err(Error::from)?;
+        let shape: &[usize] =
+            <[usize]>::ref_from_bytes(schema.dim.as_bytes()).map_err(Error::from)?;
         let offset = ctx.base + field.offset.to_index();
         let view = if let Some(table) = table {
             let data = table
@@ -846,7 +883,10 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 if key.contains('.') {
                     return Err(Error::InvalidComponentData.into());
                 }
-                (entry_base + dynm.value_offset as usize, ElementKey::Key(key))
+                (
+                    entry_base + dynm.value_offset as usize,
+                    ElementKey::Key(key),
+                )
             } else {
                 (entry_base, ElementKey::Index(i as u32))
             };
@@ -938,7 +978,9 @@ fn read_u32(table: &[u8], offset: usize) -> Result<u32, Error> {
     let bytes = table
         .get(offset..offset + 4)
         .ok_or(Error::BufferUnderflow)?;
-    Ok(u32::from_le_bytes(bytes.try_into().expect("slice is 4 bytes")))
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("slice is 4 bytes"),
+    ))
 }
 
 #[cfg(feature = "alloc")]
@@ -1599,7 +1641,11 @@ mod tests {
     fn process_members() -> Vec<super::builder::FieldBuilder> {
         vec![
             raw_field(0, 8, schema(PrimType::U64, &[], path_component("pid"))),
-            raw_field(8, 8, schema(PrimType::F64, &[], path_component("cpu_usage"))),
+            raw_field(
+                8,
+                8,
+                schema(PrimType::F64, &[], path_component("cpu_usage")),
+            ),
         ]
     }
 
@@ -1630,10 +1676,20 @@ mod tests {
         assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
         assert_eq!(sink.values[&ComponentId::new("processes.0.cpu_usage")], 0.5);
         assert_eq!(sink.values[&ComponentId::new("processes.1.pid")], 1002.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.1.cpu_usage")], 0.25);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.1.cpu_usage")],
+            0.25
+        );
         // every element-member inherits the shared frame timestamp
-        for id in ["processes.0.pid", "processes.0.cpu_usage", "processes.1.pid"] {
-            assert_eq!(sink.timestamps[&ComponentId::new(id)], Some(Timestamp(1000)));
+        for id in [
+            "processes.0.pid",
+            "processes.0.cpu_usage",
+            "processes.1.pid",
+        ] {
+            assert_eq!(
+                sink.timestamps[&ComponentId::new(id)],
+                Some(Timestamp(1000))
+            );
         }
     }
 
@@ -1669,9 +1725,15 @@ mod tests {
         v.apply(&t, &mut sink).unwrap().unwrap();
 
         assert_eq!(sink.values[&ComponentId::new("processes.htop.pid")], 1001.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.htop.cpu_usage")], 0.5);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.htop.cpu_usage")],
+            0.5
+        );
         assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 1002.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.init.cpu_usage")], 0.25);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.init.cpu_usage")],
+            0.25
+        );
         assert_eq!(
             sink.timestamps[&ComponentId::new("processes.htop.pid")],
             Some(Timestamp(1000))
@@ -1681,11 +1743,7 @@ mod tests {
     /// §5b variant — a map key containing `.` is rejected.
     #[test]
     fn test_dynamic_map_dot_key_rejected() {
-        let v = vtable([raw_field(
-            8,
-            8,
-            map("processes", process_members(), 24, 8),
-        )]);
+        let v = vtable([raw_field(8, 8, map("processes", process_members(), 24, 8))]);
 
         let mut t = Vec::new();
         put_i64(&mut t, 0); // timestamp @0 (unused)
@@ -1708,7 +1766,13 @@ mod tests {
     fn test_dynamic_nested() {
         // Host has a single member, the inner thread list, whose slot is at value
         // offset 0; Thread has a single `state: u8` member.
-        let thread_members = || vec![raw_field(0, 1, schema(PrimType::U8, &[], path_component("state")))];
+        let thread_members = || {
+            vec![raw_field(
+                0,
+                1,
+                schema(PrimType::U8, &[], path_component("state")),
+            )]
+        };
         let host_members = || vec![raw_field(0, 8, list("threads", thread_members(), 1))];
 
         let v = vtable([raw_field(
@@ -1749,9 +1813,15 @@ mod tests {
 
         let fields: Vec<_> = v.realize_fields(Some(&t)).map(|r| r.unwrap()).collect();
         let outer: Vec<_> = fields[0].outer.iter().collect();
-        assert!(matches!(outer[..], [("processes", super::ElementKey::Key("htop"))]));
+        assert!(matches!(
+            outer[..],
+            [("processes", super::ElementKey::Key("htop"))]
+        ));
         assert_eq!(fields[0].container, Some("threads"));
-        assert!(matches!(fields[0].element, Some(super::ElementKey::Index(0))));
+        assert!(matches!(
+            fields[0].element,
+            Some(super::ElementKey::Index(0))
+        ));
     }
 
     /// Schema/registration mode (`table = None`) surfaces each member template's ty/shape.

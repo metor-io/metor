@@ -1,8 +1,8 @@
 use std::{io::Write, net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
-use metor_proto::vtable;
 use metor_db::{Gather, Server};
+use metor_proto::vtable;
 use miette::IntoDiagnostic;
 use postcard_c_codegen::SchemaExt;
 use tracing::info;

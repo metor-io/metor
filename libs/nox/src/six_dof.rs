@@ -145,7 +145,9 @@ mod tests {
         let mut omega_w_max_delta = 0.0f64;
         for _ in 0..2000 {
             body = six_dof_rk4(0.01, body, |_| SpatialForce::zero());
-            let d: f64 = (body.vel.angular() - tensor![0.3, 0.2, 0.5]).norm().into_buf();
+            let d: f64 = (body.vel.angular() - tensor![0.3, 0.2, 0.5])
+                .norm()
+                .into_buf();
             omega_w_max_delta = omega_w_max_delta.max(d);
         }
         // Tolerance is set by the integrator, not the dynamics: the `SpatialTransform +
@@ -155,11 +157,18 @@ mod tests {
         let l_err: f64 = (l - l0.clone()).norm().into_buf();
         let l_mag: f64 = l0.norm().into_buf();
         assert!(l_err / l_mag < 1e-5, "L_w drifted: {}", l_err / l_mag);
-        assert!((ke - ke0).abs() / ke0 < 1e-5, "KE drifted: {}", (ke - ke0).abs() / ke0);
+        assert!(
+            (ke - ke0).abs() / ke0 < 1e-5,
+            "KE drifted: {}",
+            (ke - ke0).abs() / ke0
+        );
         // The body genuinely precesses (ω is NOT constant in the world frame) — guards against
         // reintroducing the no-coupling dynamics, for which both invariants trivially hold at
         // zero torque.
-        assert!(omega_w_max_delta > 0.05, "no precession: {omega_w_max_delta}");
+        assert!(
+            omega_w_max_delta > 0.05,
+            "no precession: {omega_w_max_delta}"
+        );
     }
 
     #[test]

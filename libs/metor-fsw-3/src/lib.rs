@@ -259,8 +259,8 @@ pub use metor_proto::types::Timestamp;
 
 pub use metor_component::path;
 pub use metor_component::{
-    AsVTable, Element, FrameArray, FrameBytes, FrameImage, FrameMap,
-    FrameStr, FrameStrError, KeyError, MapKey, Metadatatize, Mono8, Mono16, Pixel, Rgb8, Rgba8,
+    AsVTable, Element, FrameArray, FrameBytes, FrameImage, FrameMap, FrameStr, FrameStrError,
+    KeyError, MapKey, Metadatatize, Mono8, Mono16, Pixel, Rgb8, Rgba8,
 };
 pub use metor_proto;
 pub use metor_proto_wkt;
