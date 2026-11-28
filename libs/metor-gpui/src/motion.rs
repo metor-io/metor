@@ -215,6 +215,7 @@ impl Reveal {
         if amount >= 1.0 {
             return Some(
                 div()
+                    .flex_none()
                     .relative()
                     .child(content)
                     .child(measure)
@@ -225,6 +226,7 @@ impl Reveal {
         // section shows the top of it.
         Some(
             div()
+                .flex_none()
                 .relative()
                 .overflow_hidden()
                 .h(self.height.get() * amount)
