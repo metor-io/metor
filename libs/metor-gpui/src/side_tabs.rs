@@ -5,12 +5,15 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 
-use crate::{CONTROL_HEIGHT, CONTROL_RADIUS, Icon, theme};
+use crate::{CONTROL_HEIGHT, CONTROL_RADIUS, Icon, TooltipText, theme};
 
 /// Padding around a [`side_tabs`] column.
 pub const SIDE_TABS_PADDING: f32 = 6.0;
 /// Gap between neighbouring tabs.
 pub const SIDE_TABS_GAP: f32 = 2.0;
+/// Width of a [`side_tabs`] column of [`compact`](SideTab::compact) tabs: square tabs and the
+/// padding around them.
+pub const SIDE_RAIL_WIDTH: f32 = CONTROL_HEIGHT + 2.0 * SIDE_TABS_PADDING;
 
 type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
@@ -26,6 +29,7 @@ pub struct SideTab {
     icon: Option<Icon>,
     active: bool,
     disabled: bool,
+    compact: bool,
     end: Option<AnyElement>,
     on_click: Option<OnClick>,
 }
@@ -38,6 +42,7 @@ pub fn side_tab(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Sid
         icon: None,
         active: false,
         disabled: false,
+        compact: false,
         end: None,
         on_click: None,
     }
@@ -69,6 +74,13 @@ impl SideTab {
     /// Dims the tab and ignores clicks, for a page that exists but cannot open yet.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Shows only the icon, centered, with the label as its tooltip: a tab in a collapsed
+    /// sidebar's icon rail.
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
         self
     }
 
@@ -128,8 +140,17 @@ impl SideTab {
                     .hover(move |s| s.bg(bg_primary).text_color(text_primary))
             })
             .when_some(self.icon, |tab, icon| tab.child(icon.svg(14.0, text_color)))
-            .child(div().flex_1().min_w_0().truncate().child(self.label))
-            .children(self.end)
+            .map(|tab| {
+                if self.compact {
+                    let label = self.label;
+                    tab.justify_center()
+                        .px_0()
+                        .tooltip(move |_, cx| TooltipText::build(label.clone(), cx))
+                } else {
+                    tab.child(div().flex_1().min_w_0().truncate().child(self.label))
+                        .children(self.end)
+                }
+            })
             .when_some(self.on_click.filter(|_| !self.disabled), |tab, on_click| {
                 tab.on_click(on_click)
             })

@@ -6,7 +6,7 @@
 
 use gpui::{AnyView, App, Context, IntoElement, Render, SharedString, Window, div, prelude::*, px};
 
-use crate::{font_family, theme};
+use crate::{CONTROL_RADIUS, font_family, theme};
 
 pub struct TooltipText {
     text: SharedString,
@@ -27,7 +27,7 @@ impl Render for TooltipText {
             .font_family(font_family(cx))
             .px(px(8.0))
             .py(px(4.0))
-            .rounded(px(4.0))
+            .rounded(px(CONTROL_RADIUS))
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_primary)

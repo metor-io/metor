@@ -1,9 +1,9 @@
 //! Row chrome shared by lists, menus and inspectors: the inset selection pill, labels, values
 //! and tag pills.
 
-use gpui::{App, Global, Hsla, Pixels, SharedString, Window, div, prelude::*, px};
+use gpui::{App, Div, Global, Hsla, Pixels, SharedString, Window, div, prelude::*, px};
 
-use crate::{CONTROL_HEIGHT, CONTROL_RADIUS, theme};
+use crate::{CONTROL_HEIGHT, CONTROL_RADIUS, Theme, theme};
 
 /// Height of every row, so editing, header and ordinary rows stack uniformly and hosts can size
 /// their containers from a row count.
@@ -11,6 +11,9 @@ pub const ROW_HEIGHT: f32 = CONTROL_HEIGHT;
 
 /// The label font: what every row's text is set in.
 pub const LABEL_SIZE: Pixels = px(12.0);
+
+/// Corner radius of tag and state pills: a slightly rounded rectangle rather than a capsule.
+pub const PILL_RADIUS: f32 = 3.0;
 
 /// Small pill used for category and tag annotations next to a row label.
 pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
@@ -21,11 +24,31 @@ pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
         .bg(theme.pill_bg)
         .border_1()
         .border_color(theme.pill_border)
-        .rounded(px(3.0))
+        .rounded(px(PILL_RADIUS))
         .text_size(px(10.0))
         .text_color(theme.text_secondary)
         .child(tag)
 }
+
+/// An empty pill tinted in `accent`: the accent's border around a dimmed fill, the look of
+/// accented labels and state chips. The caller adds the content.
+pub fn accent_pill(accent: Hsla, cx: &App) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .px(px(6.0))
+        .rounded(px(PILL_RADIUS))
+        .bg(Theme::dim(accent, ACCENT_FILL))
+        .border_1()
+        .border_color(accent)
+        .text_size(px(11.0))
+        .text_color(theme(cx).text_primary)
+}
+
+/// How strongly an accent tints the fill of an [`accent_pill`] and other accented surfaces.
+pub const ACCENT_FILL: f32 = 0.18;
 
 /// Width of `text` at `size` in the window's font.
 pub fn measure(text: &str, size: Pixels, window: &Window) -> Pixels {

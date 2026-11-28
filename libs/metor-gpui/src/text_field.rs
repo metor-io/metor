@@ -315,16 +315,7 @@ impl TextField {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
-        // cmd on macOS, ctrl elsewhere: `platform` off macOS is the Win/Super key, which the OS
-        // mostly reserves for itself. A wasm build can't tell which OS the browser runs on, so
-        // either key works there.
-        let primary = if cfg!(target_family = "wasm") {
-            mods.platform || mods.control
-        } else if cfg!(target_os = "macos") {
-            mods.platform
-        } else {
-            mods.control
-        };
+        let primary = crate::primary_modifier(mods);
 
         // Line-wise movement replaces document-wise where there are lines to
         // move through; the document ends stay on cmd-up and cmd-down.
@@ -681,13 +672,14 @@ impl TextField {
         view: WeakEntity<V>,
     ) -> impl IntoElement {
         self.platform_input.set(true);
-        let focus = focus.clone();
-        self.render_element(Some(Box::new(move |bounds, window, cx| {
-            window.handle_input(&focus, TextFieldInput { view, bounds }, cx);
-        })))
+        let handle = focus.clone();
+        let register: RegisterInput = Box::new(move |bounds, window, cx| {
+            window.handle_input(&handle, TextFieldInput { view, bounds }, cx);
+        });
+        self.render_element(Some((focus.clone(), register)))
     }
 
-    fn render_element(&self, register_input: Option<RegisterInput>) -> impl IntoElement {
+    fn render_element(&self, input: Option<(FocusHandle, RegisterInput)>) -> impl IntoElement {
         let text = self.text.clone();
         let marked = self.marked.clone();
         let placeholder = self.placeholder.clone();
@@ -731,7 +723,12 @@ impl TextField {
                 (bounds, shaped, is_placeholder)
             },
             move |_, (bounds, shaped, is_placeholder), window, cx| {
-                if let Some(register) = register_input {
+                // A field drawn as the input handler shows its caret only while focused; one drawn
+                // plainly is drawn by its host only while it is being edited.
+                let show_caret = input
+                    .as_ref()
+                    .is_none_or(|(focus, _)| focus.is_focused(window));
+                if let Some((_, register)) = input {
                     register(bounds, window, cx);
                 }
                 let y_offset = (bounds.size.height - line_height).max(px(0.0)) / 2.0;
@@ -800,14 +797,16 @@ impl TextField {
                         window.paint_quad(fill(underline, cursor_color));
                     }
 
-                    let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
-                        - scroll_offset
-                        - cursor_width() / 2.0;
-                    let cursor_bounds = gpui::Bounds::new(
-                        point(cursor_screen_x, base_y),
-                        size(cursor_width(), line_height),
-                    );
-                    window.paint_quad(fill(cursor_bounds, cursor_color));
+                    if show_caret {
+                        let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
+                            - scroll_offset
+                            - cursor_width() / 2.0;
+                        let cursor_bounds = gpui::Bounds::new(
+                            point(cursor_screen_x, base_y),
+                            size(cursor_width(), line_height),
+                        );
+                        window.paint_quad(fill(cursor_bounds, cursor_color));
+                    }
                 });
             },
         )

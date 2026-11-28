@@ -16,11 +16,13 @@ mod fonts;
 pub mod gantt;
 pub mod graph;
 mod icons;
+pub mod menu;
 mod modal;
 pub mod motion;
 pub mod popover;
 pub mod row;
 mod scrollbar;
+pub mod selection;
 mod side_tabs;
 mod switch;
 pub mod table;
@@ -31,15 +33,18 @@ mod tooltip;
 mod tree;
 pub mod viewport;
 
-use gpui::App;
+use gpui::{App, Modifiers};
 
 pub use banner::Banner;
 pub use fonts::{BUNDLED_FAMILY, UiSettings, font_family, register_fonts};
 pub use icons::{Icon, IconAssets};
 pub use modal::{DialogButton, Modal};
-pub use motion::{Fade, MotionPreference};
+pub use motion::{Fade, MotionPreference, Reveal};
 pub use scrollbar::Scrollbar;
-pub use side_tabs::{SIDE_TABS_GAP, SIDE_TABS_PADDING, SideTab, side_tab, side_tabs};
+pub use selection::SelectableText;
+pub use side_tabs::{
+    SIDE_RAIL_WIDTH, SIDE_TABS_GAP, SIDE_TABS_PADDING, SideTab, side_tab, side_tabs,
+};
 pub use switch::{OnPick, Switch};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use text_field::{TextAlign, TextField, TextFieldHost, TextFieldStyle};
@@ -57,4 +62,19 @@ pub fn init(cx: &mut App) {
         install_themes(cx, Vec::new(), None);
     }
     cx.default_global::<UiSettings>();
+}
+
+/// Whether `modifiers` hold the platform's primary shortcut modifier: cmd on macOS and ctrl
+/// elsewhere.
+///
+/// `platform` off macOS is the Win/Super key, which the OS mostly reserves for itself. A wasm
+/// build can't tell which OS the browser runs on, so either key counts there.
+pub fn primary_modifier(modifiers: &Modifiers) -> bool {
+    if cfg!(target_family = "wasm") {
+        modifiers.platform || modifiers.control
+    } else if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
 }

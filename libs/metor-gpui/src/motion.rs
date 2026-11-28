@@ -1,8 +1,10 @@
-//! Short opacity transitions whose lifetime follows their owning view.
+//! Short opacity and height transitions whose lifetime follows their owning view.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{App, Window};
+use gpui::{AnyElement, App, IntoElement, Pixels, Window, canvas, div, prelude::*};
 use web_time::Instant;
 
 use crate::UiSettings;
@@ -121,6 +123,123 @@ impl Fade {
             window.request_animation_frame();
         }
         opacity
+    }
+}
+
+/// A collapsible section sliding open or shut.
+pub const SECTION_SLIDE: Duration = Duration::from_millis(140);
+
+/// A collapsible section's openness, eased so the section slides down as it opens and up as
+/// it closes.
+///
+/// The section keeps its content's height from the last frame it was laid out, so the owner
+/// renders the content while it is [`visible`](Self::visible), including while it closes.
+pub struct Reveal {
+    fade: Fade,
+    open: bool,
+    /// The content's height at its last layout.
+    height: Rc<Cell<Pixels>>,
+}
+
+impl Reveal {
+    /// A section that starts open, without sliding.
+    pub fn open() -> Self {
+        Self {
+            fade: Fade::settled(1.0),
+            open: true,
+            height: Rc::default(),
+        }
+    }
+
+    /// A section that starts shut.
+    pub fn closed() -> Self {
+        Self {
+            fade: Fade::settled(0.0),
+            open: false,
+            height: Rc::default(),
+        }
+    }
+
+    /// A section that slides open as it first appears.
+    pub fn opening() -> Self {
+        Self {
+            fade: Fade::entrance(SECTION_SLIDE),
+            open: true,
+            height: Rc::default(),
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Slides the section open or shut, from wherever it is now.
+    pub fn set_open(&mut self, open: bool) {
+        if open == self.open {
+            return;
+        }
+        self.open = open;
+        if open {
+            self.fade.enter(SECTION_SLIDE);
+        } else {
+            self.fade.exit(SECTION_SLIDE);
+        }
+    }
+
+    /// Whether any of the section shows: it is open or still closing.
+    pub fn visible(&self) -> bool {
+        self.open || self.fade.sample(Instant::now()) > 0.0
+    }
+
+    /// `content` clipped to the part of its height the section has slid open, or `None` once
+    /// it is shut.
+    pub fn render(
+        &mut self,
+        content: impl IntoElement,
+        window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let amount = self.fade.opacity(window, cx);
+        if amount == 0.0 && !self.open {
+            return None;
+        }
+        let height = self.height.clone();
+        let measure = canvas(
+            move |bounds, _, _| height.set(bounds.size.height),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        if amount >= 1.0 {
+            return Some(
+                div()
+                    .relative()
+                    .child(content)
+                    .child(measure)
+                    .into_any_element(),
+            );
+        }
+        // While sliding, the content lays out at its natural height out of flow and the
+        // section shows the top of it.
+        Some(
+            div()
+                .relative()
+                .overflow_hidden()
+                .h(self.height.get() * amount)
+                .opacity(amount)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .child(content)
+                        .child(measure),
+                )
+                .into_any_element(),
+        )
     }
 }
 
